@@ -52,6 +52,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/unstab
 
 import { cpus as osCpus, freemem, totalmem } from 'node:os';
 
+import { getMemoryThresholds } from '../../../lib/env-loader.js';
 import { getCloisterService } from '../../../lib/cloister/service.js';
 import { readHandoffEvents, getHandoffStats } from '../../../lib/cloister/handoff-logger.js';
 import { readSpecialistHandoffs, getSpecialistHandoffStats } from '../../../lib/cloister/specialist-handoff-logger.js';
@@ -189,6 +190,9 @@ let godViewSystemHealthCache: {
   memPercent: number;
   memUsed: number;
   memTotal: number;
+  memFree: number;
+  warnThresholdBytes: number;
+  blockThresholdBytes: number;
   updatedAt: string;
 } | null = null;
 
@@ -203,11 +207,15 @@ async function refreshGodViewSystemHealth() {
       }, 0) / cpuList.length;
     const memTotal = totalmem();
     const memFree = freemem();
+    const { warnBytes, blockBytes } = getMemoryThresholds();
     godViewSystemHealthCache = {
       cpu: Math.round(cpuUsage * 10) / 10,
       memPercent: Math.round(((memTotal - memFree) / memTotal) * 1000) / 10,
       memUsed: memTotal - memFree,
       memTotal,
+      memFree,
+      warnThresholdBytes: warnBytes,
+      blockThresholdBytes: blockBytes,
       updatedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -422,11 +430,15 @@ const getGodviewSystemHealthRoute = HttpRouter.add(
     if (godViewSystemHealthCache) {
       return jsonResponse(godViewSystemHealthCache);
     }
+    const { warnBytes, blockBytes } = getMemoryThresholds();
     return jsonResponse({
       cpu: 0,
       memPercent: 0,
       memUsed: 0,
       memTotal: 0,
+      memFree: 0,
+      warnThresholdBytes: warnBytes,
+      blockThresholdBytes: blockBytes,
       updatedAt: new Date().toISOString(),
     });
   }),
