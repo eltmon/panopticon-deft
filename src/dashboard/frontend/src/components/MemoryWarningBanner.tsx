@@ -19,8 +19,24 @@ interface SystemHealthResponse {
   updatedAt: string
 }
 
-function formatGBDecimal(bytes: number): string {
+export function formatGBDecimal(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(1)
+}
+
+export function shouldShowWarning(memFreeBytes: number, warnThresholdBytes: number): boolean {
+  return memFreeBytes < warnThresholdBytes
+}
+
+export function shouldRedisplay(
+  memFreeBytes: number,
+  dismissedAtFreeBytes: number,
+  redisplayDropBytes: number,
+): boolean {
+  return memFreeBytes < dismissedAtFreeBytes - redisplayDropBytes
+}
+
+export function isCriticalMemory(memFreeBytes: number, blockThresholdBytes: number): boolean {
+  return memFreeBytes < blockThresholdBytes
 }
 
 export function MemoryWarningBanner() {
@@ -57,7 +73,7 @@ export function MemoryWarningBanner() {
     if (!dismissed || !health || health.memTotal === 0) return
     const memFree = health.memTotal - health.memUsed
     const dismissedAt = dismissedAtFreeRef.current
-    if (dismissedAt !== null && memFree < dismissedAt - REDISPLAY_DROP_BYTES) {
+    if (dismissedAt !== null && shouldRedisplay(memFree, dismissedAt, REDISPLAY_DROP_BYTES)) {
       setDismissed(false)
       dismissedAtFreeRef.current = null
     }
@@ -67,11 +83,11 @@ export function MemoryWarningBanner() {
 
   const memFreeBytes = health.memFree ?? (health.memTotal - health.memUsed)
   const warnThreshold = health.warnThresholdBytes ?? WARN_THRESHOLD_BYTES_DEFAULT
-  if (memFreeBytes >= warnThreshold) return null
+  if (!shouldShowWarning(memFreeBytes, warnThreshold)) return null
   if (dismissed) return null
 
   const blockThreshold = health.blockThresholdBytes ?? (2 * 1024 ** 3)
-  const isCritical = memFreeBytes < blockThreshold
+  const isCritical = isCriticalMemory(memFreeBytes, blockThreshold)
 
   const runningAgents = agents
     .filter((a) => a.status === 'running' || a.status === 'starting')
