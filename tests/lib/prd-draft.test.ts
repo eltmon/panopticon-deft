@@ -180,8 +180,10 @@ describe('prd-draft', () => {
     it('should return correct info for existing draft', async () => {
       const { getPRDDraftInfo, writePRDDraft } = await import('../../src/lib/prd-draft.js');
 
+      const before = Date.now();
       const content = '# Test PRD\nSome content here';
       writePRDDraft('PAN-123', content);
+      const after = Date.now();
 
       const info = getPRDDraftInfo('PAN-123');
 
@@ -189,7 +191,9 @@ describe('prd-draft', () => {
       expect(info.path).toContain('PAN-123.md');
       expect(info.size).toBe(content.length);
       expect(info.modified).toBeInstanceOf(Date);
-      expect(info.modified!.getTime()).toBeLessThanOrEqual(Date.now());
+      // Use after+10ms buffer to account for filesystem mtime granularity
+      expect(info.modified!.getTime()).toBeLessThanOrEqual(after + 10);
+      expect(info.modified!.getTime()).toBeGreaterThanOrEqual(before - 10);
     });
   });
 
