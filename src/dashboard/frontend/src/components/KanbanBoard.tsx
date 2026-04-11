@@ -2140,8 +2140,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
     if (confirmingStart) {
       // Second click — confirmed
       setConfirmingStart(false);
-      if (confirmingStartTimer.current) clearTimeout(confirmingStartTimer.current);
-      startAgentMutation.mutate();
+      startAgentMutation.mutate({});
     } else {
       // First click — show inline confirm, stays until clicked outside or Escape
       setConfirmingStart(true);
