@@ -8,7 +8,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import type { ModelId, AnthropicModel, OpenAIModel, GoogleModel, ZAIModel } from './settings.js';
+import type { ModelId } from './settings.js';
 
 export type ProviderName = 'anthropic' | 'kimi' | 'openai' | 'google' | 'zai' | 'openrouter';
 
@@ -38,7 +38,7 @@ export interface ProviderConfig {
   authType?: ProviderAuthType; // Defaults to 'static'
   credentialFile?: string; // Path to credential file (for 'credential-file' auth)
   credentialHelper?: string; // Script that reads credential file and prints token
-  models: ModelId[];
+  models: string[];
   tested: boolean; // Whether compatibility has been verified
   description: string;
 }

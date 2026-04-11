@@ -79,9 +79,8 @@ const execAsync = promisify(exec);
 const PORT = parseInt(process.env.API_PORT || process.env.PORT || '3011', 10);
 const MAX_AUTO_REQUEUE = 7;
 
-// Track server-managed merges — imported from specialists.ts (single source of truth).
-// Previously this was a local Set that was never in sync with specialists.ts's export (PAN-632).
-import { _serverManagedMerges } from './specialists.js';
+// Track server-managed merges to prevent double-lifecycle triggers
+const _serverManagedMerges = new Set<string>();
 
 // ─── Activity log (in-memory, shared with server startup) ─────────────────────
 
@@ -2157,10 +2156,14 @@ const postWorkspaceReviewStatusRoute = HttpRouter.add(
       }
 
       if (testStatus === 'passed') {
-        // Mark ready for merge when tests pass. Post-rebase verification in
-        // triggerMerge() is the real quality gate — don't block on stale pre-merge verification.
-        setReviewStatus(issueId, { readyForMerge: true });
-        console.log(`[review-status] ${issueId} marked ready for merge after test=passed`);
+        // Mark ready for merge when tests pass — but only if verification also passed.
+        const currentStatus = getReviewStatus(issueId);
+        if (currentStatus?.verificationStatus === 'failed') {
+          console.log(`[review-status] ${issueId} tests passed but verification failed — NOT marking ready for merge`);
+        } else {
+          setReviewStatus(issueId, { readyForMerge: true });
+          console.log(`[review-status] ${issueId} marked ready for merge after test=passed`);
+        }
 
         yield* Effect.promise(() => Effect.runPromise(eventStore.append({
           type: 'pipeline.test-completed',
@@ -2997,23 +3000,33 @@ interface TriggerMergeResult {
   mergeResult?: unknown;
 }
 
-// Per-project merge queue backed by SQLite (PAN-632).
-// Replaces the in-memory _mergeQueues Map — survives server restarts.
-import {
-  enqueueMerge,
-  getCurrentMerge,
-  markMergeProcessing,
-  dequeueMerge,
-  removeMerge,
-  getAllActiveQueues,
-} from '../../../lib/database/merge-queue-db.js';
-import { rebaseFeatureBranch } from '../../../lib/cloister/merge-rebase.js';
+// Per-project merge queue: serializes merges to avoid rebase thrashing.
+// Each successful merge changes main, making concurrent rebases stale.
+const MERGE_QUEUE_STALE_MS = 5 * 60 * 1000; // 5 minutes — if current merge takes longer, force-clear
+const _mergeQueues = new Map<string, { current: string | null; currentStartedAt: number | null; queue: string[] }>();
+
+function getOrCreateMergeQueue(projectKey: string): { current: string | null; currentStartedAt: number | null; queue: string[] } {
+  let q = _mergeQueues.get(projectKey);
+  if (!q) {
+    q = { current: null, currentStartedAt: null, queue: [] };
+    _mergeQueues.set(projectKey, q);
+  }
+  // Auto-clear stale current merge (polling got stuck, server restart missed it, etc.)
+  if (q.current && q.currentStartedAt && (Date.now() - q.currentStartedAt) > MERGE_QUEUE_STALE_MS) {
+    console.log(`[merge] Force-clearing stale merge queue entry: ${q.current} (started ${Math.round((Date.now() - q.currentStartedAt) / 1000)}s ago)`);
+    q.current = null;
+    q.currentStartedAt = null;
+  }
+  return q;
+}
 
 /** Dequeue the next merge after current completes (success or failure). */
-function dequeueNextMerge(projectKey: string): void {
-  const nextIssueId = dequeueMerge(projectKey);
+function dequeueNextMerge(mergeQ: { current: string | null; currentStartedAt: number | null; queue: string[] }): void {
+  mergeQ.current = null;
+  mergeQ.currentStartedAt = null;
+  const nextIssueId = mergeQ.queue.shift();
   if (nextIssueId) {
-    console.log(`[merge] Dequeuing next merge: ${nextIssueId}`);
+    console.log(`[merge] Dequeuing next merge: ${nextIssueId} (${mergeQ.queue.length} remaining)`);
     triggerMerge(nextIssueId).catch(err =>
       console.error(`[merge] Queue error for ${nextIssueId}: ${err}`)
     );
@@ -3082,26 +3095,31 @@ async function triggerMerge(issueId: string): Promise<TriggerMergeResult> {
   const projectPath = getProjectPath(undefined, issuePrefix);
   const issueLower = issueId.toLowerCase();
 
-  // Serialize merges per project via persistent SQLite queue (PAN-632).
-  // Survives server restarts — no more lost queues.
+  // Serialize merges per project — concurrent rebases thrash each other
   const projectKey = issuePrefix.toLowerCase();
-  const normalizedId = issueId.toUpperCase();
-  const currentlyMerging = getCurrentMerge(projectKey);
-  if (currentlyMerging && currentlyMerging !== normalizedId) {
+  const mergeQ = getOrCreateMergeQueue(projectKey);
+  if (mergeQ.current && mergeQ.current !== issueId.toUpperCase()) {
     // Another merge is in progress — queue this one
-    const position = enqueueMerge(projectKey, normalizedId);
+    const normalizedId = issueId.toUpperCase();
+    if (!mergeQ.queue.includes(normalizedId)) {
+      mergeQ.queue.push(normalizedId);
+    }
+    const position = mergeQ.queue.indexOf(normalizedId) + 1;
     setReviewStatus(issueId, { mergeStatus: 'queued' });
-    console.log(`[merge] Queued ${issueId} (position ${position}, waiting for ${currentlyMerging})`);
+    console.log(`[merge] Queued ${issueId} (position ${position}, waiting for ${mergeQ.current})`);
     return {
       success: true,
       statusCode: 200,
-      message: `Queued for merge (position ${position}, waiting for ${currentlyMerging})`,
+      message: `Queued for merge (position ${position}, waiting for ${mergeQ.current})`,
     };
   }
-  // Mark as processing IMMEDIATELY — before any async work — to prevent race conditions.
-  // SQLite write is atomic — no window for concurrent calls to both pass the check.
-  enqueueMerge(projectKey, normalizedId);
-  markMergeProcessing(projectKey, normalizedId);
+  mergeQ.current = issueId.toUpperCase();
+  mergeQ.currentStartedAt = Date.now();
+
+  // Wrap in try/finally to ALWAYS dequeue the next merge on any exit path.
+  // Without this, early returns (workspace missing, PR creation fails, etc.)
+  // leave the queue stuck with no dequeue.
+  try {
 
   const workspaceInfo = getWorkspaceInfoForIssue(issueId);
 
@@ -3309,46 +3327,18 @@ async function triggerMerge(issueId: string): Promise<TriggerMergeResult> {
     }
     const prNumber = prMatch[1];
 
-    // Step 2: Rebase feature branch onto main — in-process, no specialist (PAN-632)
-    const { postMergeLifecycle } = await import(
+    // Step 2: Rebase feature branch onto main (merge-agent handles conflict resolution)
+    const { spawnRebaseAgentForBranch, postMergeLifecycle } = await import(
       '../../../lib/cloister/merge-agent.js'
     );
 
-    console.log(`[merge] Rebasing ${branchName} onto main for ${issueId} (in-process)...`);
-    const rebaseResult = await rebaseFeatureBranch(workspacePath, branchName, 'main', issueId);
+    console.log(`[merge] Rebasing ${branchName} onto main for ${issueId}...`);
+    const rebaseResult = await spawnRebaseAgentForBranch(workspacePath, branchName, 'main', issueId);
 
     if (!rebaseResult.success) {
       const error = rebaseResult.reason || 'Rebase failed';
-      setReviewStatus(issueId, { mergeStatus: 'failed', mergeNotes: error });
+      setReviewStatus(issueId, { mergeStatus: 'failed' });
       completePendingOperation(issueId, error);
-
-      // Notify work agent about conflicts
-      if (rebaseResult.conflictFiles?.length) {
-        try {
-          const { messageAgent } = await import('../../../lib/agents.js');
-          const { sessionExists } = await import('../../../lib/tmux.js');
-          const agentId = `agent-${issueId.toLowerCase()}`;
-          if (sessionExists(agentId)) {
-            await messageAgent(agentId,
-              `MERGE CONFLICT: Rebase onto main failed.\n\nConflict files: ${rebaseResult.conflictFiles.join(', ')}\n\nPlease resolve:\n1. git fetch origin main\n2. git rebase origin/main\n3. Resolve conflicts\n4. git push --force-with-lease\n5. Resubmit for review`
-            );
-            console.log(`[merge] Sent conflict details to ${agentId}`);
-          }
-        } catch { /* non-fatal */ }
-
-        // Post PR comment
-        try {
-          const prMatch2 = prResult.prUrl?.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-          if (prMatch2) {
-            const [, owner, repo, prNum] = prMatch2;
-            await execAsync(
-              `gh api repos/${owner}/${repo}/issues/${prNum}/comments -f body=${JSON.stringify(`## Merge Failed — Rebase Conflicts\n\nConflicts in: ${rebaseResult.conflictFiles.join(', ')}\n\nThe work agent has been notified to resolve conflicts and resubmit.`)}`,
-              { encoding: 'utf-8' }
-            );
-          }
-        } catch { /* non-fatal */ }
-      }
-
       return { success: false, statusCode: 500, error };
     }
 
@@ -3432,7 +3422,7 @@ async function triggerMerge(issueId: string): Promise<TriggerMergeResult> {
     _serverManagedMerges.delete(normalizedMergeId);
 
     // Dequeue next merge before lifecycle (which may kill the process)
-    dequeueNextMerge(projectKey);
+    dequeueNextMerge(mergeQ);
 
     // Post-merge lifecycle runs last — may spawn deploy script that kills this server
     await postMergeLifecycle(issueId, projectPath, branchName);
@@ -3450,11 +3440,14 @@ async function triggerMerge(issueId: string): Promise<TriggerMergeResult> {
     return { success: false, statusCode: 500, error: error.message };
   } finally {
     _serverManagedMerges.delete(normalizedMergeId);
-    // ALWAYS dequeue on any exit path — DB-backed, survives restart.
-    removeMerge(normalizedId);
-    dequeueNextMerge(projectKey);
   }
 
+  } finally {
+    // ALWAYS dequeue on any exit path — early returns, errors, or success.
+    if (mergeQ.current === issueId.toUpperCase()) {
+      dequeueNextMerge(mergeQ);
+    }
+  }
 }
 
 // ─── Route: POST /api/workspaces/:issueId/merge ───────────────────────────────
@@ -3856,7 +3849,22 @@ const getMergeQueueRoute = HttpRouter.add(
   'GET',
   '/api/merge-queue',
   httpHandler(Effect.gen(function* () {
-    const queues = getAllActiveQueues();
+    const queues: Array<{
+      projectKey: string;
+      current: string | null;
+      queue: string[];
+      queueLength: number;
+    }> = [];
+    for (const [projectKey, q] of _mergeQueues) {
+      if (q.current || q.queue.length > 0) {
+        queues.push({
+          projectKey,
+          current: q.current,
+          queue: [...q.queue],
+          queueLength: q.queue.length,
+        });
+      }
+    }
     return jsonResponse({ queues });
   })),
 );

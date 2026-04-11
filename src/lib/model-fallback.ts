@@ -12,7 +12,7 @@ import { resolveModelId } from './model-capabilities.js';
 /**
  * AI model provider types
  */
-export type ModelProvider = 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter';
+export type ModelProvider = 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai';
 
 /**
  * Map of model ID to provider
@@ -41,6 +41,10 @@ const MODEL_PROVIDERS: Record<ModelId, ModelProvider> = {
   // MiniMax models
   'minimax-m2.7': 'minimax',
   'minimax-m2.7-highspeed': 'minimax',
+
+  // ZAI (Z.AI / GLM) models
+  'glm-4.7': 'zai',
+  'glm-4.7-flash': 'zai',
 };
 
 /**

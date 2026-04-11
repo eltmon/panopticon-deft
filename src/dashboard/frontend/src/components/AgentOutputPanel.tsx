@@ -41,6 +41,7 @@ export function AgentOutputPanel({ agentId }: AgentOutputPanelProps) {
 
   const agent = useDashboardStore(selectAgentById(agentId));
   const specialist = parseSpecialistSession(agentId);
+  const [_terminalFailed, setTerminalFailed] = useState(false);
 
   // Reset view mode when agent changes
   const [prevAgent, setPrevAgent] = useState(agentId);

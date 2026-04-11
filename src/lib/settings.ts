@@ -7,7 +7,8 @@ export type OpenAIModel = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.4-nano' | 'o3';
 export type GoogleModel = 'gemini-3.1-pro-preview' | 'gemini-3-flash' | 'gemini-3.1-flash-lite-preview';
 export type KimiModel = 'kimi-k2.5';
 export type MiniMaxModel = 'minimax-m2.7' | 'minimax-m2.7-highspeed';
-export type ModelId = AnthropicModel | OpenAIModel | GoogleModel | KimiModel | MiniMaxModel;
+export type ZAIModel = 'glm-4.7' | 'glm-4.7-flash';
+export type ModelId = AnthropicModel | OpenAIModel | GoogleModel | KimiModel | MiniMaxModel | ZAIModel;
 
 // Task complexity levels
 export type ComplexityLevel = 'trivial' | 'simple' | 'medium' | 'complex' | 'expert';
@@ -36,6 +37,7 @@ export interface ApiKeysConfig {
   openai?: string;
   google?: string;
   kimi?: string;
+  zai?: string;
 }
 
 // Complete settings structure
@@ -199,6 +201,7 @@ export function getAvailableModels(settings: SettingsConfig): {
   openai: OpenAIModel[];
   google: GoogleModel[];
   kimi: KimiModel[];
+  zai: ZAIModel[];
 } {
   const anthropicModels: AnthropicModel[] = [
     'claude-opus-4-6',
@@ -218,11 +221,16 @@ export function getAvailableModels(settings: SettingsConfig): {
     ? ['kimi-k2.5']
     : [];
 
+  const zaiModels: ZAIModel[] = settings.api_keys.zai
+    ? ['glm-4.7', 'glm-4.7-flash']
+    : [];
+
   return {
     anthropic: anthropicModels,
     openai: openaiModels,
     google: googleModels,
     kimi: kimiModels,
+    zai: zaiModels,
   };
 }
 

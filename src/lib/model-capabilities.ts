@@ -82,7 +82,7 @@ export interface ModelCapability {
   /** Model identifier */
   model: ModelId;
   /** Provider for this model */
-  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter';
+  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai';
   /** Display name */
   displayName: string;
   /** Cost per 1M tokens (average of input/output) in USD */
@@ -432,6 +432,54 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
       'context-length': 92,
     },
     notes: 'Identical quality to M2.7, 100 tps (3x Opus speed). Best for high-throughput agent work.',
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ZAI (Z.AI / GLM) MODELS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  'glm-4.7': {
+    model: 'glm-4.7',
+    provider: 'zai',
+    displayName: 'GLM-4.7',
+    costPer1MTokens: 3.0,
+    contextWindow: 131072,
+    skills: {
+      'code-generation': 82,
+      'code-review': 80,
+      debugging: 80,
+      planning: 78,
+      documentation: 78,
+      testing: 78,
+      security: 75,
+      performance: 76,
+      synthesis: 80,
+      speed: 80,
+      'context-length': 85,
+    },
+    notes: 'Z.AI GLM-4.7 via Anthropic-compatible API. Tested 2026-01-28.',
+  },
+
+  'glm-4.7-flash': {
+    model: 'glm-4.7-flash',
+    provider: 'zai',
+    displayName: 'GLM-4.7 Flash',
+    costPer1MTokens: 0.5,
+    contextWindow: 131072,
+    skills: {
+      'code-generation': 76,
+      'code-review': 74,
+      debugging: 74,
+      planning: 72,
+      documentation: 72,
+      testing: 73,
+      security: 68,
+      performance: 70,
+      synthesis: 75,
+      speed: 90,
+      'context-length': 85,
+    },
+    notes: 'Fast, cheap GLM variant. Best for low-stakes or high-volume tasks.',
   },
 };
 

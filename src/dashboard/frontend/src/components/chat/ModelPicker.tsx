@@ -100,31 +100,7 @@ interface ModelPickerProps {
 export function ModelPicker({ value, onChange, disabled = false }: ModelPickerProps) {
   const [open, setOpen] = useState(false);
   const [groups, setGroups] = useState<ModelGroup[]>(FALLBACK_GROUPS);
-  const [dropdownAlign, setDropdownAlign] = useState<'left' | 'right'>('left');
-  const [openUp, setOpenUp] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-
-  // Adjust dropdown alignment if it would overflow the viewport
-  useEffect(() => {
-    if (!open || !dropdownRef.current || !ref.current) return;
-
-    const dropdownRect = dropdownRef.current.getBoundingClientRect();
-
-    // If dropdown extends past right edge of viewport, align to right
-    if (dropdownRect.right > window.innerWidth - 8) {
-      setDropdownAlign('right');
-    } else {
-      setDropdownAlign('left');
-    }
-
-    // If dropdown extends past bottom edge of viewport, open upward
-    if (dropdownRect.bottom > window.innerHeight - 8) {
-      setOpenUp(true);
-    } else {
-      setOpenUp(false);
-    }
-  }, [open]);
 
   // Fetch available models from the API on mount
   useEffect(() => {
@@ -233,11 +209,7 @@ export function ModelPicker({ value, onChange, disabled = false }: ModelPickerPr
       </button>
 
       {open && (
-        <div
-          ref={dropdownRef}
-          className={`${styles.pickerDropdown} ${openUp ? styles.pickerDropdownUp : ''}`}
-          style={dropdownAlign === 'right' ? { left: 'auto', right: 0 } : {}}
-        >
+        <div className={styles.pickerDropdown}>
           {groups.map((group) => (
             <div key={group.provider}>
               {groups.length > 1 && (

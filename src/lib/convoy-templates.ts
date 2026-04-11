@@ -48,8 +48,8 @@ export interface ConvoyTemplate {
 /**
  * Code Review Template
  *
- * Spawns 3 parallel review agents followed by a synthesis agent.
- * Each reviewer focuses on a specific aspect (correctness, security, performance).
+ * Spawns 4 parallel review agents followed by a synthesis agent.
+ * Each reviewer focuses on a specific aspect (correctness, security, performance, requirements).
  * The synthesis agent combines all findings into a unified report.
  */
 export const CODE_REVIEW_TEMPLATE: ConvoyTemplate = {

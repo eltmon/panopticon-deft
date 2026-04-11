@@ -138,6 +138,12 @@ export const WORK_TYPE_REQUIREMENTS: Record<WorkTypeId, SkillRequirement[]> = {
     { skill: 'testing', weight: 0.2 }, // Test coverage
   ],
 
+  'convoy:requirements-reviewer': [
+    { skill: 'planning', weight: 0.4 }, // Understanding requirements
+    { skill: 'code-review', weight: 0.4 }, // Verifying implementation
+    { skill: 'documentation', weight: 0.2 }, // Acceptance criteria analysis
+  ],
+
   'convoy:synthesis-agent': [
     { skill: 'synthesis', weight: 0.6 }, // Primary skill
     { skill: 'documentation', weight: 0.2 }, // Clear writing
