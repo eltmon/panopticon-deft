@@ -242,10 +242,12 @@ describe('shadow-state', () => {
   });
 
   describe('getPendingSyncCount', () => {
-    it('should return 0 when no issues need sync', () => {
+    it('should not count a freshly created synced state', () => {
+      const countBefore = getPendingSyncCount();
       const id = getUniqueId('nosync');
       createShadowState(id, 'open');
-      expect(getPendingSyncCount()).toBe(0);
+      // A newly created state has matching shadow/tracker status — count must not increase
+      expect(getPendingSyncCount()).toBe(countBefore);
     });
 
     it('should return count of issues needing sync', () => {
