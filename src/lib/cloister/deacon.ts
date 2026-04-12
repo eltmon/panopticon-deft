@@ -2123,18 +2123,79 @@ export function containerRestartBackoffMs(count: number): number {
  * PAN-464: Kill orphaned host processes (e.g., Vite, node) for a workspace path.
  * Orphaned Vite watchers exhaust inotify handles, causing ENOSPC in containers.
  * Runs before restarting the container so the root cause is cleared.
+ *
+ * CRITICAL: Must not kill the active work agent's process tree OR the dashboard
+ * server's own child processes (e.g., npm/tsc spawned by the verification gate).
+ * We collect agent tmux pane PIDs, their descendants, and all descendants of the
+ * server process itself, then exclude them all from the kill list.
  */
 async function killOrphanedWorkspaceProcesses(workspacePath: string): Promise<void> {
   try {
+    // 1. Collect tmux pane PIDs for agent sessions in this workspace
+    const protectedPids = new Set<string>([String(process.pid)]);
+
+    // 1a. Protect all descendants of the server process itself (e.g., npm/tsc spawned
+    //     by the verification gate). These are children of the server, not tmux panes.
+    try {
+      const { stdout: serverDesc } = await execAsync(
+        `pstree -p ${process.pid} 2>/dev/null | grep -oE '\\([0-9]+\\)' | tr -d '()' || true`,
+        { encoding: 'utf-8', timeout: 3000 },
+      );
+      for (const d of serverDesc.trim().split('\n')) {
+        if (d && /^\d+$/.test(d.trim())) protectedPids.add(d.trim());
+      }
+    } catch { /* non-fatal */ }
+
+    // 1b. Protect agent/planning tmux pane PIDs and their descendants
+    try {
+      const { stdout: sessions } = await execAsync(
+        `tmux list-sessions -F "#{session_name}" 2>/dev/null || true`,
+        { encoding: 'utf-8', timeout: 3000 },
+      );
+      const agentSessions = sessions.trim().split('\n').filter(s => s.startsWith('agent-') || s.startsWith('planning-'));
+      for (const session of agentSessions) {
+        try {
+          const { stdout: panePid } = await execAsync(
+            `tmux list-panes -t "${session}" -F "#{pane_pid}" 2>/dev/null || true`,
+            { encoding: 'utf-8', timeout: 3000 },
+          );
+          const pid = panePid.trim().split('\n')[0]?.trim();
+          if (pid && /^\d+$/.test(pid)) {
+            protectedPids.add(pid);
+            try {
+              const { stdout: descendants } = await execAsync(
+                `pgrep -P ${pid} 2>/dev/null; ps -o pid= --ppid ${pid} 2>/dev/null | xargs -I{} pgrep -P {} 2>/dev/null`,
+                { encoding: 'utf-8', timeout: 3000 },
+              );
+              for (const d of descendants.trim().split(/\s+/)) {
+                if (d && /^\d+$/.test(d)) protectedPids.add(d);
+              }
+              const { stdout: allDesc } = await execAsync(
+                `pstree -p ${pid} 2>/dev/null | grep -oE '\\([0-9]+\\)' | tr -d '()' || true`,
+                { encoding: 'utf-8', timeout: 3000 },
+              );
+              for (const d of allDesc.trim().split('\n')) {
+                if (d && /^\d+$/.test(d.trim())) protectedPids.add(d.trim());
+              }
+            } catch { /* non-fatal */ }
+          }
+        } catch { /* non-fatal */ }
+      }
+    } catch { /* non-fatal */ }
+
+    // 2. Find processes with files open in the workspace
     const { stdout } = await execAsync(
       `lsof +D "${workspacePath}" -t 2>/dev/null || true`,
       { encoding: 'utf-8', timeout: 10000 },
     );
     const pids = stdout.trim().split('\n').filter(Boolean).map(p => p.trim()).filter(p => /^\d+$/.test(p));
-    const safePids = pids.filter(p => p !== String(process.pid));
+
+    // 3. Filter out protected PIDs (server descendants, agent tmux panes and descendants)
+    const safePids = pids.filter(p => !protectedPids.has(p));
+
     if (safePids.length > 0) {
       await execAsync(`kill ${safePids.join(' ')} 2>/dev/null || true`, { encoding: 'utf-8', timeout: 5000 });
-      console.log(`[deacon] Killed ${safePids.length} orphaned process(es) in ${workspacePath} before container restart`);
+      console.log(`[deacon] Killed ${safePids.length} orphaned process(es) in ${workspacePath} before container restart (protected ${protectedPids.size - 1} agent/server PIDs)`);
     }
   } catch {
     // Non-fatal — proceed with restart even if cleanup fails
