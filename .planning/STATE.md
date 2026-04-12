@@ -17,7 +17,8 @@ All beads complete, running final quality gates before signaling done
 - D2: Chart x-axis ticks use autoSkip:false + callback showing labels only on week boundaries (every 7th tick from end), so all 30 daily tick marks render but only ~4 date labels show
 
 ## Specialist Feedback
-(none yet)
 - **[2026-04-12T03:51Z] verification-gate → FAILED** — `.planning/feedback/001-verification-gate-failed.md`
 - **[2026-04-12T03:52Z] verification-gate → FAILED** — `.planning/feedback/002-verification-gate-failed.md`
 - **[2026-04-12T03:53Z] verification-gate → FAILED** — `.planning/feedback/003-verification-gate-failed.md`
+- **[2026-04-12T04:05Z] verification-gate → FAILED** — `.planning/feedback/004-verification-gate-failed.md`
+- **[2026-04-12T00:15Z] investigation** — All gates pass locally (build/typecheck/lint/test exit 0). Prior failures were OOM kills from crashing UAT containers (panopticon-feature-pan-619-*) causing memory pressure. Containers have stabilized; resubmitting.
