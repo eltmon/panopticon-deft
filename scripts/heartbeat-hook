@@ -53,38 +53,10 @@ EVENT_BODY=$(jq -n \
   '{kind: $kind, activity: $activity, tool: $tool}')
 panopticon_post_event "$AGENT_ID" "$EVENT_BODY" || true
 
-# ─── Legacy: heartbeat JSON, activity log, runtime.json, sessions, costs ──────
-
-# Ensure directories exist
-HEARTBEAT_DIR="$HOME/.panopticon/heartbeats"
-mkdir -p "$HEARTBEAT_DIR"
+# ─── Legacy: activity log, runtime.json, sessions, costs ──────────────────────
 
 AGENT_DIR="$HOME/.panopticon/agents/$AGENT_ID"
 mkdir -p "$AGENT_DIR"
-
-# Write heartbeat atomically (write to temp file, then move)
-TEMP_FILE="$HEARTBEAT_DIR/$AGENT_ID.json.tmp"
-jq -n \
-  --arg timestamp "$TIMESTAMP" \
-  --arg agent_id "$AGENT_ID" \
-  --arg tool_name "$TOOL_NAME" \
-  --arg last_action "$TOOL_INPUT" \
-  --arg current_task "$CURRENT_TASK" \
-  --arg git_branch "$GIT_BRANCH" \
-  --arg workspace "$WORKSPACE" \
-  --argjson pid $$ \
-  '{
-    timestamp: $timestamp,
-    agent_id: $agent_id,
-    tool_name: $tool_name,
-    last_action: $last_action,
-    current_task: $current_task,
-    git_branch: $git_branch,
-    workspace: $workspace,
-    pid: $pid
-  }' > "$TEMP_FILE" 2>/dev/null || true
-
-mv "$TEMP_FILE" "$HEARTBEAT_DIR/$AGENT_ID.json" 2>/dev/null || true
 
 # Append to activity log (JSONL format)
 ACTIVITY_FILE="$AGENT_DIR/activity.jsonl"

@@ -70,7 +70,6 @@ import {
 import {
   messageAgent,
   saveAgentRuntimeState,
-  getAgentRuntimeState,
   getAgentRuntimeStateAsync,
   transitionIssueToInReview,
   getAgentState,

@@ -48,7 +48,6 @@ import { getRuntimeForAgent } from '../../../lib/runtimes/index.js';
 import {
   getAgentState,
   getAgentStateAsync,
-  getAgentRuntimeState,
   getAgentRuntimeStateAsync,
   saveAgentRuntimeState,
   saveAgentState,
@@ -218,6 +217,7 @@ const getAgentsRoute = HttpRouter.add(
           return jsonResponse(agentsCache.data);
         }
 
+        const agentState = yield* AgentStateService;
         const sessions = yield* Effect.promise(() => listSessionsAsync());
         const agentLines = sessions
           .filter((session) => session.name.startsWith('agent-') || session.name.startsWith('planning-'))
@@ -288,8 +288,12 @@ const getAgentsRoute = HttpRouter.add(
               });
             }
 
+            const snapshotOpt = await Effect.runPromise(agentState.get(name));
+            const isIdle = Option.isSome(snapshotOpt) && (snapshotOpt.value.activity === 'idle' || (snapshotOpt.value.currentTool === 'AskUserQuestion' && pendingQuestions.length === 0));
+
+            // Transitional: read enrichment fields (resolution) from runtime.json
+            // until enrichment events fully replace file-based storage.
             const runtimeState = await getAgentRuntimeStateAsync(name);
-            const isIdle = runtimeState?.state === 'idle' || (runtimeState?.currentTool === 'AskUserQuestion' && pendingQuestions.length === 0);
 
             const issueReviewStatus = getReviewStatus(issueId);
             const hasActiveSpecialist = issueReviewStatus?.reviewStatus === 'reviewing'
@@ -767,15 +771,6 @@ const postAgentAnswerQuestionRoute = HttpRouter.add(
 // ─── Route: POST /api/agents/:id/heartbeat ───────────────────────────────────
 // PAN-800: Schema-validated typed-event ingestion endpoint.
 
-const LEGACY_STATE_MAP: Record<string, typeof Activity.Type> = {
-  active: 'working',
-  idle: 'idle',
-  suspended: 'idle',
-  stopped: 'stopped',
-  uninitialized: 'idle',
-  'waiting-on-human': 'waiting',
-};
-
 const RuntimeEventBody = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('activity'), activity: Activity, tool: Schema.optional(Schema.String) }),
   Schema.Struct({ kind: Schema.Literal('thinking_start'), lastToolAt: Schema.String }),
@@ -784,8 +779,6 @@ const RuntimeEventBody = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('waiting_clear'), clearedBy: Schema.Literals(['user_response', 'timeout', 'stopped', 'tool_resumed']) }),
   Schema.Struct({ kind: Schema.Literal('message_received'), direction: Schema.Literals(['to_agent', 'from_agent']), source: Schema.Literals(['user', 'cloister', 'specialist', 'automated']) }),
   Schema.Struct({ kind: Schema.Literal('model_set'), model: Schema.String, claudeSessionId: Schema.optional(Schema.String) }),
-  // Legacy body shape — mapped to activity for transition window
-  Schema.Struct({ state: Schema.String, tool: Schema.optional(Schema.String), timestamp: Schema.optional(Schema.String) }),
 );
 
 const postAgentHeartbeatRoute = HttpRouter.add(
@@ -805,23 +798,6 @@ const postAgentHeartbeatRoute = HttpRouter.add(
     const eventBody = decoded.right;
     const timestamp = new Date().toISOString();
 
-    // Legacy body shape
-    if (!('kind' in eventBody)) {
-      const activity = LEGACY_STATE_MAP[eventBody.state] ?? 'idle';
-      yield* agentState.emit({
-        type: 'agent.activity_changed',
-        sequence: 0, // assigned by event store
-        timestamp: eventBody.timestamp || timestamp,
-        payload: {
-          agentId: id,
-          activity,
-          currentTool: eventBody.tool ?? undefined,
-        },
-      });
-      return jsonResponse({ success: true });
-    }
-
-    // Typed event body
     switch (eventBody.kind) {
       case 'activity':
         yield* agentState.emit({
