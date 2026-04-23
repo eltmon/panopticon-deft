@@ -12,7 +12,23 @@ Phase 5 — Consumer migration + cleanup: Migrate 22 `tmux capture-pane` call si
 - [x] Phase 4 — Hook migration (all hooks become POST emitters) (commit: 28861293)
 
 ## Remaining Work
-- [ ] Phase 5 — Consumer migration + cleanup (22 `tmux capture-pane` call sites)
+- [x] Phase 5 — Consumer migration + cleanup (partial, see below)
+
+### Phase 5 completed
+- Migrated GET /api/agents to use AgentStateService for isIdle detection
+- Removed unused `getAgentRuntimeState` (sync) imports from server routes
+- Removed legacy heartbeat body mapping from POST /api/agents/:id/heartbeat
+- Stopped writing `heartbeats/` directory in heartbeat-hook
+
+### Phase 5 remaining
+- Migrate remaining server routes (mission-control.ts, specialists.ts, workspaces.ts) to AgentStateService
+- Delete `getAgentRuntimeState` (sync) and update ~25 callers in src/lib/
+- Delete `saveAgentRuntimeState` and update ~15 callers in src/lib/ and server routes
+- Delete `confirmDelivery` from src/lib/tmux.ts
+- Delete `parseThinkingDuration`, `checkLazyAgent`, `checkStuckWorkAgents` from src/lib/cloister/deacon.ts
+- Migrate ~14 `capturePane` call sites in src/lib/cloister/ and src/dashboard/server/
+- Remove transitional runtime.json writes from hooks once all consumers are migrated
+- Update tests for deleted functions
 
 ## Key Decisions
 - Follow existing `Record<string, T>` pattern in `ReadModelState` rather than introducing `HashMap` in the shared reducer (the service layer can use `SubscriptionRef<HashMap>` internally).
