@@ -169,6 +169,17 @@ function canonicalStatus(state: IssueState): string {
   }
 }
 
+function displayStatus(state: IssueState): string {
+  switch (state) {
+    case 'open': return 'Open';
+    case 'in_planning': return 'In Planning';
+    case 'in_progress': return 'In Progress';
+    case 'in_review': return 'In Review';
+    case 'closed': return 'Closed';
+    case 'canceled': return 'Canceled';
+  }
+}
+
 export const IssueLifecycleLive = Layer.effect(
   IssueLifecycle,
   Effect.gen(function* () {
@@ -220,9 +231,9 @@ export const IssueLifecycleLive = Layer.effect(
           // Patch the in-memory cache and emit a domain event (non-fatal)
           yield* Effect.try({ try: () => getSharedIssueService().patchIssue(issueId, { canonicalStatus: canonicalStatus(state) }), catch: () => void 0 }).pipe(Effect.ignore);
           yield* emitEvent({
-            type: 'issue.transitioned',
+            type: 'issue.statusChanged',
             timestamp: new Date().toISOString(),
-            payload: { issueId, state },
+            payload: { issueId, status: displayStatus(state), canonicalStatus: canonicalStatus(state) },
           });
         }),
 
