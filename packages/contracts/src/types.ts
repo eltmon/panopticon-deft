@@ -42,6 +42,43 @@ export type MergeStatusValue = typeof MergeStatusValue.Type
 export const VerificationStatusValue = Schema.Literals(["pending", "running", "passed", "failed", "skipped"])
 export type VerificationStatusValue = typeof VerificationStatusValue.Type
 
+// ─── Agent Runtime ────────────────────────────────────────────────────────────
+// (PAN-800) Effect-native agent runtime state
+
+export const Activity = Schema.Literals(["working", "thinking", "waiting", "idle", "stopped"])
+export type Activity = typeof Activity.Type
+
+export const ThinkingState = Schema.Struct({
+  since: Schema.String,
+  lastToolAt: Schema.String,
+})
+export type ThinkingState = typeof ThinkingState.Type
+
+export const WaitingReason = Schema.Literals(["tool_permission", "user_question", "disambiguation", "other"])
+export type WaitingReason = typeof WaitingReason.Type
+
+export const WaitingState = Schema.Struct({
+  reason: WaitingReason,
+  startedAt: Schema.String,
+  message: Schema.optional(Schema.String),
+  notificationSent: Schema.optional(Schema.Boolean),
+})
+export type WaitingState = typeof WaitingState.Type
+
+export const AgentRuntimeSnapshot = Schema.Struct({
+  id: AgentId,
+  activity: Activity,
+  lastActivity: Schema.String,
+  currentTool: Schema.optional(Schema.String),
+  thinking: Schema.optional(ThinkingState),
+  waiting: Schema.optional(WaitingState),
+  claudeSessionId: Schema.optional(Schema.String),
+  model: Schema.optional(Schema.String),
+  lastMessageAt: Schema.optional(Schema.String),
+  updatedAtSequence: SequenceNumber,
+})
+export type AgentRuntimeSnapshot = typeof AgentRuntimeSnapshot.Type
+
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
 export const AgentSnapshot = Schema.Struct({
@@ -64,6 +101,9 @@ export const AgentSnapshot = Schema.Struct({
   pendingQuestionCount: Schema.optional(Schema.Number),
   resolution: Schema.optional(AgentResolution),
   resolutionCount: Schema.optional(Schema.Number),
+  // PAN-800: sequence number of the last runtime snapshot update
+  // Cheaply detect runtime changes without deep-comparing the full AgentSnapshot
+  runtimeSnapshotSequence: Schema.optional(SequenceNumber),
 })
 export type AgentSnapshot = typeof AgentSnapshot.Type
 
