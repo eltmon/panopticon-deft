@@ -25,6 +25,10 @@ export interface ProjectionCache {
   load(): DashboardSnapshot | null;
   /** Persist the snapshot (debounced at 100ms). */
   save(snapshot: DashboardSnapshot): void;
+  /** Load an arbitrary keyed entry. Returns null if not found or corrupt. */
+  loadKey(key: string): unknown | null;
+  /** Persist an arbitrary keyed entry (debounced at 100ms). */
+  saveKey(key: string, data: unknown, sequence: number): void;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -46,6 +50,11 @@ export function createProjectionCache(db: DbAdapter): ProjectionCache {
 
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingSnapshot: DashboardSnapshot | null = null;
+
+  // Generic key-value cache debounce state
+  type PendingKv = { key: string; data: unknown; sequence: number };
+  let kvDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingKv: PendingKv | null = null;
 
   function load(): DashboardSnapshot | null {
     try {
@@ -87,7 +96,36 @@ export function createProjectionCache(db: DbAdapter): ProjectionCache {
     debounceTimer = setTimeout(flush, 100);
   }
 
-  return { load, save };
+  function loadKey(key: string): unknown | null {
+    try {
+      const row = loadStmt.get([key]);
+      if (!row) return null;
+      return JSON.parse(row.data);
+    } catch (err) {
+      console.warn(`[projection-cache] Failed to load key=${key}:`, err);
+      return null;
+    }
+  }
+
+  function flushKv(): void {
+    if (!pendingKv) return;
+    const { key, data, sequence } = pendingKv;
+    pendingKv = null;
+    kvDebounceTimer = null;
+    try {
+      upsertStmt.run([key, JSON.stringify(data), sequence, new Date().toISOString()]);
+    } catch (err) {
+      console.warn(`[projection-cache] Failed to save key=${key}:`, err);
+    }
+  }
+
+  function saveKey(key: string, data: unknown, sequence: number): void {
+    pendingKv = { key, data, sequence };
+    if (kvDebounceTimer !== null) return; // Already scheduled
+    kvDebounceTimer = setTimeout(flushKv, 100);
+  }
+
+  return { load, save, loadKey, saveKey };
 }
 
 // ─── Module-level singleton ───────────────────────────────────────────────────

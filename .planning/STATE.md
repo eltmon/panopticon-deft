@@ -3,13 +3,12 @@
 ## Status: In Progress
 
 ## Current Phase
-Phase 1 — Contracts: Adding `AgentRuntimeSnapshot`, activity/thinking/waiting types, 7 new `agent.*` runtime events, and `agent.state_restored` to `packages/contracts`. Extending `event-reducers.ts` to fold them into `ReadModelState.agentRuntimeById`.
+Phase 2 — Service: Implement `AgentStateService` with `SubscriptionRef`, bootstrap from event store replay, fallback from `projection_cache` and `runtime.json`, forward subscription to event store, and `projection_cache` persistence on every fold.
 
 ## Completed Work
-- [none yet]
+- [x] Phase 1 — Contracts: types, events, reducers, unit tests (commit: 5436645e)
 
 ## Remaining Work
-- [ ] Phase 1 — Contracts: types, events, reducers, unit tests
 - [ ] Phase 2 — Service: `AgentStateService` with `SubscriptionRef`, bootstrap, projection_cache
 - [ ] Phase 3 — Ingestion endpoint + `session-start-hook` install
 - [ ] Phase 4 — Hook migration (all hooks become POST emitters)
