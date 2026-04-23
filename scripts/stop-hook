@@ -1,72 +1,43 @@
 #!/bin/bash
-# ~/.panopticon/bin/stop-hook
-# Called by Claude Code when it finishes responding (Stop hook)
+# ~/.panopticon/bin/stop-hook  (PAN-800)
 #
-# Emits agent.activity_changed(idle) via POST to the Panopticon dashboard.
-# Keeps runtime.json fallback during Phase 4→5 transition.
-# Chains to specialist-stop-hook and work-agent-stop-hook.
+# Fires on Claude Code Stop. Emits agent.activity_changed(idle) — the reducer
+# clears currentTool / thinking / waiting on that transition, so no separate
+# waiting_cleared is needed. Still chains to specialist-stop-hook and
+# work-agent-stop-hook, and still fires the planning auto-completion call.
 
-# Don't use set -e - we want the hook to be resilient to failures
-# and never break Claude Code execution
+set +e
 
-# Source shared helpers
-source "$(dirname "$0")/hook-lib.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=pan-hook-lib.sh
+. "$SCRIPT_DIR/pan-hook-lib.sh" 2>/dev/null || exit 0
 
-# Resolve agent ID
-AGENT_ID="$(_panopticon_resolve_agent_id)"
-AGENT_ID="${AGENT_ID:-unknown}"
+pan_resolve_agent_id || exit 0
 
-# Check if jq is available
-if ! command -v jq &> /dev/null; then
-  exit 0  # Silent failure - don't break Claude Code execution
-fi
+TS=$(date -Iseconds)
+BODY="{\"kind\":\"activity\",\"activity\":\"idle\",\"timestamp\":\"$TS\"}"
+pan_emit_event "$AGENT_ID" "$BODY"
 
-# ─── PAN-800: Emit typed event ────────────────────────────────────────────────
-
-TIMESTAMP="$(date -Iseconds)"
-EVENT_BODY=$(jq -n \
-  --arg kind "activity" \
-  --arg activity "idle" \
-  '{kind: $kind, activity: $activity}')
-panopticon_post_event "$AGENT_ID" "$EVENT_BODY" || true
-
-# ─── Legacy: update runtime.json (transitional fallback) ──────────────────────
-
-STATE_DIR="$HOME/.panopticon/agents/$AGENT_ID"
-mkdir -p "$STATE_DIR"
-
-RUNTIME_FILE="$STATE_DIR/runtime.json"
-TEMP_FILE="$RUNTIME_FILE.tmp"
-if [ -f "$RUNTIME_FILE" ]; then
-  jq --arg ts "$TIMESTAMP" \
-    '.state = "idle" | .lastActivity = $ts | del(.currentTool) | del(.waitingReason) | del(.waitingStartedAt) | del(.waitingNotification)' \
-    "$RUNTIME_FILE" > "$TEMP_FILE" 2>/dev/null && mv "$TEMP_FILE" "$RUNTIME_FILE" 2>/dev/null || true
-else
-  jq -n --arg ts "$TIMESTAMP" \
-    '{state: "idle", lastActivity: $ts}' > "$TEMP_FILE" 2>/dev/null && mv "$TEMP_FILE" "$RUNTIME_FILE" 2>/dev/null || true
-fi
-
-# Chain to specialist-specific hook for auto-completion detection
+# Chain to specialist-specific hook (auto-completion detection).
 SPECIALIST_HOOK="$HOME/.panopticon/bin/specialist-stop-hook"
 if [ -x "$SPECIALIST_HOOK" ]; then
   "$SPECIALIST_HOOK" &
 fi
 
-# Chain to work-agent completion detection hook
+# Chain to work-agent completion detection (nudges agents that forgot `pan work done`).
 WORK_AGENT_HOOK="$HOME/.panopticon/bin/work-agent-stop-hook"
 if [ -x "$WORK_AGENT_HOOK" ]; then
   "$WORK_AGENT_HOOK" &
 fi
 
-# Auto-mark planning complete when a planning agent finishes
+# Auto-mark planning complete when a planning agent finishes.
 if [[ "$AGENT_ID" == planning-* ]]; then
   ISSUE_ID=$(echo "$AGENT_ID" | sed 's/^planning-//' | tr '[:lower:]' '[:upper:]')
   if [ -n "$ISSUE_ID" ]; then
-    curl -s -X POST "http://localhost:3011/api/issues/$ISSUE_ID/complete-planning" \
+    curl -s -m 1.0 -X POST "$PAN_DASHBOARD_URL/api/issues/$ISSUE_ID/complete-planning" \
       -H "Content-Type: application/json" \
       -d '{"skipKill":true}' > /dev/null 2>&1 &
   fi
 fi
 
-# Always exit successfully
 exit 0

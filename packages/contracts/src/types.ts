@@ -21,7 +21,7 @@ export type AgentStatus = typeof AgentStatus.Type
 export const AgentPhase = Schema.Literals(["planning", "exploration", "implementation", "testing", "documentation", "pre_push", "post_push", "review", "review-response", "merge"])
 export type AgentPhase = typeof AgentPhase.Type
 
-export const AgentResolution = Schema.Literals(["working", "done", "needs_input", "stuck", "completed", "unclear"])
+export const AgentResolution = Schema.Literals(["working", "done", "needs_input", "stuck", "completed", "unclear", "abandoned"])
 export type AgentResolution = typeof AgentResolution.Type
 
 export const SpecialistType = Schema.Literals(["review-agent", "test-agent", "merge-agent", "inspect-agent", "uat-agent"])
@@ -42,20 +42,33 @@ export type MergeStatusValue = typeof MergeStatusValue.Type
 export const VerificationStatusValue = Schema.Literals(["pending", "running", "passed", "failed", "skipped"])
 export type VerificationStatusValue = typeof VerificationStatusValue.Type
 
-// ─── Agent Runtime ────────────────────────────────────────────────────────────
-// (PAN-800) Effect-native agent runtime state
+// ─── Agent Runtime (PAN-800) ─────────────────────────────────────────────────
+// High-frequency per-tool-call surface. Kept separate from AgentSnapshot because
+// AgentSnapshot is the low-frequency lifecycle projection (config, status, cost)
+// and merging them means every tool call re-diffs a giant object on the frontend.
 
-export const Activity = Schema.Literals(["working", "thinking", "waiting", "idle", "stopped"])
+export const Activity = Schema.Literals([
+  "working",   // tool in flight, or tool completed <30s ago
+  "thinking",  // no tool in flight, waiting for model
+  "waiting",   // needs human (permission, answer, disambiguation)
+  "idle",      // Stop hook fired, waiting for next turn
+  "stopped",   // session ended
+])
 export type Activity = typeof Activity.Type
 
+export const WaitingReason = Schema.Literals([
+  "tool_permission",
+  "user_question",
+  "disambiguation",
+  "other",
+])
+export type WaitingReason = typeof WaitingReason.Type
+
 export const ThinkingState = Schema.Struct({
-  since: Schema.String,
-  lastToolAt: Schema.String,
+  since: Schema.String,        // ISO timestamp
+  lastToolAt: Schema.String,   // timestamp of the tool that preceded this thinking state
 })
 export type ThinkingState = typeof ThinkingState.Type
-
-export const WaitingReason = Schema.Literals(["tool_permission", "user_question", "disambiguation", "other"])
-export type WaitingReason = typeof WaitingReason.Type
 
 export const WaitingState = Schema.Struct({
   reason: WaitingReason,
@@ -68,14 +81,21 @@ export type WaitingState = typeof WaitingState.Type
 export const AgentRuntimeSnapshot = Schema.Struct({
   id: AgentId,
   activity: Activity,
-  lastActivity: Schema.String,
-  currentTool: Schema.optional(Schema.String),
-  thinking: Schema.optional(ThinkingState),
-  waiting: Schema.optional(WaitingState),
+  lastActivity: Schema.String,                    // ISO timestamp of last event for this agent
+  currentTool: Schema.optional(Schema.String),   // set when activity === "working"
+  thinking: Schema.optional(ThinkingState),       // set when activity === "thinking"
+  waiting: Schema.optional(WaitingState),         // set when activity === "waiting"
   claudeSessionId: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
-  lastMessageAt: Schema.optional(Schema.String),
-  updatedAtSequence: SequenceNumber,
+  lastMessageAt: Schema.optional(Schema.String),  // last user→agent message delivered
+  // Lifecycle resolution signal emitted by work-agent-stop-hook. Values mirror
+  // AgentResolution so the enrichment poller can consume this as input.
+  resolution: Schema.optional(AgentResolution),
+  resolutionCount: Schema.optional(Schema.Number),
+  resolutionUpdatedAt: Schema.optional(Schema.String),
+  // For specialists: the issue currently being processed.
+  currentIssue: Schema.optional(IssueId),
+  updatedAtSequence: SequenceNumber,              // event sequence that produced this snapshot
 })
 export type AgentRuntimeSnapshot = typeof AgentRuntimeSnapshot.Type
 
@@ -101,8 +121,8 @@ export const AgentSnapshot = Schema.Struct({
   pendingQuestionCount: Schema.optional(Schema.Number),
   resolution: Schema.optional(AgentResolution),
   resolutionCount: Schema.optional(Schema.Number),
-  // PAN-800: sequence number of the last runtime snapshot update
-  // Cheaply detect runtime changes without deep-comparing the full AgentSnapshot
+  // PAN-800 — bumped on every runtime event so subscribers can cheaply detect
+  // a change without diffing the full AgentRuntimeSnapshot.
   runtimeSnapshotSequence: Schema.optional(SequenceNumber),
 })
 export type AgentSnapshot = typeof AgentSnapshot.Type

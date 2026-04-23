@@ -31,11 +31,18 @@ import { useConfirm, useAlert } from './DialogProvider';
 import { CostBreakdownModal } from './CostBreakdownModal';
 import { VBriefDialog } from './vbrief/VBriefDialog';
 import { useUIPreferences } from '../hooks/useUIPreferences';
-import { useKillAgent } from '../hooks/useKillAgent';
 import { ResetIssueButton } from './ResetIssueButton';
+import { StopAgentButton } from './StopAgentButton';
+import { ArtifactLinks } from './ArtifactLinks';
+import { MergeButton } from './MergeButton';
+import { RecoverButton } from './RecoverButton';
 import { hasActualPendingQuestion, isReviewPipelineStuck } from '../lib/pipeline-state';
 import { refreshDashboardState } from '../lib/refresh-dashboard-state';
 import type { ReviewStatusSnapshot } from '@panopticon/contracts';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import { BulkActionBar } from './BulkActionBar';
+import { BulkAgentWarningDialog } from './BulkAgentWarningDialog';
+import { BulkCloseOutProgress, type BulkCloseResult } from './BulkCloseOutProgress';
 
 
 // Difficulty badge colors
@@ -751,6 +758,8 @@ export function ListIssueRow({
   selectedIssue,
   onSelectIssue,
   onPlan,
+  isBulkSelected,
+  onBulkToggle,
 }: {
   issue: Issue;
   agents: Agent[];
@@ -760,6 +769,8 @@ export function ListIssueRow({
   selectedIssue: string | null | undefined;
   onSelectIssue: (id: string | null) => void;
   onPlan: (issue: Issue) => void;
+  isBulkSelected?: boolean;
+  onBulkToggle?: () => void;
 }) {
   const isSelected = selectedIssue === issue.identifier;
   const canonical = STATUS_LABELS[issue.status] || 'backlog';
@@ -802,9 +813,23 @@ export function ListIssueRow({
       ref={rowRef}
       onClick={() => onSelectIssue(isSelected ? null : issue.identifier)}
       className={`flex items-center gap-3 px-4 py-3 hover:bg-surface-overlay/50 transition-colors cursor-pointer ${
-        isSelected ? 'bg-surface-overlay' : ''
+        isSelected ? 'bg-surface-overlay' : isBulkSelected ? 'bg-primary/[0.03]' : ''
       }`}
     >
+      {/* Bulk selection checkbox */}
+      {onBulkToggle && (
+        <input
+          type="checkbox"
+          checked={isBulkSelected || false}
+          onChange={(e) => {
+            e.stopPropagation();
+            onBulkToggle();
+          }}
+          onClick={(e) => e.stopPropagation()}
+          className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
+          aria-label={`Select ${issue.identifier}`}
+        />
+      )}
       {/* Status indicator */}
       <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} title={canonical} />
 
@@ -923,6 +948,10 @@ interface KanbanBoardProps {
   selectedIssue?: string | null;
   onSelectIssue?: (issueId: string | null) => void;
   onPlanDialogChange?: (issueId: string | null) => void;
+  bulkSelectedIds?: Set<string>;
+  onBulkToggle?: (issueId: string) => void;
+  onBulkSelectAll?: (issueIds: string[]) => void;
+  onBulkDeselectAll?: (issueIds: string[]) => void;
 }
 
 type CycleFilter = 'current' | 'all' | 'backlog' | 'canceled';
@@ -935,7 +964,7 @@ interface UndoEntry {
   timestamp: number;
 }
 
-export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssue: externalOnSelectIssue, onPlanDialogChange }: KanbanBoardProps) {
+export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssue: externalOnSelectIssue, onPlanDialogChange, bulkSelectedIds, onBulkToggle, onBulkSelectAll, onBulkDeselectAll }: KanbanBoardProps) {
   const queryClient = useQueryClient();
   const [internalSelectedIssue, setInternalSelectedIssue] = useState<string | null>(null);
   const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set()); // Empty = all projects
@@ -995,6 +1024,111 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
   const agents = useDashboardStore(selectAgentList) as unknown as Agent[];
   const specialists = useDashboardStore(selectSpecialistList) as unknown as SpecialistAgent[];
   const reviewStatusByIssueId = useDashboardStore((s) => s.reviewStatusByIssueId);
+
+  // Bulk selection state — key based on filters so selection survives data refreshes
+  const internalBulkSelection = useBulkSelection(`${cycleFilter}-${includeCompleted}-${Array.from(selectedProjects).sort().join(',')}`);
+  const bulkSelection = useMemo(() =>
+    bulkSelectedIds && onBulkToggle && onBulkSelectAll && onBulkDeselectAll
+      ? { selectedIds: bulkSelectedIds, toggle: onBulkToggle, selectAll: onBulkSelectAll, deselectAll: onBulkDeselectAll, clear: () => onBulkDeselectAll(Array.from(bulkSelectedIds)), isSelected: (id: string) => bulkSelectedIds.has(id), count: bulkSelectedIds.size }
+      : internalBulkSelection,
+    [bulkSelectedIds, onBulkToggle, onBulkSelectAll, onBulkDeselectAll, internalBulkSelection]
+  );
+
+  // Bulk close-out mutation
+  const [bulkCloseResults, setBulkCloseResults] = useState<BulkCloseResult[]>([]);
+  const [showBulkProgress, setShowBulkProgress] = useState(false);
+  const [showBulkWarning, setShowBulkWarning] = useState(false);
+
+  const bulkCloseOutMutation = useMutation({
+    mutationFn: async (issueIds: string[]) => {
+      const res = await fetch('/api/issues/bulk-close-out', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issueIds }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text.length < 200 ? text : `Failed to bulk close out (${res.status})`);
+      }
+      return res.json() as Promise<{ results: Array<{ issueId: string; success: boolean; error?: string; skipped?: boolean }> }>;
+    },
+    onSuccess: (data) => {
+      setBulkCloseResults(prev => {
+        const backendMap = new Map(data.results.map(r => [r.issueId, r]));
+        return prev.map(p => {
+          const backend = backendMap.get(p.issueId);
+          if (backend) {
+            return {
+              issueId: p.issueId,
+              status: backend.skipped ? 'skipped' : backend.success ? 'done' : 'failed',
+              error: backend.error,
+            };
+          }
+          // Backend response omitted this issueId — if already marked skipped (active-agent guardrail), preserve it
+          if (p.status === 'skipped') return p;
+          // Otherwise mark as failed so modal doesn't hang
+          return { issueId: p.issueId, status: 'failed' as const, error: 'Missing from server response' };
+        });
+      });
+      refreshDashboardState(queryClient);
+    },
+    onError: (err: Error, issueIds) => {
+      setBulkCloseResults(prev => {
+        const failedIds = new Set(issueIds);
+        return prev.map(p => failedIds.has(p.issueId) ? { ...p, status: 'failed' as const, error: err.message } : p);
+      });
+    },
+  });
+
+  // Memoize selected issues and active-agent filtering — pre-index agents by issueId for O(1) lookup
+  const selectedIssues = useMemo(
+    () => issues.filter(i => bulkSelection.isSelected(i.identifier)),
+    [issues, bulkSelection]
+  );
+  const issuesWithAgents = useMemo(() => {
+    // Build a Set of issueIds that have at least one active agent
+    const activeAgentIssueIds = new Set<string>();
+    for (const agent of agents) {
+      if (agent.issueId && agent.status !== 'dead' && agent.status !== 'stopped' && agent.status !== 'failed') {
+        activeAgentIssueIds.add(agent.issueId.toLowerCase());
+      }
+    }
+    return selectedIssues.filter(issue => activeAgentIssueIds.has(issue.identifier.toLowerCase()));
+  }, [selectedIssues, agents]);
+
+  const handleBulkCloseOut = useCallback(() => {
+    if (issuesWithAgents.length > 0) {
+      setShowBulkWarning(true);
+    } else {
+      // No active agents — proceed directly
+      const ids = selectedIssues.map(i => i.identifier);
+      setBulkCloseResults(ids.map(id => ({ issueId: id, status: 'pending' })));
+      setShowBulkProgress(true);
+      bulkCloseOutMutation.mutate(ids);
+    }
+  }, [issuesWithAgents, selectedIssues, bulkCloseOutMutation]);
+
+  const handleProceedAfterWarning = useCallback(() => {
+    setShowBulkWarning(false);
+    const issuesWithoutAgents = selectedIssues.filter(i => !issuesWithAgents.some(wa => wa.identifier === i.identifier));
+    const ids = issuesWithoutAgents.map(i => i.identifier);
+
+    // Mark skipped issues
+    const results: BulkCloseResult[] = [
+      ...issuesWithAgents.map(i => ({ issueId: i.identifier, status: 'skipped' as const })),
+      ...ids.map(id => ({ issueId: id, status: 'pending' as const })),
+    ];
+    setBulkCloseResults(results);
+    setShowBulkProgress(true);
+    if (ids.length > 0) {
+      bulkCloseOutMutation.mutate(ids);
+    }
+  }, [selectedIssues, issuesWithAgents, bulkCloseOutMutation]);
+
+  const handleCloseProgress = useCallback(() => {
+    setShowBulkProgress(false);
+    bulkSelection.clear();
+  }, [bulkSelection]);
 
   /* DnD sensors disabled pending rework
   const sensors = useSensors(
@@ -1309,24 +1443,24 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
 
   const grouped = groupByStatus(filteredIssues, includeCompleted);
 
-  // Fetch planning-complete state for all Todo issues so we can sort
-  // "ready to start" items to the top of the Todo column.
+  // Fetch planning state for all Todo issues so we can sort
+  // "ready to start" items to the top and pass full state to cards (avoids per-card fan-out).
   const todoPlanningStates = useQueries({
     queries: (grouped.todo ?? []).map(issue => ({
       queryKey: ['planning-state', issue.identifier],
       queryFn: async () => {
         const res = await fetch(`/api/issues/${issue.identifier}/planning-state`);
-        if (!res.ok) return { planningComplete: false };
-        return res.json() as Promise<{ planningComplete: boolean }>;
+        if (!res.ok) return { hasPlan: false, hasBeads: false, beadsCount: 0, planningComplete: false };
+        return res.json() as Promise<PlanningState>;
       },
       staleTime: 30000,
     })),
   });
 
-  const planningCompleteById = useMemo(() => {
-    const map: Record<string, boolean> = {};
+  const planningStateById = useMemo(() => {
+    const map: Record<string, PlanningState> = {};
     (grouped.todo ?? []).forEach((issue, i) => {
-      map[issue.identifier] = todoPlanningStates[i]?.data?.planningComplete ?? false;
+      map[issue.identifier] = todoPlanningStates[i]?.data ?? { hasPlan: false, hasBeads: false, beadsCount: 0, planningComplete: false };
     });
     return map;
   }, [grouped.todo, todoPlanningStates]);
@@ -1336,14 +1470,14 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     const result = { ...grouped };
     if (result.todo) {
       result.todo = [...result.todo].sort((a, b) => {
-        const aReady = planningCompleteById[a.identifier] ? 1 : 0;
-        const bReady = planningCompleteById[b.identifier] ? 1 : 0;
+        const aReady = planningStateById[a.identifier]?.planningComplete ? 1 : 0;
+        const bReady = planningStateById[b.identifier]?.planningComplete ? 1 : 0;
         if (aReady !== bReady) return bReady - aReady;
         return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
       });
     }
     return result;
-  }, [grouped, planningCompleteById]);
+  }, [grouped, planningStateById]);
 
   return (
     <div className="space-y-4">
@@ -1482,6 +1616,8 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
                     onPlan={setPlanDialogIssue}
+                    isBulkSelected={bulkSelection.isSelected(issue.identifier)}
+                    onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
                 ))}
               </div>
@@ -1515,6 +1651,8 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
                     onPlan={setPlanDialogIssue}
+                    isBulkSelected={bulkSelection.isSelected(issue.identifier)}
+                    onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
                 ))}
               </div>
@@ -1550,6 +1688,8 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
                     onPlan={setPlanDialogIssue}
+                    isBulkSelected={bulkSelection.isSelected(issue.identifier)}
+                    onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
                 ))}
               </div>
@@ -1564,32 +1704,60 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
       ) : (
         /* Kanban columns - DnD disabled pending rework (PAN-TODO) */
         <div className="flex gap-4 overflow-hidden pb-4">
-          {STATUS_ORDER.filter(s => s !== 'backlog').map((status) => (
-            <div key={status} className="flex-1 min-w-0">
-              <div className={`border-t-4 ${COLUMN_COLORS[status]} bg-surface-raised rounded-lg transition-colors`}>
-                <div className="px-4 py-3 border-b border-divider bg-surface-raised">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-semibold text-content">{COLUMN_TITLES[status]}</h3>
-                    <span className="text-sm text-content-subtle">{sortedGrouped[status].length}</span>
+          {STATUS_ORDER.filter(s => s !== 'backlog').map((status) => {
+            const columnIssueIds = sortedGrouped[status].map(i => i.identifier);
+            const selectedInColumn = columnIssueIds.filter(id => bulkSelection.isSelected(id));
+            const allSelected = columnIssueIds.length > 0 && selectedInColumn.length === columnIssueIds.length;
+            const someSelected = selectedInColumn.length > 0 && selectedInColumn.length < columnIssueIds.length;
+
+            return (
+              <div key={status} className="flex-1 min-w-0">
+                <div className={`border-t-4 ${COLUMN_COLORS[status]} bg-surface-raised rounded-lg transition-colors`}>
+                  <div className="px-4 py-3 border-b border-divider bg-surface-raised">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={allSelected}
+                          ref={(el) => {
+                            if (el) el.indeterminate = someSelected;
+                          }}
+                          onChange={() => {
+                            if (allSelected) {
+                              bulkSelection.deselectAll(columnIssueIds);
+                            } else {
+                              bulkSelection.selectAll(columnIssueIds);
+                            }
+                          }}
+                          className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
+                          aria-label={`Select all ${COLUMN_TITLES[status]}`}
+                        />
+                        <h3 className="font-semibold text-content">{COLUMN_TITLES[status]}</h3>
+                      </div>
+                      <span className="text-sm text-content-subtle">{sortedGrouped[status].length}</span>
+                    </div>
                   </div>
+                  <ColumnContent
+                    issues={sortedGrouped[status]}
+                    agents={agents}
+                    specialists={specialists}
+                    issueCosts={issueCosts}
+                    costsLoading={costsLoading}
+                    selectedIssue={selectedIssue}
+                    onSelectIssue={onSelectIssue}
+                    onPlan={setPlanDialogIssue}
+                    onViewBeads={setBeadsDialogIssue}
+                    onViewVBrief={setVbriefDialogIssue}
+                    collapsedFeatures={collapsedFeatures}
+                    onToggleFeature={toggleFeature}
+                    bulkSelectedIds={bulkSelection.selectedIds}
+                    onBulkToggle={bulkSelection.toggle}
+                    planningStateById={planningStateById}
+                  />
                 </div>
-                <ColumnContent
-                  issues={sortedGrouped[status]}
-                  agents={agents}
-                  specialists={specialists}
-                  issueCosts={issueCosts}
-                  costsLoading={costsLoading}
-                  selectedIssue={selectedIssue}
-                  onSelectIssue={onSelectIssue}
-                  onPlan={setPlanDialogIssue}
-                  onViewBeads={setBeadsDialogIssue}
-                  onViewVBrief={setVbriefDialogIssue}
-                  collapsedFeatures={collapsedFeatures}
-                  onToggleFeature={toggleFeature}
-                />
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -1645,6 +1813,29 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
           onClose={() => setVbriefDialogIssue(null)}
         />
       )}
+
+      {/* Bulk Action Bar */}
+      <BulkActionBar
+        count={bulkSelection.count}
+        onCloseOut={handleBulkCloseOut}
+        onCancel={bulkSelection.clear}
+      />
+
+      {/* Bulk Agent Warning Dialog */}
+      <BulkAgentWarningDialog
+        isOpen={showBulkWarning}
+        onClose={() => setShowBulkWarning(false)}
+        onProceed={handleProceedAfterWarning}
+        issues={issues.filter(i => bulkSelection.isSelected(i.identifier))}
+        agents={agents}
+      />
+
+      {/* Bulk Close Out Progress */}
+      <BulkCloseOutProgress
+        isOpen={showBulkProgress}
+        results={bulkCloseResults}
+        onClose={handleCloseProgress}
+      />
     </div>
   );
 }
@@ -1663,6 +1854,9 @@ function ColumnContent({
   onViewVBrief,
   collapsedFeatures,
   onToggleFeature,
+  bulkSelectedIds,
+  onBulkToggle,
+  planningStateById,
 }: {
   issues: Issue[];
   agents: Agent[];
@@ -1676,6 +1870,9 @@ function ColumnContent({
   onViewVBrief?: (issue: Issue) => void;
   collapsedFeatures: Set<string>;
   onToggleFeature: (featureId: string) => void;
+  bulkSelectedIds?: Set<string>;
+  onBulkToggle?: (issueId: string) => void;
+  planningStateById?: Record<string, PlanningState>;
 }) {
   // Check if any Rally issues with hierarchy exist
   const hasRallyHierarchy = issues.some(i => i.artifactType?.includes('PortfolioItem'));
@@ -1709,6 +1906,9 @@ function ColumnContent({
         onPlan={() => onPlan(issue)}
         onViewBeads={(i) => onViewBeads(i)}
         onViewVBrief={onViewVBrief ? (i) => onViewVBrief(i) : undefined}
+        isBulkSelected={bulkSelectedIds?.has(issue.identifier)}
+        onBulkToggle={onBulkToggle ? () => onBulkToggle(issue.identifier) : undefined}
+        planningState={planningStateById?.[issue.identifier]}
       />
     );
   };
@@ -2276,6 +2476,13 @@ export function DeaconIgnoreButton({
   );
 }
 
+interface PlanningState {
+  hasPlan: boolean;
+  hasBeads: boolean;
+  beadsCount: number;
+  planningComplete: boolean;
+}
+
 interface IssueCardProps {
   issue: Issue;
   workAgent?: Agent;
@@ -2288,9 +2495,12 @@ interface IssueCardProps {
   onPlan: () => void; // Lifted to parent to survive re-renders
   onViewBeads?: (issue: Issue) => void;
   onViewVBrief?: (issue: Issue) => void;
+  isBulkSelected?: boolean;
+  onBulkToggle?: () => void;
+  planningState?: PlanningState;
 }
 
-function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, costsLoading, isSelected, onSelect, onPlan, onViewBeads, onViewVBrief }: IssueCardProps) {
+function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, costsLoading, isSelected, onSelect, onPlan, onViewBeads, onViewVBrief, isBulkSelected, onBulkToggle, planningState: planningStateProp }: IssueCardProps) {
   const queryClient = useQueryClient();
   const showAlert = useAlert();
   const [showCostModal, setShowCostModal] = useState(false);
@@ -2312,8 +2522,8 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
   // Determine which agent is relevant based on issue status
   const activeAgent = workAgent;
   const isRunning = activeAgent && activeAgent.status !== 'dead' && activeAgent.status !== 'stopped';
-  // Only show "Watch Planning" when there's an actual live tmux session — 'starting'/'failed'/'stopped'/'dead' all mean no session to attach to
-  const isPlanningActive = planningAgent != null && (planningAgent.status === 'healthy' || planningAgent.status === 'warning' || planningAgent.status === 'stuck');
+  // Show "Watch Planning" when planning agent is starting or has a live session
+  const isPlanningActive = planningAgent != null && (planningAgent.status === 'starting' || planningAgent.status === 'healthy' || planningAgent.status === 'warning' || planningAgent.status === 'stuck');
 
   // For display in terminal viewer and INPUT badge, prefer work agent, fall back to planning agent
   const agent = activeAgent || planningAgent;
@@ -2363,71 +2573,30 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
   // Only fetched when this card has any chance of having a plan (anything past
   // backlog where the agent could have produced one). We poll every 30s so the
   // chip flips from red→green right after Generate Tasks runs.
+  // If parent passes planningState prop, skip the per-card fetch (avoids fan-out).
   const planningStateQuery = useQuery({
     queryKey: ['planning-state', issue.identifier],
     queryFn: async () => {
       const res = await fetch(`/api/issues/${issue.identifier}/planning-state`);
       if (!res.ok) throw new Error('Failed to fetch planning state');
-      return res.json() as Promise<{ hasPlan: boolean; hasBeads: boolean; beadsCount: number; planningComplete: boolean }>;
+      return res.json() as Promise<PlanningState>;
     },
-    enabled: !!issue.identifier,
+    enabled: !!issue.identifier && !planningStateProp,
     refetchInterval: 30000,
     staleTime: 15000,
   });
-  const hasPlan = planningStateQuery.data?.hasPlan ?? false;
-  const beadsCount = planningStateQuery.data?.beadsCount ?? 0;
-  const planningComplete = planningStateQuery.data?.planningComplete ?? false;
-  const needsTaskGeneration = hasPlan && beadsCount === 0;
-
-  const generateTasksMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(`/api/issues/${issue.identifier}/generate-tasks`, { method: 'POST' });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || body?.success === false) {
-        throw new Error(body?.error || (body?.errors?.[0] ?? 'Failed to generate tasks'));
-      }
-      return body as { success: true; created: string[]; count: number };
-    },
-    onSuccess: async (data) => {
-      await queryClient.invalidateQueries({ queryKey: ['planning-state', issue.identifier] });
-      await refreshDashboardState(queryClient);
-      void showAlert({ title: 'Tasks generated', message: `Created ${data.count} bead${data.count === 1 ? '' : 's'} from the vBRIEF plan.` });
-    },
-    onError: (err: Error) => {
-      void showAlert({ title: 'Generate tasks failed', message: err.message, variant: 'error' });
-    },
-  });
-
-  const handleTasksClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (needsTaskGeneration) {
-      if (!generateTasksMutation.isPending) generateTasksMutation.mutate();
-    } else {
-      onViewBeads && onViewBeads(issue);
-    }
-  };
-
-  // Reusable chip elements — colored by planning state.
-  // vBRIEF green when a plan exists; Tasks red when plan exists but no beads
-  // (and the click action becomes "Generate Tasks" instead of "view beads").
-  const tasksChip = (
-    <button
-      onClick={handleTasksClick}
-      disabled={generateTasksMutation.isPending}
-      className={`flex items-center gap-1 text-xs transition-colors disabled:opacity-50 ${
-        needsTaskGeneration
-          ? 'text-destructive hover:text-destructive/80 font-medium'
-          : beadsCount > 0
-            ? 'text-success hover:text-success/80'
-            : 'text-muted-foreground hover:text-foreground'
-      }`}
-      title={needsTaskGeneration ? 'Generate beads from vBRIEF plan' : 'Tasks'}
-    >
-      {generateTasksMutation.isPending
-        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-        : <List className="w-3.5 h-3.5" />}
-      {needsTaskGeneration ? 'Generate Tasks' : 'Tasks'}
-    </button>
+  const hasPlan = planningStateProp?.hasPlan ?? planningStateQuery.data?.hasPlan ?? false;
+  const beadsCount = planningStateProp?.beadsCount ?? planningStateQuery.data?.beadsCount ?? 0;
+  const planningComplete = planningStateProp?.planningComplete ?? planningStateQuery.data?.planningComplete ?? false;
+  const artifactLinks = (
+    <ArtifactLinks
+      issueId={issue.identifier || ''}
+      hasPlan={hasPlan}
+      beadsCount={beadsCount}
+      onViewBeads={() => onViewBeads && onViewBeads(issue)}
+      onViewVBrief={() => onViewVBrief && onViewVBrief(issue)}
+      variant="card"
+    />
   );
 
   // Plan/See Plan chip — opens the planning dialog. Green "See Plan" when a
@@ -2450,23 +2619,6 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
     </button>
   );
 
-  const vbriefChip = (
-    <button
-      onClick={(e) => { e.stopPropagation(); onViewVBrief && onViewVBrief(issue); }}
-      className={`flex items-center gap-1 text-xs transition-colors ${
-        hasPlan
-          ? 'text-success hover:text-success/80'
-          : 'text-muted-foreground hover:text-foreground'
-      }`}
-      title="vBRIEF"
-    >
-      <ScrollText className="w-3.5 h-3.5" />
-      vBRIEF
-    </button>
-  );
-
-  const { confirmAndKill, isPending: killPending } = useKillAgent(agent?.id);
-
   // Send message mutation
   const [messageInput, setMessageInput] = useState('');
   const [showMessageInput, setShowMessageInput] = useState(false);
@@ -2486,16 +2638,6 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
       setShowMessageInput(false);
     },
   });
-
-  const handleKill = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    await confirmAndKill();
-  };
-
-  const handleWatch = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    onSelect();
-  };
 
   const handleTell = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -2630,10 +2772,12 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
       ref={cardRef}
       data-testid={`issue-card-${issue.identifier}`}
       onClick={onSelect}
-      className={`group relative overflow-hidden rounded-2xl border border-divider/70 cursor-pointer transition-all shadow-[0_6px_22px_rgba(0,0,0,0.08)] ${isSessionLost ? 'border-warning/50' : ''} ${
+      className={`group relative overflow-hidden rounded-2xl border cursor-pointer transition-all shadow-[0_6px_22px_rgba(0,0,0,0.08)] ${isSessionLost ? 'border-warning/50' : ''} ${
         isSelected
           ? 'ring-2 ring-warning/70 shadow-[0_12px_30px_rgba(245,158,11,0.18)]'
-          : 'hover:-translate-y-0.5 hover:border-divider-strong hover:shadow-[0_12px_28px_rgba(0,0,0,0.12)]'
+          : isBulkSelected
+            ? 'border-primary/50 bg-primary/[0.03] shadow-[0_6px_22px_rgba(0,0,0,0.08)]'
+            : 'hover:-translate-y-0.5 border-divider/70 hover:border-divider-strong hover:shadow-[0_12px_28px_rgba(0,0,0,0.12)]'
       } bg-[linear-gradient(145deg,var(--color-surface)_0%,rgba(255,255,255,0.03)_100%)]`}
     >
       <div className={`pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-br ${cardTone}`} />
@@ -2653,6 +2797,19 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 flex-wrap">
+              {onBulkToggle && (
+                <input
+                  type="checkbox"
+                  checked={isBulkSelected || false}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    onBulkToggle();
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
+                  aria-label={`Select ${issue.identifier}`}
+                />
+              )}
               {issue.project && (
                 <span
                   className="w-2 h-2 rounded-full shrink-0 shadow-[0_0_0_4px_rgba(255,255,255,0.05)]"
@@ -2783,7 +2940,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
               <button
                 onClick={(e) => { e.stopPropagation(); onPlan(); }}
                 className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-signal-review text-signal-review-foreground animate-pulse hover:bg-signal-review/30 transition-colors cursor-pointer"
-                title="Click to watch planning session"
+                title="Planning in progress — click to watch"
               >
                 <Sparkles className="w-3 h-3" />
                 Planning
@@ -3003,18 +3160,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
       {/* Action buttons for running agents */}
       {isRunning && (
         <div className={actionBarClass}>
-          <button
-            onClick={handleWatch}
-            className={`flex items-center gap-1 text-xs transition-colors ${
-              isSelected ? 'text-primary' : 'text-content-subtle hover:text-content'
-            }`}
-            title="Watch"
-          >
-            <Eye className="w-3.5 h-3.5" />
-            Watch
-          </button>
-          {tasksChip}
-          {vbriefChip}
+          {artifactLinks}
           <button
             onClick={handleTell}
             className={`flex items-center gap-1 text-xs transition-colors ${
@@ -3026,28 +3172,17 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
             Tell
           </button>
           {canonical === 'in_review' && !isTerminal && (
-            <ResetPipelineButton issue={issue} reviewStatus={reviewStatus} />
+            <RecoverButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
           )}
-          <MergeIssueButton issue={issue} reviewStatus={reviewStatus} />
+          <MergeButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
           <ResetIssueButton issueId={issue.identifier} variant="card" issue={issue} />
-          {/* Model badge - centered between Tell and Kill */}
+          {/* Model badge */}
           {activeAgent && activeAgent.model && (
             <span className="flex-1 text-center text-[10px] text-content-body font-medium">
               {getFriendlyModelName(activeAgent.model)}
             </span>
           )}
-          <button
-            onClick={handleKill}
-            disabled={killPending}
-            className="flex items-center text-xs text-destructive-foreground hover:text-destructive-foreground/80 transition-colors"
-            title="Kill"
-          >
-            {killPending ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <X className="w-3.5 h-3.5" />
-            )}
-          </button>
+          <StopAgentButton agentId={agent?.id} variant="card" />
         </div>
       )}
 
@@ -3091,8 +3226,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
           )}
           {planLabelExists && (
             <>
-              {tasksChip}
-              {vbriefChip}
+              {artifactLinks}
               <button
                 ref={startButtonRef}
                 onClick={handleStartAgent}
@@ -3125,8 +3259,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
           ) : (
             planChip
           )}
-          {tasksChip}
-          {vbriefChip}
+          {artifactLinks}
           {/* Resume Session only when there's an actual prior work agent to resume.
               For freshly-planned issues with no work agent yet, show Start Agent
               instead (gated on beads existing). */}
@@ -3166,7 +3299,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
             </div>
           )}
           <div className={actionBarClass}>
-            <MergeIssueButton issue={issue} reviewStatus={reviewStatus} />
+            <MergeButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
             {((activeAgent?.lifecycle?.canResumeSession ?? false) || isSessionLost || isResuming) && (
             <button
               onClick={handleResumeSession}
@@ -3178,7 +3311,7 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
               <span>{(resumeSessionMutation.isPending || isResuming) ? 'Resuming...' : 'Resume Session'}</span>
             </button>
           )}
-            <ResetPipelineButton issue={issue} reviewStatus={reviewStatus} />
+            <RecoverButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
             <ReopenSection issue={issue} inline />
             <ResetIssueButton issueId={issue.identifier} variant="card" issue={issue} />
           </div>
@@ -3215,136 +3348,6 @@ function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, co
       />
       </div>
     </div>
-  );
-}
-
-// Recover button - clears failed pipeline state and re-dispatches review/test
-function ResetPipelineButton({
-  issue,
-  reviewStatus,
-}: {
-  issue: Issue;
-  reviewStatus?: Pick<ReviewStatusSnapshot, 'reviewStatus' | 'testStatus' | 'mergeStatus' | 'verificationStatus'>;
-}) {
-  const confirm = useConfirm();
-  const queryClient = useQueryClient();
-  const [isPending, setIsPending] = useState(false);
-  const isRecoverable = isReviewPipelineStuck(reviewStatus);
-
-  if (!isRecoverable) {
-    return null;
-  }
-
-  return (
-    <button
-      onClick={async (e) => {
-        e.stopPropagation();
-        if (await confirm({
-          title: 'Recover Pipeline',
-          message: `Recover ${issue.identifier}?\n\nThis will:\n• Clear failed review, test, and merge state\n• Reset circuit breaker counters\n• Remove queued specialist tasks\n• Re-dispatch review and test as needed`,
-          confirmLabel: 'Recover',
-        })) {
-          setIsPending(true);
-          try {
-            const res = await fetch(`/api/review/${issue.identifier}/reset`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ rerun: true }),
-            });
-            if (!res.ok) {
-              const err = await res.json();
-              console.error('Pipeline reset failed:', err);
-            }
-            await refreshDashboardState(queryClient);
-          } catch (err) {
-            console.error('Pipeline reset error:', err);
-          } finally {
-            setIsPending(false);
-          }
-        }
-      }}
-      disabled={isPending}
-      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-      title="Recover from the failed review/test/merge state and rerun the pipeline"
-    >
-      {isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
-      {isPending ? 'Recovering...' : 'Recover'}
-    </button>
-  );
-}
-
-function MergeIssueButton({
-  issue,
-  reviewStatus,
-}: {
-  issue: Issue;
-  reviewStatus?: { readyForMerge?: boolean; mergeStatus?: string };
-}) {
-  const confirm = useConfirm();
-  const showAlert = useAlert();
-  const queryClient = useQueryClient();
-
-  const mergeMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(`/api/issues/${issue.identifier}/merge`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        let message = `Failed to merge (${res.status})`;
-        try {
-          const data = JSON.parse(text);
-          message = data.error || message;
-        } catch {
-          message = text.length < 200 ? text : message;
-        }
-        throw new Error(message);
-      }
-      return res.json();
-    },
-    onSuccess: async () => {
-      await refreshDashboardState(queryClient);
-    },
-    onError: (err: Error) => {
-      showAlert({ message: `Failed to merge: ${err.message}`, variant: 'error' });
-    },
-  });
-
-  const isBusy =
-    reviewStatus?.mergeStatus === 'queued' ||
-    reviewStatus?.mergeStatus === 'merging' ||
-    reviewStatus?.mergeStatus === 'verifying';
-
-  if (!reviewStatus?.readyForMerge || reviewStatus?.mergeStatus === 'merged') {
-    return null;
-  }
-
-  return (
-    <button
-      onClick={async (e) => {
-        e.stopPropagation();
-        if (await confirm({
-          title: 'Merge to Main',
-          message: `Merge ${issue.identifier} to main?\n\nReview and tests have passed. This will:\n- Merge the feature branch to main\n- Run final verification tests\n- Clean up workspace`,
-          confirmLabel: 'Merge',
-        })) {
-          mergeMutation.mutate();
-        }
-      }}
-      disabled={mergeMutation.isPending || isBusy}
-      className="flex items-center gap-1 text-xs text-success hover:text-success/80 transition-colors disabled:opacity-50"
-      title="Merge"
-    >
-      {(mergeMutation.isPending || isBusy) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <GitMerge className="w-3.5 h-3.5" />}
-      {reviewStatus?.mergeStatus === 'queued'
-        ? 'Queued'
-        : reviewStatus?.mergeStatus === 'verifying'
-          ? 'Verifying'
-          : reviewStatus?.mergeStatus === 'merging'
-            ? 'Merging'
-            : 'Merge'}
-    </button>
   );
 }
 

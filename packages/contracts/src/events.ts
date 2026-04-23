@@ -84,6 +84,8 @@ export const AgentCreatedEvent = Schema.Struct({
 export type AgentCreatedEvent = typeof AgentCreatedEvent.Type
 
 // ─── Agent Runtime Events (PAN-800) ───────────────────────────────────────────
+// Canonical per-tool-call runtime signals. Fold into ReadModelState.agentRuntimeById
+// via the shared reducer. Server AgentStateService ref is derived from the same fold.
 
 export const AgentActivityChangedEvent = Schema.Struct({
   type: Schema.Literal("agent.activity_changed"),
@@ -166,7 +168,33 @@ export const AgentModelSetEvent = Schema.Struct({
 })
 export type AgentModelSetEvent = typeof AgentModelSetEvent.Type
 
-/** Bootstrap event — seeded from runtime.json during migration */
+export const AgentCurrentIssueSetEvent = Schema.Struct({
+  type: Schema.Literal("agent.current_issue_set"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    agentId: AgentId,
+    currentIssue: Schema.optional(IssueId),
+  }),
+})
+export type AgentCurrentIssueSetEvent = typeof AgentCurrentIssueSetEvent.Type
+
+export const AgentResolutionChangedEvent = Schema.Struct({
+  type: Schema.Literal("agent.resolution_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    agentId: AgentId,
+    resolution: AgentResolution,
+    resolutionCount: Schema.Number,
+  }),
+})
+export type AgentResolutionChangedEvent = typeof AgentResolutionChangedEvent.Type
+
+/**
+ * Bootstrap-only event emitted by AgentStateService when it seeds a runtime
+ * snapshot from projection_cache. Not emitted by hooks.
+ */
 export const AgentStateRestoredEvent = Schema.Struct({
   type: Schema.Literal("agent.state_restored"),
   sequence: SequenceNumber,
@@ -570,6 +598,7 @@ export const DomainEvent = Schema.Union([
   AgentStoppedEvent,
   AgentStatusChangedEvent,
   AgentOutputReceivedEvent,
+  // PAN-800 runtime events
   AgentActivityChangedEvent,
   AgentThinkingStartedEvent,
   AgentThinkingStoppedEvent,
@@ -577,6 +606,8 @@ export const DomainEvent = Schema.Union([
   AgentWaitingClearedEvent,
   AgentMessageReceivedEvent,
   AgentModelSetEvent,
+  AgentCurrentIssueSetEvent,
+  AgentResolutionChangedEvent,
   AgentStateRestoredEvent,
   PlanningStartedEvent,
   PlanningFailedEvent,

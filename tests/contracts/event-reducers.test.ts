@@ -110,7 +110,7 @@ describe('agent.thinking_started', () => {
 // ─── agent.thinking_stopped ──────────────────────────────────────────────────
 
 describe('agent.thinking_stopped', () => {
-  it('resolves to working when resolvedBy is tool', () => {
+  it('clears thinking but leaves activity for follow-up event', () => {
     const prev = {
       ...INITIAL_READ_MODEL_STATE,
       agentRuntimeById: {
@@ -125,44 +125,8 @@ describe('agent.thinking_stopped', () => {
     }
     const ev = makeEvent('agent.thinking_stopped', { agentId, resolvedBy: 'tool' }, 2)
     const next = applyEvent(prev, ev)
-    expect(next.agentRuntimeById[agentId].activity).toBe('working')
     expect(next.agentRuntimeById[agentId].thinking).toBeUndefined()
-  })
-
-  it('resolves to waiting when resolvedBy is waiting', () => {
-    const prev = {
-      ...INITIAL_READ_MODEL_STATE,
-      agentRuntimeById: {
-        [agentId]: {
-          id: agentId,
-          activity: 'thinking' as const,
-          thinking: { since: ts, lastToolAt: ts },
-          lastActivity: ts,
-          updatedAtSequence: 0,
-        },
-      },
-    }
-    const ev = makeEvent('agent.thinking_stopped', { agentId, resolvedBy: 'waiting' }, 2)
-    const next = applyEvent(prev, ev)
-    expect(next.agentRuntimeById[agentId].activity).toBe('waiting')
-  })
-
-  it('resolves to idle when resolvedBy is idle', () => {
-    const prev = {
-      ...INITIAL_READ_MODEL_STATE,
-      agentRuntimeById: {
-        [agentId]: {
-          id: agentId,
-          activity: 'thinking' as const,
-          thinking: { since: ts, lastToolAt: ts },
-          lastActivity: ts,
-          updatedAtSequence: 0,
-        },
-      },
-    }
-    const ev = makeEvent('agent.thinking_stopped', { agentId, resolvedBy: 'idle' }, 2)
-    const next = applyEvent(prev, ev)
-    expect(next.agentRuntimeById[agentId].activity).toBe('idle')
+    expect(next.agentRuntimeById[agentId].activity).toBe('thinking')
   })
 
   it('returns state unchanged when agent has no runtime snapshot', () => {
@@ -191,7 +155,7 @@ describe('agent.waiting_started', () => {
 // ─── agent.waiting_cleared ───────────────────────────────────────────────────
 
 describe('agent.waiting_cleared', () => {
-  it('resumes to working when clearedBy is tool_resumed', () => {
+  it('removes waiting but leaves activity for follow-up event', () => {
     const prev = {
       ...INITIAL_READ_MODEL_STATE,
       agentRuntimeById: {
@@ -206,48 +170,8 @@ describe('agent.waiting_cleared', () => {
     }
     const ev = makeEvent('agent.waiting_cleared', { agentId, clearedBy: 'tool_resumed' }, 2)
     const next = applyEvent(prev, ev)
-    expect(next.agentRuntimeById[agentId].activity).toBe('working')
     expect(next.agentRuntimeById[agentId].waiting).toBeUndefined()
-  })
-
-  it('resumes to thinking when clearedBy is user_response', () => {
-    const prev = {
-      ...INITIAL_READ_MODEL_STATE,
-      agentRuntimeById: {
-        [agentId]: {
-          id: agentId,
-          activity: 'waiting' as const,
-          waiting: { reason: 'user_question' as const, startedAt: ts },
-          lastActivity: ts,
-          updatedAtSequence: 0,
-        },
-      },
-    }
-    const ev = makeEvent('agent.waiting_cleared', { agentId, clearedBy: 'user_response' }, 2)
-    const next = applyEvent(prev, ev)
-    expect(next.agentRuntimeById[agentId].activity).toBe('thinking')
-  })
-
-  it('returns to idle for timeout or stopped', () => {
-    const prev = {
-      ...INITIAL_READ_MODEL_STATE,
-      agentRuntimeById: {
-        [agentId]: {
-          id: agentId,
-          activity: 'waiting' as const,
-          waiting: { reason: 'other' as const, startedAt: ts },
-          lastActivity: ts,
-          updatedAtSequence: 0,
-        },
-      },
-    }
-    const evTimeout = makeEvent('agent.waiting_cleared', { agentId, clearedBy: 'timeout' }, 2)
-    const nextTimeout = applyEvent(prev, evTimeout)
-    expect(nextTimeout.agentRuntimeById[agentId].activity).toBe('idle')
-
-    const evStopped = makeEvent('agent.waiting_cleared', { agentId, clearedBy: 'stopped' }, 3)
-    const nextStopped = applyEvent(prev, evStopped)
-    expect(nextStopped.agentRuntimeById[agentId].activity).toBe('idle')
+    expect(next.agentRuntimeById[agentId].activity).toBe('waiting')
   })
 
   it('returns state unchanged when agent has no runtime snapshot', () => {

@@ -24,6 +24,9 @@ interface ClaudeSettings {
     PostToolUse?: HookConfig[];
     Stop?: HookConfig[];
     SessionStart?: HookConfig[];
+    Notification?: HookConfig[];
+    PreCompact?: HookConfig[];
+    PostCompact?: HookConfig[];
   };
   mcpServers?: Record<string, McpServer>;
   [key: string]: any;
@@ -88,26 +91,24 @@ function installJq(): boolean {
 }
 
 /**
- * Check if Panopticon hooks are already configured
+ * Per-hook-type detection of whether a Panopticon hook is already registered.
+ * PAN-800: rewritten from an all-or-nothing short-circuit to a delta-install
+ * check so users with older installs still get SessionStart/Notification/etc.
+ * added without having to wipe their settings.
  */
-function hooksAlreadyConfigured(settings: ClaudeSettings, binDir: string): boolean {
-  const hookTypes = ['PreToolUse', 'PostToolUse', 'Stop', 'SessionStart'] as const;
-
-  for (const hookType of hookTypes) {
-    const hooks = settings?.hooks?.[hookType] || [];
-    const hasHook = hooks.some((hookConfig: HookConfig) =>
-      hookConfig.hooks?.some((hook: { type: string; command: string }) =>
-        hook.command?.includes('panopticon') ||
-        hook.command?.includes(binDir)
-      )
-    );
-
-    if (hasHook) {
-      return true; // At least one hook type is configured
-    }
-  }
-
-  return false;
+function isHookConfigured(
+  settings: ClaudeSettings,
+  hookType: keyof NonNullable<ClaudeSettings['hooks']>,
+  binDir: string,
+  scriptName: string,
+): boolean {
+  const hooks = settings?.hooks?.[hookType] || [];
+  return hooks.some((hookConfig: HookConfig) =>
+    hookConfig.hooks?.some((hook: { type: string; command: string }) =>
+      (hook.command?.includes(join(binDir, scriptName)) ?? false) ||
+      (hook.command?.includes(`panopticon/bin/${scriptName}`) ?? false)
+    )
+  );
 }
 
 /**
@@ -149,7 +150,19 @@ export async function setupHooksCommand(): Promise<void> {
   }
 
   // 3. Copy hook scripts to ~/.panopticon/bin/
-  const hookScripts = ['pre-tool-hook', 'heartbeat-hook', 'stop-hook', 'specialist-stop-hook', 'work-agent-stop-hook', 'session-start-hook', 'record-cost-event.js', 'tldr-read-enforcer', 'tldr-post-edit', 'hook-lib.sh'];
+  const hookScripts = [
+    'pan-hook-lib.sh',        // PAN-800: shared library sourced by all hooks
+    'pre-tool-hook',
+    'heartbeat-hook',
+    'stop-hook',
+    'notification-hook',      // PAN-800: Notification — emits agent.waiting_started
+    'specialist-stop-hook',
+    'work-agent-stop-hook',   // PAN-800: chained from stop-hook; emits agent.resolution_changed
+    'session-start-hook',     // PAN-800: SessionStart — emits agent.activity_changed(idle) + agent.model_set
+    'record-cost-event.js',
+    'tldr-read-enforcer',
+    'tldr-post-edit',
+  ];
   const { fileURLToPath } = await import('url');
   const { dirname } = await import('path');
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -242,99 +255,47 @@ export async function setupHooksCommand(): Promise<void> {
     }
   }
 
-  // 7. Check if hooks are already configured
-  if (hooksAlreadyConfigured(settings, binDir)) {
-    console.log(chalk.cyan('\n✓ Panopticon hooks already configured'));
-    console.log(chalk.dim('  No changes needed\n'));
-    return;
-  }
-
-  // 6. Add Panopticon hooks to settings
+  // 7. Delta-register missing hooks. Existing registrations are left alone so
+  // users can hand-customize matchers without the installer clobbering them.
   if (!settings.hooks) {
     settings.hooks = {};
   }
 
-  // Configure PreToolUse hooks
-  if (!settings.hooks.PreToolUse) {
-    settings.hooks.PreToolUse = [];
-  }
-  // Sets agent state to "active"
-  settings.hooks.PreToolUse.push({
-    matcher: '.*',
-    hooks: [
-      {
-        type: 'command',
-        command: join(binDir, 'pre-tool-hook')
-      }
-    ]
-  });
-  // TLDR read enforcer — intercepts large code file reads and returns TLDR summaries
-  if (python3Available) {
-    settings.hooks.PreToolUse.push({
-      matcher: 'Read',
-      hooks: [
-        {
-          type: 'command',
-          command: join(binDir, 'tldr-read-enforcer')
-        }
-      ]
+  const added: string[] = [];
+  const addHookIfMissing = (
+    hookType: keyof NonNullable<ClaudeSettings['hooks']>,
+    scriptName: string,
+    matcher: string = '.*',
+  ): void => {
+    if (isHookConfigured(settings, hookType, binDir, scriptName)) return;
+    const list = (settings.hooks![hookType] ??= []);
+    list.push({
+      matcher,
+      hooks: [{ type: 'command', command: join(binDir, scriptName) }],
     });
-  }
+    added.push(`${hookType}:${scriptName}`);
+  };
 
-  // Configure PostToolUse hooks
-  if (!settings.hooks.PostToolUse) {
-    settings.hooks.PostToolUse = [];
-  }
-  // Logs activity to activity.jsonl
-  settings.hooks.PostToolUse.push({
-    matcher: '.*',
-    hooks: [
-      {
-        type: 'command',
-        command: join(binDir, 'heartbeat-hook')
-      }
-    ]
-  });
-  // TLDR post-edit — tracks dirty files and triggers re-warm after threshold
+  // Core runtime hooks.
+  addHookIfMissing('PreToolUse', 'pre-tool-hook');
+  addHookIfMissing('PostToolUse', 'heartbeat-hook');
+  addHookIfMissing('Stop', 'stop-hook');
+  // PAN-800: SessionStart + Notification hooks.
+  addHookIfMissing('SessionStart', 'session-start-hook');
+  addHookIfMissing('Notification', 'notification-hook');
+
+  // TLDR helpers (optional — only when python3 is available).
   if (python3Available) {
-    settings.hooks.PostToolUse.push({
-      matcher: 'Edit|Write',
-      hooks: [
-        {
-          type: 'command',
-          command: join(binDir, 'tldr-post-edit')
-        }
-      ]
-    });
+    addHookIfMissing('PreToolUse', 'tldr-read-enforcer', 'Read');
+    addHookIfMissing('PostToolUse', 'tldr-post-edit', 'Edit|Write');
   }
 
-  // Configure Stop hook (sets state to "idle")
-  if (!settings.hooks.Stop) {
-    settings.hooks.Stop = [];
+  if (added.length === 0) {
+    console.log(chalk.cyan('\n✓ All Panopticon hooks already registered'));
+  } else {
+    console.log(chalk.green(`\n✓ Registered ${added.length} hook(s):`));
+    for (const entry of added) console.log(chalk.dim(`  • ${entry}`));
   }
-  settings.hooks.Stop.push({
-    matcher: '.*',
-    hooks: [
-      {
-        type: 'command',
-        command: join(binDir, 'stop-hook')
-      }
-    ]
-  });
-
-  // Configure SessionStart hook (PAN-800)
-  if (!settings.hooks.SessionStart) {
-    settings.hooks.SessionStart = [];
-  }
-  settings.hooks.SessionStart.push({
-    matcher: '.*',
-    hooks: [
-      {
-        type: 'command',
-        command: join(binDir, 'session-start-hook')
-      }
-    ]
-  });
 
   // 8. Install caveman hook files and compress scripts to ~/.panopticon/hooks/caveman/
   try {

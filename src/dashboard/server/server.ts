@@ -216,6 +216,7 @@ const IssueLifecycleServiceLive = IssueLifecycleLive.pipe(
 
 const DomainServicesLive = Layer.mergeAll(
   ReadModelServiceLive,
+  AgentStateServiceLive,
   EventStoreServiceLive.pipe(Layer.provide(ReadModelServiceLive)),
   AgentStateServiceLive,
   TerminalServiceLive,

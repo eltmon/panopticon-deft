@@ -1,87 +1,47 @@
 #!/bin/bash
-# ~/.panopticon/bin/session-start-hook
-# Called by Claude Code on session start
+# ~/.panopticon/bin/session-start-hook  (PAN-800)
 #
-# Emits agent.model_set (if model inferable) and agent.activity_changed (idle)
-# via POST to the Panopticon dashboard heartbeat endpoint.
+# Fires on Claude Code SessionStart. Emits agent.activity_changed(idle) so the
+# runtime snapshot is current before the first tool fires, and emits
+# agent.model_set when the model is inferable from the payload or env.
+#
+# This hook replaces the waitForReadySignal tmux fallback referenced in
+# PAN-759 — the hook that was supposed to exist from the start but was never
+# registered in ~/.claude/settings.json by the installer.
 
-# Don't use set -e - we want the hook to be resilient to failures
-# and never break Claude Code execution
+set +e
 
-# Resolve agent ID from env (set by pan work start) or tmux session name
-if [ -n "$PANOPTICON_AGENT_ID" ]; then
-  AGENT_ID="$PANOPTICON_AGENT_ID"
-elif [ -n "$TMUX" ]; then
-  AGENT_ID=$(tmux display-message -p '#S' 2>/dev/null)
-else
-  AGENT_ID="main-cli"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=pan-hook-lib.sh
+. "$SCRIPT_DIR/pan-hook-lib.sh" 2>/dev/null || exit 0
+
+pan_resolve_agent_id || exit 0
+
+INPUT=$(cat 2>/dev/null || echo '{}')
+
+CLAUDE_SESSION_ID=""
+MODEL=""
+if command -v jq >/dev/null 2>&1; then
+  CLAUDE_SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
+  MODEL=$(echo "$INPUT" | jq -r '.model // .model_name // ""' 2>/dev/null)
 fi
-AGENT_ID="${AGENT_ID:-unknown}"
+[ -z "$MODEL" ] && MODEL="${ANTHROPIC_MODEL:-}"
 
-# Infer model from environment if available
-MODEL="${PANOPTICON_MODEL:-${CLAUDE_MODEL:-}}"
+TS=$(date -Iseconds)
 
-# Dashboard endpoint (default to localhost if not configured)
-DASHBOARD_URL="${PANOPTICON_DASHBOARD_URL:-http://localhost:3000}"
+pan_emit_event "$AGENT_ID" "{\"kind\":\"activity\",\"activity\":\"idle\",\"timestamp\":\"$TS\"}"
 
-# POST helper with 0.5s timeout and fallback to pending-events.jsonl
-post_event() {
-  local body="$1"
-  local agent_dir="$HOME/.panopticon/agents/$AGENT_ID"
-  local pending_file="$agent_dir/pending-events.jsonl"
-  local lock_file="$agent_dir/pending.lock"
-
-  # Try POST with 0.5s timeout
-  if curl -s -o /dev/null -w "%{http_code}" \
-       --max-time 0.5 \
-       -X POST \
-       -H "Content-Type: application/json" \
-       -d "$body" \
-       "$DASHBOARD_URL/api/agents/$AGENT_ID/heartbeat" 2>/dev/null | grep -q "^2"; then
-
-    # On success, replay any pending events first
-    if [ -f "$pending_file" ]; then
-      (
-        flock -x -w 5 200 || exit 0
-        while IFS= read -r line; do
-          [ -n "$line" ] || continue
-          curl -s -o /dev/null --max-time 0.5 \
-            -X POST -H "Content-Type: application/json" \
-            -d "$line" \
-            "$DASHBOARD_URL/api/agents/$AGENT_ID/heartbeat" 2>/dev/null || true
-        done < "$pending_file"
-        : > "$pending_file"
-      ) 200>"$lock_file"
-    fi
-    return 0
-  fi
-
-  # On failure, append to pending-events.jsonl with flock
-  mkdir -p "$agent_dir"
-  (
-    flock -x -w 5 200 || exit 0
-    echo "$body" >> "$pending_file"
-  ) 200>"$lock_file"
-  return 1
-}
-
-TIMESTAMP="$(date -Iseconds)"
-
-# Emit model_set if model is known
 if [ -n "$MODEL" ]; then
-  MODEL_BODY=$(jq -n \
-    --arg kind "model_set" \
-    --arg model "$MODEL" \
-    '{kind: $kind, model: $model}')
-  post_event "$MODEL_BODY" || true
+  if command -v jq >/dev/null 2>&1; then
+    BODY=$(jq -n --arg model "$MODEL" --arg sid "$CLAUDE_SESSION_ID" --arg ts "$TS" \
+      'if $sid == "" then {kind: "model_set", model: $model, timestamp: $ts}
+       else {kind: "model_set", model: $model, claudeSessionId: $sid, timestamp: $ts} end')
+  elif [ -n "$CLAUDE_SESSION_ID" ]; then
+    BODY="{\"kind\":\"model_set\",\"model\":\"$MODEL\",\"claudeSessionId\":\"$CLAUDE_SESSION_ID\",\"timestamp\":\"$TS\"}"
+  else
+    BODY="{\"kind\":\"model_set\",\"model\":\"$MODEL\",\"timestamp\":\"$TS\"}"
+  fi
+  pan_emit_event "$AGENT_ID" "$BODY"
 fi
 
-# Emit activity_changed to idle
-IDLE_BODY=$(jq -n \
-  --arg kind "activity" \
-  --arg activity "idle" \
-  '{kind: $kind, activity: $activity}')
-post_event "$IDLE_BODY" || true
-
-# Always exit successfully - never break Claude Code execution
 exit 0

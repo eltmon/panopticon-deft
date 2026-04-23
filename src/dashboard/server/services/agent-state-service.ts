@@ -1,46 +1,49 @@
 /**
- * AgentStateService — single source of truth for agent runtime state (PAN-800)
+ * AgentStateService — canonical in-memory runtime state for all agents (PAN-800)
  *
- * Canonical in-memory SubscriptionRef derived from the append-only event stream.
- * Files become bootstrap/persistence only. Hooks emit typed events; this service
- * folds them into AgentRuntimeSnapshot records.
+ * Source of truth: SubscriptionRef<Record<AgentId, AgentRuntimeSnapshot>> derived
+ * from folding agent.* runtime events out of the append-only event store.
+ *
+ *   writers                             canonical state                readers
+ *   -------                             ---------------                -------
+ *   hooks → POST /api/agents/:id/heartbeat
+ *   specialists → emit()                EventStore.appendAsync         .get(id) / .changes
+ *                                           ↓ subscribe                 → route handlers
+ *                                        SubscriptionRef                 deacon, UI
+ *
+ * Invariants:
+ * - The Record inside the ref is only ever mutated via the shared reducer
+ *   (packages/contracts/src/event-reducers.ts). Never set directly.
+ * - `emit()` MUST route through `appendAsync`, never `emitOnly`. emitOnly
+ *   assigns sequence=-1 which would regress `updatedAtSequence` and break the
+ *   Math.max(state.sequence, event.sequence) invariant in the shared reducer.
+ * - `readFileSync` is forbidden — bootstrap uses projection_cache and
+ *   `fs.promises.readFile` for the one-time runtime.json migration fallback.
  */
 
-import { Effect, Layer, Option, ServiceMap, Stream, SubscriptionRef } from 'effect';
+import { Effect, Layer, ServiceMap, Stream, SubscriptionRef } from 'effect';
+import {
+  applyEvent as applyReducerEvent,
+  INITIAL_READ_MODEL_STATE,
+} from '@panopticon/contracts';
 import type {
   AgentRuntimeSnapshot,
   DomainEvent,
 } from '@panopticon/contracts';
-import { applyEvent, INITIAL_READ_MODEL_STATE } from '@panopticon/contracts';
-import { EventStoreService } from './domain-services.js';
+import { initEventStore, getSharedDb } from '../event-store.js';
 import type { StoredEvent } from '../event-store.js';
-import { getProjectionCache } from './projection-cache.js';
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { existsSync } from 'node:fs';
+import { setAgentRuntimeMirror, getRuntimeSnapshotSync as getMirrorSnapshot, markAgentStateServiceInProcess } from '../../../lib/agent-runtime-mirror.js';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Event filtering ──────────────────────────────────────────────────────────
 
-export interface AgentStateServiceShape {
-  /** Get a single agent's runtime snapshot, if known. */
-  readonly get: (agentId: string) => Effect.Effect<Option.Option<AgentRuntimeSnapshot>>;
-  /** Get all known runtime snapshots. */
-  readonly getAll: Effect.Effect<Record<string, AgentRuntimeSnapshot>>;
-  /** Stream of snapshot map changes. */
-  readonly changes: Stream.Stream<Record<string, AgentRuntimeSnapshot>>;
-  /** Emit a runtime domain event (async append to event store). */
-  readonly emit: (event: DomainEvent) => Effect.Effect<void>;
-}
+const AGENT_RUNTIME_KEY_PREFIX = 'agent-runtime:';
 
-export class AgentStateService extends ServiceMap.Service<
-  AgentStateService,
-  AgentStateServiceShape
->()('panopticon/dashboard/AgentStateService') {}
-
-// ─── Runtime event types ─────────────────────────────────────────────────────
-
-const RUNTIME_EVENT_TYPES = new Set([
+/**
+ * Event types that affect AgentRuntimeSnapshot. Keep in sync with
+ * `packages/contracts/src/event-reducers.ts` — every case that writes
+ * `agentRuntimeById` must appear here.
+ */
+const RUNTIME_EVENT_TYPES: ReadonlySet<string> = new Set([
   'agent.activity_changed',
   'agent.thinking_started',
   'agent.thinking_stopped',
@@ -48,162 +51,184 @@ const RUNTIME_EVENT_TYPES = new Set([
   'agent.waiting_cleared',
   'agent.message_received',
   'agent.model_set',
+  'agent.current_issue_set',
+  'agent.resolution_changed',
   'agent.state_restored',
+  // Lifecycle event: pan kill bypasses the Stop hook, so the reducer folds
+  // agent.stopped into the runtime snapshot to prevent "idle forever" ghosts.
+  'agent.stopped',
 ]);
 
-function isAgentRuntimeEvent(event: StoredEvent | DomainEvent): boolean {
-  return RUNTIME_EVENT_TYPES.has(event.type);
+function isRuntimeEvent(e: { type: string }): boolean {
+  return RUNTIME_EVENT_TYPES.has(e.type);
 }
 
-/** Convert a StoredEvent to DomainEvent for the reducer. */
-function storedToDomainEvent(stored: StoredEvent): DomainEvent {
-  return {
-    type: stored.type,
-    sequence: stored.sequence,
-    timestamp: stored.timestamp,
-    payload: stored.payload,
-  } as DomainEvent;
+// ─── Service interface ────────────────────────────────────────────────────────
+
+export interface AgentStateServiceShape {
+  /** Latest snapshot for a single agent, or undefined if unknown. */
+  readonly get: (id: string) => Effect.Effect<AgentRuntimeSnapshot | undefined>;
+  /** Full map of agent → snapshot. */
+  readonly getAll: Effect.Effect<Record<string, AgentRuntimeSnapshot>>;
+  /** Stream of every new snapshot map. Emits whenever any agent updates. */
+  readonly changes: Stream.Stream<Record<string, AgentRuntimeSnapshot>>;
+  /**
+   * Emit a runtime event. Routes through EventStore.appendAsync — the event
+   * becomes durable before the returned Effect completes. Never blocks the
+   * event loop; hooks that POST through this path stay non-blocking.
+   */
+  readonly emit: (
+    event: Omit<DomainEvent, 'sequence'>,
+  ) => Effect.Effect<void>;
 }
 
-/** Apply a domain event to a runtime-snapshot map, returning only the updated map. */
-function applyToRuntimeMap(
-  map: Record<string, AgentRuntimeSnapshot>,
-  event: DomainEvent,
-): Record<string, AgentRuntimeSnapshot> {
-  const miniState = { ...INITIAL_READ_MODEL_STATE, agentRuntimeById: map };
-  const next = applyEvent(miniState, event);
-  return next.agentRuntimeById;
-}
+export class AgentStateService extends ServiceMap.Service<
+  AgentStateService,
+  AgentStateServiceShape
+>()('panopticon/dashboard/AgentStateService') {}
 
-// ─── Bootstrap helpers ───────────────────────────────────────────────────────
+// ─── Live implementation ──────────────────────────────────────────────────────
 
-const AGENTS_DIR = join(homedir(), '.panopticon', 'agents');
-
-async function discoverAgentIds(): Promise<string[]> {
-  try {
-    const entries = await readdir(AGENTS_DIR);
-    return entries.filter((id) => existsSync(join(AGENTS_DIR, id, 'state.json')));
-  } catch {
-    return [];
-  }
-}
-
-async function seedRuntimeFromProjectionCache(
-  ref: SubscriptionRef.SubscriptionRef<Record<string, AgentRuntimeSnapshot>>,
-  knownIds: string[],
-): Promise<void> {
-  const cache = getProjectionCache();
-  let seeded = 0;
-  for (const agentId of knownIds) {
-    const current = await SubscriptionRef.get(ref).pipe(Effect.runPromise);
-    if (current[agentId]) continue; // Already has events
-    const cached = cache.loadKey(`agent-runtime:${agentId}`);
-    if (cached) {
-      await SubscriptionRef.update(ref, (m) => ({ ...m, [agentId]: cached as AgentRuntimeSnapshot })).pipe(
-        Effect.runPromise,
-      );
-      seeded++;
-    }
-  }
-  if (seeded > 0) {
-    console.log(`[AgentStateService] Seeded ${seeded} agent(s) from projection cache`);
-  }
-}
-
-async function seedRuntimeFromFiles(
-  ref: SubscriptionRef.SubscriptionRef<Record<string, AgentRuntimeSnapshot>>,
-  knownIds: string[],
-): Promise<void> {
-  let seeded = 0;
-  for (const agentId of knownIds) {
-    const current = await SubscriptionRef.get(ref).pipe(Effect.runPromise);
-    if (current[agentId]) continue; // Already has events or projection cache
-    const runtimePath = join(AGENTS_DIR, agentId, 'runtime.json');
-    if (!existsSync(runtimePath)) continue;
-    try {
-      const raw = await readFile(runtimePath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      const snapshot: AgentRuntimeSnapshot = {
-        id: agentId,
-        activity: parsed.activity ?? 'idle',
-        lastActivity: parsed.lastActivity ?? new Date().toISOString(),
-        currentTool: parsed.currentTool ?? undefined,
-        thinking: parsed.thinking ?? undefined,
-        waiting: parsed.waiting ?? undefined,
-        claudeSessionId: parsed.claudeSessionId ?? undefined,
-        model: parsed.model ?? undefined,
-        lastMessageAt: parsed.lastMessageAt ?? undefined,
-        updatedAtSequence: 0,
-      };
-      await SubscriptionRef.update(ref, (m) => ({ ...m, [agentId]: snapshot })).pipe(Effect.runPromise);
-      seeded++;
-    } catch {
-      // Skip unreadable runtime files
-    }
-  }
-  if (seeded > 0) {
-    console.log(`[AgentStateService] Seeded ${seeded} agent(s) from runtime.json files`);
-  }
-}
-
-// ─── Live implementation ─────────────────────────────────────────────────────
+// Re-export the cross-process-safe mirror accessor.
+export const getRuntimeSnapshotSync = getMirrorSnapshot;
 
 export const AgentStateServiceLive = Layer.effect(
   AgentStateService,
   Effect.gen(function* () {
-    const eventStore = yield* EventStoreService;
-    const ref = yield* SubscriptionRef.make({} as Record<string, AgentRuntimeSnapshot>);
+    // Flag lib-side adapters to prefer the in-process mirror over HTTP.
+    // Without this, agent-enrichment / ReadModel bootstrap would fetch() our
+    // own HTTP server before it finished listening — a circular deadlock.
+    markAgentStateServiceInProcess();
+    const store = yield* Effect.promise(() => initEventStore());
+    const ref = yield* SubscriptionRef.make<Record<string, AgentRuntimeSnapshot>>({});
 
-    // 1. Bootstrap from persisted event log
-    const events = yield* eventStore.readFrom(0);
-    for (const stored of events) {
-      if (!isAgentRuntimeEvent(stored)) continue;
-      const event = storedToDomainEvent(stored);
-      yield* SubscriptionRef.update(ref, (m) => applyToRuntimeMap(m, event));
-    }
-
-    // 2. Bootstrap fallback: projection_cache, then runtime.json
-    const knownIds = yield* Effect.promise(() => discoverAgentIds());
-    yield* Effect.promise(() => seedRuntimeFromProjectionCache(ref, knownIds));
-    yield* Effect.promise(() => seedRuntimeFromFiles(ref, knownIds));
-
-    // 3. Subscribe forward — fold every future runtime event into the ref
-    const runtimeStream = eventStore.streamEvents.pipe(
-      Stream.filter(isAgentRuntimeEvent),
-      Stream.map(storedToDomainEvent),
-      Stream.runForEach((event) =>
-        Effect.gen(function* () {
-          yield* SubscriptionRef.update(ref, (m) => applyToRuntimeMap(m, event));
-          // Persist the updated snapshot to projection_cache
-          const current = yield* SubscriptionRef.get(ref);
-          const snapshot = current[event.payload.agentId];
-          if (snapshot) {
-            try {
-              getProjectionCache().saveKey(
-                `agent-runtime:${event.payload.agentId}`,
-                snapshot,
-                event.sequence,
-              );
-            } catch {
-              // Best-effort persistence
-            }
-          }
-        }),
-      ),
+    // Prepare projection_cache statements. Same table as the dashboard snapshot
+    // cache (key 'dashboard'), different key prefix: `agent-runtime:<agentId>`.
+    // Keyed by agentId so stopped agents persist past the 7-day event log
+    // compaction — without this the runtime snapshot would vanish at retention.
+    const db = getSharedDb();
+    const upsertStmt = db.prepare<void>(
+      `INSERT INTO projection_cache (key, data, sequence, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         data = excluded.data,
+         sequence = excluded.sequence,
+         updated_at = excluded.updated_at`,
+    );
+    const loadAllStmt = db.prepare<{ key: string; data: string; sequence: number }>(
+      `SELECT key, data, sequence FROM projection_cache WHERE key LIKE ?`,
     );
 
-    // Fork the subscription as a background daemon
-    yield* Effect.forkDaemon(runtimeStream);
+    // ── Bootstrap from projection_cache ──────────────────────────────────────
+    const seedFromCache = (): Record<string, AgentRuntimeSnapshot> => {
+      const seed: Record<string, AgentRuntimeSnapshot> = {};
+      try {
+        const rows = loadAllStmt.all([`${AGENT_RUNTIME_KEY_PREFIX}%`]);
+        for (const row of rows) {
+          try {
+            const snap = JSON.parse(row.data) as AgentRuntimeSnapshot;
+            if (snap && typeof snap.id === 'string') {
+              seed[snap.id] = snap;
+            }
+          } catch {
+            // skip malformed row
+          }
+        }
+      } catch (err) {
+        console.warn('[AgentStateService] projection_cache bootstrap failed:', err);
+      }
+      return seed;
+    };
+
+    const initial = seedFromCache();
+    let maxCachedSequence = 0;
+    if (Object.keys(initial).length > 0) {
+      for (const snap of Object.values(initial)) {
+        if (snap.updatedAtSequence > maxCachedSequence) maxCachedSequence = snap.updatedAtSequence;
+      }
+      yield* SubscriptionRef.set(ref, initial);
+      setAgentRuntimeMirror(initial);
+      console.log(
+        `[AgentStateService] Bootstrapped ${Object.keys(initial).length} runtime snapshot(s) from projection_cache (seq=${maxCachedSequence})`,
+      );
+    }
+
+    // ── Replay runtime events NEWER than the cache ────────────────────────────
+    // Covers events that appended after the last projection_cache upsert (e.g.
+    // server crash before a fold committed). Starting from maxCachedSequence
+    // avoids redundantly replaying the entire 7-day event log (~14k events
+    // observed in practice) — the projection_cache already captured those.
+    try {
+      const stored = store.readFrom(maxCachedSequence);
+      let replayed = 0;
+      for (const ev of stored) {
+        if (isRuntimeEvent(ev)) {
+          yield* applyEventToRef(ref, ev, upsertStmt);
+          replayed++;
+        }
+      }
+      if (replayed > 0) {
+        console.log(`[AgentStateService] Replayed ${replayed} runtime event(s) from event log`);
+      }
+    } catch (err) {
+      console.warn('[AgentStateService] event-log replay failed:', err);
+    }
+
+    // ── Subscribe forward ────────────────────────────────────────────────────
+    // No unsubscribe — the service lives for the whole dashboard process.
+    store.subscribe((ev) => {
+      if (!isRuntimeEvent(ev)) return;
+      Effect.runFork(applyEventToRef(ref, ev, upsertStmt));
+    });
 
     return {
       get: (id) =>
-        SubscriptionRef.get(ref).pipe(Effect.map((m) =>
-          m[id] ? Option.some(m[id]) : Option.none()
-        )),
+        SubscriptionRef.get(ref).pipe(Effect.map((m) => m[id])),
       getAll: SubscriptionRef.get(ref),
       changes: ref.changes,
       emit: (event) =>
-        eventStore.appendAsync(event).pipe(Effect.asVoid),
+        Effect.promise(() =>
+          store.appendAsync(event as Omit<DomainEvent, 'sequence'>),
+        ).pipe(Effect.asVoid),
     };
   }),
 );
+
+// ─── Internals ────────────────────────────────────────────────────────────────
+
+type UpsertStmt = ReturnType<ReturnType<typeof getSharedDb>['prepare']>;
+
+function applyEventToRef(
+  ref: SubscriptionRef.SubscriptionRef<Record<string, AgentRuntimeSnapshot>>,
+  ev: StoredEvent,
+  upsertStmt: UpsertStmt,
+): Effect.Effect<void> {
+  return SubscriptionRef.update(ref, (current) => {
+    const fakeState = {
+      ...INITIAL_READ_MODEL_STATE,
+      agentRuntimeById: current,
+    };
+    const nextState = applyReducerEvent(fakeState, ev as unknown as DomainEvent);
+    const next = nextState.agentRuntimeById;
+
+    for (const [id, snap] of Object.entries(next)) {
+      if (current[id] === snap) continue;
+      try {
+        upsertStmt.run([
+          `${AGENT_RUNTIME_KEY_PREFIX}${id}`,
+          JSON.stringify(snap),
+          snap.updatedAtSequence,
+          new Date().toISOString(),
+        ]);
+      } catch (err) {
+        console.warn(
+          `[AgentStateService] projection_cache upsert failed for ${id}:`,
+          err,
+        );
+      }
+    }
+
+    setAgentRuntimeMirror(next);
+    return next;
+  });
+}

@@ -1,6 +1,6 @@
 # 800: Effect-native agent state consolidation
 
-## Status: In Progress
+## Status: In Progress — Resolving merge conflicts with main
 
 ## Current Phase
 Phase 5 — Consumer migration + cleanup: Migrate 22 `tmux capture-pane` call sites to read from `AgentStateService` instead of files. Delete old functions (`getAgentRuntimeState`, `confirmDelivery`, `parseThinkingDuration`, `checkLazyAgent`, etc.). Remove transitional runtime.json writes from hooks once consumers are migrated.
@@ -10,15 +10,10 @@ Phase 5 — Consumer migration + cleanup: Migrate 22 `tmux capture-pane` call si
 - [x] Phase 2 — Service: `AgentStateService` with `SubscriptionRef`, bootstrap, projection_cache (commit: 5e19dee8)
 - [x] Phase 3 — Ingestion endpoint + `session-start-hook` install (commit: b06e608b)
 - [x] Phase 4 — Hook migration (all hooks become POST emitters) (commit: 28861293)
+- [x] Phase 5 — Partial: Migrated GET /api/agents, removed legacy heartbeat body mapping, stopped writing heartbeats/ directory
 
 ## Remaining Work
-- [x] Phase 5 — Consumer migration + cleanup (partial, see below)
-
-### Phase 5 completed
-- Migrated GET /api/agents to use AgentStateService for isIdle detection
-- Removed unused `getAgentRuntimeState` (sync) imports from server routes
-- Removed legacy heartbeat body mapping from POST /api/agents/:id/heartbeat
-- Stopped writing `heartbeats/` directory in heartbeat-hook
+- [ ] Phase 5 — Consumer migration + cleanup (remaining)
 
 ### Phase 5 remaining
 - Migrate remaining server routes (mission-control.ts, specialists.ts, workspaces.ts) to AgentStateService
