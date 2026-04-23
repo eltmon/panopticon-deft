@@ -1,0 +1,87 @@
+#!/bin/bash
+# ~/.panopticon/bin/session-start-hook
+# Called by Claude Code on session start
+#
+# Emits agent.model_set (if model inferable) and agent.activity_changed (idle)
+# via POST to the Panopticon dashboard heartbeat endpoint.
+
+# Don't use set -e - we want the hook to be resilient to failures
+# and never break Claude Code execution
+
+# Resolve agent ID from env (set by pan work start) or tmux session name
+if [ -n "$PANOPTICON_AGENT_ID" ]; then
+  AGENT_ID="$PANOPTICON_AGENT_ID"
+elif [ -n "$TMUX" ]; then
+  AGENT_ID=$(tmux display-message -p '#S' 2>/dev/null)
+else
+  AGENT_ID="main-cli"
+fi
+AGENT_ID="${AGENT_ID:-unknown}"
+
+# Infer model from environment if available
+MODEL="${PANOPTICON_MODEL:-${CLAUDE_MODEL:-}}"
+
+# Dashboard endpoint (default to localhost if not configured)
+DASHBOARD_URL="${PANOPTICON_DASHBOARD_URL:-http://localhost:3000}"
+
+# POST helper with 0.5s timeout and fallback to pending-events.jsonl
+post_event() {
+  local body="$1"
+  local agent_dir="$HOME/.panopticon/agents/$AGENT_ID"
+  local pending_file="$agent_dir/pending-events.jsonl"
+  local lock_file="$agent_dir/pending.lock"
+
+  # Try POST with 0.5s timeout
+  if curl -s -o /dev/null -w "%{http_code}" \
+       --max-time 0.5 \
+       -X POST \
+       -H "Content-Type: application/json" \
+       -d "$body" \
+       "$DASHBOARD_URL/api/agents/$AGENT_ID/heartbeat" 2>/dev/null | grep -q "^2"; then
+
+    # On success, replay any pending events first
+    if [ -f "$pending_file" ]; then
+      (
+        flock -x -w 5 200 || exit 0
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          curl -s -o /dev/null --max-time 0.5 \
+            -X POST -H "Content-Type: application/json" \
+            -d "$line" \
+            "$DASHBOARD_URL/api/agents/$AGENT_ID/heartbeat" 2>/dev/null || true
+        done < "$pending_file"
+        : > "$pending_file"
+      ) 200>"$lock_file"
+    fi
+    return 0
+  fi
+
+  # On failure, append to pending-events.jsonl with flock
+  mkdir -p "$agent_dir"
+  (
+    flock -x -w 5 200 || exit 0
+    echo "$body" >> "$pending_file"
+  ) 200>"$lock_file"
+  return 1
+}
+
+TIMESTAMP="$(date -Iseconds)"
+
+# Emit model_set if model is known
+if [ -n "$MODEL" ]; then
+  MODEL_BODY=$(jq -n \
+    --arg kind "model_set" \
+    --arg model "$MODEL" \
+    '{kind: $kind, model: $model}')
+  post_event "$MODEL_BODY" || true
+fi
+
+# Emit activity_changed to idle
+IDLE_BODY=$(jq -n \
+  --arg kind "activity" \
+  --arg activity "idle" \
+  '{kind: $kind, activity: $activity}')
+post_event "$IDLE_BODY" || true
+
+# Always exit successfully - never break Claude Code execution
+exit 0

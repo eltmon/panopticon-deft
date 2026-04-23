@@ -87,7 +87,10 @@ import {
 import { parseConversationMessages } from '../services/conversation-service.js';
 import type { ConversationResponse } from '@panopticon/contracts';
 import { EventStoreService } from '../services/domain-services.js';
+import { AgentStateService } from '../services/agent-state-service.js';
 import { buildTmuxCommandString, capturePaneAsync, createSessionAsync, killSessionAsync, listSessionsAsync, sessionExistsAsync } from '../../../lib/tmux.js';
+import { Activity, WaitingReason } from '@panopticon/contracts';
+import { Schema } from 'effect';
 
 const execAsync = promisify(exec);
 
@@ -762,6 +765,28 @@ const postAgentAnswerQuestionRoute = HttpRouter.add(
 );
 
 // ─── Route: POST /api/agents/:id/heartbeat ───────────────────────────────────
+// PAN-800: Schema-validated typed-event ingestion endpoint.
+
+const LEGACY_STATE_MAP: Record<string, typeof Activity.Type> = {
+  active: 'working',
+  idle: 'idle',
+  suspended: 'idle',
+  stopped: 'stopped',
+  uninitialized: 'idle',
+  'waiting-on-human': 'waiting',
+};
+
+const RuntimeEventBody = Schema.Union(
+  Schema.Struct({ kind: Schema.Literal('activity'), activity: Activity, tool: Schema.optional(Schema.String) }),
+  Schema.Struct({ kind: Schema.Literal('thinking_start'), lastToolAt: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal('thinking_stop'), resolvedBy: Schema.Literals(['tool', 'waiting', 'idle', 'stopped']) }),
+  Schema.Struct({ kind: Schema.Literal('waiting_start'), reason: WaitingReason, message: Schema.optional(Schema.String) }),
+  Schema.Struct({ kind: Schema.Literal('waiting_clear'), clearedBy: Schema.Literals(['user_response', 'timeout', 'stopped', 'tool_resumed']) }),
+  Schema.Struct({ kind: Schema.Literal('message_received'), direction: Schema.Literals(['to_agent', 'from_agent']), source: Schema.Literals(['user', 'cloister', 'specialist', 'automated']) }),
+  Schema.Struct({ kind: Schema.Literal('model_set'), model: Schema.String, claudeSessionId: Schema.optional(Schema.String) }),
+  // Legacy body shape — mapped to activity for transition window
+  Schema.Struct({ state: Schema.String, tool: Schema.optional(Schema.String), timestamp: Schema.optional(Schema.String) }),
+);
 
 const postAgentHeartbeatRoute = HttpRouter.add(
   'POST',
@@ -770,14 +795,127 @@ const postAgentHeartbeatRoute = HttpRouter.add(
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
     const body = yield* readJsonBody;
+    const agentState = yield* AgentStateService;
 
-    const { state, tool, timestamp } = body as any;
-    saveAgentRuntimeState(id, {
-      state,
-      lastActivity: timestamp || new Date().toISOString(),
-      currentTool: tool,
-    });
+    const decoded = Schema.decodeUnknownEither(RuntimeEventBody)(body);
+    if (decoded._tag === 'Left') {
+      return jsonResponse({ success: false, error: 'Invalid event body' }, { status: 400 });
+    }
+
+    const eventBody = decoded.right;
+    const timestamp = new Date().toISOString();
+
+    // Legacy body shape
+    if (!('kind' in eventBody)) {
+      const activity = LEGACY_STATE_MAP[eventBody.state] ?? 'idle';
+      yield* agentState.emit({
+        type: 'agent.activity_changed',
+        sequence: 0, // assigned by event store
+        timestamp: eventBody.timestamp || timestamp,
+        payload: {
+          agentId: id,
+          activity,
+          currentTool: eventBody.tool ?? undefined,
+        },
+      });
+      return jsonResponse({ success: true });
+    }
+
+    // Typed event body
+    switch (eventBody.kind) {
+      case 'activity':
+        yield* agentState.emit({
+          type: 'agent.activity_changed',
+          sequence: 0,
+          timestamp,
+          payload: {
+            agentId: id,
+            activity: eventBody.activity,
+            currentTool: eventBody.tool ?? undefined,
+          },
+        });
+        break;
+      case 'thinking_start':
+        yield* agentState.emit({
+          type: 'agent.thinking_started',
+          sequence: 0,
+          timestamp,
+          payload: { agentId: id, lastToolAt: eventBody.lastToolAt },
+        });
+        break;
+      case 'thinking_stop':
+        yield* agentState.emit({
+          type: 'agent.thinking_stopped',
+          sequence: 0,
+          timestamp,
+          payload: { agentId: id, resolvedBy: eventBody.resolvedBy },
+        });
+        break;
+      case 'waiting_start':
+        yield* agentState.emit({
+          type: 'agent.waiting_started',
+          sequence: 0,
+          timestamp,
+          payload: {
+            agentId: id,
+            reason: eventBody.reason,
+            message: eventBody.message ?? undefined,
+          },
+        });
+        break;
+      case 'waiting_clear':
+        yield* agentState.emit({
+          type: 'agent.waiting_cleared',
+          sequence: 0,
+          timestamp,
+          payload: { agentId: id, clearedBy: eventBody.clearedBy },
+        });
+        break;
+      case 'message_received':
+        yield* agentState.emit({
+          type: 'agent.message_received',
+          sequence: 0,
+          timestamp,
+          payload: {
+            agentId: id,
+            direction: eventBody.direction,
+            source: eventBody.source,
+          },
+        });
+        break;
+      case 'model_set':
+        yield* agentState.emit({
+          type: 'agent.model_set',
+          sequence: 0,
+          timestamp,
+          payload: {
+            agentId: id,
+            model: eventBody.model,
+            claudeSessionId: eventBody.claudeSessionId ?? undefined,
+          },
+        });
+        break;
+    }
+
     return jsonResponse({ success: true });
+  })),
+);
+
+// ─── Route: GET /api/agents/:id/runtime ──────────────────────────────────────
+// PAN-800: Read canonical runtime state from AgentStateService.
+
+const getAgentRuntimeRoute = HttpRouter.add(
+  'GET',
+  '/api/agents/:id/runtime',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    const agentState = yield* AgentStateService;
+    const snapshot = yield* agentState.get(id);
+    if (Option.isNone(snapshot)) {
+      return jsonResponse({ error: 'Agent runtime state not found' }, { status: 404 });
+    }
+    return jsonResponse(snapshot.value);
   })),
 );
 
@@ -1958,6 +2096,7 @@ export const agentsRouteLayer = Layer.mergeAll(
   getAgentPendingQuestionsRoute,
   postAgentAnswerQuestionRoute,
   postAgentHeartbeatRoute,
+  getAgentRuntimeRoute,
   getAgentActivityRoute,
   getAgentFilesRoute,
   getAgentTimelineRoute,

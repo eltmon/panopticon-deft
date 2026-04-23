@@ -23,6 +23,7 @@ interface ClaudeSettings {
     PreToolUse?: HookConfig[];
     PostToolUse?: HookConfig[];
     Stop?: HookConfig[];
+    SessionStart?: HookConfig[];
   };
   mcpServers?: Record<string, McpServer>;
   [key: string]: any;
@@ -90,7 +91,7 @@ function installJq(): boolean {
  * Check if Panopticon hooks are already configured
  */
 function hooksAlreadyConfigured(settings: ClaudeSettings, binDir: string): boolean {
-  const hookTypes = ['PreToolUse', 'PostToolUse', 'Stop'] as const;
+  const hookTypes = ['PreToolUse', 'PostToolUse', 'Stop', 'SessionStart'] as const;
 
   for (const hookType of hookTypes) {
     const hooks = settings?.hooks?.[hookType] || [];
@@ -148,7 +149,7 @@ export async function setupHooksCommand(): Promise<void> {
   }
 
   // 3. Copy hook scripts to ~/.panopticon/bin/
-  const hookScripts = ['pre-tool-hook', 'heartbeat-hook', 'stop-hook', 'specialist-stop-hook', 'record-cost-event.js', 'tldr-read-enforcer', 'tldr-post-edit'];
+  const hookScripts = ['pre-tool-hook', 'heartbeat-hook', 'stop-hook', 'specialist-stop-hook', 'session-start-hook', 'record-cost-event.js', 'tldr-read-enforcer', 'tldr-post-edit'];
   const { fileURLToPath } = await import('url');
   const { dirname } = await import('path');
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -321,6 +322,20 @@ export async function setupHooksCommand(): Promise<void> {
     ]
   });
 
+  // Configure SessionStart hook (PAN-800)
+  if (!settings.hooks.SessionStart) {
+    settings.hooks.SessionStart = [];
+  }
+  settings.hooks.SessionStart.push({
+    matcher: '.*',
+    hooks: [
+      {
+        type: 'command',
+        command: join(binDir, 'session-start-hook')
+      }
+    ]
+  });
+
   // 8. Install caveman hook files and compress scripts to ~/.panopticon/hooks/caveman/
   try {
     const { setupCavemanHooks, setupCavemanCompressScripts } = await import('../../../lib/caveman/setup.js');
@@ -345,6 +360,7 @@ export async function setupHooksCommand(): Promise<void> {
   // 10. Success message
   console.log(chalk.green.bold('\n✓ Setup complete!\n'));
   console.log(chalk.dim('Claude Code hooks are now configured:'));
+  console.log(chalk.dim('  • SessionStart - Emits model_set + activity_changed(idle)'));
   console.log(chalk.dim('  • PreToolUse  - Sets agent state to "active"'));
   console.log(chalk.dim('  • PostToolUse - Logs activity to activity.jsonl'));
   console.log(chalk.dim('  • Stop        - Sets agent state to "idle"'));
