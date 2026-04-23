@@ -10,7 +10,7 @@ Phase 3 — Ingestion endpoint + SessionStart hook install: Reshape `POST /api/a
 - [x] Phase 2 — Service: `AgentStateService` with `SubscriptionRef`, bootstrap, projection_cache (commit: 5e19dee8)
 
 ## Remaining Work
-- [ ] Phase 3 — Ingestion endpoint + `session-start-hook` install
+- [x] Phase 3 — Ingestion endpoint + `session-start-hook` install (commit: b06e608b)
 - [ ] Phase 4 — Hook migration (all hooks become POST emitters)
 - [ ] Phase 5 — Consumer migration + cleanup (22 `tmux capture-pane` call sites)
 

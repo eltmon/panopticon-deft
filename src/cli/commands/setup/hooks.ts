@@ -149,7 +149,7 @@ export async function setupHooksCommand(): Promise<void> {
   }
 
   // 3. Copy hook scripts to ~/.panopticon/bin/
-  const hookScripts = ['pre-tool-hook', 'heartbeat-hook', 'stop-hook', 'specialist-stop-hook', 'session-start-hook', 'record-cost-event.js', 'tldr-read-enforcer', 'tldr-post-edit'];
+  const hookScripts = ['pre-tool-hook', 'heartbeat-hook', 'stop-hook', 'specialist-stop-hook', 'work-agent-stop-hook', 'session-start-hook', 'record-cost-event.js', 'tldr-read-enforcer', 'tldr-post-edit', 'hook-lib.sh'];
   const { fileURLToPath } = await import('url');
   const { dirname } = await import('path');
   const __dirname = dirname(fileURLToPath(import.meta.url));
