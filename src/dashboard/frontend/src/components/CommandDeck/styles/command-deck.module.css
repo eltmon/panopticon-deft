@@ -1801,7 +1801,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px 4px 24px;
+  padding: 4px 30px 4px 24px;
   position: relative;
   cursor: pointer;
   transition: background 0.1s;
@@ -1928,8 +1928,11 @@
   letter-spacing: 0;
 }
 
-/* Star / favorite button (in-group, only rendered when NOT favorited) */
 .conversationStarBtn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1938,45 +1941,26 @@
   border: none;
   background: none;
   cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+  flex-shrink: 0;
+  padding: 0;
+  z-index: 1;
   color: var(--muted-foreground);
-  border-radius: 4px;
-  line-height: 1;
-  transition: background 0.1s, color 0.1s;
-  flex-shrink: 0;
-  padding: 0;
-}
-
-/* Favorited modifier — keeps the actions group partially open (just wide enough
-   to show the star at slot 1) even when the row is not hovered.  The rename button
-   (slot 0) is hidden via opacity so it still reserves its column width, keeping
-   the star aligned with the hover-only star position. */
-.conversationActionsFavorited {
-  max-width: calc(2 * 18px + 4px);  /* slot0 (18px) + gap (4px) + slot1 (18px) */
-  opacity: 1;
-  margin-left: 0;
-  overflow: hidden;
-}
-
-/* Inside a favorited (non-hovered) group, hide everything except the star */
-.conversationActionsFavorited .conversationEditBtn {
   opacity: 0;
-  pointer-events: none;
+  transition: background 0.1s, color 0.1s, opacity 0.15s ease;
 }
 
-/* On hover, fully expand even if favorited — all buttons become visible */
-.conversationItem:hover .conversationActionsFavorited,
-.conversationItem:focus-within .conversationActionsFavorited {
-  max-width: 120px;
-}
-
-.conversationItem:hover .conversationActionsFavorited .conversationEditBtn,
-.conversationItem:focus-within .conversationActionsFavorited .conversationEditBtn {
+.conversationItem:hover .conversationStarBtn,
+.conversationItem:focus-within .conversationStarBtn {
   opacity: 1;
-  pointer-events: auto;
 }
 
-/* Persistent favorited star — always visible within the actions group */
 .conversationStarPersistent {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1985,12 +1969,13 @@
   border: none;
   background: none;
   cursor: pointer;
-  color: var(--primary);
   border-radius: 4px;
   line-height: 1;
-  transition: background 0.1s, color 0.1s;
   flex-shrink: 0;
   padding: 0;
+  z-index: 1;
+  color: var(--primary);
+  transition: background 0.1s, color 0.1s;
 }
 
 .conversationStarPersistent:hover {
