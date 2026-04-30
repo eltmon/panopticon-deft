@@ -1801,7 +1801,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px 4px 24px;
+  padding: 4px 30px 4px 24px;
   position: relative;
   cursor: pointer;
   transition: background 0.1s;
@@ -1929,6 +1929,10 @@
 }
 
 .conversationStarBtn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1939,7 +1943,6 @@
   cursor: pointer;
   border-radius: 4px;
   line-height: 1;
-  flex-shrink: 0;
   padding: 0;
   color: var(--muted-foreground);
   opacity: 0;
@@ -1952,6 +1955,10 @@
 }
 
 .conversationStarPersistent {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1962,7 +1969,6 @@
   cursor: pointer;
   border-radius: 4px;
   line-height: 1;
-  flex-shrink: 0;
   padding: 0;
   color: var(--primary);
   transition: background 0.1s, color 0.1s;
