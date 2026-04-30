@@ -632,8 +632,25 @@ function initSchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_git_ops_op_ts
       ON git_operations(operation, ts);
+
+    -- ===== Outbox (PAN-826: message delivery retry queue) =====
+    CREATE TABLE IF NOT EXISTS outbox (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_name TEXT    NOT NULL,
+      message           TEXT    NOT NULL,
+      status            TEXT    NOT NULL DEFAULT 'pending',  -- 'pending', 'failed', 'delivered'
+      error             TEXT,
+      error_phase       TEXT,       -- from MessageDeliveryFailed.phase: 'paste-not-visible', 'submit-not-confirmed', 'busy'
+      attempts          INTEGER NOT NULL DEFAULT 0,
+      created_at        TEXT    NOT NULL,
+      updated_at        TEXT    NOT NULL,
+      FOREIGN KEY (conversation_name) REFERENCES conversations(name) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_outbox_conversation_status
+      ON outbox(conversation_name, status);
   `);
-	db.pragma(`user_version = 31`);
+	db.pragma(`user_version = 32`);
 }
 /**
 * Run schema migrations if the database version is older than SCHEMA_VERSION.
@@ -641,7 +658,7 @@ function initSchema(db) {
 */
 function runMigrations(db) {
 	const currentVersion = db.pragma("user_version", { simple: true });
-	if (currentVersion === 31) return;
+	if (currentVersion === 32) return;
 	if (currentVersion === 0) {
 		initSchema(db);
 		return;
@@ -946,7 +963,23 @@ function runMigrations(db) {
 			db.exec(`ALTER TABLE review_status ADD COLUMN pr_number INTEGER`);
 		} catch {}
 	}
-	db.pragma(`user_version = 31`);
+	if (currentVersion < 32) db.exec(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_name TEXT    NOT NULL,
+        message           TEXT    NOT NULL,
+        status            TEXT    NOT NULL DEFAULT 'pending',
+        error             TEXT,
+        error_phase       TEXT,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        created_at        TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL,
+        FOREIGN KEY (conversation_name) REFERENCES conversations(name) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_outbox_conversation_status
+        ON outbox(conversation_name, status);
+    `);
+	db.pragma(`user_version = 32`);
 }
 //#endregion
 //#region ../src/lib/database/index.ts
