@@ -536,6 +536,11 @@ async function spawnReviewer(
   const claudeCmd = await getAgentRuntimeBaseCommand(model);
   const providerExports = await getProviderExportsForModel(model);
 
+  // INVARIANT (PAN-826): Reviewer spawn always uses a fresh UUID via --session-id,
+  // never --resume. Context compaction corrupts thinking block signatures (PAN-612).
+  // Round 2+ review prompts are delivered via sendKeysAsync into the live Claude REPL
+  // pane (PAN-830), NOT via --resume — the Claude process stays alive between rounds.
+  //
   // Pre-generate the Claude session UUID and persist it to the canonical reviewer
   // agent directory BEFORE Claude starts. Without this, jsonl-resolver has nothing
   // to look up: session.id is missing, sessions.json hasn't been written yet (the

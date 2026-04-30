@@ -3,7 +3,7 @@
  *
  * Orchestrates model handoffs for running agents using two methods:
  * 1. Kill & Spawn: For general agents (clean handoff with context preservation)
- * 2. Specialist Wake: For permanent specialists (resume with preserved context)
+ * 2. Specialist Wake: For specialists (fresh session per dispatch, context via STATE.md + beads)
  */
 
 import { existsSync, writeFileSync, mkdirSync } from 'fs';
@@ -95,7 +95,7 @@ export async function performHandoff(
  * @returns Handoff method
  */
 function detectHandoffMethod(agentId: string): HandoffMethod {
-  // Specialists use specialist-wake (context-preserving resume)
+  // Specialists use specialist-wake (fresh session per dispatch — no --resume, PAN-826)
   const specialists = ['merge-agent', 'review-agent', 'test-agent', 'inspect-agent', 'uat-agent'];
   if (specialists.some(s => agentId.includes(s))) {
     return 'specialist-wake';
@@ -190,12 +190,13 @@ async function performKillAndSpawn(
  *
  * Process:
  * 1. Capture handoff context
- * 2. Use `claude --resume {sessionId}` to wake specialist
- * 3. Pass task-specific prompt
- * 4. Faster context loading, specialist expertise retained
+ * 2. Delegate to wakeSpecialistOrQueue (fresh session per dispatch — no --resume)
+ * 3. Specialist picks up context via STATE.md + beads + role-prompt template
  *
- * NOTE: This requires the specialist to have been initialized first.
- * Specialists are persistent sessions that can be resumed.
+ * INVARIANT (PAN-826): Specialists NEVER use --resume. Context compaction corrupts
+ * thinking block signatures, making resumed sessions permanently fail (PAN-612).
+ * Each dispatch gets a fresh randomUUID() session ID via spawnEphemeralSpecialist
+ * or wakeSpecialist.
  *
  * @param state - Current agent state
  * @param options - Handoff options
@@ -212,7 +213,7 @@ async function performSpecialistWake(
     // Step 2: Build task prompt for specialist
     const prompt = buildHandoffPrompt(context, options.additionalInstructions);
 
-    // Step 3: Wake specialist using --resume
+    // Step 3: Wake specialist (fresh session — no --resume per PAN-826)
     // Determine specialist type from agent ID or options
     const specialistName = extractSpecialistName(state.id) as SpecialistType | null;
     if (!specialistName) {

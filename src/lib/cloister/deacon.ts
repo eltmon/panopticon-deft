@@ -12,7 +12,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync } from 'fs';
-import { readdir } from 'fs/promises';
+import { readdir, rename } from 'fs/promises';
 import { join } from 'path';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -741,6 +741,55 @@ export async function checkStuckWorkAgents(): Promise<string[]> {
         actions.push(`Stuck recovery: dismissed exclude-from-context dialog for ${agent.id}`);
       } catch (err) {
         console.error(`[deacon] Failed to send Escape to ${agent.id}:`, err);
+      }
+      continue;
+    }
+
+    // Detect thinking-block signature corruption (PAN-826).
+    // Claude Code outputs this error when a session's JSONL contains thinking
+    // blocks with invalid cryptographic signatures (e.g. from cross-model forks).
+    // Recovery: rename the corrupted JSONL aside (never delete — JSONL is sacred),
+    // kill the agent, and respawn fresh. The agent picks up via STATE.md + beads.
+    const hasSignatureCorruption = tmuxOutput.includes('Invalid signature in thinking block')
+      || tmuxOutput.includes('thinking block signature');
+    if (hasSignatureCorruption) {
+      console.log(`[deacon] Signature corruption detected in ${agent.id} — initiating recovery`);
+      try {
+        const agentState = getAgentState(agent.id);
+        const workspace = agentState?.workspace;
+        const launcherPath = join(AGENTS_DIR, agent.id, 'launcher.sh');
+
+        // Find and rename the corrupted JSONL aside (never delete — JSONL is sacred)
+        const sessionId = agentState?.sessionId;
+        if (sessionId && workspace) {
+          const { sessionFilePath } = await import('../paths.js');
+          const jsonlPath = sessionFilePath(workspace, sessionId);
+          if (existsSync(jsonlPath)) {
+            const corruptedPath = `${jsonlPath}.corrupted-${Date.now()}`;
+            await rename(jsonlPath, corruptedPath);
+            console.log(`[deacon] Renamed corrupted JSONL: ${jsonlPath} → ${corruptedPath}`);
+          }
+        }
+
+        // Kill the stuck agent
+        await killSessionAsync(agent.id).catch(() => {});
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Respawn if we have the launcher
+        if (existsSync(launcherPath) && workspace) {
+          await killSessionAsync(agent.id).catch(() => {});
+          await createSessionAsync(agent.id, workspace, `bash ${launcherPath}`);
+          actions.push(`Signature corruption recovery: respawned ${agent.id} (corrupted JSONL renamed aside)`);
+          console.log(`[deacon] Respawned ${agent.id} after signature corruption recovery`);
+        } else {
+          actions.push(`Signature corruption detected in ${agent.id} but cannot respawn (missing launcher/workspace)`);
+        }
+
+        stuckRecoveryState.set(agent.id, { lastAttempt: now, attempts: 0 });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[deacon] Signature corruption recovery failed for ${agent.id}:`, errMsg);
+        actions.push(`Signature corruption recovery failed for ${agent.id}: ${errMsg}`);
       }
       continue;
     }

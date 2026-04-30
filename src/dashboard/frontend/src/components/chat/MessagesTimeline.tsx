@@ -22,7 +22,7 @@ import {
   memo,
 } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { ChevronDown, ChevronRight, Circle, Bot, GitBranchPlus } from 'lucide-react';
+import { ChevronDown, ChevronRight, Circle, Bot, GitBranchPlus, Lightbulb } from 'lucide-react';
 import type { WorkLogEntry } from './chat-types';
 import { ChatMarkdown } from './ChatMarkdown';
 import {
@@ -30,7 +30,7 @@ import {
   deriveMessagesTimelineRows,
   estimateMessagesTimelineRowHeight,
   type MessagesTimelineRow,
-} from './session-logic';
+} from './MessagesTimeline.logic';
 import type { ChatMessage } from './chat-types';
 import type { RoundVerdict } from '../CommandDeck/RoundCard';
 import styles from '../CommandDeck/styles/command-deck.module.css';
@@ -428,7 +428,7 @@ function WorkLogGroup({ entries }: { entries: WorkLogEntry[] }) {
   return (
     <div className={styles.workLogGroup}>
       {visible.map((entry) => (
-        <WorkLogEntryRow key={entry.id} entry={entry} />
+        <WorkLogRow key={entry.id} entry={entry} />
       ))}
       {hasOverflow && !expanded && (
         <button
@@ -454,7 +454,7 @@ function WorkLogGroup({ entries }: { entries: WorkLogEntry[] }) {
 
 const TERMINAL_TOOLS = new Set(['Bash', 'bash', 'terminal', 'shell']);
 
-function WorkLogEntryRow({ entry }: { entry: WorkLogEntry }) {
+function WorkLogRow({ entry }: { entry: WorkLogEntry }) {
   const [showResult, setShowResult] = useState(false);
   const toneColor: Record<WorkLogEntry['tone'], string> = {
     thinking: 'var(--muted-foreground)',
@@ -464,16 +464,27 @@ function WorkLogEntryRow({ entry }: { entry: WorkLogEntry }) {
   };
 
   const isTerminal = TERMINAL_TOOLS.has(entry.toolTitle ?? entry.label);
+  const isThinking = entry.tone === 'thinking';
   const hasResult = !!entry.result;
+  const isExpandable = hasResult || (isThinking && !!entry.detail);
 
   return (
     <div>
       <div
         className={styles.workLogEntry}
-        style={hasResult ? { cursor: 'pointer' } : undefined}
-        onClick={hasResult ? () => setShowResult(prev => !prev) : undefined}
+        style={isExpandable ? { cursor: 'pointer' } : undefined}
+        onClick={isExpandable ? () => setShowResult(prev => !prev) : undefined}
       >
-        {isTerminal ? (
+        {isThinking ? (
+          <Lightbulb
+            size={10}
+            style={{
+              color: toneColor.thinking,
+              flexShrink: 0,
+              marginTop: 1,
+            }}
+          />
+        ) : isTerminal ? (
           <span
             className={styles.workLogTerminalIcon}
             style={{ color: toneColor[entry.tone] }}
@@ -492,13 +503,19 @@ function WorkLogEntryRow({ entry }: { entry: WorkLogEntry }) {
           />
         )}
         <span className={styles.workLogLabel}>{entry.toolTitle ?? entry.label}</span>
-        {entry.detail && (
+        {entry.detail && !isThinking && (
           <span className={styles.workLogDetail} title={entry.detail}>
             {entry.detail.slice(0, 80)}
             {entry.detail.length > 80 ? '…' : ''}
           </span>
         )}
-        {hasResult && (
+        {isThinking && !showResult && entry.detail && (
+          <span className={styles.workLogDetail} title={entry.detail}>
+            {entry.detail.slice(0, 60)}
+            {entry.detail.length > 60 ? '…' : ''}
+          </span>
+        )}
+        {isExpandable && (
           <ChevronRight
             size={10}
             style={{
@@ -511,6 +528,11 @@ function WorkLogEntryRow({ entry }: { entry: WorkLogEntry }) {
           />
         )}
       </div>
+      {showResult && isThinking && entry.detail && (
+        <div className={styles.workLogThinkingResult}>
+          {entry.detail}
+        </div>
+      )}
       {showResult && entry.result && (
         isTerminal ? (
           <pre className={styles.workLogResult}>{entry.result}</pre>

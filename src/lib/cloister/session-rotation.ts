@@ -263,7 +263,7 @@ export async function rotateSpecialistSession(
 
     console.log(`Started fresh session: ${newAgent.sessionId.substring(0, 8)}`);
 
-    // Persist the new session ID so subsequent wakes use --resume
+    // Persist the new session ID so subsequent wakes use --session-id (not --resume, PAN-826)
     if (newAgent.sessionId && newAgent.sessionId !== 'unknown') {
       setSessionId(specialistName, newAgent.sessionId);
     }

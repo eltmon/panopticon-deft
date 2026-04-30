@@ -433,7 +433,7 @@ export async function parseConversationMessages(
           messages.push(pendingAssistant);
         }
         pendingAssistant = {
-          id: entry.uuid ?? msg.id ?? `asst-${messages.length}`,
+          id: entry.uuid ?? `asst-${messages.length}`,
           role: 'assistant',
           text: assistantText,
           // createdAt = when the assistant response was generated (preserves

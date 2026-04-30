@@ -10,7 +10,7 @@ import { existsSync } from 'fs';
 import { encodeClaudeProjectDir } from '../paths.js';
 
 // Schema version — increment when making breaking schema changes
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 /**
  * Initialize the complete database schema.
@@ -321,6 +321,23 @@ export function initSchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_git_ops_op_ts
       ON git_operations(operation, ts);
+
+    -- ===== Outbox (PAN-826: message delivery retry queue) =====
+    CREATE TABLE IF NOT EXISTS outbox (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_name TEXT    NOT NULL,
+      message           TEXT    NOT NULL,
+      status            TEXT    NOT NULL DEFAULT 'pending',  -- 'pending', 'failed', 'delivered'
+      error             TEXT,
+      error_phase       TEXT,       -- from MessageDeliveryFailed.phase: 'paste-not-visible', 'submit-not-confirmed', 'busy'
+      attempts          INTEGER NOT NULL DEFAULT 0,
+      created_at        TEXT    NOT NULL,
+      updated_at        TEXT    NOT NULL,
+      FOREIGN KEY (conversation_name) REFERENCES conversations(name) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_outbox_conversation_status
+      ON outbox(conversation_name, status);
   `);
 
   // Record schema version
@@ -760,6 +777,26 @@ export function runMigrations(db: Database.Database): void {
   if (currentVersion < 31) {
     try { db.exec(`ALTER TABLE review_status ADD COLUMN pr_head_sha TEXT`); } catch { /* already exists */ }
     try { db.exec(`ALTER TABLE review_status ADD COLUMN pr_number INTEGER`); } catch { /* already exists */ }
+  }
+
+  // v31 → v32: add outbox table for message delivery retry queue (PAN-826)
+  if (currentVersion < 32) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_name TEXT    NOT NULL,
+        message           TEXT    NOT NULL,
+        status            TEXT    NOT NULL DEFAULT 'pending',
+        error             TEXT,
+        error_phase       TEXT,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        created_at        TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL,
+        FOREIGN KEY (conversation_name) REFERENCES conversations(name) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_outbox_conversation_status
+        ON outbox(conversation_name, status);
+    `);
   }
 
   // After all migrations, set the version

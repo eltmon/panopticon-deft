@@ -488,7 +488,7 @@ export function getSessionId(name: SpecialistType, projectKey?: string): string 
 
   try {
     const sessionId = readFileSync(sessionFile, 'utf-8').trim();
-    // Validate UUID format — Claude Code requires valid UUIDs for --resume and --session-id.
+    // Validate UUID format — Claude Code requires valid UUIDs for --session-id.
     // Old deterministic IDs (e.g., "specialist-mind-your-now-review-agent") are not valid UUIDs.
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!uuidRegex.test(sessionId)) {
@@ -930,8 +930,9 @@ export async function spawnEphemeralSpecialist(
     console.log(`[specialist] Using promptOverride for ${projectKey}/${task.issueId} (${basePrompt.length} chars)`);
   }
 
-  // Prepend session-aware preamble: specialists accumulate context via --resume,
-  // so they may have seen this issue before. They MUST re-execute fresh every time.
+  // Prepend session-aware preamble: each specialist dispatch gets a fresh session
+  // (PAN-826 — no --resume), but the preamble ensures the specialist does not rely
+  // on any stale context and re-executes the task from scratch.
   const taskPrompt = `IMPORTANT: This is a NEW task dispatch. You may have context from prior runs in this session — that is useful background knowledge, but you MUST execute this task fresh RIGHT NOW. Do NOT skip steps or report cached results. Read the code, run the commands, and call the status update APIs as instructed below. Prior results are stale — the code may have changed.
 
 ${basePrompt}`;
@@ -1050,8 +1051,9 @@ ${basePrompt}`;
 
     console.log(`[specialist] Dispatching ${specialistType} for ${projectKey}/${task.issueId} (session: ${sessionId.slice(0, 8)}...)`);
 
-    // Single launcher script: always try --resume first (normal case).
-    // Falls back to --session-id only on first cold start (session not in Claude's storage).
+    // Single launcher script: always uses --session-id with a fresh UUID (no --resume).
+    // INVARIANT (PAN-826): Specialists NEVER use --resume — context compaction corrupts
+    // thinking block signatures (PAN-612). Each dispatch starts fresh.
     // Prompt is always passed as CLI argument — no tmux key delivery needed.
     // Inner script runs Claude; outer launcher wraps with script(1) for real-time PTY output
     // so tmux capture-pane (God View) can see output while also logging to file.
@@ -1059,7 +1061,7 @@ ${basePrompt}`;
     const innerScript = join(agentDir, 'run-claude.sh');
 
     // Inner script: the actual Claude invocation.
-    // Non-reviewer specialist dispatches start fresh — no --resume. Reasons:
+    // INVARIANT (PAN-826): Non-reviewer specialist dispatches start fresh — no --resume. Reasons:
     // 1. Context compaction corrupts thinking block signatures, making resumed sessions
     //    permanently fail with "Invalid signature in thinking block" (PAN-612)
     // 2. These dispatches are task-based: each is a new task with a full prompt
@@ -2427,7 +2429,7 @@ async function resetSpecialist(name: SpecialistType): Promise<void> {
  * Wake a specialist to process a task
  *
  * Sends a task prompt to a running specialist. If the specialist isn't running,
- * starts it first (with --resume if it has a session).
+ * starts it with a fresh session ID (no --resume — PAN-826).
  *
  * @param name - Specialist name
  * @param taskPrompt - The task prompt to send to the specialist
@@ -2538,9 +2540,9 @@ export async function wakeSpecialist(
       // All autonomous specialists need full permission bypass to avoid interactive prompts
       const permissionFlags = '--dangerously-skip-permissions --permission-mode bypassPermissions';
 
-      // Start with --resume if we have a session, otherwise generate a new session ID
-      // Always start fresh — no --resume. Context compaction corrupts thinking block
-      // signatures, making resumed sessions permanently fail (PAN-612).
+      // INVARIANT (PAN-826): Always start fresh — no --resume. Context compaction
+      // corrupts thinking block signatures, making resumed sessions permanently
+      // fail with "Invalid signature in thinking block" (PAN-612).
       const effectiveSessionId = sessionId || randomUUID();
       if (!sessionId) setSessionId(name, effectiveSessionId);
       const providerExportCmd = Object.entries(providerEnv)

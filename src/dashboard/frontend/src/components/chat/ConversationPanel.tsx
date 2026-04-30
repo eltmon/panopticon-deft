@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Circle, Copy, Check, Loader2, Pencil, Terminal, FileCode, Search, Globe, Wrench, Zap, GitBranchPlus, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Circle, Copy, Check, Loader2, Pencil, Terminal, FileCode, Search, Globe, Wrench, Zap, GitBranchPlus, CheckCircle2, AlertCircle, RotateCcw, Trash2 } from 'lucide-react';
 import { XTerminal } from '../XTerminal';
 import type { Conversation } from '../CommandDeck/ConversationList';
 import { updateConversationTitle } from '../CommandDeck/ConversationList';
@@ -12,6 +12,8 @@ import type { ChatMessage, WorkLogEntry } from './chat-types';
 import { getWorkingPhase, getPhaseLabel, getPendingToolEntry, isSpinnerPhase } from '../../lib/workingPhase';
 import { deriveRoundMarkers } from '../../lib/deriveRoundMarkers';
 import type { ReviewerRoundMetadata } from '@panctl/contracts';
+import { WS_METHODS } from '@panctl/contracts';
+import { getTransport, type PanRpcProtocolClient } from '../../lib/wsTransport';
 import styles from '../CommandDeck/styles/command-deck.module.css';
 
 // ─── Phase icon map ───────────────────────────────────────────────────────────
@@ -27,6 +29,69 @@ const PHASE_ICONS = {
   tool:       Wrench,
   processing: Loader2,
 } as const;
+
+// ─── Message types ───────────────────────────────────────────────────────────
+
+interface OutboxEntry {
+  id: number;
+  conversationName: string;
+  message: string;
+  status: 'pending' | 'failed' | 'delivered';
+  error: string | null;
+  errorPhase: string | null;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface MessagesResponse {
+  messages: ChatMessage[];
+  workLog: WorkLogEntry[];
+  streaming: boolean;
+  discovering?: boolean;
+  totalCost?: number;
+  outbox?: OutboxEntry[];
+}
+
+// ─── WebSocket subscription for live message updates (PAN-826) ───────────────
+
+function useConversationMessagesSubscription(
+  conversationName: string,
+  sessionAlive: boolean,
+) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!sessionAlive) return;
+
+    const transport = getTransport();
+    const unsubscribe = transport.subscribe(
+      (client) =>
+        (client as PanRpcProtocolClient)[WS_METHODS.subscribeConversationMessages]({
+          conversationName,
+        }) as unknown as import('effect').Stream.Stream<
+          { kind: 'messages'; messages: ChatMessage[]; workLog: WorkLogEntry[]; streaming: boolean }
+          | { kind: 'discovering' },
+          Error
+        >,
+      (event) => {
+        if (event.kind !== 'messages') return;
+        queryClient.setQueryData(
+          ['conversation-messages', conversationName],
+          (prev: MessagesResponse | undefined) => ({
+            messages: event.messages,
+            workLog: event.workLog,
+            streaming: event.streaming,
+            outbox: prev?.outbox ?? [],
+            totalCost: prev?.totalCost,
+          }),
+        );
+      },
+    );
+
+    return unsubscribe;
+  }, [conversationName, sessionAlive, queryClient]);
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -92,11 +157,11 @@ export function ConversationPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversation.model]);
 
-  // Query messages at this level so we can drive the header working-spinner
+  useConversationMessagesSubscription(conversation.name, conversation.sessionAlive);
+
   const { data: messagesData } = useQuery({
     queryKey: ['conversation-messages', conversation.name],
     queryFn: () => fetchMessages(conversation.name),
-    refetchInterval: conversation.sessionAlive ? 2000 : false,
   });
   const headerMessages = messagesData?.messages ?? [];
   const headerWorkLog = messagesData?.workLog ?? [];
@@ -402,14 +467,6 @@ function ForkProgressView({ forkStatus, forkError, parentTitle }: {
 
 // ─── ConversationView ─────────────────────────────────────────────────────────
 
-interface MessagesResponse {
-  messages: ChatMessage[];
-  workLog: WorkLogEntry[];
-  streaming: boolean;
-  discovering?: boolean;
-  totalCost?: number;
-}
-
 async function fetchMessages(name: string): Promise<MessagesResponse> {
   const res = await fetch(`/api/conversations/${encodeURIComponent(name)}/messages`);
   if (!res.ok) throw new Error('Failed to fetch messages');
@@ -429,6 +486,70 @@ interface ConversationViewProps {
   roundMetadata?: ReviewerRoundMetadata;
 }
 
+function FailedPromptCard({
+  entry,
+  conversationName,
+  onRetried,
+}: {
+  entry: OutboxEntry;
+  conversationName: string;
+  onRetried: () => void;
+}) {
+  const [retrying, setRetrying] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const handleRetry = async () => {
+    setRetrying(true);
+    try {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(conversationName)}/outbox/${entry.id}/retry`,
+        { method: 'POST' },
+      );
+      if (res.ok) onRetried();
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const handleDiscard = async () => {
+    await fetch(
+      `/api/conversations/${encodeURIComponent(conversationName)}/outbox/${entry.id}`,
+      { method: 'DELETE' },
+    );
+    onRetried();
+  };
+
+  const handleCopy = () => {
+    void navigator.clipboard.writeText(entry.message);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className={styles.failedPromptCard}>
+      <div className={styles.failedPromptHeader}>
+        <AlertCircle size={12} />
+        <span>Failed to send{entry.error ? `: ${entry.errorPhase}` : ''}</span>
+      </div>
+      <p className={styles.failedPromptText}>
+        {entry.message.slice(0, 200)}
+        {entry.message.length > 200 ? '…' : ''}
+      </p>
+      <div className={styles.failedPromptActions}>
+        <button onClick={handleRetry} disabled={retrying} title="Retry">
+          <RotateCcw size={12} /> {retrying ? 'Retrying…' : 'Retry'}
+        </button>
+        <button onClick={handleCopy} title="Copy">
+          {copied ? <Check size={12} /> : <Copy size={12} />} Copy
+        </button>
+        <button onClick={handleDiscard} title="Discard">
+          <Trash2 size={12} /> Discard
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ConversationView({ conversation, onResume, onArchive, resumePending, modelPicker, roundMarkers, roundMetadata }: ConversationViewProps) {
   const [optimisticMessages, setOptimisticMessages] = useState<ChatMessage[]>([]);
   // Track count so we know when the server caught up
@@ -437,13 +558,12 @@ function ConversationView({ conversation, onResume, onArchive, resumePending, mo
   const { data, isLoading } = useQuery({
     queryKey: ['conversation-messages', conversation.name],
     queryFn: () => fetchMessages(conversation.name),
-    // Poll every 2s while session is active for live updates.
-    // Since we don't have WebSocket push (unlike T3Code), polling is our streaming mechanism.
-    refetchInterval: conversation.sessionAlive ? 2000 : false,
   });
 
+  const queryClient = useQueryClient();
   const serverMessages = data?.messages ?? [];
   const workLog = data?.workLog ?? [];
+  const outbox = data?.outbox ?? [];
 
   // Drop optimistic messages once the server has returned at least as many messages
   // as we had before plus the optimistic ones (the real message has arrived).
@@ -536,6 +656,18 @@ function ConversationView({ conversation, onResume, onArchive, resumePending, mo
           streaming={isWorking}
           roundMarkers={derivedRoundMarkers}
         />
+      )}
+      {outbox.length > 0 && (
+        <div className={styles.failedPromptList}>
+          {outbox.map(entry => (
+            <FailedPromptCard
+              key={entry.id}
+              entry={entry}
+              conversationName={conversation.name}
+              onRetried={() => void queryClient.invalidateQueries({ queryKey: ['conversation-messages', conversation.name] })}
+            />
+          ))}
+        </div>
       )}
       {isForking ? null : onResume ? (
         <div className={styles.conversationResumeBar}>

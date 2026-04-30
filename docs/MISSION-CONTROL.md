@@ -148,7 +148,7 @@ The conversation list shows all active and ended sessions:
 - **Title**: Auto-generated from the first message, or manually renamed
 - **Cost**: Estimated token cost for the session
 
-### Forking Conversations
+### Forks
 
 Click the fork icon on any conversation to create a continuation. The fork dialog offers:
 
@@ -160,4 +160,4 @@ Click the fork icon on any conversation to create a continuation. The fork dialo
 | **Summary model** | Which model generates the summary (when Fast summary is off) |
 | **Launch model** | Which model the new conversation uses |
 
-**Summary fork** (default) distills the conversation into a structured checkpoint and injects it as the first message. **Plain fork** copies the raw history with `--resume`. See [FORKS.md](./FORKS.md) for full details on fork behavior, thinking block handling, and model-switching considerations.
+**Summary fork** (default) distills the conversation into a structured checkpoint and injects it as the first message — cheaper and portable across model families. **Plain fork** copies the raw history with `--resume`, preserving exact message history but carrying the full token weight. See [FORKS.md](./FORKS.md) for full details on fork behavior, thinking block sanitization, cross-model gotchas, and cost implications.

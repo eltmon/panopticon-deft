@@ -1946,7 +1946,36 @@
   padding: 0;
 }
 
-/* Persistent favorited star — always visible (not collapsed by .conversationActions) */
+/* Favorited modifier — keeps the actions group partially open (just wide enough
+   to show the star at slot 1) even when the row is not hovered.  The rename button
+   (slot 0) is hidden via opacity so it still reserves its column width, keeping
+   the star aligned with the hover-only star position. */
+.conversationActionsFavorited {
+  max-width: calc(2 * 18px + 4px);  /* slot0 (18px) + gap (4px) + slot1 (18px) */
+  opacity: 1;
+  margin-left: 0;
+  overflow: hidden;
+}
+
+/* Inside a favorited (non-hovered) group, hide everything except the star */
+.conversationActionsFavorited .conversationEditBtn {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* On hover, fully expand even if favorited — all buttons become visible */
+.conversationItem:hover .conversationActionsFavorited,
+.conversationItem:focus-within .conversationActionsFavorited {
+  max-width: 120px;
+}
+
+.conversationItem:hover .conversationActionsFavorited .conversationEditBtn,
+.conversationItem:focus-within .conversationActionsFavorited .conversationEditBtn {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Persistent favorited star — always visible within the actions group */
 .conversationStarPersistent {
   display: flex;
   align-items: center;
@@ -2537,6 +2566,21 @@
   line-height: 1.4;
 }
 
+.workLogThinkingResult {
+  margin: 2px 0 4px 18px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--muted) 60%, transparent);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.5;
+  font-style: italic;
+}
+
 .workLogExpandBtn {
   background: none;
   border: none;
@@ -2548,6 +2592,62 @@
   gap: 4px;
   padding: 2px 0;
   align-self: flex-start;
+}
+
+.failedPromptList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.failedPromptCard {
+  border: 1px solid var(--destructive);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--destructive) 6%, var(--background));
+}
+
+.failedPromptHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--destructive);
+  margin-bottom: 4px;
+}
+
+.failedPromptText {
+  font-size: 13px;
+  color: var(--foreground);
+  margin: 0 0 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.failedPromptActions {
+  display: flex;
+  gap: 8px;
+}
+
+.failedPromptActions button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  transition: background 0.1s, color 0.1s;
+}
+
+.failedPromptActions button:hover {
+  background: var(--accent);
+  color: var(--foreground);
 }
 
 /* Working indicator */

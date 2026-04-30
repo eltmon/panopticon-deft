@@ -51,6 +51,7 @@ import {
 } from '../../../lib/database/conversations-db.js';
 import {
   sendKeysAsync,
+  MessageDeliveryFailed,
   capturePaneAsync,
   sessionExistsAsync,
   killSessionAsync,
@@ -66,7 +67,6 @@ import {
 import { generateLauncherScript } from '../../../lib/launcher-generator.js';
 import {
   parseConversationMessages,
-  parseFromLastCompactBoundary,
   type ParseState,
 } from '../services/conversation-service.js';
 import {
@@ -75,6 +75,7 @@ import {
   shouldInterceptManualCompact,
 } from '../services/conversation-compaction.js';
 import { sessionFilePath, sessionIdFromFile, encodeClaudeProjectDir } from '../../../lib/paths.js';
+import { insertOutboxEntry, getOutboxEntries, updateOutboxStatus, deleteOutboxEntry, type OutboxEntry, type OutboxErrorPhase } from '../../../lib/database/outbox-db.js';
 import { generateSummaryForFork, generateFallbackSummary, reserveSummaryForkSession, copySessionFromCompactBoundary } from '../../../lib/conversations/summary-fork.js';
 import {
   ensureConversationAttachmentDir,
@@ -192,9 +193,7 @@ async function getCachedMessages(
 
   let result: Awaited<ReturnType<typeof parseConversationMessages>>;
 
-  if (isSpecialist) {
-    result = await parseFromLastCompactBoundary(sessionFile);
-  } else if (
+  if (
     cached &&
     cached.parseState &&
     cached.byteOffset <= fileStats.size &&
@@ -399,7 +398,7 @@ async function waitForClaudeReady(tmuxSession: string): Promise<void> {
     }
     await new Promise<void>((r) => setTimeout(r, 500));
   }
-  console.warn(`[conversations] Timed out waiting for Claude Code prompt in ${tmuxSession}`);
+  throw new Error(`Timed out waiting for Claude Code prompt in ${tmuxSession}`);
 }
 
 /** Resolve the JSONL session file path for a conversation.
@@ -558,7 +557,19 @@ export async function handleConversationMessage(
     // Unmanaged @paths in prose are allowed to pass through
   }
 
-  await deliverMessage(conv.tmuxSession, message, 'conversation-message');
+  try {
+    await deliverMessage(conv.tmuxSession, message, 'conversation-message');
+  } catch (err) {
+    if (err instanceof MessageDeliveryFailed) {
+      const entry = insertOutboxEntry(name, message);
+      updateOutboxStatus(entry.id, 'failed', err.message, err.phase as OutboxErrorPhase);
+      return jsonResponse(
+        { error: err.message, phase: err.phase, outboxId: entry.id },
+        { status: 502 },
+      );
+    }
+    throw err;
+  }
   return jsonResponse({ ok: true });
 }
 
@@ -860,19 +871,10 @@ const getConversationsRoute = HttpRouter.add(
         const conversations = listConversations({ limit, offset });
         const favoritedNames = getCachedFavoritedIds();
 
-        // Enrich with live tmux status
-        // Grace period: treat recently-created active conversations as alive (tmux may not have
-        // started yet — spawn is async). After 30s we fall back to the actual tmux check.
-        const SPAWN_GRACE_MS = 30_000;
+        // Enrich with live tmux status (instant-start makes spawn synchronous — no grace period needed)
         const liveSessionNames = new Set(await listSessionNamesAsync());
-        const now = Date.now();
-        const graceThreshold = now - SPAWN_GRACE_MS;
         const enriched = conversations.map((conv) => {
-          const withinGrace =
-            conv.status === 'active' &&
-            !conv.endedAt &&
-            new Date(conv.createdAt).getTime() > graceThreshold;
-          const sessionAlive = !conv.forkStatus && (withinGrace || liveSessionNames.has(conv.tmuxSession));
+          const sessionAlive = !conv.forkStatus && liveSessionNames.has(conv.tmuxSession);
 
           return { ...conv, sessionAlive, isWorking: false, currentTool: null, isFavorited: favoritedNames.has(conv.name) };
         });
@@ -921,9 +923,10 @@ const getConversationRoute = HttpRouter.add(
 
 // ─── Route: POST /api/conversations ──────────────────────────────────────────
 //
-// Unified spawn + create endpoint. Called on first message from draft mode.
-// Spawns Claude Code with selected model/effort, creates DB record, sends message.
-// Accepts: { message, model?, effort?, issueId? }
+// Synchronous spawn endpoint. Creates a tmux session, waits for Claude to reach
+// its prompt, then returns the live conversation record. The frontend mounts
+// XTerminal + /ws/rpc immediately — no polling or grace windows needed.
+// Accepts: { message?, model?, effort?, issueId? }
 
 const postConversationRoute = HttpRouter.add(
   'POST',
@@ -950,17 +953,13 @@ const postConversationRoute = HttpRouter.add(
         if (effort && !SAFE_EFFORT_PATTERN.test(effort)) {
           return jsonResponse({ error: 'Invalid effort' }, { status: 400 });
         }
-        const cwd = join(homedir(), 'Projects');
-
-        if (!message) {
-          return jsonResponse({ error: 'message is required' }, { status: 400 });
-        }
-        if (message.length > MAX_MESSAGE_LENGTH) {
+        if (message && message.length > MAX_MESSAGE_LENGTH) {
           return jsonResponse(
             { error: `message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` },
             { status: 400 },
           );
         }
+        const cwd = join(homedir(), 'Projects');
 
         // Generate identifiers — retry on UNIQUE collision (extremely unlikely
         // with HHMMSS+random, but cheap insurance against sub-second races).
@@ -977,9 +976,23 @@ const postConversationRoute = HttpRouter.add(
         await spawnConversationSession(tmuxSession, cwd, claudeSessionId, model, effort, issueId);
         console.log(`[conversations] tmux session ${tmuxSession} spawned, sessionId: ${claudeSessionId}`);
 
-        // Title = truncated first message (T3Code pattern)
+        // Wait synchronously for Claude to reach its prompt before returning.
+        // Bounded by waitForClaudeReady's 30s timeout.
+        try {
+          await waitForClaudeReady(tmuxSession);
+        } catch {
+          console.error(`[conversations] Claude did not reach prompt in ${tmuxSession} within timeout`);
+          return jsonResponse(
+            { error: 'Claude failed to start within timeout', tmuxSession },
+            { status: 504 },
+          );
+        }
+
+        // Title: use message if provided, otherwise a placeholder
         const MAX_TITLE_LEN = 60;
-        const title = message.slice(0, MAX_TITLE_LEN) + (message.length > MAX_TITLE_LEN ? '…' : '');
+        const title = message
+          ? message.slice(0, MAX_TITLE_LEN) + (message.length > MAX_TITLE_LEN ? '…' : '')
+          : 'New conversation';
 
         // Create DB record
         const conv = createConversation({
@@ -990,16 +1003,14 @@ const postConversationRoute = HttpRouter.add(
           claudeSessionId,
           title,
           titleSource: 'auto',
-          titleSeed: title,
+          titleSeed: message || title,
           model,
           effort,
         });
 
-        // Wait for Claude Code to be ready, send message, and generate title — all async.
-        // Don't block the HTTP response; the frontend will poll for messages.
-        void (async () => {
+        // If a message was provided, send it now that Claude is ready
+        if (message) {
           try {
-            await waitForClaudeReady(tmuxSession);
             await sendKeysAsync(tmuxSession, message, 'conversation-message');
             void generateAiTitle(name, message).catch((err: unknown) => {
               console.error(`[conversations] AI title generation failed for "${name}":`, err);
@@ -1007,7 +1018,7 @@ const postConversationRoute = HttpRouter.add(
           } catch (err) {
             console.error(`[conversations] Failed to send first message to ${tmuxSession}:`, err);
           }
-        })();
+        }
 
         return jsonResponse({ ...conv, sessionAlive: true }, { status: 201 });
       } catch (error: unknown) {
@@ -1300,11 +1311,13 @@ const getConversationMessagesRoute = HttpRouter.add(
             updateConversationCost(name, result.totalCost);
           }
 
+          const outbox = conv ? getOutboxEntries(name) : [];
           return jsonResponse({
             messages: result.messages,
             workLog: result.workLog,
             streaming: result.streaming,
             totalCost: result.totalCost,
+            outbox,
           });
         } catch (parseErr: unknown) {
           // File may not exist yet — Claude Code is still starting up.
@@ -1448,6 +1461,77 @@ const postConversationMessageRoute = HttpRouter.add(
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
         console.error('[conversations] send message failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: POST /api/conversations/:name/outbox/:id/retry ───────────────────
+
+const postOutboxRetryRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/outbox/:id/retry',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const id = parseInt(params['id'] ?? '', 10);
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        const entries = getOutboxEntries(name);
+        const entry = entries.find(e => e.id === id);
+        if (!entry) return jsonResponse({ error: 'Outbox entry not found' }, { status: 404 });
+
+        try {
+          await sendKeysAsync(conv.tmuxSession, entry.message, 'outbox-retry');
+          deleteOutboxEntry(id);
+          return jsonResponse({ ok: true });
+        } catch (err) {
+          if (err instanceof MessageDeliveryFailed) {
+            updateOutboxStatus(id, 'failed', err.message, err.phase as OutboxErrorPhase);
+            return jsonResponse(
+              { error: err.message, phase: err.phase },
+              { status: 502 },
+            );
+          }
+          throw err;
+        }
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] outbox retry failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: DELETE /api/conversations/:name/outbox/:id ───────────────────────
+
+const deleteOutboxRoute = HttpRouter.add(
+  'DELETE',
+  '/api/conversations/:name/outbox/:id',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const id = parseInt(params['id'] ?? '', 10);
+    return yield* Effect.promise(async () => {
+      try {
+        deleteOutboxEntry(id);
+        return jsonResponse({ ok: true });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] outbox delete failed:', msg);
         return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
@@ -1763,7 +1847,16 @@ async function runForkPipeline(
   if (!ready) {
     console.warn(`[summary-fork] Prompt not detected in time for ${convName}, sending summary anyway`);
   }
-  await sendKeysAsync(conv.tmuxSession, summary, 'summary-fork');
+  try {
+    await sendKeysAsync(conv.tmuxSession, summary, 'summary-fork');
+  } catch (err) {
+    if (err instanceof MessageDeliveryFailed) {
+      console.error(`[summary-fork] Delivery failed (${err.phase}) for ${convName}`);
+      updateForkStatus(convName, null);
+      throw err;
+    }
+    throw err;
+  }
 
   markConversationActive(convName);
   updateForkStatus(convName, null);
@@ -1886,6 +1979,8 @@ export const conversationsRouteLayer = Layer.mergeAll(
   postConversationUploadImageRoute,
   postConversationDeleteImageRoute,
   postConversationMessageRoute,
+  postOutboxRetryRoute,
+  deleteOutboxRoute,
   postConversationFavoriteRoute,
   deleteConversationFavoriteRoute,
   postConversationSummaryForkRoute,

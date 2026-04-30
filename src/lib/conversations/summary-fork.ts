@@ -218,6 +218,39 @@ function sanitizeEntryForPlainFork(entry: any): any {
 }
 
 /**
+ * Strip the `signature` field from any thinking content blocks in a JSONL entry.
+ * Thinking block signatures are bound to the original API request and model —
+ * they cause validation errors when a forked session is resumed on a different model.
+ * This is a lighter-touch alternative to full thinking→text conversion: the thinking
+ * block is preserved (type, content) but the cryptographic signature is removed.
+ */
+function stripThinkingSignatures(entry: any): any {
+  if (!entry.message || !Array.isArray(entry.message.content)) {
+    return entry;
+  }
+
+  let modified = false;
+  const strippedContent = entry.message.content.map((block: any) => {
+    if (block.type === 'thinking' && 'signature' in block) {
+      modified = true;
+      const { signature: _, ...rest } = block;
+      return rest;
+    }
+    return block;
+  });
+
+  if (!modified) return entry;
+
+  return {
+    ...entry,
+    message: {
+      ...entry.message,
+      content: strippedContent,
+    },
+  };
+}
+
+/**
  * Copy JSONL content from the last compact_boundary (or from the start)
  * into a new session file. Thinking blocks are sanitized to prevent
  * signature validation errors on cross-model forks.
@@ -231,12 +264,13 @@ export async function copySessionFromCompactBoundary(
   const content = await readFile(sourcePath, 'utf-8');
   const sliced = boundaryOffset > 0 ? content.slice(boundaryOffset) : content;
 
-  // Sanitize each line to strip thinking signatures
+  // Sanitize each line: strip thinking signatures, then apply plain-fork sanitization
   const sanitizedLines = sliced.split('\n').map((line) => {
     if (!line.trim()) return line;
     try {
       const entry = JSON.parse(line);
-      const sanitized = sanitizeEntryForPlainFork(entry);
+      const signatureStripped = stripThinkingSignatures(entry);
+      const sanitized = sanitizeEntryForPlainFork(signatureStripped);
       return JSON.stringify(sanitized);
     } catch {
       // Keep malformed lines as-is

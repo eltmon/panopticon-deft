@@ -17,7 +17,7 @@ import ts from 'typescript';
 /** Read deriveTimelineEntries source and transpile to JS for browser eval. */
 function getDeriveTimelineEntriesSource(): string {
   const path = new URL(
-    '../src/components/chat/session-logic.ts',
+    '../src/components/chat/MessagesTimeline.logic.ts',
     import.meta.url,
   ).pathname;
   const source = readFileSync(path, 'utf-8');

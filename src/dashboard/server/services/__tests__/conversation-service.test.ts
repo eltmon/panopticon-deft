@@ -139,7 +139,7 @@ describe('parseConversationMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toMatchObject({
-      id: 'msg-abc',
+      id: 'asst-0',
       role: 'assistant',
       text: 'Hello! How can I help?',
     });
@@ -183,6 +183,49 @@ describe('parseConversationMessages', () => {
       'First assistant event',
       'Second assistant event',
     ]);
+  });
+
+  it('generates unique IDs when uuid is absent and message.id is shared', async () => {
+    const lines = [
+      {
+        type: 'user',
+        timestamp: '2024-01-01T00:00:01.000Z',
+        message: { content: 'First user msg' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2024-01-01T00:00:02.000Z',
+        message: {
+          id: 'resp-shared',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'First reply' }],
+          stop_reason: 'end_turn',
+        },
+      },
+      {
+        type: 'user',
+        timestamp: '2024-01-01T00:00:03.000Z',
+        message: { content: 'Second user msg' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2024-01-01T00:00:04.000Z',
+        message: {
+          id: 'resp-shared',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Second reply' }],
+          stop_reason: 'end_turn',
+        },
+      },
+    ];
+    mockReadFile.mockResolvedValue(makeBuffer(lines));
+
+    const { parseConversationMessages } = await import('../conversation-service.js');
+    const result = await parseConversationMessages('/fake/session.jsonl');
+
+    const ids = result.messages.map((m) => m.id);
+    const uniqueIds = new Set(ids);
+    expect(uniqueIds.size).toBe(ids.length);
   });
 
   it('marks assistant message as streaming when no stop_reason and file is fresh', async () => {

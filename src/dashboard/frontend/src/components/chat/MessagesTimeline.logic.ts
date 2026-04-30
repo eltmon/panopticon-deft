@@ -1,10 +1,10 @@
 /**
- * session-logic.ts (PAN-451)
+ * MessagesTimeline.logic.ts (PAN-451)
  *
  * Transforms raw ChatMessage[] + WorkLogEntry[] into TimelineEntry[],
  * which can then be rendered or converted to MessagesTimelineRow[].
  *
- * Mirrors the core pattern from T3Code's session-logic.ts, simplified
+ * Mirrors the core pattern from T3Code's MessagesTimeline.logic.ts, simplified
  * for Panopticon (no ProposedPlan, no attachment handling, etc.).
  */
 

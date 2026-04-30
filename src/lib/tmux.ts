@@ -411,40 +411,121 @@ export async function resizeWindowAsync(target: string, cols: number, rows: numb
  * Uses load-buffer + paste-buffer for reliable delivery, with a delay before Enter.
  * MUST be used from the dashboard server and any async context.
  */
+export class MessageDeliveryFailed extends Error {
+  readonly paneState: string;
+  readonly phase: 'paste-not-visible' | 'submit-not-confirmed' | 'busy';
+  constructor(phase: MessageDeliveryFailed['phase'], session: string, paneState: string) {
+    super(`Message delivery failed (${phase}) in ${session}`);
+    this.name = 'MessageDeliveryFailed';
+    this.phase = phase;
+    this.paneState = paneState;
+  }
+}
+
+const BUSY_INDICATORS = ['●', '⎿', '✻', '✶', '✽', '✢', 'Generating', 'thought for', 'Whirring'];
+
+async function isClaudeBusy(sessionName: string): Promise<{ busy: boolean; paneState: string }> {
+  const paneState = await capturePaneAsync(sessionName, 30);
+  const lines = paneState.split('\n').filter(l => l.trim());
+  const lastLines = lines.slice(-5).join('\n');
+  const hasPrompt = lastLines.includes('❯');
+  if (hasPrompt) return { busy: false, paneState };
+  const busy = BUSY_INDICATORS.some(ind => lastLines.includes(ind));
+  return { busy, paneState };
+}
+
+async function waitForPasteVisible(
+  sessionName: string,
+  snippet: string,
+  timeoutMs = 3000,
+): Promise<{ visible: boolean; paneState: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let paneState = '';
+  while (Date.now() < deadline) {
+    paneState = await capturePaneAsync(sessionName, 50);
+    if (paneState.includes(snippet)) return { visible: true, paneState };
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return { visible: false, paneState };
+}
+
+async function waitForSubmitConfirmed(
+  sessionName: string,
+  snippet: string,
+  timeoutMs = 5000,
+): Promise<{ confirmed: boolean; paneState: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let paneState = '';
+  while (Date.now() < deadline) {
+    paneState = await capturePaneAsync(sessionName, 30);
+    const lines = paneState.split('\n').filter(l => l.trim());
+    const lastLines = lines.slice(-5).join('\n');
+    const promptStillHasText = lastLines.includes('❯') && lastLines.includes(snippet);
+    if (!promptStillHasText) return { confirmed: true, paneState };
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return { confirmed: false, paneState };
+}
+
 export async function sendKeysAsync(sessionName: string, keys: string, caller?: string): Promise<void> {
   validateSessionName(sessionName);
   logSendKeys(sessionName, keys, caller);
 
-  // Mirror the sync `sendKeys` pattern: one temp file, one load-buffer, one
-  // paste-buffer, one Enter. Splitting by line and pasting line-by-line
-  // (the previous implementation) cost ~5 tmux spawns and 50 ms of sleep
-  // per line, which made large prompts take seconds (PAN-785).
-  // `paste-buffer -d` drops the buffer in the same call so we don't need a
-  // separate delete-buffer round-trip.
+  const { busy, paneState: busyPane } = await isClaudeBusy(sessionName);
+  if (busy) {
+    throw new MessageDeliveryFailed('busy', sessionName, busyPane);
+  }
+
   const sendId = randomUUID();
   const tmpFile = join(tmpdir(), `pan-sendkeys-${sendId}.txt`);
-  // Use a named tmux buffer so concurrent sendKeysAsync calls (e.g. spawning
-  // 4 parallel reviewers) don't race on the global unnamed buffer.
   const bufferName = `pan-${sendId}`;
 
   try {
     await writeFile(tmpFile, keys, 'utf-8');
     await tmuxExecAsync(['load-buffer', '-b', bufferName, tmpFile], { encoding: 'utf-8' });
     await tmuxExecAsync(['paste-buffer', '-b', bufferName, '-t', sessionName], { encoding: 'utf-8' });
-    // Explicitly delete the named buffer — paste-buffer -d only drops the default buffer.
     await tmuxExecAsync(['delete-buffer', '-b', bufferName], { encoding: 'utf-8' }).catch(() => {});
-    // Scale delay with prompt size — large pastes need more time to render before
-    // Enter arrives. Hybrid formula: 15ms/line + 50ms per 1000 chars, minimum 600ms.
-    // (PAN-699: 300ms was insufficient for small messages when Claude Code shows
-    // warning banners; 600ms provides headroom for TUI render latency.)
-    const lineDelay = keys.split('\n').length * 15;
-    const lengthDelay = Math.floor(keys.length / 1000) * 50;
-    const delayMs = Math.max(600, Math.min(3000, lineDelay + lengthDelay));
-    await new Promise(r => setTimeout(r, delayMs));
+
+    const snippet = keys.slice(0, Math.min(40, keys.length)).trim();
+    if (snippet) {
+      const { visible, paneState } = await waitForPasteVisible(sessionName, snippet);
+      if (!visible) {
+        throw new MessageDeliveryFailed('paste-not-visible', sessionName, paneState);
+      }
+    } else {
+      await new Promise(r => setTimeout(r, 300));
+    }
+
     await tmuxExecAsync(['send-keys', '-t', sessionName, 'C-m'], { encoding: 'utf-8' });
     logSendKeys(sessionName, '[Enter sent]', caller);
+
+    if (snippet) {
+      const { confirmed, paneState } = await waitForSubmitConfirmed(sessionName, snippet);
+      if (!confirmed) {
+        throw new MessageDeliveryFailed('submit-not-confirmed', sessionName, paneState);
+      }
+    }
   } finally {
     await unlink(tmpFile).catch(() => {});
+  }
+}
+
+export async function sendKeysWithRetry(
+  sessionName: string,
+  keys: string,
+  caller?: string,
+): Promise<void> {
+  try {
+    await sendKeysAsync(sessionName, keys, caller);
+  } catch (err) {
+    if (err instanceof MessageDeliveryFailed && err.phase === 'busy') {
+      const ready = await waitForClaudePrompt(sessionName, 15_000);
+      if (ready) {
+        await sendKeysAsync(sessionName, keys, caller);
+        return;
+      }
+    }
+    throw err;
   }
 }
 

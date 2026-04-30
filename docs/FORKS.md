@@ -36,7 +36,7 @@ A **plain fork** copies the raw JSONL history (from the last compact boundary) i
 
 **What happens:**
 1. Panopticon copies JSONL entries from the last `compact_boundary` forward
-2. Thinking blocks are sanitized: `thinking` blocks with signatures are converted to plain `text` blocks to prevent cross-model API errors
+2. Thinking blocks are sanitized — signatures are stripped, and assistant thinking blocks are converted to text (see [Thinking Block Behavior](#thinking-block-behavior) below)
 3. The new conversation spawns with `claude --resume <sessionId>`
 4. Claude Code loads the full raw transcript directly
 
@@ -54,26 +54,30 @@ A **plain fork** copies the raw JSONL history (from the last compact boundary) i
 
 When forking from the dashboard, you can configure:
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| **Plain fork** | Off | Copy raw history instead of generating a summary |
-| **Fast summary (no LLM)** | Off | Use a heuristic fallback instead of calling an LLM to summarize. Faster and free, but less nuanced |
-| **Include thinking in summary** | Off | When generating a summary, include thinking block content as labeled text. Increases summary size but preserves reasoning details |
-| **Summary model** | Configured compaction model | Which model generates the summary. Only applies when Fast summary is off |
-| **Launch model** | Source conversation's model | Which model the new forked conversation uses |
+| Option (UI) | API option | Default | Description |
+|-------------|-----------|---------|-------------|
+| **Plain fork** | `plain` | Off | Copy raw history instead of generating a summary |
+| **Fast summary (no LLM)** | `localSummaryOnly` | Off | Use a heuristic fallback instead of calling an LLM to summarize. Faster and free, but less nuanced |
+| **Include thinking in summary** | `includeThinkingInSummary` | Off | When generating a summary, include thinking block content as labeled text. Increases summary size but preserves reasoning details |
+| **Summary model** | `model` | Configured compaction model | Which model generates the summary. Only applies when Fast summary is off |
+| **Launch model** | `model` | Source conversation's model | Which model the new forked conversation uses |
+
+These map to the `SummaryForkOptions` interface in `summary-fork.ts`.
 
 ### Thinking Block Behavior
 
-Thinking blocks are handled differently depending on fork mode:
+Thinking blocks contain a cryptographic `signature` field bound to the specific API request and model that produced them. Reusing a signed thinking block in a different session or model causes `Invalid signature in thinking block` API errors. Both fork modes handle this, but differently.
 
 **Summary fork:**
-- Thinking blocks are stripped from the serialized conversation sent to the summary model by default
-- If **Include thinking in summary** is enabled, thinking content is included as `[thinking]: ...` text in the summary
-- The new conversation never receives signed thinking blocks — only plain text
+- Thinking blocks are excluded from the serialized conversation sent to the summary model by default
+- If `includeThinkingInSummary` is enabled, thinking content is included as `[thinking]: ...` plain text in the summary (signatures are never forwarded)
+- The new conversation receives only plain text — no thinking blocks at all
 
-**Plain fork:**
-- Thinking blocks are sanitized during copy: `type: "thinking"` blocks are converted to `type: "text"` blocks with a `[Thinking]` prefix
-- This prevents `Invalid signature in thinking block` errors when resuming cross-model
+**Plain fork** (two-step sanitization in `copySessionFromCompactBoundary()`):
+1. `stripThinkingSignatures()` runs first on every entry — removes only the `signature` field from thinking blocks, preserving the block's `type: "thinking"` and content
+2. `sanitizeEntryForPlainFork()` runs second on assistant entries — converts `type: "thinking"` blocks to `type: "text"` blocks with a `[Thinking]` prefix
+
+The two-step approach ensures no signed thinking blocks survive in the destination JSONL regardless of entry type.
 
 ## What Gets Preserved
 
@@ -85,13 +89,18 @@ Thinking blocks are handled differently depending on fork mode:
 | Model | Configurable | Defaults to source model, overrideable at fork time |
 | Message history | Mode-dependent | Summary fork: distilled; Plain fork: copied raw |
 
-## Model Switching
+## Model Switching & Cross-Model Gotchas
 
 Switching models when forking is common, but comes with caveats:
 
-- **Summary fork + model switch:** Safe. The summary is plain text, portable to any model.
-- **Plain fork + same model:** Safe. Raw history loads directly.
-- **Plain fork + different model:** Risky. Even with thinking sanitization, tool schemas and other provider-specific metadata may cause issues. The dashboard shows a warning when you select a different launch model with plain fork enabled.
+- **Summary fork + model switch:** Safe. The summary is plain text, portable across any model or provider (Anthropic, OpenAI, Kimi, etc.).
+- **Plain fork + same model family:** Safe. Raw history loads directly. Thinking blocks are sanitized as a precaution but the content is compatible.
+- **Plain fork + different model family:** Risky. Even with thinking block sanitization, the copied history may contain:
+  - Provider-specific tool schemas that the destination model doesn't support
+  - Content block types or metadata fields unique to one provider
+  - Role/turn structures that differ between providers (e.g., system message handling)
+
+  The dashboard shows a warning when you select a different launch model with plain fork enabled. If you need to switch model families, use a summary fork.
 
 ## Token & Cost Implications
 
@@ -114,5 +123,7 @@ See `src/lib/conversations/summary-fork.ts` for the fork pipeline implementation
 Key functions:
 - `createSummaryFork()` — entry point, orchestrates session reservation and summary generation
 - `generateSummaryForFork()` — calls the LLM summarizer with fork-specific settings
-- `generateFallbackSummary()` — heuristic summary when LLM is unavailable
+- `generateFallbackSummary()` — heuristic summary when `localSummaryOnly` is true
 - `copySessionFromCompactBoundary()` — raw JSONL copy with thinking sanitization for plain fork
+- `stripThinkingSignatures()` — removes `signature` field from thinking blocks (preserves block type)
+- `sanitizeEntryForPlainFork()` — converts thinking blocks to `[Thinking]`-prefixed text blocks
