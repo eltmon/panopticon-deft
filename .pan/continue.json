@@ -1,0 +1,134 @@
+{
+  "version": "1",
+  "issueId": "PAN-1191",
+  "created": "2026-05-18T13:11:35.075Z",
+  "updated": "2026-05-18T13:30:00.000Z",
+  "gitState": { "branch": "feature/pan-1191", "sha": "868481420", "dirty": false },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Provisioning is triggered inside POST /api/agents (and `pan start`) — not a separate endpoint. The user clicks Start once; the dialog progress is the natural surface for the kickoff state.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Introduce a typed contract event `workspace.provisioning_step` (in `packages/contracts/src/events.ts`, with reducer in `event-reducers.ts`) rather than re-purposing free-form `activity.entry` payloads. Step payload: `{ issueId, stepId, stepLabel, status: 'started'|'completed'|'failed'|'skipped', startedAt, endedAt?, error?, hint? }`. Typed events make the frontend modal trivial to render and snapshot-test, and let downstream agents (review, test) reason about provisioning state explicitly.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "Extract a single async helper `provisionWorkspaceStack(issueId, { force?, onStep })` in `src/lib/workspace/provision-stack.ts`. Both `pan workspace rebuild` (refactored) and the dashboard route call it. Helper is idempotent: it calls `getWorkspaceStackHealth` first and short-circuits (emitting `skipped` steps) when the stack is already healthy AND `.devcontainer/` is rendered. When unhealthy/missing, it renders `.devcontainer/` via `ensureDevcontainer` if absent, then runs `docker compose up -d --build` and waits for healthy. `force: true` runs `docker compose down -v --remove-orphans` first.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "REMOVE the pre-flight 422 stack-health gate in `src/dashboard/server/routes/agents.ts` (~line 2430-2455) and the post-spawn fallback (~line 3095-3115). Replace with a single in-line call to `provisionWorkspaceStack` before the agent spawn. The existing background-container-up path (line 2830-3057) is replaced by `provisionWorkspaceStack` to avoid two code paths that drift. Without removing the 422 gate, provisioning still won't run on Start — this is the regression cited in the issue body.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Dashboard response contract: when provisioning is needed, the POST /api/agents handler returns 202 (Accepted) with `{ success: true, provisioning: true, agentId, issueId }` immediately and runs provisioning + spawn in the background. When the stack is already healthy, the handler proceeds inline and returns 200 with the same shape as today plus `{ provisioning: false }`. The frontend opens the modal iff `provisioning: true`.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D6",
+      "summary": "Per-issue in-process mutex (Map<issueId, Promise>) in `provision-stack.ts` serializes concurrent calls within the dashboard process. Cross-process concurrency (two CLI invocations) is left to docker-compose's own serialization on a given project name — the worst case is a second `compose up -d --build` no-ops once the first completes. Cross-process locking via file-system locks is OUT OF SCOPE and recorded in autoDecisions.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D7",
+      "summary": "Failure UX: the dialog shows three remediation buttons when a step fails. Retry re-POSTs `/api/agents` with the original body. Force rebuild re-POSTs with `forceRebuild: true` (passes through to `provisionWorkspaceStack({ force: true })`). Switch to --host (advanced) requires a second confirmation step (matches existing `--host --yes` CLI safety gate) and re-POSTs with `allowHost: true, hostConfirmed: true`. No new endpoint — same start-agent handler interprets the new flags.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D8",
+      "summary": "CLI parity: `pan start <id>` (without `--host`) calls the same `provisionWorkspaceStack` helper before spawning. The CLI passes an `onStep` callback that drives an `ora` spinner with the current step label. The same `workspace.provisioning_step` events are emitted so the dashboard sees CLI-initiated provisioning identically. `pan workspace rebuild` is refactored to delegate to `provisionWorkspaceStack({ force: true })` so the rebuild semantics live in one place.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D9",
+      "summary": "Canonical step sequence: (1) `ensure-devcontainer` — render `.devcontainer/` from template if missing; (2) `compose-down` (only when `force: true`) — `docker compose down -v --remove-orphans`; (3) `compose-up` — `docker compose up -d --build`; (4) `wait-healthy` — poll until all services are `Up (healthy)` or `Up` with no healthcheck, with the existing 3-minute timeout from agents.ts:2955; (5) `cleanup-node-modules` — remove Docker-created root-owned empty `node_modules` dirs (preserved from agents.ts:3007); (6) `verify-health` — final call to `getWorkspaceStackHealth` to confirm. Each step emits started + completed/failed.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D10",
+      "summary": "Pinning the step sequence as a vitest snapshot (run helper against a fake docker, assert the emitted event sequence) is the cheapest regression guard. The snapshot is bead B10. The Playwright UAT bead (B11) verifies the dialog renders correctly end-to-end with an isolated browser context per the planning template's Playwright Isolation rule.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    },
+    {
+      "id": "D11",
+      "summary": "The `evaluateWorkspaceStackHealth` semantics in `src/lib/workspace/stack-health.ts` are NOT changed — current behavior (return healthy when `.devcontainer/` is missing because `isWorkspaceStackExpected` is false) is preserved. The new behavior is that the start path proactively renders `.devcontainer/` before consulting health, so the no-`.devcontainer/` short-circuit no longer races with the spawn.",
+      "recordedAt": "2026-05-18T13:30:00.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "Re-introducing the order bug: it is tempting to add provisioning AFTER the existing 422 gate. That would leave the gate firing first on unhealthy stacks and provisioning would never run. The gate at agents.ts:2430-2455 MUST be removed (or restructured to call provisionWorkspaceStack on failure instead of returning 422).",
+      "mitigation": "B5 acceptance criteria explicitly require: clicking Start on an unprovisioned workspace MUST trigger provisioning (not return 422). Add a route-level integration test that POSTs /api/agents against a workspace with no `.devcontainer/` and asserts the response is 202 (provisioning kickoff) rather than 422."
+    },
+    {
+      "id": "H2",
+      "summary": "The existing background-container path at agents.ts:2830-3057 spawns `./dev all` (workspace dev script) — this code path only triggers when `.devcontainer/dev` already exists. Removing it without replacing produces a regression for workspaces that DO have `.devcontainer/dev` and currently rely on this path.",
+      "mitigation": "B5 replaces the old block end-to-end with the new helper. Add a route-level test against a workspace WITH an existing `.devcontainer/` but no running containers — assert the new helper takes over and emits step events. The pan-1148, pan-1169, pan-1189, pan-1190 issues cited in the body remain valid manual UAT targets after this lands."
+    },
+    {
+      "id": "H3",
+      "summary": "Concurrent stack-up storms: clicking Start on 5 issues in a row currently allows 5 docker-compose up commands to race. PER-ISSUE that doesn't conflict (different compose project names), but it can saturate Docker's daemon and pre-warm the OOM killer.",
+      "mitigation": "Per-issue mutex in provision-stack.ts handles same-issue races within process. Cross-issue concurrency is bounded by docker daemon itself. If observed to be a real problem, a future bead can add a global semaphore (max N concurrent compose builds). Out of scope for this issue."
+    },
+    {
+      "id": "H4",
+      "summary": "Slow first-time Start UX: bun install + dashboard build can take 30-90 seconds. Without informative progress, users will assume the dashboard is broken.",
+      "mitigation": "This is precisely what the dialog solves. Each step emits with its label and a running elapsed-time clock so the user sees forward motion. The `wait-healthy` step also surfaces the polled service names so the user can see WHICH container is slow."
+    },
+    {
+      "id": "H5",
+      "summary": "The `--host` bypass remains legitimate for some workflows (dashboard hacking, container-bypass debugging). Hiding it entirely would break those workflows.",
+      "mitigation": "Keep `--host` available on the CLI and as a 'Switch to --host (advanced)' button in the failure dialog, gated behind a second confirmation. The healthy-stack path no longer offers --host as a primary option in the dashboard UI; users go through Start and only see --host as a recovery option when provisioning fails."
+    },
+    {
+      "id": "H6",
+      "summary": "The current 422 response carries `{ stackHealth, hint }` payloads that the InspectorPanel and KanbanBoard already render to surface unhealthy stacks. After this change, the start path no longer returns 422 for unhealthy stacks — but the `useWorkspaceStackHealthQuery` polling path still returns the same shape. The kanban hover-tooltip and inspector badge for unhealthy stacks must continue to work.",
+      "mitigation": "Do NOT touch `useWorkspaceStackHealthQuery` or the kanban/inspector tooltips. They are independent of the start-agent route and surface stack health independently. The only changes are inside the start-agent code path and the new dialog."
+    },
+    {
+      "id": "H7",
+      "summary": "node-pty / Node 22 / blocking-call constraints: the dashboard runs under Node 22 only (NEVER Bun). Any new server code must use `execAsync`, `spawn` with async handling, or Effect FileSystem service. The CLAUDE.md rule against `execSync`/`readFileSync`/`writeFileSync` in dashboard-server code paths applies to all new code in `src/dashboard/server/` and to `src/lib/workspace/provision-stack.ts` (because the dashboard imports it). Use `existsSync` only — it's a fast stat with no data read.",
+      "mitigation": "Lint and review the helper for sync FS calls. The existing workspace-rebuild.ts uses `existsSync` + `readFileSync` + `rmSync` — only `existsSync` is acceptable in code paths reachable from the dashboard. Replace `readFileSync` with `fs/promises.readFile`, and `rmSync` with `fs/promises.rm`."
+    },
+    {
+      "id": "H8",
+      "summary": "ensureDevcontainer is currently sync (uses `existsSync` + writes through `renderDevcontainer`). If it makes blocking syscalls during render, calling it from the dashboard route blocks the event loop.",
+      "mitigation": "Audit `ensureDevcontainer` and `renderDevcontainer`. If they make sync FS calls, wrap them in a Worker or convert to async before calling from `provisionWorkspaceStack`. If the render is fast (<50ms in practice), document the constraint and proceed."
+    },
+    {
+      "id": "H9",
+      "summary": "Single-deacon invariant (.claude/rules/single-deacon-invariant.md): never mount `~/.panopticon` into workspace containers. This work doesn't change the compose template, but the helper renders `.devcontainer/` from the template — if the template ever drifts to mount `~/.panopticon`, this code path becomes the trigger.",
+      "mitigation": "No template edits in this issue. The render step uses the existing renderer which already enforces `PANOPTICON_DISABLE_DEACON=1`. Document the constraint in B2's acceptance criteria so reviewers know not to add a mount."
+    },
+    {
+      "id": "H10",
+      "summary": "Playwright UAT for the dialog: must use an isolated browser context (not depend on other agents' Playwright state) per the planning template's Playwright Isolation rule.",
+      "mitigation": "B11 explicitly creates a fresh browser context per test run via `browser.newContext()`. No login or shared cookies required — the dashboard at https://pan.localhost is local and unauthenticated."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-7",
+  "sessionHistory": [
+    {
+      "timestamp": "2026-05-18T13:11:35.075Z",
+      "reason": "planning",
+      "note": "Planning session started for PAN-1191: Create workspace docker stack on Start (not Plan), with progress dialog",
+      "agentModel": "agent:claude-opus-4-7"
+    },
+    {
+      "timestamp": "2026-05-18T13:30:00.000Z",
+      "reason": "planning",
+      "note": "Auto-mode discovery complete: 11 decisions, 10 hazards. vBRIEF written with 11 beads decomposed across contract → helper → CLI → dashboard route → frontend store → modal → failure UI → tests.",
+      "agentModel": "agent:claude-opus-4-7"
+    }
+  ],
+  "feedback": []
+}
