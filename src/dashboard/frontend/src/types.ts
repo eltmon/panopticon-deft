@@ -84,7 +84,7 @@ export interface Agent {
   runtime: string;
   harness?: 'claude-code' | 'pi' | null;
   model: string;
-  status: 'healthy' | 'warning' | 'stuck' | 'dead' | 'stopped' | 'starting' | 'running' | 'failed';
+  status: 'healthy' | 'warning' | 'stuck' | 'dead' | 'stopped' | 'starting' | 'running' | 'failed' | 'error' | 'unknown';
   error?: string;
   pid?: number;
   startedAt: string;
@@ -103,13 +103,14 @@ export interface Agent {
   killCount: number;
   workspace?: string;
   workspaceLocation?: 'local' | 'remote';
+  costSoFar?: number;
   git?: GitStatus;
   type?: 'agent';
   /**
    * PAN-1048 role primitive. Replaces the legacy agentPhase string.
-   * 'plan' | 'work' | 'review' | 'test' | 'ship'.
+   * 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel'.
    */
-  role?: 'plan' | 'work' | 'review' | 'test' | 'ship';
+  role?: 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel';
   /**
    * @deprecated PAN-1048 — server stopped emitting this; kept on the type
    * temporarily so older test fixtures still compile while their references

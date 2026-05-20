@@ -90,7 +90,8 @@ import { resourcesCommand } from './commands/resources.js';
 import { devCommand } from './commands/dev.js';
 import { registerScopeCommands } from './commands/scope.js';
 import { openCommand } from './commands/open.js';
-import { swarmCommand } from './commands/swarm.js';
+import { registerSwarmCommands } from './commands/swarm.js';
+import { registerFlywheelCommands } from './commands/flywheel.js';
 
 // Pre-parse --yolo from argv so it works regardless of position relative to the
 // subcommand. Commander's enablePositionalOptions() routes post-subcommand options
@@ -311,9 +312,10 @@ const planCmd = program
 
 planCmd
   .command('finalize')
-  .description('Materialize plan into beads and mark the workspace spec as proposed')
+  .description('Materialize plan into beads, mark the workspace spec as proposed, and promote to main')
   .option('-w, --workspace <path>', 'Workspace path (defaults to cwd, walks up to find .pan/)')
   .option('--json', 'Emit JSON result')
+  .option('--no-promote', 'Skip auto-promotion to main; leave spec at status=proposed for manual Done')
   .action(planFinalizeCommand);
 
 planCmd
@@ -365,6 +367,8 @@ program
 program
   .command('resume <id>')
   .description('Resume from saved Claude session')
+  .option('--host', 'Bypass workspace docker stack-health gate and resume on the host')
+  .option('--yes', 'Confirm --host in non-interactive contexts')
   .action(resumeCommand);
 
 program
@@ -437,22 +441,7 @@ program
   .option('--yes', 'Confirm --host in non-interactive contexts')
   .action(startCommand);
 
-program
-  .command('swarm <id>')
-  .description('Swarm execution: spawn parallel agents across vBRIEF plan items using dependency-wave scheduling')
-  .option('--dry-run', 'Print the wave plan without spawning agents')
-  .option('--wave <n>', 'Dispatch only wave N')
-  .option('--model <model>', 'Override model for work slots (default: kimi-k2.6)')
-  .option('--max-slots <n>', 'Max concurrent agents')
-  .option('--auto-advance', 'Automatically dispatch the next wave when the current one completes')
-  .option('--no-auto-advance', 'Disable automatic next-wave dispatching for this swarm')
-  .option('--host', 'Bypass workspace docker stack-health gate and spawn swarm slots on the host')
-  .option('--yes', 'Confirm --host in non-interactive contexts')
-  .option('--task <op>', 'vBRIEF task operation: next | show | claim | done | block | unblock | cancel')
-  .option('--item <id>', 'vBRIEF item ID for show/claim/done/block operations')
-  .option('--reason <text>', 'Reason for task status mutation')
-  .option('--sequence <n>', 'Expected vBRIEF plan.sequence for CAS-protected task mutations')
-  .action(swarmCommand);
+registerSwarmCommands(program);
 
 // Register workspace commands (pan workspace create, pan workspace list, etc.)
 registerWorkspaceCommands(program);
@@ -480,6 +469,7 @@ registerInspectCommand(program);
 // Register caveman commands (pan caveman-compress)
 registerCavemanCommands(program);
 registerScopeCommands(program);
+registerFlywheelCommands(program);
 
 // Shorthand: pan status = pan status
 program

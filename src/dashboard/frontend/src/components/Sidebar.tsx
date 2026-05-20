@@ -3,9 +3,10 @@ import { useQuery, useMutation } from '@tanstack/react-query';
 import {
   Eye, LayoutGrid, Bot, Server,
   Terminal, BarChart3, DollarSign, HeartPulse, Cpu, Settings,
-  Zap, Compass, ChevronsLeft, ChevronsRight, Sun, Moon, Menu,
-  Hammer, Loader2, GitMerge, History, Mic,
+  Zap, Compass, GitBranch, GitMerge, ChevronsLeft, ChevronsRight, Sun, Moon, Menu,
+  Hammer, Loader2, History, Mic,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { CloisterStatusBar } from './CloisterStatusBar';
 import { FreshnessIndicator } from './FreshnessIndicator';
 import { DeaconPauseToggle } from './DeaconPauseToggle';
@@ -14,15 +15,35 @@ import type { Tab } from './Header';
 
 const SIDEBAR_STORAGE_KEY = 'panopticon.ui.sidebarCollapsed';
 
-const NAV_GROUPS = [
+interface FlywheelRunSummary {
+  id: string;
+  status: 'running' | 'complete' | 'aborted';
+}
+
+interface NavItem {
+  id: Tab;
+  label: string;
+  icon: LucideIcon;
+  badge?: 'flywheel-live';
+  title?: string;
+}
+
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Operations',
     items: [
       { id: 'command-deck' as Tab, label: 'Command Deck', icon: Compass },
       { id: 'kanban' as Tab, label: 'Board', icon: LayoutGrid },
+      { id: 'pipeline' as Tab, label: 'Pipeline', icon: GitBranch },
       { id: 'awaiting-merge' as Tab, label: 'Awaiting Merge', icon: GitMerge },
       { id: 'agents' as Tab, label: 'Agents', icon: Bot },
       { id: 'autopreso' as Tab, label: 'AutoPreso', icon: Mic },
+      { id: 'flywheel' as Tab, label: 'Flywheel', icon: Loader2, badge: 'flywheel-live' },
     ],
   },
   {
@@ -49,7 +70,7 @@ const NAV_GROUPS = [
       { id: 'god-view' as Tab, label: 'God View', icon: Zap },
     ],
   },
-] as const;
+];
 
 interface SidebarProps {
   activeTab: Tab;
@@ -74,6 +95,18 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
   });
 
   const isDev = versionData?.isDev ?? false;
+
+  const { data: flywheelRunsRaw } = useQuery({
+    queryKey: ['flywheel-runs'],
+    queryFn: async () => {
+      const res = await fetch('/api/flywheel/runs?limit=10');
+      if (!res.ok) return [];
+      return res.json() as Promise<FlywheelRunSummary[]>;
+    },
+    refetchInterval: 5000,
+  });
+  const flywheelRuns = Array.isArray(flywheelRunsRaw) ? flywheelRunsRaw : [];
+  const hasActiveFlywheelRun = flywheelRuns.some((run) => run.status === 'running');
 
   const rebuildMutation = useMutation({
     mutationFn: async () => {
@@ -136,9 +169,9 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
         <div className="flex items-center justify-between h-12 px-3 shrink-0 border-b border-border">
           {!collapsed && (
             <button
-              onClick={() => onTabChange('kanban')}
+              onClick={() => onTabChange('pipeline')}
               className="flex items-center gap-2 hover:opacity-80 transition-opacity min-w-0"
-              title="Go to Board"
+              title="Go to Pipeline"
             >
               <Eye className="w-5 h-5 text-primary shrink-0" />
               {/* PAN-698: Space Grotesk is reserved for the sidebar wordmark only */}
@@ -152,9 +185,9 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
           )}
           {collapsed && (
             <button
-              onClick={() => onTabChange('kanban')}
+              onClick={() => onTabChange('pipeline')}
               className="flex items-center justify-center w-full hover:opacity-80 transition-opacity"
-              title="Go to Board"
+              title="Go to Pipeline"
             >
               <Eye className="w-5 h-5 text-primary" />
             </button>
@@ -181,13 +214,14 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
                 </p>
               )}
               {collapsed && <div className="h-px mx-2 bg-border my-2" />}
-              {group.items.map(({ id, label, icon: Icon }) => {
+              {group.items.map(({ id, label, icon: Icon, badge, title }) => {
                 const isActive = activeTab === id;
+                const liveBadge = badge === 'flywheel-live' && hasActiveFlywheelRun;
                 return (
                   <button
                     key={id}
                     onClick={() => { onTabChange(id); setMobileOpen(false); }}
-                    title={collapsed ? label : undefined}
+                    title={title ?? (collapsed ? label : undefined)}
                     data-testid={`sidebar-${id}`}
                     className={`
                       w-full flex items-center gap-3 transition-colors duration-150 text-sm font-medium
@@ -200,6 +234,11 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
                   >
                     <Icon className={`shrink-0 ${collapsed ? 'w-4 h-4' : 'w-4 h-4'}`} />
                     {!collapsed && <span className="truncate">{label}</span>}
+                    {!collapsed && liveBadge && (
+                      <span className="ml-auto rounded-full border border-success/30 bg-success/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-success">
+                        live
+                      </span>
+                    )}
                   </button>
                 );
               })}

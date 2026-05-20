@@ -43,7 +43,7 @@ import { resolveAutoResumeConfigForIssue } from './cloister/auto-resume-config.j
 
 const execAsync = promisify(exec);
 
-export type Role = 'plan' | 'work' | 'review' | 'test' | 'ship';
+export type Role = 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel';
 
 /**
  * Write an agent launcher script atomically. Every agent shares a fixed
@@ -300,6 +300,7 @@ export async function getRoleRuntimeBaseCommand(
   role: Role,
   harness: 'claude-code' | 'pi' = 'claude-code',
   subRole?: string,
+  effort?: 'low' | 'medium' | 'high',
 ): Promise<string> {
   const validatedModel = requireModelOverride(model);
   const quotedModel = shellQuoteModelId(validatedModel);
@@ -311,6 +312,7 @@ export async function getRoleRuntimeBaseCommand(
   const definitionPath = roleAgentDefinitionPath(role, subRole);
   const agentFlag = definitionPath ? ` --agent ${definitionPath}` : '';
   const nameFlag = ` --name ${agentName}`;
+  const effortFlag = effort ? ` --effort ${effort}` : '';
   // The convoy sub-roles have no `--agent` definition, so claude won't pick up
   // a frontmatter permissionMode. Fall back to the global Claude permission
   // flags in that case so the run still launches with the user's bypass/plan
@@ -322,17 +324,19 @@ export async function getRoleRuntimeBaseCommand(
 
   if (provider.name === 'openai' && (await getProviderAuthMode(validatedModel)) === 'subscription') {
     const resolvedModel = CLI_PROXY_MODEL_ALIASES[validatedModel] ?? validatedModel;
-    return `claude${bypassWithAgent}${printFlag}${agentFlag}${permissionFlags} --model ${shellQuoteModelId(resolvedModel)}${nameFlag}`;
+    return `claude${bypassWithAgent}${printFlag}${agentFlag}${permissionFlags} --model ${shellQuoteModelId(resolvedModel)}${effortFlag}${nameFlag}`;
   }
 
-  return `claude${bypassWithAgent}${printFlag}${agentFlag}${permissionFlags} --model ${quotedModel}${nameFlag}`;
+  return `claude${bypassWithAgent}${printFlag}${agentFlag}${permissionFlags} --model ${quotedModel}${effortFlag}${nameFlag}`;
 }
 
 /** Known agent ID prefixes — IDs with these prefixes are already normalized */
 const AGENT_PREFIXES = ['agent-', 'planning-', 'conv-'];
+const SINGLETON_AGENT_IDS = new Set(['flywheel-orchestrator']);
 
 /** Normalize agent ID: preserve known prefixes, add 'agent-' for bare issue IDs */
 export function normalizeAgentId(agentId: string): string {
+  if (SINGLETON_AGENT_IDS.has(agentId)) return agentId;
   if (AGENT_PREFIXES.some(p => agentId.startsWith(p))) {
     return agentId;
   }
@@ -608,7 +612,7 @@ export function getAgentDir(agentId: string): string {
 }
 
 function isRole(value: unknown): value is Role {
-  return value === 'plan' || value === 'work' || value === 'review' || value === 'test' || value === 'ship';
+  return value === 'plan' || value === 'work' || value === 'review' || value === 'test' || value === 'ship' || value === 'flywheel';
 }
 
 function cleanAgentState(raw: AgentState): AgentState {
@@ -1754,6 +1758,8 @@ export interface SpawnRunOptions {
   reviewSynthesisAgentId?: string;
   reviewOutputPath?: string;
   allowHost?: boolean;
+  registerConversation?: boolean;
+  effort?: 'low' | 'medium' | 'high';
 }
 
 /**
@@ -1998,7 +2004,7 @@ export async function buildAgentLaunchConfig(opts: {
       spawnMode: 'resume',
       workingDir: opts.workspace,
       changeDir: false,
-      setCi: true,
+      setTerminalEnv: true,
       providerExports,
       // PAN-1048 + PAN-1055: claude-code resumes load the role-specific
       // frontmatter (roleAgentDefinitionPath); pi resumes route through
@@ -2032,7 +2038,6 @@ export async function buildAgentLaunchConfig(opts: {
     role: launchRole,
     workingDir: opts.workspace,
     changeDir: false,
-    setCi: true,
     setTerminalEnv: true,
     providerExports,
     cavemanExports,
@@ -2187,9 +2192,10 @@ export async function spawnRun(issueId: string, role: Role, options: SpawnRunOpt
   await saveAgentStateAsync(state);
 
   const isSpecialistRole = role === 'review' || role === 'test' || role === 'ship';
+  const shouldRegisterConversation = isSpecialistRole || options.registerConversation === true;
   const isClaudeCodeReviewSubRole = role === 'review' && !!options.subRole && resolvedHarness === 'claude-code';
-  const shouldDeliverPromptViaTmux = isSpecialistRole && !isClaudeCodeReviewSubRole && resolvedHarness === 'claude-code';
-  const shouldDeliverPromptViaPi = isSpecialistRole && resolvedHarness === 'pi';
+  const shouldDeliverPromptViaTmux = shouldRegisterConversation && !isClaudeCodeReviewSubRole && resolvedHarness === 'claude-code';
+  const shouldDeliverPromptViaPi = shouldRegisterConversation && resolvedHarness === 'pi';
 
   let promptFile: string | undefined;
   if (options.prompt && !shouldDeliverPromptViaTmux && !shouldDeliverPromptViaPi) {
@@ -2229,8 +2235,23 @@ export async function spawnRun(issueId: string, role: Role, options: SpawnRunOpt
   // synthesize a Conversation whose sessionAlive came from `agent.status`, and
   // stale snapshots made active synthesizers render as "Starting…".
   let sessionId: string | undefined;
-  if (isSpecialistRole) {
+  if (shouldRegisterConversation) {
     sessionId = randomUUID();
+
+    // Persist the pinned --session-id to <agentDir>/session.id so
+    // resolveClaudeSessionId can locate the JSONL after the specialist exits.
+    // Specialists run with --session-id <uuid> but `claude --print` never fires
+    // the heartbeat hook that normally writes this file for interactive agents,
+    // so without this write the dashboard's "Conversation" tab renders
+    // "No conversation data available" even though the JSONL sits on disk.
+    try {
+      const agentDir = getAgentDir(agentId);
+      await mkdir(agentDir, { recursive: true });
+      await writeFile(join(agentDir, 'session.id'), sessionId, 'utf-8');
+    } catch (err) {
+      console.warn(`[spawnRun] Failed to persist session.id for ${agentId}:`, err instanceof Error ? err.message : String(err));
+    }
+
     try {
       const conversation = {
         name: agentId,
@@ -2279,13 +2300,12 @@ export async function spawnRun(issueId: string, role: Role, options: SpawnRunOpt
     role,
     workingDir: workspace,
     changeDir: false,
-    setCi: true,
     setTerminalEnv: true,
     providerExports,
     promptFile: shouldDeliverPromptViaTmux ? undefined : promptFile,
     promptFileMode: isClaudeCodeReviewSubRole ? 'stdin' : undefined,
     panopticonEnv: { agentId, issueId, sessionType: options.subRole ? `${role}.${options.subRole}` : role },
-    baseCommand: await getRoleRuntimeBaseCommand(selectedModel, agentId, role, resolvedHarness, options.subRole),
+    baseCommand: await getRoleRuntimeBaseCommand(selectedModel, agentId, role, resolvedHarness, options.subRole, options.effort),
     sessionId,
     reviewSignal,
     // PAN-977: review sub-role launchers must outlive their tmux session. The
@@ -2470,6 +2490,41 @@ export async function spawnAgent(options: SpawnOptions): Promise<AgentState> {
       await writeStoryFeatureContext(options.workspace, options.issueId);
     } catch (ctxErr: any) {
       console.warn(`[agents] Could not write story feature context for ${options.issueId}: ${ctxErr.message}`);
+    }
+  }
+
+  // PAN-1215: One-shot cleanup of tracked workspace-only .pan/ artifacts.
+  // These files are gitignored but may still be tracked on older branches.
+  // If tracked, checkpoint commits and rebases can drop them, breaking the
+  // verification gate. Remove them from the index when the workspace is clean.
+  if (role === 'work') {
+    try {
+      const workspace = options.workspace;
+      const { stdout: trackedFiles } = await execAsync(
+        'git ls-files .pan/continue.json .pan/spec.vbrief.json',
+        { cwd: workspace },
+      );
+      if (trackedFiles.trim()) {
+        const { stdout: porcelain } = await execAsync(
+          'git status --porcelain -- .pan/',
+          { cwd: workspace },
+        );
+        if (!porcelain.trim()) {
+          await execAsync(
+            'git rm --cached --ignore-unmatch .pan/continue.json .pan/spec.vbrief.json',
+            { cwd: workspace },
+          );
+          await execAsync(
+            'git commit -m "chore: untrack workspace .pan/ artifacts (PAN-1215)"',
+            { cwd: workspace },
+          );
+          console.log(`[agents] Untracked workspace .pan/ artifacts for ${options.issueId}`);
+        } else {
+          console.warn(`[agents] Skipping .pan/ untrack for ${options.issueId} — .pan/ paths have uncommitted changes`);
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[agents] .pan/ untrack cleanup failed for ${options.issueId}: ${err.message}`);
     }
   }
 
@@ -3020,7 +3075,7 @@ export async function messageAgent(agentId: string, message: string): Promise<vo
       role: resumeRole,
       workingDir: agentState.workspace,
       changeDir: false,
-      setCi: true,
+      setTerminalEnv: true,
       providerExports,
       baseCommand: await getRoleRuntimeBaseCommand(
         resumeModel,
@@ -3115,7 +3170,7 @@ export async function messageAgent(agentId: string, message: string): Promise<vo
  * - Specialists: When queued work arrives
  * - Work agents: When message is sent via /work-tell
  */
-export async function resumeAgent(agentId: string, message?: string, opts?: { model?: string }): Promise<{ success: boolean; messageDelivered?: boolean; error?: string }> {
+export async function resumeAgent(agentId: string, message?: string, opts?: { model?: string; allowHost?: boolean }): Promise<{ success: boolean; messageDelivered?: boolean; error?: string }> {
   const normalizedId = normalizeAgentId(agentId);
   const requestedModel = normalizeModelOverride(opts?.model);
   logAgentLifecycle(normalizedId, `resumeAgent called (message=${message ? 'yes' : 'no'})`);
@@ -3175,7 +3230,7 @@ export async function resumeAgent(agentId: string, message?: string, opts?: { mo
     await assertWorkspaceStackHealthyForSpawn(
       agentState.issueId || normalizedId.replace(/^agent-/, '').toUpperCase(),
       agentState.role ?? 'work',
-      agentState.hostOverride === true,
+      opts?.allowHost === true || agentState.hostOverride === true,
       agentState.workspace,
     );
   } catch (error) {

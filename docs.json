@@ -6,7 +6,11 @@
   "colors": {
     "primary": "#D4A27F",
     "light": "#E5C4A8",
-    "dark": "#B8886A"
+    "dark": "#B8886A",
+    "background": {
+      "light": "#FFFFFF",
+      "dark": "#0c0a09"
+    }
   },
   "favicon": "/favicon.svg",
   "logo": {
@@ -124,7 +128,8 @@
   },
   "analytics": {
     "posthog": {
-      "apiKey": ""
+      "apiKey": "",
+      "host": "https://us.i.posthog.com"
     }
   }
 }

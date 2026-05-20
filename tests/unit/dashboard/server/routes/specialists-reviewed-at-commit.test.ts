@@ -39,16 +39,21 @@ vi.mock('child_process', async (importActual) => {
   return {
     ...actual,
     exec: (...args: unknown[]) => {
-      // exec(cmd, opts, callback) or exec(cmd, callback)
+      const command = String(args[0]);
       const callback = args[args.length - 1] as (err: null, result: { stdout: string; stderr: string }) => void;
+      const stdout = command.includes('^{tree}')
+        ? command.includes('oldsha1') ? `${mockOldTreeSha}\n` : `${mockNewTreeSha}\n`
+        : `${mockExecHeadSha}\n`;
       mockExecCallback(...args);
-      callback(null, { stdout: mockExecHeadSha + '\n', stderr: '' });
+      callback(null, { stdout, stderr: '' });
       return {} as ReturnType<typeof actual.exec>;
     },
   };
 });
 
 let mockExecHeadSha = 'defaultsha';
+let mockOldTreeSha = 'old-tree';
+let mockNewTreeSha = 'new-tree';
 
 // ─── Stub modules that deacon imports ────────────────────────────────────────
 
@@ -105,6 +110,10 @@ vi.mock('../../../../../src/lib/cloister/feedback-writer.js', () => ({
   writeFeedbackFile: vi.fn(),
 }));
 
+vi.mock('../../../../../src/lib/cloister/review-agent.js', () => ({
+  spawnReviewRoleForIssue: vi.fn().mockResolvedValue({ success: true, message: 'spawned' }),
+}));
+
 vi.mock('node:fs', async (importActual) => {
   const actual = await importActual<typeof import('node:fs')>();
   return { ...actual, existsSync: vi.fn().mockReturnValue(true) };
@@ -119,6 +128,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   (existsSync as ReturnType<typeof vi.fn>).mockReturnValue(true);
   mockExecHeadSha = 'defaultsha';
+  mockOldTreeSha = 'old-tree';
+  mockNewTreeSha = 'new-tree';
   mockResolveProject.mockReturnValue({ projectPath: '/fake/project' });
 });
 
@@ -192,6 +203,29 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
     expect(after?.testStatus).toBe('pending');
     expect(after?.readyForMerge).toBe(false);
     expect(after?.reviewedAtCommit).toBeUndefined();
+  });
+
+  it('preserves review when HEAD changed but the tree did not', async () => {
+    setReviewStatus('PAN-904', {
+      reviewStatus: 'passed',
+      testStatus: 'passed',
+      readyForMerge: true,
+      reviewedAtCommit: 'oldsha1',
+    });
+
+    mockExecHeadSha = 'newsha99';
+    mockOldTreeSha = 'sametree';
+    mockNewTreeSha = 'sametree';
+
+    const actions = await checkPostReviewCommits();
+
+    expect(actions.filter((a) => a.includes('PAN-904'))).toHaveLength(0);
+
+    const after = getReviewStatus('PAN-904');
+    expect(after?.reviewStatus).toBe('passed');
+    expect(after?.testStatus).toBe('passed');
+    expect(after?.readyForMerge).toBe(true);
+    expect(after?.reviewedAtCommit).toBe('newsha99');
   });
 
   it('does not reset review when HEAD matches reviewedAtCommit', async () => {

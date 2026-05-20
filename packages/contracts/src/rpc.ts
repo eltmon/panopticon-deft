@@ -15,6 +15,7 @@ import {
   WorkspaceDetail,
 } from "./types"
 import { EditorIdSchema, OpenInEditorInput } from "./editor"
+import { FlywheelStatus } from "./flywheel"
 
 // ─── RPC method names ─────────────────────────────────────────────────────────
 
@@ -32,10 +33,12 @@ export const WS_METHODS = {
 
   // Streaming subscriptions
   subscribeDomainEvents: "pan.subscribeDomainEvents",
+  subscribeIssueEvents: "pan.subscribeIssueEvents",
   subscribeTerminal: "pan.subscribeTerminal",
   subscribeAgentOutput: "pan.subscribeAgentOutput",
   subscribeConversationMessages: "pan.subscribeConversationMessages",
   subscribeProjectSessionTree: "pan.subscribeProjectSessionTree",
+  subscribeFlywheelStatus: "pan.subscribeFlywheelStatus",
 
   // Snapshot / replay
   getSnapshot: "pan.getSnapshot",
@@ -185,6 +188,13 @@ export const SubscribeDomainEventsRpc = Rpc.make(WS_METHODS.subscribeDomainEvent
   stream: true,
 })
 
+/** 1b. Subscribe to the live domain event stream for one issue (stream) */
+export const SubscribeIssueEventsRpc = Rpc.make(WS_METHODS.subscribeIssueEvents, {
+  payload: Schema.Struct({ issueId: IssueId }),
+  success: DomainEvent,
+  stream: true,
+})
+
 /** 2. Subscribe to raw terminal output for a tmux session (stream) */
 export const SubscribeTerminalRpc = Rpc.make(WS_METHODS.subscribeTerminal, {
   payload: Schema.Struct({ sessionName: Schema.String, cols: Schema.Number, rows: Schema.Number }),
@@ -296,7 +306,15 @@ export const SubscribeProjectSessionTreeRpc = Rpc.make(WS_METHODS.subscribeProje
   stream: true,
 })
 
-/** 18. Open a workspace in an editor (PAN-966) */
+/** 18. Subscribe to latest Flywheel status snapshots (stream) */
+export const SubscribeFlywheelStatusRpc = Rpc.make(WS_METHODS.subscribeFlywheelStatus, {
+  payload: Schema.Struct({}),
+  success: Schema.NullOr(FlywheelStatus),
+  error: PanRpcError,
+  stream: true,
+})
+
+/** 19. Open a workspace in an editor (PAN-966) */
 export const ShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: OpenInEditorInput,
   error: PanRpcError,
@@ -436,6 +454,7 @@ export const GetConversationStatsRpc = Rpc.make(WS_METHODS.getConversationStats,
 /** All Panopticon WebSocket RPC methods */
 export const PanRpcGroup = RpcGroup.make(
   SubscribeDomainEventsRpc,
+  SubscribeIssueEventsRpc,
   SubscribeTerminalRpc,
   SubscribeAgentOutputRpc,
   GetSnapshotRpc,
@@ -452,6 +471,7 @@ export const PanRpcGroup = RpcGroup.make(
   ResizeTerminalRpc,
   SubscribeConversationMessagesRpc,
   SubscribeProjectSessionTreeRpc,
+  SubscribeFlywheelStatusRpc,
   ShellOpenInEditorRpc,
   GetAvailableEditorsRpc,
   ScanConversationsRpc,

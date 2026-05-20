@@ -2,12 +2,10 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { Toaster, toast } from 'sonner';
 import { KanbanBoard } from './components/KanbanBoard';
-import { AgentList } from './components/AgentList';
-import { AgentOutputPanel } from './components/AgentOutputPanel';
+import { FleetAgentsView } from './components/Agents/FleetAgentsView';
 import { HealthDashboard } from './components/HealthDashboard';
 import { SkillsList } from './components/SkillsList';
 import { ActivityPanel } from './components/ActivityPanel';
-import { AwaitingMergePage } from './components/AwaitingMergePage';
 import { ConfirmationDialog, ConfirmationRequest } from './components/ConfirmationDialog';
 import { ChannelPermissionDialog } from './components/ChannelPermissionDialog';
 import { EventRouter } from './components/EventRouter';
@@ -18,17 +16,20 @@ import { SettingsPage } from './components/Settings/SettingsPage';
 import { SearchModal } from './components/search/SearchModal';
 import { CommandPalette } from './components/CommandPalette';
 import { CommandDeck } from './components/CommandDeck';
+import { PipelineView } from './components/Pipeline/PipelineView';
+import { AwaitingMergePage } from './components/AwaitingMergePage';
+import { IssueDrawer } from './components/drawer/IssueDrawer';
 import { ResourcesPanel } from './components/ResourcesPanel';
 import { GodViewPage } from './components/GodView';
 import { ConversationsPage } from './components/conversations/ConversationsPage';
 import { AutoPresoView } from './components/autopreso/AutoPresoView';
+import { FlywheelPage } from './pages/FlywheelPage';
 import { Tab } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { BootstrapGate } from './components/BootstrapGate';
 import { KanbanSkeleton } from './components/skeletons/KanbanSkeleton';
-import { AgentListSkeleton } from './components/skeletons/AgentListSkeleton';
+import { AgentsSkeleton } from './components/skeletons/AgentsSkeleton';
 import { GodViewSkeleton } from './components/skeletons/GodViewSkeleton';
-import { DetailPanelLayout } from './components/DetailPanelLayout';
 
 import { StandaloneTerminal } from './components/StandaloneTerminal';
 import { DeaconPauseBanner } from './components/DeaconPauseToggle';
@@ -40,7 +41,7 @@ import { SystemHealthPill } from './components/SystemHealthPill';
 import { CostWarningStyles } from './components/shared/costWarning';
 import { AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
 import { Agent, Issue } from './types';
-import { useDashboardStore, selectAgentList, selectChannelPermissionRequests, selectIssues, selectDashboardLifecycle } from './lib/store';
+import { useDashboardStore, selectAgents, selectChannelPermissionRequests, selectIssues, selectDashboardLifecycle } from './lib/store';
 import { refreshDashboardState } from './lib/refresh-dashboard-state';
 import type { ClaudeChannelPermissionBehavior } from '@panctl/contracts';
 import type { ViewMode as ConversationViewMode } from './components/chat/ConversationPanel';
@@ -60,11 +61,12 @@ interface TrackerStatus {
 }
 
 const TAB_PATHS: Record<Tab, string> = {
-  kanban: '/',
+  pipeline: '/',
+  kanban: '/board',
   'command-deck': '/command-deck',
   agents: '/agents',
+  flywheel: '/flywheel',
   resources: '/resources',
-  'awaiting-merge': '/awaiting-merge',
   autopreso: '/autopreso',
   activity: '/activity',
   metrics: '/metrics',
@@ -74,16 +76,20 @@ const TAB_PATHS: Record<Tab, string> = {
   settings: '/settings',
   'god-view': '/god-view',
   sessions: '/sessions',
+  'awaiting-merge': '/awaiting-merge',
 };
 
-const PATH_TO_TAB: Record<string, Tab> = Object.fromEntries(
-  Object.entries(TAB_PATHS).map(([tab, path]) => [path, tab as Tab])
-) as Record<string, Tab>;
+const PATH_TO_TAB: Record<string, Tab> = {
+  ...Object.fromEntries(
+    Object.entries(TAB_PATHS).map(([tab, path]) => [path, tab as Tab])
+  ) as Record<string, Tab>,
+  '/pipeline': 'pipeline',
+};
 
 function getTabFromPath(): Tab {
   const path = window.location.pathname;
   if (path.startsWith('/conv/')) return 'command-deck';
-  return PATH_TO_TAB[path] || 'command-deck';
+  return PATH_TO_TAB[path] || 'pipeline';
 }
 
 export function getConversationViewModeFromSearch(search = window.location.search): ConversationViewMode {
@@ -115,6 +121,17 @@ export function serializeConversationViewModes(viewModes: ConversationViewModeMa
     .sort(([a], [b]) => Number(a) - Number(b))
     .map(([id, mode]) => `${id}:${mode}`)
     .join(',');
+}
+
+export function normalizeLegacyAwaitingMergeRoute(_path = window.location.pathname, _search = window.location.search): string | null {
+  // Awaiting Merge is its own dedicated page again — no redirect to /pipeline.
+  // Kept as a stub so existing imports/tests still resolve.
+  return null;
+}
+
+function normalizeCurrentRoute() {
+  // No legacy route normalization needed currently — Awaiting Merge is a
+  // first-class page at /awaiting-merge again.
 }
 
 /** Extract conversation ID from /conv/:id path, or null if not matching. */
@@ -252,6 +269,9 @@ function StandaloneTerminalRoute({ sessionName, token }: { sessionName: string; 
 }
 
 export default function App() {
+  useEffect(() => {
+    normalizeCurrentRoute();
+  }, []);
   const terminalPath = window.location.pathname;
   const terminalSession = new URLSearchParams(window.location.search).get('terminal');
   if (terminalPath.startsWith('/terminal/') || terminalSession) {
@@ -263,7 +283,7 @@ export default function App() {
   }
 
   const [activeTab, setActiveTabState] = useState<Tab>(() => getConversationRouteState().tab);
-  const [selectedAgent, setSelectedAgentState] = useState<string | null>(() => {
+  const [, setSelectedAgentState] = useState<string | null>(() => {
     const hash = window.location.hash;
     if (hash.startsWith('#agent=')) return decodeURIComponent(hash.slice(7));
     return null;
@@ -322,23 +342,15 @@ export default function App() {
 
   const queryClient = useQueryClient();
 
-  const [selectedIssue, setSelectedIssue] = useState<string | null>(null);
-  const [planDialogIssueId, setPlanDialogIssueId] = useState<string | null>(null);
+  const [_planDialogIssueId, setPlanDialogIssueId] = useState<string | null>(null);
   const [currentConfirmation, setCurrentConfirmation] = useState<ConfirmationRequest | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [trackerBannerDismissed, setTrackerBannerDismissed] = useState(false);
 
-  useEffect(() => {
-    if (!selectedIssue) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setSelectedIssue(null);
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [selectedIssue]);
+  const drawerOpen = useDashboardStore((state) => state.drawer.issueId !== null);
+  const openIssue = useDashboardStore((state) => state.openIssue);
+  const syncDrawerFromUrl = useDashboardStore((state) => state.syncDrawerFromUrl);
 
   // Dashboard lifecycle state from event store (restart events)
   const dashboardLifecycle = useDashboardStore(selectDashboardLifecycle);
@@ -474,19 +486,21 @@ export default function App() {
   // Handle browser back/forward
   useEffect(() => {
     const onPopState = () => {
+      normalizeCurrentRoute();
       const routeState = getConversationRouteState();
       setActiveTabState(routeState.tab);
       setSelectedConvIdState(routeState.convId);
       setConversationViewModeState(routeState.viewMode);
       setConversationViewModes(routeState.viewModes);
+      syncDrawerFromUrl();
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, []);
+  }, [syncDrawerFromUrl]);
 
   // Agents from Zustand store (event-sourced — no polling)
   // Cast to Agent[] since AgentSnapshot is a compatible subset for the fields used here
-  const agents = useDashboardStore(selectAgentList) as unknown as Agent[];
+  const agents = useDashboardStore(selectAgents) as unknown as Agent[];
   const channelPermissionRequests = useDashboardStore(selectChannelPermissionRequests);
   const [optimisticallyResolvedChannelPermissionRequestIds, setOptimisticallyResolvedChannelPermissionRequestIds] =
     useState<Set<string>>(new Set());
@@ -558,19 +572,6 @@ export default function App() {
       }
     }
   }, [agents]);
-
-  // Find the work agent for selected issue (agent-<id>, not planning-<id>)
-  const selectedIssueAgent = selectedIssue
-    ? agents.find((a) => a.issueId?.toLowerCase() === selectedIssue.toLowerCase() && a.id.startsWith('agent-'))
-      ?? agents.find((a) => a.issueId?.toLowerCase() === selectedIssue.toLowerCase())
-      ?? null
-    : null;
-
-  // Find issue URL for selected issue
-  const selectedIssueData = selectedIssue
-    ? issues.find((i) => i.identifier.toLowerCase() === selectedIssue.toLowerCase())
-    : null;
-
 
   const channelPermissionResponseMutation = useMutation({
     mutationFn: ({
@@ -683,7 +684,7 @@ export default function App() {
       } else if (action.startsWith('open-workspace:')) {
         const issueId = action.slice('open-workspace:'.length);
         setActiveTab('kanban');
-        if (issueId) setSelectedIssue(issueId);
+        if (issueId) openIssue(issueId);
       } else if (action.startsWith('auto-start-nag:')) {
         // Format: auto-start-nag:<count>:<max>
         setIsPaletteOpen(false);
@@ -695,7 +696,7 @@ export default function App() {
       }
     });
     return unsub;
-  }, []);
+  }, [openIssue, setActiveTab]);
 
   // Auto-start nag toast for desktop app (launched 2-5 times without enabling)
   function showAutoStartNag(count: number, max: number): void {
@@ -718,9 +719,9 @@ export default function App() {
   }
 
   const handleSelectIssueFromSearch = useCallback((issueId: string) => {
-    setSelectedIssue(issueId);
     setActiveTab('kanban');
-  }, []);
+    openIssue(issueId);
+  }, [openIssue, setActiveTab]);
 
   return (
     <div className="h-screen flex flex-row overflow-hidden bg-background">
@@ -846,7 +847,10 @@ export default function App() {
           </div>
         </div>
 
-        <main className="flex-1 flex overflow-hidden">
+        <main
+          data-drawer-open={drawerOpen ? 'true' : undefined}
+          className="relative flex-1 flex overflow-hidden data-[drawer-open=true]:before:pointer-events-none data-[drawer-open=true]:before:absolute data-[drawer-open=true]:before:inset-0 data-[drawer-open=true]:before:z-[80] data-[drawer-open=true]:before:bg-primary/[0.04] data-[drawer-open=true]:before:backdrop-blur-[2px]"
+        >
           {activeTab === 'command-deck' && (
             <div className="w-full h-full">
               <CommandDeck
@@ -858,6 +862,16 @@ export default function App() {
               />
             </div>
           )}
+        {activeTab === 'pipeline' && (
+          <div className="w-full h-full overflow-hidden">
+            <PipelineView />
+          </div>
+        )}
+        {activeTab === 'awaiting-merge' && (
+          <div className="w-full h-full overflow-auto">
+            <AwaitingMergePage />
+          </div>
+        )}
         {activeTab === 'kanban' && (
           <BootstrapGate fallback={
             <div className="flex-1 overflow-auto p-6 w-full">
@@ -868,49 +882,20 @@ export default function App() {
               <div className="flex-1 overflow-auto p-6 w-full">
                 <MetricsSummaryRow />
                 <KanbanBoard
-                  selectedIssue={selectedIssue}
-                  onSelectIssue={setSelectedIssue}
+                  selectedIssue={null}
+                  onSelectIssue={(issueId) => {
+                    if (issueId) openIssue(issueId);
+                  }}
                   onPlanDialogChange={setPlanDialogIssueId}
                 />
               </div>
-              {selectedIssue && selectedIssueData && (
-                <div
-                  className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 backdrop-blur-sm p-6"
-                  onClick={() => setSelectedIssue(null)}
-                >
-                  <div
-                    className="h-[min(90vh,1100px)] w-[min(92vw,1400px)] overflow-hidden rounded-2xl border border-border bg-background shadow-2xl"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    <DetailPanelLayout
-                      agent={selectedIssueAgent ?? undefined}
-                      issueId={selectedIssue}
-                      issueUrl={selectedIssueData.url}
-                      issue={selectedIssueData}
-                      onClose={() => setSelectedIssue(null)}
-                      suppressTerminal={planDialogIssueId === selectedIssue}
-                      inline
-                    />
-                  </div>
-                </div>
-              )}
             </>
           </BootstrapGate>
         )}
         {activeTab === 'agents' && (
-          <BootstrapGate fallback={<AgentListSkeleton />}>
-            <div className="flex w-full h-full overflow-hidden">
-              <div className={`${selectedAgent ? 'w-1/2 lg:w-5/12' : 'w-full'} overflow-y-auto p-6`}>
-                <AgentList
-                  selectedAgent={selectedAgent}
-                  onSelectAgent={setSelectedAgent}
-                />
-              </div>
-              {selectedAgent && (
-                <div className="flex-1 min-w-0 h-full flex flex-col border-l border-border">
-                  <AgentOutputPanel agentId={selectedAgent} />
-                </div>
-              )}
+          <BootstrapGate fallback={<AgentsSkeleton />}>
+            <div className="h-full w-full overflow-y-auto">
+              <FleetAgentsView />
             </div>
           </BootstrapGate>
         )}
@@ -949,14 +934,20 @@ export default function App() {
             <CostsPage />
           </div>
         )}
-        {activeTab === 'awaiting-merge' && (
-          <div className="w-full overflow-auto">
-            <AwaitingMergePage />
-          </div>
-        )}
         {activeTab === 'autopreso' && (
           <div className="w-full h-full overflow-hidden">
             <AutoPresoView />
+          </div>
+        )}
+        {activeTab === 'flywheel' && (
+          <div className="w-full h-full overflow-hidden">
+            <FlywheelPage
+              onOpenSettings={() => setActiveTab('settings')}
+              onNavigateAgent={(agentId) => {
+                setSelectedAgent(agentId);
+                setActiveTab('agents');
+              }}
+            />
           </div>
         )}
         {activeTab === 'settings' && (
@@ -982,6 +973,8 @@ export default function App() {
         )}
         </main>
       </div>
+
+      <IssueDrawer />
 
       <ChannelPermissionDialog
         request={currentChannelPermissionRequest}
@@ -1016,7 +1009,7 @@ export default function App() {
         onClose={() => setIsPaletteOpen(false)}
         onNavigate={(tab, issueId) => {
           setActiveTab(tab as Tab);
-          if (issueId) setSelectedIssue(issueId);
+          if (issueId) openIssue(issueId);
         }}
       />
 

@@ -8,7 +8,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Bell, BellOff, AlertTriangle, StopCircle, Settings, Zap, RefreshCw } from 'lucide-react';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { useDashboardStore, selectAgentList } from '../lib/store';
+import { useDashboardStore, selectAgents } from '../lib/store';
 
 interface CloisterStatus {
   running: boolean;
@@ -89,7 +89,7 @@ function formatTtsHealthTitle(health: TtsHealthStatus | undefined, failed: boole
   const details = [
     health.model !== undefined ? `model: ${String(health.model)}` : undefined,
     health.queueDepth !== undefined ? `queue: ${String(health.queueDepth)}` : health.queue !== undefined ? `queue: ${String(health.queue)}` : undefined,
-    health.pid !== null ? `pid: ${health.pid}` : undefined,
+    typeof health.pid === 'number' ? `pid: ${health.pid}` : undefined,
     health.gpuMemoryUsedMb !== undefined ? `VRAM: ${health.gpuMemoryUsedMb}MB` : undefined,
   ].filter(Boolean);
   return details.length > 0 ? `TTS: Running (${details.join(', ')})` : 'TTS: Running';
@@ -143,7 +143,7 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
     retry: false,
   });
 
-  const agents = useDashboardStore(selectAgentList);
+  const agents = useDashboardStore(selectAgents);
   const runningAgentCount = agents.filter(a => a.status === 'running').length;
   const aliveConversationCount = conversations.filter(c => c.sessionAlive).length;
 

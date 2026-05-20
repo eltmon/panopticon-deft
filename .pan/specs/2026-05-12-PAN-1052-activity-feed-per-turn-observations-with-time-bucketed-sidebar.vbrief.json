@@ -4,7 +4,7 @@
     "created": "2026-05-12T19:50:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1052: Activity feed: per-turn observations with time-bucketed sidebar",
-    "updated": "2026-05-17T00:40:08.312Z"
+    "updated": "2026-05-19T08:54:35.274Z"
   },
   "plan": {
     "id": "pan-1052",
@@ -12,9 +12,9 @@
     "status": "running",
     "uid": "7c4e9a2f-3d18-4b6e-9f2a-8c5d1e4f7a3b",
     "author": "agent:claude-opus-4-7",
-    "sequence": 14,
+    "sequence": 184,
     "created": "2026-05-12T19:50:00.000Z",
-    "updated": "2026-05-17T00:40:08.312Z",
+    "updated": "2026-05-19T08:54:35.274Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1052",
@@ -2276,47 +2276,62 @@
     "metadata": {
       "canonicalFilename": "2026-05-12-PAN-1052-activity-feed-per-turn-observations-with-time-bucketed-sidebar.vbrief.json",
       "pipeline": {
-        "phase": "work",
+        "phase": "review",
         "issueId": "PAN-1052",
         "sqliteAuthoritative": true,
-        "updatedAt": "2026-05-17T00:40:08.311Z",
+        "updatedAt": "2026-05-19T08:54:35.264Z",
         "work": {
-          "updatedAt": "2026-05-17T00:40:08.311Z",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
           "history": []
         },
         "verification": {
-          "updatedAt": "2026-05-17T00:40:08.311Z",
-          "history": []
-        },
-        "review": {
-          "status": "pending",
-          "updatedAt": "2026-05-17T00:40:08.311Z",
+          "status": "passed",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
           "history": [
             {
-              "status": "pending",
-              "at": "2026-05-17T00:40:08.311Z"
+              "status": "passed",
+              "at": "2026-05-19T08:54:35.264Z"
+            }
+          ]
+        },
+        "review": {
+          "status": "blocked",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
+          "notes": "All four convoy reviewers (security/correctness/performance/requirements) exited with code 1 without producing reports — blocking infrastructure failure",
+          "history": [
+            {
+              "status": "blocked",
+              "at": "2026-05-19T08:54:35.264Z",
+              "notes": "All four convoy reviewers (security/correctness/performance/requirements) exited with code 1 without producing reports — blocking infrastructure failure"
             }
           ],
-          "approval": "pending"
+          "approval": "changes_requested"
         },
         "test": {
           "status": "pending",
-          "updatedAt": "2026-05-17T00:40:08.311Z",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
           "history": [
             {
               "status": "pending",
-              "at": "2026-05-17T00:40:08.311Z"
+              "at": "2026-05-19T08:54:35.264Z"
             }
           ]
         },
         "uat": {
-          "updatedAt": "2026-05-17T00:40:08.311Z",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
           "history": []
         },
         "merge": {
-          "updatedAt": "2026-05-17T00:40:08.311Z",
-          "history": [],
-          "readyForMerge": false
+          "status": "pending",
+          "updatedAt": "2026-05-19T08:54:35.264Z",
+          "history": [
+            {
+              "status": "pending",
+              "at": "2026-05-19T08:54:35.264Z"
+            }
+          ],
+          "readyForMerge": false,
+          "prUrl": "https://github.com/eltmon/panopticon-cli/pull/1211"
         }
       }
     }
