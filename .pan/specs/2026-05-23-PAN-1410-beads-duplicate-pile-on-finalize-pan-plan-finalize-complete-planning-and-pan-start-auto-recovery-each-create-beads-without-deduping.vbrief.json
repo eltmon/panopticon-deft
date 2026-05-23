@@ -2,19 +2,19 @@
   "vBRIEFInfo": {
     "version": "0.5",
     "created": "2026-05-23T08:40:00.000Z",
-    "updated": "2026-05-23T08:40:40.999Z",
+    "updated": "2026-05-23T17:51:03.043Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1410: Beads duplicate-pile-on-finalize across pan plan finalize, complete-planning, and pan start auto-recovery"
   },
   "plan": {
     "id": "pan-1410",
     "title": "Beads duplicate-pile-on-finalize: pan plan finalize, complete-planning, and pan start auto-recovery each create beads without deduping",
-    "status": "proposed",
+    "status": "completed",
     "uid": "d4e1c9a2-7b85-4f6c-9d12-3a8f5e7b1c40",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T08:40:00.000Z",
-    "updated": "2026-05-23T08:40:40.999Z",
+    "updated": "2026-05-23T17:51:03.043Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1410",
@@ -317,5 +317,5 @@
       "canonicalFilename": "2026-05-23-PAN-1410-beads-duplicate-pile-on-finalize-pan-plan-finalize-complete-planning-and-pan-start-auto-recovery-each-create-beads-without-deduping.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
