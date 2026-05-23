@@ -4,17 +4,17 @@
     "created": "2026-05-23T05:00:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1394: Conversation title Sparkles 'regenerate title' button is invisible (opacity: 0 by default)",
-    "updated": "2026-05-23T04:47:27.068Z"
+    "updated": "2026-05-23T17:50:07.625Z"
   },
   "plan": {
     "id": "pan-1394",
     "title": "Conversation title: Sparkles 'regenerate title' button is invisible (opacity: 0 by default)",
-    "status": "proposed",
+    "status": "completed",
     "uid": "3b72ae7b-3018-4f54-8849-142c5c0123b9",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T05:00:00.000Z",
-    "updated": "2026-05-23T04:47:27.068Z",
+    "updated": "2026-05-23T17:50:07.625Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1394",
@@ -137,5 +137,5 @@
       "canonicalFilename": "2026-05-23-PAN-1394-conversation-title-sparkles-regenerate-title-button-is-invisible-opacity-0-by-default.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
