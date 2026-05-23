@@ -7,13 +7,13 @@
  * All filesystem I/O uses fs/promises so this is safe on the dashboard event loop.
  */
 
-import { existsSync } from 'fs';
-import { readFile, appendFile } from 'fs/promises';
-import { join } from 'path';
 import {
-  getReviewStatus,
-  setReviewStatus,
+  getReviewStatusSync,
+  setReviewStatusSync,
 } from './review-status.js';
+import { Data, Effect } from 'effect';
+import { resolveProjectFromIssueSync } from './projects.js';
+import { appendContinueSessionEntryForIssue } from './vbrief/lifecycle-io.js';
 
 export interface ReopenResult {
   specialistStatesReset: boolean;
@@ -21,28 +21,17 @@ export interface ReopenResult {
   previousTestStatus: string | null;
   previousMergeStatus: string | null;
   queueItemsRemoved: Record<string, number>;
-  stateMdUpdated: boolean;
+  /** True when a `reason: 'resume'` entry was appended to the continue file. */
+  continueFileUpdated: boolean;
   reason?: string;
 }
 
 export interface ReopenOptions {
   reason?: string;
   trackerContext?: string;
-}
-
-/**
- * Reset workspace state for a reopened issue.
- *
- * - Resets specialist states (review/test/merge → pending) via setReviewStatus
- * - Removes the issue from all specialist queues
- * - Appends a "Reopened" section to .planning/STATE.md
- *
- * @param issueId - Issue identifier (e.g., "PAN-256")
- * @param workspacePath - Absolute path to workspace directory
- * @param options - Optional reason and tracker context
- */
-export async function reopenWorkspaceState(
+}async function reopenWorkspaceStatePromise(
   issueId: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   workspacePath: string,
   options: ReopenOptions = {}
 ): Promise<ReopenResult> {
@@ -52,13 +41,13 @@ export async function reopenWorkspaceState(
     previousTestStatus: null,
     previousMergeStatus: null,
     queueItemsRemoved: {},
-    stateMdUpdated: false,
+    continueFileUpdated: false,
     reason: options.reason,
   };
 
   // 1. Reset specialist states — single-row atomic update, no TOCTOU risk.
   // setReviewStatus() reads only this issue's row and upserts only this issue's row.
-  const existing = getReviewStatus(issueId);
+  const existing = getReviewStatusSync(issueId);
 
   if (existing) {
     result.previousReviewStatus = existing.reviewStatus;
@@ -66,7 +55,7 @@ export async function reopenWorkspaceState(
     result.previousMergeStatus = existing.mergeStatus ?? null;
   }
 
-  setReviewStatus(issueId, {
+  setReviewStatusSync(issueId, {
     reviewStatus: 'pending',
     testStatus: 'pending',
     mergeStatus: 'pending',
@@ -86,43 +75,60 @@ export async function reopenWorkspaceState(
   });
   result.specialistStatesReset = true;
 
-  // 2. Append "Reopened" section to STATE.md (async — safe on dashboard event loop)
-  const statePath = join(workspacePath, '.planning', 'STATE.md');
-  if (existsSync(statePath)) {
-    const previousContent = await readFile(statePath, 'utf-8');
-    const lastStatusMatch = previousContent.match(/\*\*STATUS:\s*([^*\n]+)\*\*/);
-    const previousStatus = lastStatusMatch ? lastStatusMatch[1].trim() : 'Unknown';
+  // 2. Append a reopen breadcrumb to the scope vBRIEF's continue file.
+  const resolved = resolveProjectFromIssueSync(issueId);
+  if (resolved) {
+    try {
+      const noteParts: string[] = [`Reopened on ${new Date().toISOString().slice(0, 10)}`];
+      if (options.reason) noteParts.push(`reason: ${options.reason}`);
+      if (result.previousReviewStatus) {
+        noteParts.push(`review: ${result.previousReviewStatus} → pending`);
+      }
+      if (result.previousTestStatus) {
+        noteParts.push(`test: ${result.previousTestStatus} → pending`);
+      }
+      if (result.previousMergeStatus) {
+        noteParts.push(`merge: ${result.previousMergeStatus} → pending`);
+      }
+      if (options.trackerContext) {
+        noteParts.push('tracker context attached');
+      }
 
-    const date = new Date().toISOString().slice(0, 10);
-    const lines: string[] = [
-      '',
-      `## Reopened — ${date}`,
-      '',
-      `**Previous status:** ${previousStatus}`,
-    ];
-
-    if (result.previousReviewStatus) {
-      lines.push(`**Previous review status:** ${result.previousReviewStatus}`);
+      appendContinueSessionEntryForIssue(resolved.projectPath, issueId, {
+        reason: 'resume',
+        note: noteParts.join('; '),
+      });
+      result.continueFileUpdated = true;
+    } catch {
+      // Non-fatal — specialist states were still reset above.
     }
-    if (result.previousTestStatus) {
-      lines.push(`**Previous test status:** ${result.previousTestStatus}`);
-    }
-    if (options.reason) {
-      lines.push(`**Reason:** ${options.reason}`);
-    }
-    if (options.trackerContext) {
-      lines.push('');
-      lines.push('**Tracker context at reopen:**');
-      lines.push('');
-      lines.push(options.trackerContext);
-    }
-
-    lines.push('');
-    lines.push('Specialist states reset to pending. Resume implementation based on tracker context above.');
-
-    await appendFile(statePath, lines.join('\n') + '\n', 'utf-8');
-    result.stateMdUpdated = true;
   }
 
   return result;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Tagged error for reopen Effect variants. */
+export class ReopenError extends Data.TaggedError('ReopenError')<{
+  readonly issueId: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `reopenWorkspaceState`. */
+export const reopenWorkspaceState = (
+  issueId: string,
+  workspacePath: string,
+  options: ReopenOptions = {},
+): Effect.Effect<ReopenResult, ReopenError> =>
+  Effect.tryPromise({
+    try: () => reopenWorkspaceStatePromise(issueId, workspacePath, options),
+    catch: (cause) =>
+      new ReopenError({
+        issueId,
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+

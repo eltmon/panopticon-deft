@@ -2,16 +2,43 @@ import { Schema } from "effect"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import { DomainEvent } from "./events"
-import { DashboardSnapshot, IssueId, SequenceNumber, WorkspaceDetail } from "./types"
+import {
+  AgentStatus,
+  ConversationCostSummary,
+  ConversationFilter,
+  DashboardSnapshot,
+  DiscoveredSessionSnapshot,
+  IssueId,
+  ScanResult,
+  SequenceNumber,
+  SessionNodePresence,
+  WorkspaceDetail,
+} from "./types"
+import { EditorIdSchema, OpenInEditorInput } from "./editor"
+import { FlywheelStatus } from "./flywheel"
 
 // ─── RPC method names ─────────────────────────────────────────────────────────
 
 export const WS_METHODS = {
+  // Conversations (PAN-457)
+  scanConversations: "pan.scanConversations",
+  searchConversations: "pan.searchConversations",
+  listDiscoveredSessions: "pan.listDiscoveredSessions",
+  getDiscoveredSession: "pan.getDiscoveredSession",
+  enrichSessions: "pan.enrichSessions",
+  embedSessions: "pan.embedSessions",
+  getConversationCost: "pan.getConversationCost",
+  getConversationCostByWorkspace: "pan.getConversationCostByWorkspace",
+  getConversationStats: "pan.getConversationStats",
+
   // Streaming subscriptions
   subscribeDomainEvents: "pan.subscribeDomainEvents",
+  subscribeIssueEvents: "pan.subscribeIssueEvents",
   subscribeTerminal: "pan.subscribeTerminal",
   subscribeAgentOutput: "pan.subscribeAgentOutput",
   subscribeConversationMessages: "pan.subscribeConversationMessages",
+  subscribeProjectSessionTree: "pan.subscribeProjectSessionTree",
+  subscribeFlywheelStatus: "pan.subscribeFlywheelStatus",
 
   // Snapshot / replay
   getSnapshot: "pan.getSnapshot",
@@ -19,6 +46,7 @@ export const WS_METHODS = {
 
   // Workspace detail (batched)
   getWorkspaceDetail: "pan.getWorkspaceDetail",
+  readWorkspaceFile: "pan.readWorkspaceFile",
 
   // Terminal control
   terminalOpen: "pan.terminalOpen",
@@ -32,6 +60,10 @@ export const WS_METHODS = {
   deepWipe: "pan.deepWipe",
   sendTerminalInput: "pan.sendTerminalInput",
   resizeTerminal: "pan.resizeTerminal",
+
+  // Editor integration (PAN-966)
+  shellOpenInEditor: "pan.shellOpenInEditor",
+  getAvailableEditors: "pan.getAvailableEditors",
 } as const
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -54,6 +86,37 @@ export const AgentOutput = Schema.Struct({
   line: Schema.String,
 })
 export type AgentOutput = typeof AgentOutput.Type
+
+// ─── Plan mode types ─────────────────────────────────────────────────────────
+
+export const ProposedPlan = Schema.Struct({
+  id: Schema.String,
+  plan: Schema.String,
+  planFilePath: Schema.optional(Schema.String),
+  status: Schema.Literals(['pending', 'approved', 'rejected']),
+  createdAt: Schema.String,
+  resolvedAt: Schema.optional(Schema.String),
+})
+export type ProposedPlan = typeof ProposedPlan.Type
+
+// ─── Compact boundary types ──────────────────────────────────────────────────
+
+export const CompactBoundary = Schema.Struct({
+  id: Schema.String,
+  timestamp: Schema.String,
+  trigger: Schema.optional(Schema.String),
+  preTokens: Schema.optional(Schema.Number),
+  model: Schema.optional(Schema.String),
+})
+export type CompactBoundary = typeof CompactBoundary.Type
+
+export const ContextUsage = Schema.Struct({
+  activeBytes: Schema.Number,
+  estimatedTokens: Schema.Number,
+  contextWindow: Schema.Number,
+  percentUsed: Schema.Number,
+})
+export type ContextUsage = typeof ContextUsage.Type
 
 // ─── Chat / conversation message types (PAN-451) ──────────────────────────────
 
@@ -94,6 +157,9 @@ export interface ConversationResponse {
   streaming: boolean;
   totalCost: number;
   byteOffset: number;
+  proposedPlan?: ProposedPlan;
+  compactBoundaries?: CompactBoundary[];
+  contextUsage?: ContextUsage | null;
 }
 
 export const ConversationEvent = Schema.Union([
@@ -102,6 +168,9 @@ export const ConversationEvent = Schema.Union([
     messages: Schema.Array(ChatMessage),
     workLog: Schema.Array(WorkLogEntry),
     streaming: Schema.Boolean,
+    proposedPlan: Schema.optional(ProposedPlan),
+    compactBoundaries: Schema.optional(Schema.Array(CompactBoundary)),
+    contextUsage: Schema.optional(Schema.NullOr(ContextUsage)),
   }),
   Schema.Struct({
     kind: Schema.Literal('discovering'),
@@ -109,11 +178,30 @@ export const ConversationEvent = Schema.Union([
 ])
 export type ConversationEvent = typeof ConversationEvent.Type
 
+// ─── Session Tree Delta (PAN-821) ─────────────────────────────────────────────
+
+export const SessionTreeDelta = Schema.Struct({
+  kind: Schema.Literals(['session_added', 'session_removed', 'presence_changed', 'status_changed']),
+  issueId: Schema.String,
+  sessionId: Schema.String,
+  presence: Schema.optional(SessionNodePresence),
+  status: Schema.optional(AgentStatus),
+  timestamp: Schema.String,
+})
+export type SessionTreeDelta = typeof SessionTreeDelta.Type
+
 // ─── RPC definitions ──────────────────────────────────────────────────────────
 
 /** 1. Subscribe to the live domain event stream (stream) */
 export const SubscribeDomainEventsRpc = Rpc.make(WS_METHODS.subscribeDomainEvents, {
   payload: Schema.Struct({}),
+  success: DomainEvent,
+  stream: true,
+})
+
+/** 1b. Subscribe to the live domain event stream for one issue (stream) */
+export const SubscribeIssueEventsRpc = Rpc.make(WS_METHODS.subscribeIssueEvents, {
+  payload: Schema.Struct({ issueId: IssueId }),
   success: DomainEvent,
   stream: true,
 })
@@ -180,6 +268,29 @@ export const GetWorkspaceDetailRpc = Rpc.make(WS_METHODS.getWorkspaceDetail, {
   error: PanRpcError,
 })
 
+export const ReadWorkspaceFileInput = Schema.Struct({
+  issueId: IssueId,
+  relativePath: Schema.String,
+  line: Schema.optional(Schema.Number),
+  contextLines: Schema.optional(Schema.Number),
+})
+export type ReadWorkspaceFileInput = typeof ReadWorkspaceFileInput.Type
+
+export const ReadWorkspaceFileResult = Schema.Struct({
+  text: Schema.String,
+  lang: Schema.String,
+  truncated: Schema.Boolean,
+  totalLines: Schema.Number,
+})
+export type ReadWorkspaceFileResult = typeof ReadWorkspaceFileResult.Type
+
+/** 10b. Read a workspace file for inline previews (unary) */
+export const ReadWorkspaceFileRpc = Rpc.make(WS_METHODS.readWorkspaceFile, {
+  payload: ReadWorkspaceFileInput,
+  success: ReadWorkspaceFileResult,
+  error: PanRpcError,
+})
+
 /** 11. Start planning for an issue (command) */
 export const StartPlanningRpc = Rpc.make(WS_METHODS.startPlanning, {
   payload: Schema.Struct({ issueId: IssueId, options: Schema.optional(Schema.Unknown) }),
@@ -221,16 +332,169 @@ export const SubscribeConversationMessagesRpc = Rpc.make(WS_METHODS.subscribeCon
   stream: true,
 })
 
+/** 17. Subscribe to live session tree deltas for a project (stream, PAN-821) */
+export const SubscribeProjectSessionTreeRpc = Rpc.make(WS_METHODS.subscribeProjectSessionTree, {
+  payload: Schema.Struct({ projectKey: Schema.String }),
+  success: SessionTreeDelta,
+  error: PanRpcError,
+  stream: true,
+})
+
+/** 18. Subscribe to latest Flywheel status snapshots (stream) */
+export const SubscribeFlywheelStatusRpc = Rpc.make(WS_METHODS.subscribeFlywheelStatus, {
+  payload: Schema.Struct({}),
+  success: Schema.NullOr(FlywheelStatus),
+  error: PanRpcError,
+  stream: true,
+})
+
+/** 19. Open a workspace in an editor (PAN-966) */
+export const ShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
+  payload: OpenInEditorInput,
+  error: PanRpcError,
+})
+
+/** 19. Get available (installed) editors (PAN-966) */
+export const GetAvailableEditorsRpc = Rpc.make(WS_METHODS.getAvailableEditors, {
+  success: Schema.Struct({ editors: Schema.Array(EditorIdSchema) }),
+  error: PanRpcError,
+})
+
+// ─── Conversation Discovery RPC procs (PAN-457) ───────────────────────────────
+
+const DiscoveredSessionListResult = Schema.Struct({
+  sessions: Schema.Array(DiscoveredSessionSnapshot),
+  count: Schema.Number,
+  total: Schema.Number,
+})
+
+const DiscoveredSessionSearchResult = Schema.Struct({
+  sessions: Schema.Array(DiscoveredSessionSnapshot),
+  total: Schema.Number,
+  mode: Schema.String,
+  durationMs: Schema.Number,
+  error: Schema.optional(Schema.String),
+})
+
+const DiscoveredSessionStatsResult = Schema.Struct({
+  total: Schema.Number,
+  enriched: Schema.Number,
+  embedded: Schema.Number,
+  managedCount: Schema.Number,
+  embeddingModels: Schema.optional(Schema.Array(Schema.Struct({
+    model: Schema.String,
+    embedded: Schema.Number,
+  }))),
+})
+
+const ConversationCostTotals = Schema.Struct({
+  sessionCount: Schema.Number,
+  totalCost: Schema.Number,
+  totalTokensIn: Schema.Number,
+  totalTokensOut: Schema.Number,
+})
+
+/** Scan conversations (trigger discovery) */
+export const ScanConversationsRpc = Rpc.make(WS_METHODS.scanConversations, {
+  payload: Schema.Struct({
+    mode: Schema.Literals(['targeted', 'watched', 'system']),
+    dirs: Schema.optional(Schema.Array(Schema.String)),
+    dryRun: Schema.optional(Schema.Boolean),
+  }),
+  success: ScanResult,
+  error: PanRpcError,
+})
+
+/** Search discovered sessions with filters + optional FTS query */
+export const SearchConversationsRpc = Rpc.make(WS_METHODS.searchConversations, {
+  payload: ConversationFilter,
+  success: DiscoveredSessionSearchResult,
+  error: PanRpcError,
+})
+
+/** List discovered sessions (recent, with optional managed/unmanaged filter) */
+export const ListDiscoveredSessionsRpc = Rpc.make(WS_METHODS.listDiscoveredSessions, {
+  payload: ConversationFilter,
+  success: DiscoveredSessionListResult,
+  error: PanRpcError,
+})
+
+/** Get a single discovered session by ID */
+export const GetDiscoveredSessionRpc = Rpc.make(WS_METHODS.getDiscoveredSession, {
+  payload: Schema.Struct({ id: Schema.Number }),
+  success: DiscoveredSessionSnapshot,
+  error: PanRpcError,
+})
+
+/** Enrich sessions by ID or filter */
+export const EnrichSessionsRpc = Rpc.make(WS_METHODS.enrichSessions, {
+  payload: Schema.Struct({
+    ids: Schema.optional(Schema.Array(Schema.Number)),
+    filter: Schema.optional(ConversationFilter),
+    level: Schema.Literals([1, 2, 3]),
+    model: Schema.optional(Schema.String),
+    fullTranscript: Schema.optional(Schema.Boolean),
+    customPrompt: Schema.optional(Schema.String),
+    upgrade: Schema.optional(Schema.Boolean),
+    limit: Schema.optional(Schema.Number),
+    confirmed: Schema.optional(Schema.Boolean),
+    force: Schema.optional(Schema.Boolean),
+  }),
+  success: Schema.Struct({
+    processed: Schema.Number,
+    totalCost: Schema.Number,
+    failures: Schema.Number,
+  }),
+  error: PanRpcError,
+})
+
+/** Generate or update embeddings for enriched sessions */
+export const EmbedSessionsRpc = Rpc.make(WS_METHODS.embedSessions, {
+  payload: Schema.Struct({
+    ids: Schema.optional(Schema.Array(Schema.Number)),
+    regenerate: Schema.optional(Schema.Boolean),
+  }),
+  success: Schema.Struct({
+    total: Schema.Number,
+    embedded: Schema.Number,
+    model: Schema.String,
+  }),
+  error: PanRpcError,
+})
+
+/** Aggregate cost totals for discovered sessions */
+export const GetConversationCostRpc = Rpc.make(WS_METHODS.getConversationCost, {
+  payload: ConversationFilter,
+  success: ConversationCostTotals,
+  error: PanRpcError,
+})
+
+/** Aggregate workspace cost totals for the full filtered corpus */
+export const GetConversationCostByWorkspaceRpc = Rpc.make(WS_METHODS.getConversationCostByWorkspace, {
+  payload: ConversationFilter,
+  success: ConversationCostSummary,
+  error: PanRpcError,
+})
+
+/** Discovery index statistics */
+export const GetConversationStatsRpc = Rpc.make(WS_METHODS.getConversationStats, {
+  payload: Schema.Struct({}),
+  success: DiscoveredSessionStatsResult,
+  error: PanRpcError,
+})
+
 // ─── RPC Group ────────────────────────────────────────────────────────────────
 
-/** All 16 Panopticon WebSocket RPC methods */
+/** All Panopticon WebSocket RPC methods */
 export const PanRpcGroup = RpcGroup.make(
   SubscribeDomainEventsRpc,
+  SubscribeIssueEventsRpc,
   SubscribeTerminalRpc,
   SubscribeAgentOutputRpc,
   GetSnapshotRpc,
   ReplayEventsRpc,
   GetWorkspaceDetailRpc,
+  ReadWorkspaceFileRpc,
   TerminalOpenRpc,
   TerminalWriteRpc,
   TerminalResizeRpc,
@@ -241,5 +505,18 @@ export const PanRpcGroup = RpcGroup.make(
   SendTerminalInputRpc,
   ResizeTerminalRpc,
   SubscribeConversationMessagesRpc,
+  SubscribeProjectSessionTreeRpc,
+  SubscribeFlywheelStatusRpc,
+  ShellOpenInEditorRpc,
+  GetAvailableEditorsRpc,
+  ScanConversationsRpc,
+  SearchConversationsRpc,
+  ListDiscoveredSessionsRpc,
+  GetDiscoveredSessionRpc,
+  EnrichSessionsRpc,
+  EmbedSessionsRpc,
+  GetConversationCostRpc,
+  GetConversationCostByWorkspaceRpc,
+  GetConversationStatsRpc,
 )
 export type PanRpcGroup = typeof PanRpcGroup

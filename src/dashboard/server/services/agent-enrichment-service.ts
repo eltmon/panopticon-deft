@@ -12,14 +12,18 @@
  * restored here via the event-driven projection pipeline.
  */
 
-import { listRunningAgentsAsync } from '../../../lib/agents.js'
+import { Effect } from 'effect'
+import { listRunningAgents, type AgentState } from '../../../lib/agents.js'
 import { computeAgentEnrichment, getAgentJsonlMtime, type AgentEnrichment } from '../../../lib/agent-enrichment.js'
-import { getReviewStatus } from '../../../lib/review-status.js'
+import { getReviewStatusSync } from '../../../lib/review-status.js'
+import { withConcurrencyLimit } from '../../../lib/concurrency.js'
 import { getEventStore } from '../event-store.js'
-import type { AgentEnrichmentChangedEvent, AgentCreatedEvent, AgentStatusChangedEvent } from '@panopticon/contracts'
-import { toAgentStatus, toAgentPhase, toAgentResolution } from '../read-model.js'
+import type { AgentEnrichmentChangedEvent, AgentCreatedEvent, AgentStatusChangedEvent } from '@panctl/contracts'
+import { toAgentStatus, toRole, toAgentResolution } from '../read-model.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+type RunningAgent = AgentState & { tmuxActive: boolean }
 
 interface EnrichmentServiceState {
   timer: ReturnType<typeof setInterval> | null
@@ -37,9 +41,11 @@ interface EnrichmentServiceState {
 function enrichmentChanged(prev: AgentEnrichment | undefined, next: AgentEnrichment): boolean {
   if (!prev) return true
   return (
-    prev.agentPhase !== next.agentPhase ||
+    prev.role !== next.role ||
     prev.hasPendingQuestion !== next.hasPendingQuestion ||
     prev.pendingQuestionCount !== next.pendingQuestionCount ||
+    prev.pendingQuestionPrompt !== next.pendingQuestionPrompt ||
+    prev.pendingQuestionReason !== next.pendingQuestionReason ||
     prev.resolution !== next.resolution ||
     prev.resolutionCount !== next.resolutionCount
   )
@@ -48,9 +54,9 @@ function enrichmentChanged(prev: AgentEnrichment | undefined, next: AgentEnrichm
 // ─── Poller ───────────────────────────────────────────────────────────────────
 
 async function pollOnce(state: EnrichmentServiceState): Promise<void> {
-  let runningAgents: Awaited<ReturnType<typeof listRunningAgentsAsync>>
+  let runningAgents: RunningAgent[]
   try {
-    runningAgents = await listRunningAgentsAsync()
+    runningAgents = await Effect.runPromise(listRunningAgents())
   } catch {
     return
   }
@@ -61,8 +67,8 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
   // Stopped agents have no changing state — their enrichment is static.
   const activeAgents = runningAgents.filter(a => a.tmuxActive)
 
-  await Promise.all(
-    activeAgents.map(async (agent) => {
+  await Effect.runPromise(withConcurrencyLimit(
+    activeAgents.map((agent) => Effect.promise(async () => {
       const { id: agentId, issueId, startedAt } = agent
 
       // If this agent hasn't been seen since server start, emit agent.created so the
@@ -80,7 +86,7 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
                 id: agentId,
                 issueId: issueId ?? agentId,
                 workspace: agent.workspace || undefined,
-                runtime: agent.runtime || undefined,
+                runtime: undefined,
                 model: agent.model || undefined,
                 status: toAgentStatus(agent.tmuxActive && agent.status === 'stopped' ? 'running' : agent.status),
                 startedAt: agent.startedAt || undefined,
@@ -88,11 +94,12 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
                 branch: agent.branch || undefined,
                 costSoFar: agent.costSoFar,
                 sessionId: agent.sessionId || undefined,
-                phase: toAgentPhase(agent.phase),
-                agentPhase: undefined,
+                role: toRole(agent.role) ?? 'work',
                 hasPendingQuestion: undefined,
                 pendingQuestionCount: undefined,
-                resolution: toAgentResolution(agent.resolution),
+                pendingQuestionPrompt: undefined,
+                pendingQuestionReason: undefined,
+                resolution: toAgentResolution((agent as { resolution?: unknown }).resolution),
                 resolutionCount: undefined,
               },
             },
@@ -126,7 +133,7 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
       // Determine if the agent's issue has an active specialist
       let hasActiveSpecialist = false
       if (issueId) {
-        const reviewStatus = getReviewStatus(issueId)
+        const reviewStatus = getReviewStatusSync(issueId)
         hasActiveSpecialist =
           reviewStatus?.reviewStatus === 'reviewing' ||
           reviewStatus?.testStatus === 'testing' ||
@@ -136,12 +143,13 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
       // Skip JSONL scan if file mtime is unchanged (avoids I/O on static sessions)
       const currentMtime = await getAgentJsonlMtime(agentId)
       const prevMtime = state.lastMtime.get(agentId)
-      const jsonlUnchanged = prevMtime !== undefined && currentMtime === prevMtime
+      const previousEnrichment = state.lastEnrichment.get(agentId)
+      const jsonlUnchanged = prevMtime !== undefined && currentMtime === prevMtime && previousEnrichment?.hasPendingQuestion !== true
       state.lastMtime.set(agentId, currentMtime)
 
       let enrichment: AgentEnrichment
       try {
-        // If JSONL hasn't changed, only re-check runtime state (resolution/phase)
+        // If JSONL hasn't changed, only re-check runtime state (resolution)
         // by passing a flag that skips the expensive JSONL scan.
         enrichment = await computeAgentEnrichment(agentId, startedAt, hasActiveSpecialist, jsonlUnchanged)
       } catch {
@@ -160,9 +168,11 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
         timestamp: new Date().toISOString(),
         payload: {
           agentId,
-          agentPhase: enrichment.agentPhase,
+          role: toRole(agent.role) ?? 'work',
           hasPendingQuestion: enrichment.hasPendingQuestion,
           pendingQuestionCount: enrichment.pendingQuestionCount,
+          pendingQuestionPrompt: enrichment.pendingQuestionPrompt,
+          pendingQuestionReason: enrichment.pendingQuestionReason,
           resolution: enrichment.resolution as AgentEnrichmentChangedEvent['payload']['resolution'],
           resolutionCount: enrichment.resolutionCount,
         },
@@ -173,8 +183,9 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
       } catch {
         // Non-fatal — event store may not be initialized yet at startup
       }
-    }),
-  )
+    })),
+    4,
+  ))
 
   // Clean up stale entries for agents that have stopped
   const activeIds = new Set(activeAgents.map(a => a.id))

@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * Tests for runVerificationForIssue (PAN-174, updated for PAN-336)
  */
@@ -16,6 +17,7 @@ const {
   writeFeedbackFileMock,
   messageAgentMock,
   findProjectByPathMock,
+  existsSyncMock,
 } = vi.hoisted(() => ({
   execMock: vi.fn<[string, any?], Promise<{ stdout: string; stderr: string }>>()
     .mockResolvedValue({ stdout: 'Already up to date\n', stderr: '' }),
@@ -25,6 +27,7 @@ const {
   writeFeedbackFileMock: vi.fn(),
   messageAgentMock: vi.fn(),
   findProjectByPathMock: vi.fn(),
+  existsSyncMock: vi.fn(),
 }));
 
 vi.mock('child_process', () => {
@@ -52,9 +55,15 @@ vi.mock('child_process', () => {
   return { exec, execFile };
 });
 
+vi.mock('fs', () => ({
+  existsSync: existsSyncMock,
+}));
+
 vi.mock('../../src/lib/review-status.js', () => ({
   getReviewStatus: getReviewStatusMock,
+  getReviewStatusSync: getReviewStatusMock,
   setReviewStatus: setReviewStatusMock,
+  setReviewStatusSync: setReviewStatusMock,
 }));
 
 vi.mock('../../src/lib/cloister/validation.js', () => ({
@@ -75,6 +84,20 @@ vi.mock('../../src/lib/agents.js', () => ({
 
 vi.mock('../../src/lib/projects.js', () => ({
   findProjectByPath: findProjectByPathMock,
+  findProjectByPathSync: findProjectByPathMock,
+}));
+
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal() as any;
+  return {
+    ...actual,
+    existsSync: vi.fn().mockReturnValue(true),
+  };
+});
+
+vi.mock('../../src/lib/vbrief/beads.js', () => ({
+  getVBriefACStatus: vi.fn().mockReturnValue(Effect.succeed({ allCompleted: true, totalPending: 0, totalCount: 0, items: [] })),
+  getVBriefACStatusSync: vi.fn().mockReturnValue({ allCompleted: true, totalPending: 0, totalCount: 0, items: [] }),
 }));
 
 // Import under test after mocks
@@ -110,17 +133,18 @@ describe('runVerificationForIssue', () => {
     execMock.mockReset();
     execMock.mockResolvedValue({ stdout: 'Already up to date\n', stderr: '' });
     getReviewStatusMock.mockReturnValue(null); // no existing status → 0 cycles
-    runQualityGatesMock.mockResolvedValue(makePassedResults());
-    writeFeedbackFileMock.mockResolvedValue({ success: true, relativePath: '.planning/feedback/001-verification-failed.md' });
+    runQualityGatesMock.mockReturnValue(Effect.succeed(makePassedResults()));
+    writeFeedbackFileMock.mockReturnValue(Effect.succeed({ success: true, relativePath: '.pan/feedback/001-verification-failed.md' }));
     messageAgentMock.mockResolvedValue(undefined);
     findProjectByPathMock.mockReturnValue(null); // no project config → DEFAULT_GATES
+    existsSyncMock.mockImplementation((p: string) => p.endsWith('/.git'));
   });
 
   describe('circuit breaker', () => {
     it('returns skipped and sets verificationStatus:skipped when at max cycles', async () => {
       getReviewStatusMock.mockReturnValue({ verificationCycleCount: VERIFICATION_MAX_CYCLES });
 
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('skipped');
       expect(setReviewStatusMock).toHaveBeenCalledWith(issueId, { verificationStatus: 'skipped' });
@@ -130,7 +154,7 @@ describe('runVerificationForIssue', () => {
     it('runs verification when cycles are below max', async () => {
       getReviewStatusMock.mockReturnValue({ verificationCycleCount: VERIFICATION_MAX_CYCLES - 1 });
 
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(runQualityGatesMock).toHaveBeenCalledOnce();
     });
@@ -138,7 +162,7 @@ describe('runVerificationForIssue', () => {
 
   describe('verification passes', () => {
     it('returns passed and sets verificationStatus:passed', async () => {
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('passed');
       expect(setReviewStatusMock).toHaveBeenCalledWith(
@@ -148,13 +172,13 @@ describe('runVerificationForIssue', () => {
     });
 
     it('sets verificationStatus:running while gate runs', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(setReviewStatusMock).toHaveBeenCalledWith(issueId, { verificationStatus: 'running' });
     });
 
     it('does not write feedback or message agent on pass', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(writeFeedbackFileMock).not.toHaveBeenCalled();
       expect(messageAgentMock).not.toHaveBeenCalled();
@@ -167,7 +191,7 @@ describe('runVerificationForIssue', () => {
         workspace: { default_branch: 'develop' },
       });
 
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(execMock).toHaveBeenCalledWith(
         'git fetch origin develop',
@@ -180,24 +204,64 @@ describe('runVerificationForIssue', () => {
     });
 
     it('can verify current state without syncing target branch', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test', {
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test', {
         syncTargetBranch: false,
-      });
+      }));
 
       const commands = execMock.mock.calls.map(call => call[0]);
       expect(commands).not.toContain('git fetch origin main');
       expect(commands).not.toContain('git merge origin/main --no-edit');
       expect(runQualityGatesMock).toHaveBeenCalledOnce();
     });
+
+    it('writes feedback and stops when syncing target branch fails without merge conflicts', async () => {
+      execMock
+        .mockResolvedValueOnce({ stdout: '', stderr: '' })
+        .mockRejectedValueOnce(Object.assign(new Error('fetch rejected'), {
+          stdout: '',
+          stderr: 'fatal: Not possible to fast-forward, aborting.\n',
+        }));
+
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
+
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        expect(result.failedCheck).toBe('sync-target-branch');
+        expect(result.cycleCount).toBe(1);
+      }
+      expect(setReviewStatusMock).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          reviewStatus: 'pending',
+          verificationStatus: 'failed',
+          verificationCycleCount: 1,
+        })
+      );
+      expect(writeFeedbackFileMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId,
+          workspacePath,
+          specialist: 'verification-gate',
+          outcome: 'failed',
+          summary: expect.stringContaining('Sync FAILED'),
+          markdownBody: expect.stringContaining('fatal: Not possible to fast-forward, aborting.'),
+        })
+      );
+      expect(messageAgentMock).toHaveBeenCalledWith(
+        `agent-${issueId.toLowerCase()}`,
+        expect.stringContaining('Failed check: sync-target-branch')
+      );
+      expect(runQualityGatesMock).not.toHaveBeenCalled();
+    });
   });
 
   describe('verification fails', () => {
     beforeEach(() => {
-      runQualityGatesMock.mockResolvedValue(makeFailedResults('lint'));
+      runQualityGatesMock.mockReturnValue(Effect.succeed(makeFailedResults('lint')));
     });
 
     it('returns failed with correct failedCheck and cycleCount', async () => {
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('failed');
       if (result.outcome === 'failed') {
@@ -208,7 +272,7 @@ describe('runVerificationForIssue', () => {
     });
 
     it('resets reviewStatus to pending on failure', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(setReviewStatusMock).toHaveBeenCalledWith(
         issueId,
@@ -219,7 +283,7 @@ describe('runVerificationForIssue', () => {
     it('increments verificationCycleCount correctly', async () => {
       getReviewStatusMock.mockReturnValue({ verificationCycleCount: 1 });
 
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       if (result.outcome === 'failed') {
         expect(result.cycleCount).toBe(2);
@@ -231,7 +295,7 @@ describe('runVerificationForIssue', () => {
     });
 
     it('writes feedback file and messages agent on failure', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(writeFeedbackFileMock).toHaveBeenCalledWith(
         expect.objectContaining({ issueId, workspacePath, specialist: 'verification-gate' })
@@ -243,7 +307,7 @@ describe('runVerificationForIssue', () => {
     });
 
     it('uses workspacePath directly for writeFeedbackFile', async () => {
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(writeFeedbackFileMock).toHaveBeenCalledWith(
         expect.objectContaining({ workspacePath })
@@ -252,12 +316,12 @@ describe('runVerificationForIssue', () => {
 
     it('treats first failed required gate as failedCheck', async () => {
       // Multiple gates: optional failure then required failure
-      runQualityGatesMock.mockResolvedValue([
+      runQualityGatesMock.mockReturnValue(Effect.succeed([
         { name: 'format', passed: false, required: false, output: 'style issues', durationMs: 50 },
         { name: 'typecheck', passed: false, required: true, output: 'type error', durationMs: 200 },
-      ]);
+      ]));
 
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('failed');
       if (result.outcome === 'failed') {
@@ -266,9 +330,9 @@ describe('runVerificationForIssue', () => {
     });
 
     it('continues and returns failed even if feedback writing throws', async () => {
-      writeFeedbackFileMock.mockRejectedValue(new Error('disk full'));
+      writeFeedbackFileMock.mockReturnValue(Effect.fail(new Error('disk full')));
 
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('failed');
     });
@@ -276,9 +340,9 @@ describe('runVerificationForIssue', () => {
 
   describe('infrastructure error', () => {
     it('returns error outcome and sets verificationStatus:failed', async () => {
-      runQualityGatesMock.mockRejectedValue(new Error('exec failed'));
+      runQualityGatesMock.mockReturnValue(Effect.fail(new Error('exec failed')));
 
-      const result = await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      const result = await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(result.outcome).toBe('error');
       if (result.outcome === 'error') {
@@ -291,11 +355,11 @@ describe('runVerificationForIssue', () => {
     });
 
     it('does not throw — returns error outcome instead', async () => {
-      runQualityGatesMock.mockRejectedValue(new Error('unexpected'));
+      runQualityGatesMock.mockReturnValue(Effect.fail(new Error('unexpected')));
 
-      await expect(
+      await expect(Effect.runPromise(
         runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test')
-      ).resolves.toMatchObject({ outcome: 'error' });
+      )).resolves.toMatchObject({ outcome: 'error' });
     });
   });
 
@@ -303,7 +367,7 @@ describe('runVerificationForIssue', () => {
     it('passes isRemote and vmName to runQualityGates', async () => {
       const remoteInfo = { isRemote: true, vmName: 'my-vm' };
 
-      await runVerificationForIssue(issueId, workspacePath, remoteInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, remoteInfo, 'test'));
 
       expect(runQualityGatesMock).toHaveBeenCalledWith(
         expect.any(Object), // gates (DEFAULT_GATES since findProjectByPath returns null)
@@ -321,7 +385,7 @@ describe('runVerificationForIssue', () => {
       };
       findProjectByPathMock.mockReturnValue({ quality_gates: projectGates });
 
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(runQualityGatesMock).toHaveBeenCalledWith(
         projectGates,
@@ -334,7 +398,7 @@ describe('runVerificationForIssue', () => {
     it('falls back to DEFAULT_GATES when project has no quality_gates', async () => {
       findProjectByPathMock.mockReturnValue({ name: 'my-project', path: '/some/path' }); // no quality_gates
 
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(runQualityGatesMock).toHaveBeenCalledWith(
         expect.objectContaining({ typecheck: expect.any(Object), lint: expect.any(Object) }),
@@ -347,7 +411,7 @@ describe('runVerificationForIssue', () => {
     it('falls back to DEFAULT_GATES when no project found', async () => {
       findProjectByPathMock.mockReturnValue(null);
 
-      await runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test');
+      await Effect.runPromise(runVerificationForIssue(issueId, workspacePath, workspaceInfo, 'test'));
 
       expect(runQualityGatesMock).toHaveBeenCalledWith(
         expect.objectContaining({ typecheck: expect.any(Object) }),

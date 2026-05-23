@@ -51,13 +51,41 @@ describe('stuck state schema (PAN-653)', () => {
     expect(stuckCol?.dflt_value).toBe('0');
   });
 
+  it('workspace discovered-session schema initializer creates all PAN-457 tables', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const { initWorkspaceDiscoveredSessionsSchema } = await import('../schema.js');
+    const db = new Database(join(TEST_HOME, 'workspace.db'));
+    try {
+      initWorkspaceDiscoveredSessionsSchema(db);
+      const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual')`).all() as Array<{ name: string }>;
+      const names = tables.map((t) => t.name);
+      expect(names).toContain('discovered_sessions');
+      expect(names).toContain('sessions_fts');
+      expect(names).toContain('session_embeddings');
+      const indexes = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as Array<{ name: string }>;
+      expect(indexes.map((index) => index.name)).toContain('idx_discovered_session_id');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('dashboard startup database opener wires the workspace discovered-session schema', async () => {
+    const { openEventDb } = await import('../../../dashboard/server/event-store.js');
+    const db = await openEventDb();
+    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual')`).all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    expect(names).toContain('discovered_sessions');
+    expect(names).toContain('sessions_fts');
+    expect(names).toContain('session_embeddings');
+  });
+
   it('markWorkspaceStuck persists across a read', async () => {
     const { markWorkspaceStuck } = await import('../../review-status.js');
-    const { getReviewStatusFromDb } = await import('../review-status-db.js');
+    const { getReviewStatusFromDbSync } = await import('../review-status-db.js');
 
     markWorkspaceStuck('PAN-653', 'main_diverged', { localSha: 'abc123', remoteSha: 'def456' });
 
-    const row = getReviewStatusFromDb('PAN-653');
+    const row = getReviewStatusFromDbSync('PAN-653');
     expect(row).not.toBeNull();
     expect(row?.stuck).toBe(true);
     expect(row?.stuckReason).toBe('main_diverged');
@@ -67,13 +95,13 @@ describe('stuck state schema (PAN-653)', () => {
 
   it('clearWorkspaceStuck removes the stuck flag', async () => {
     const { markWorkspaceStuck, clearWorkspaceStuck } = await import('../../review-status.js');
-    const { getReviewStatusFromDb } = await import('../review-status-db.js');
+    const { getReviewStatusFromDbSync } = await import('../review-status-db.js');
 
     markWorkspaceStuck('PAN-100', 'main_diverged');
-    expect(getReviewStatusFromDb('PAN-100')?.stuck).toBe(true);
+    expect(getReviewStatusFromDbSync('PAN-100')?.stuck).toBe(true);
 
     clearWorkspaceStuck('PAN-100');
-    const row = getReviewStatusFromDb('PAN-100');
+    const row = getReviewStatusFromDbSync('PAN-100');
     expect(row?.stuck).toBeFalsy();
     expect(row?.stuckReason).toBeUndefined();
     expect(row?.stuckAt).toBeUndefined();
@@ -100,13 +128,13 @@ describe('stuck state schema (PAN-653)', () => {
 
   it('stuck state survives upsert without overwriting other fields', async () => {
     const { markWorkspaceStuck } = await import('../../review-status.js');
-    const { upsertReviewStatus, getReviewStatusFromDb } = await import('../review-status-db.js');
+    const { upsertReviewStatusSync, getReviewStatusFromDbSync } = await import('../review-status-db.js');
 
     // Mark stuck first
     markWorkspaceStuck('PAN-200', 'main_diverged', { localSha: 'aaa', remoteSha: 'bbb' });
 
     // Normal upsert via setReviewStatus (e.g. review status update) that doesn't include stuck field
-    upsertReviewStatus({
+    upsertReviewStatusSync({
       issueId: 'PAN-200',
       reviewStatus: 'passed',
       testStatus: 'passed',
@@ -118,7 +146,7 @@ describe('stuck state schema (PAN-653)', () => {
     // (it will write stuck=false since the ReviewStatus object doesn't have it)
     // This test verifies the DB round-trip integrity, not that stuck survives arbitrary upserts
     // (for that, callers must use markWorkspaceStuck separately)
-    const row = getReviewStatusFromDb('PAN-200');
+    const row = getReviewStatusFromDbSync('PAN-200');
     expect(row).not.toBeNull();
     expect(row?.reviewStatus).toBe('passed');
   });

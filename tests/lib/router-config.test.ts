@@ -110,12 +110,11 @@ describe('router-config', () => {
       expect(openaiProvider?.apiKey).toBe('sk-test-key');
       expect(openaiProvider?.models).toEqual([
         'gpt-5.5',
-        'gpt-5.5-mini',
-        'gpt-5.5-nano',
         'gpt-5.4',
         'gpt-5.4-mini',
-        'gpt-5.4-nano',
-        'o3',
+        'gpt-5.3-codex',
+        'gpt-5.3-codex-spark',
+        'gpt-5.2',
       ]);
     });
 
@@ -152,7 +151,7 @@ describe('router-config', () => {
       expect(googleProvider?.apiKey).toBe('AIza-test-key');
       expect(googleProvider?.models).toEqual([
         'gemini-3.1-pro-preview',
-        'gemini-3-flash',
+        'gemini-3-flash-preview',
         'gemini-3.1-flash-lite-preview',
       ]);
     });
@@ -281,9 +280,9 @@ describe('router-config', () => {
 
       const config = generateRouterConfig(settings);
 
-      expect(config.router['specialist-review-agent'].model).toBe('claude-sonnet-4-5');
-      expect(config.router['specialist-test-agent'].model).toBe('gpt-4o-mini');
-      expect(config.router['specialist-merge-agent'].model).toBe('gemini-3-flash-preview');
+      expect(config.router['role:review'].model).toBe('claude-sonnet-4-5');
+      expect(config.router['role:test'].model).toBe('gpt-4o-mini');
+      expect(config.router['role:ship'].model).toBe('gemini-3-flash-preview');
     });
 
     it('should map complexity levels to configured models', async () => {
@@ -301,7 +300,7 @@ describe('router-config', () => {
             simple: 'claude-haiku-4-5',
             medium: 'gpt-4o',
             complex: 'claude-sonnet-4-5',
-            expert: 'gpt-5.2-codex',
+            expert: 'gpt-5.3-codex',
           },
         },
         api_keys: {
@@ -311,11 +310,8 @@ describe('router-config', () => {
 
       const config = generateRouterConfig(settings);
 
-      expect(config.router['complexity-trivial'].model).toBe('gpt-4o-mini');
-      expect(config.router['complexity-simple'].model).toBe('claude-haiku-4-5');
-      expect(config.router['complexity-medium'].model).toBe('gpt-4o');
-      expect(config.router['complexity-complex'].model).toBe('claude-sonnet-4-5');
-      expect(config.router['complexity-expert'].model).toBe('gpt-5.2-codex');
+      expect(config.router['role:work'].model).toBe('gpt-4o');
+      expect(config.router['role:plan'].model).toBe('claude-sonnet-4-5');
     });
 
     it('should create all router rules', async () => {
@@ -341,22 +337,19 @@ describe('router-config', () => {
 
       const config = generateRouterConfig(settings);
 
-      // Should have 3 specialists + 5 complexity = 8 rules (planning removed)
-      expect(Object.keys(config.router)).toHaveLength(8);
-      expect(config.router).toHaveProperty('specialist-review-agent');
-      expect(config.router).toHaveProperty('specialist-test-agent');
-      expect(config.router).toHaveProperty('specialist-merge-agent');
-      expect(config.router).toHaveProperty('complexity-trivial');
-      expect(config.router).toHaveProperty('complexity-simple');
-      expect(config.router).toHaveProperty('complexity-medium');
-      expect(config.router).toHaveProperty('complexity-complex');
-      expect(config.router).toHaveProperty('complexity-expert');
+      // Legacy SettingsConfig maps to the five role router keys.
+      expect(Object.keys(config.router)).toHaveLength(5);
+      expect(config.router).toHaveProperty('role:plan');
+      expect(config.router).toHaveProperty('role:work');
+      expect(config.router).toHaveProperty('role:review');
+      expect(config.router).toHaveProperty('role:test');
+      expect(config.router).toHaveProperty('role:ship');
     });
   });
 
   describe('writeRouterConfig', () => {
     it('should write config to ~/.claude-code-router/config.json', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [
@@ -372,7 +365,7 @@ describe('router-config', () => {
         },
       };
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       const configPath = getRouterConfigPath();
       expect(existsSync(configPath)).toBe(true);
@@ -384,7 +377,7 @@ describe('router-config', () => {
     });
 
     it('should create directory if it does not exist', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [],
@@ -396,7 +389,7 @@ describe('router-config', () => {
       const configDir = join(tempDir, '.claude-code-router');
       expect(existsSync(configDir)).toBe(false);
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       // Directory should now exist
       expect(existsSync(configDir)).toBe(true);
@@ -404,7 +397,7 @@ describe('router-config', () => {
     });
 
     it('should write pretty-formatted JSON', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [
@@ -420,7 +413,7 @@ describe('router-config', () => {
         },
       };
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       const configPath = getRouterConfigPath();
       const content = readFileSync(configPath, 'utf8');
@@ -431,7 +424,7 @@ describe('router-config', () => {
     });
 
     it('should overwrite existing config', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config1 = {
         providers: [],
@@ -443,8 +436,8 @@ describe('router-config', () => {
         router: { test: { model: 'model2' } },
       };
 
-      writeRouterConfig(config1);
-      writeRouterConfig(config2);
+      writeRouterConfigSync(config1);
+      writeRouterConfigSync(config2);
 
       const configPath = getRouterConfigPath();
       const content = readFileSync(configPath, 'utf8');

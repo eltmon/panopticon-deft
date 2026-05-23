@@ -1,19 +1,22 @@
 import chalk from 'chalk';
+import { Effect } from 'effect';
 import { homedir } from 'os';
 import { join } from 'path';
 import { readFileSync, existsSync } from 'fs';
-import { extractPrefix } from '../../lib/issue-id.js';
+import { extractPrefixSync } from '../../lib/issue-id.js';
 import { getIssuePrefix } from '../../lib/projects.js';
 
 interface WipeOptions {
   workspace?: boolean;
   yes?: boolean;
+  force?: boolean;
 }
 
 export async function wipeCommand(issueId: string, options: WipeOptions): Promise<void> {
   console.log(chalk.yellow(`\n🔥 Reset issue to Todo for ${issueId}\n`));
+  console.log(chalk.yellow('This touches workspace files, running processes, git branches, review state, beads, and tracker status.'));
 
-  if (!options.yes) {
+  if (!options.yes && !options.force) {
     const readline = await import('readline');
     const rl = readline.createInterface({
       input: process.stdin,
@@ -33,7 +36,7 @@ export async function wipeCommand(issueId: string, options: WipeOptions): Promis
     }
   }
 
-  const prefix = extractPrefix(issueId);
+  const prefix = extractPrefixSync(issueId);
   if (!prefix) {
     console.log(chalk.red('  ✗ Could not extract prefix from issue ID'));
     return;
@@ -81,7 +84,7 @@ export async function wipeCommand(issueId: string, options: WipeOptions): Promis
   }
 
   const { resetToTodo } = await import('../../lib/lifecycle/index.js');
-  const result = await resetToTodo({
+  const result = await Effect.runPromise(resetToTodo({
     issueId,
     projectPath,
     projectName,
@@ -90,7 +93,7 @@ export async function wipeCommand(issueId: string, options: WipeOptions): Promis
     deleteWorkspace: options.workspace !== false,
     deleteBranches: options.workspace !== false,
     resetIssue: true,
-  });
+  }));
 
   for (const step of result.steps) {
     if (step.details) {

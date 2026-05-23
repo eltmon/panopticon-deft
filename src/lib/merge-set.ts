@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import {
   deleteMergeSet as dbDelete,
   getAllMergeSetsFromDb,
@@ -5,8 +6,8 @@ import {
   upsertMergeSet as dbUpsert,
 } from './database/merge-set-db.js';
 import type { ForgeType } from './forge.js';
-import { resolveProjectFromIssue } from './projects.js';
-import { resolveProjectReposFromResolvedIssue } from './project-repos.js';
+import { resolveProjectFromIssueSync } from './projects.js';
+import { resolveProjectReposFromResolvedIssueSync } from './project-repos.js';
 
 export type MergeSetStatus = 'draft' | 'reviewing' | 'ready' | 'merging' | 'merged' | 'failed';
 export type MergeSetGateStatus = 'pending' | 'running' | 'passed' | 'failed' | 'blocked' | 'skipped';
@@ -41,27 +42,27 @@ export interface MergeSet {
   repos: MergeSetRepoState[];
 }
 
-export function upsertMergeSet(mergeSet: MergeSet): void {
+export function upsertMergeSetSync(mergeSet: MergeSet): void {
   dbUpsert(mergeSet);
 }
 
-export function getMergeSet(issueId: string): MergeSet | null {
+export function getMergeSetSync(issueId: string): MergeSet | null {
   return getMergeSetFromDb(issueId);
 }
 
-export function getAllMergeSets(projectKey?: string): MergeSet[] {
+export function getAllMergeSetsSync(projectKey?: string): MergeSet[] {
   return getAllMergeSetsFromDb(projectKey);
 }
 
-export function deleteMergeSet(issueId: string): void {
+export function deleteMergeSetSync(issueId: string): void {
   dbDelete(issueId);
 }
 
-export function buildMergeSetForIssue(issueId: string, labels: string[] = []): MergeSet | null {
-  const resolved = resolveProjectFromIssue(issueId, labels);
+export function buildMergeSetForIssueSync(issueId: string, labels: string[] = []): MergeSet | null {
+  const resolved = resolveProjectFromIssueSync(issueId, labels);
   if (!resolved) return null;
 
-  const repos = resolveProjectReposFromResolvedIssue(issueId, resolved);
+  const repos = resolveProjectReposFromResolvedIssueSync(issueId, resolved);
   if (!repos) return null;
 
   const now = new Date().toISOString();
@@ -90,18 +91,18 @@ export function buildMergeSetForIssue(issueId: string, labels: string[] = []): M
   };
 }
 
-export function ensureMergeSetForIssue(issueId: string, labels: string[] = []): MergeSet | null {
-  const existing = getMergeSet(issueId);
+export function ensureMergeSetForIssueSync(issueId: string, labels: string[] = []): MergeSet | null {
+  const existing = getMergeSetSync(issueId);
   if (existing) return existing;
 
-  const built = buildMergeSetForIssue(issueId, labels);
+  const built = buildMergeSetForIssueSync(issueId, labels);
   if (built) {
-    upsertMergeSet(built);
+    upsertMergeSetSync(built);
   }
   return built;
 }
 
-export function withRepoArtifactUrl(
+export function withRepoArtifactUrlSync(
   mergeSet: MergeSet,
   repoKey: string,
   artifactUrl: string,
@@ -118,7 +119,7 @@ export function withRepoArtifactUrl(
   };
 }
 
-export function withRepoState(
+export function withRepoStateSync(
   mergeSet: MergeSet,
   repoKey: string,
   patch: Partial<MergeSetRepoState>
@@ -133,3 +134,70 @@ export function withRepoState(
     )),
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// All operations delegate to the SQLite-backed merge-set DB. The underlying
+// merge-set-db is sync (better-sqlite3); these wrappers preserve the contract
+// and route exceptions through Effect.try so callers in Effect graphs get a
+// typed error channel instead of an unchecked throw.
+
+/** Insert-or-update a merge-set in the DB. */
+export const upsertMergeSet = (mergeSet: MergeSet): Effect.Effect<void, Error> =>
+  Effect.try({
+    try: () => upsertMergeSetSync(mergeSet),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/** Fetch a merge-set by issue id. */
+export const getMergeSet = (issueId: string): Effect.Effect<MergeSet | null, Error> =>
+  Effect.try({
+    try: () => getMergeSetSync(issueId),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/** List all merge-sets (optionally filtered by project). */
+export const getAllMergeSets = (projectKey?: string): Effect.Effect<MergeSet[], Error> =>
+  Effect.try({
+    try: () => getAllMergeSetsSync(projectKey),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/** Delete a merge-set by issue id. */
+export const deleteMergeSet = (issueId: string): Effect.Effect<void, Error> =>
+  Effect.try({
+    try: () => deleteMergeSetSync(issueId),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/** Build a new merge-set from an issue id + labels (no DB write). Pure. */
+export const buildMergeSetForIssue = (
+  issueId: string,
+  labels: string[] = [],
+): Effect.Effect<MergeSet | null> =>
+  Effect.sync(() => buildMergeSetForIssueSync(issueId, labels));
+
+/** Build-or-fetch a merge-set; persists when newly built. */
+export const ensureMergeSetForIssue = (
+  issueId: string,
+  labels: string[] = [],
+): Effect.Effect<MergeSet | null, Error> =>
+  Effect.try({
+    try: () => ensureMergeSetForIssueSync(issueId, labels),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/** Immutably attach an artifact URL/id to a repo entry. Pure. */
+export const withRepoArtifactUrl = (
+  mergeSet: MergeSet,
+  repoKey: string,
+  artifactUrl: string,
+  artifactId?: string,
+): Effect.Effect<MergeSet> =>
+  Effect.sync(() => withRepoArtifactUrlSync(mergeSet, repoKey, artifactUrl, artifactId));
+
+/** Immutably patch a repo state entry. Pure. */
+export const withRepoState = (
+  mergeSet: MergeSet,
+  repoKey: string,
+  patch: Partial<MergeSetRepoState>,
+): Effect.Effect<MergeSet> => Effect.sync(() => withRepoStateSync(mergeSet, repoKey, patch));

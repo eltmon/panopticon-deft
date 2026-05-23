@@ -1,10 +1,52 @@
+import { Effect } from 'effect';
 import chalk from 'chalk';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, chmodSync } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  copyFileSync,
+  chmodSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+} from 'fs';
 import { join, dirname } from 'path';
-import { execSync } from 'child_process';
-import { homedir } from 'os';
+import { execFileSync, execSync } from 'child_process';
+import { arch as osArch, homedir, platform as osPlatform, tmpdir } from 'os';
+import { createHash } from 'crypto';
+import { readSettingsOrAbortSync, backupSettingsSync, pruneBackupsSync, atomicWriteJsonSync, diffJson } from './safe-settings.js';
+import { SYNC_SOURCES } from '../../../lib/paths.js';
 
-interface HookConfig {
+const RTK_VERSION = '0.41.0';
+const RTK_RELEASE_TAG = `v${RTK_VERSION}`;
+const RTK_RELEASE_BASE_URL = `https://github.com/rtk-ai/rtk/releases/download/${RTK_RELEASE_TAG}`;
+
+interface RtkReleaseAsset {
+  assetName: string;
+  sha256: string;
+}
+
+const RTK_ASSETS: Record<string, RtkReleaseAsset> = {
+  'linux-x64': {
+    assetName: 'rtk-x86_64-unknown-linux-musl.tar.gz',
+    sha256: '90ae10f5c76de9bacaec5eeeefb6012f74dd47f4e280ec614295555b64da6b57',
+  },
+  'linux-arm64': {
+    assetName: 'rtk-aarch64-unknown-linux-gnu.tar.gz',
+    sha256: '68d6fedfd76f16437eb79cb659169ef8bc3994124486cc71d9479a1b241b7812',
+  },
+  'darwin-arm64': {
+    assetName: 'rtk-aarch64-apple-darwin.tar.gz',
+    sha256: '8b9751f927da4fb433be23f24f205bf1c22f9dd6949790c0980d2cc91b14658c',
+  },
+  'darwin-x64': {
+    assetName: 'rtk-x86_64-apple-darwin.tar.gz',
+    sha256: 'b2729d9983b38af77824a5c7a3c23de415533be9fb022a5e473904ecc9620db9',
+  },
+};
+
+export interface HookConfig {
   matcher: string;  // Regex pattern, e.g. ".*" for all tools or "Bash" for specific
   hooks: Array<{
     type: string;
@@ -18,7 +60,7 @@ interface McpServer {
   env?: Record<string, string>;
 }
 
-interface ClaudeSettings {
+export interface ClaudeSettings {
   hooks?: {
     PreToolUse?: HookConfig[];
     PostToolUse?: HookConfig[];
@@ -27,6 +69,8 @@ interface ClaudeSettings {
     Notification?: HookConfig[];
     PreCompact?: HookConfig[];
     PostCompact?: HookConfig[];
+    UserPromptSubmit?: HookConfig[];
+    PermissionRequest?: HookConfig[];
   };
   mcpServers?: Record<string, McpServer>;
   [key: string]: any;
@@ -90,6 +134,80 @@ function installJq(): boolean {
   }
 }
 
+function getRtkReleaseAsset(): RtkReleaseAsset | null {
+  const key = `${osPlatform()}-${osArch()}`;
+  return RTK_ASSETS[key] ?? null;
+}
+
+function readInstalledRtkVersion(rtkPath: string): string | null {
+  try {
+    return execFileSync(rtkPath, ['--version'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+async function installRtk(binDir: string): Promise<boolean> {
+  const asset = getRtkReleaseAsset();
+  if (!asset) {
+    console.log(
+      chalk.yellow(`⚠ RTK prebuilt binary unavailable for ${osPlatform()}-${osArch()} — skipping`),
+    );
+    return false;
+  }
+
+  const rtkPath = join(binDir, 'rtk');
+  const expectedVersion = `rtk ${RTK_VERSION}`;
+  if (existsSync(rtkPath) && readInstalledRtkVersion(rtkPath) === expectedVersion) {
+    console.log(chalk.cyan(`✓ RTK ${RTK_VERSION} already installed`));
+    return true;
+  }
+
+  const tempDir = mkdtempSync(join(tmpdir(), 'pan-rtk-'));
+  try {
+    const archiveUrl = `${RTK_RELEASE_BASE_URL}/${asset.assetName}`;
+    const response = await fetch(archiveUrl);
+    if (!response.ok) {
+      throw new Error(`download failed: ${response.status} ${response.statusText}`);
+    }
+
+    const archiveBytes = Buffer.from(await response.arrayBuffer());
+    const actualSha = createHash('sha256').update(archiveBytes).digest('hex');
+    if (actualSha !== asset.sha256) {
+      throw new Error(`checksum mismatch for ${asset.assetName}`);
+    }
+
+    const archivePath = join(tempDir, asset.assetName);
+    writeFileSync(archivePath, archiveBytes);
+    execFileSync('tar', ['-xzf', archivePath, '-C', tempDir], { stdio: 'pipe' });
+
+    const extractedRtk = join(tempDir, 'rtk');
+    if (!existsSync(extractedRtk)) {
+      throw new Error(`archive did not contain rtk binary`);
+    }
+
+    chmodSync(extractedRtk, 0o755);
+    renameSync(extractedRtk, rtkPath);
+    const installedVersion = readInstalledRtkVersion(rtkPath);
+    if (installedVersion !== expectedVersion) {
+      throw new Error(`rtk --version returned ${installedVersion ?? 'no output'}`);
+    }
+
+    console.log(chalk.green(`✓ Installed RTK ${RTK_VERSION} to ~/.panopticon/bin/rtk`));
+    return true;
+  } catch (err: unknown) {
+    console.log(
+      chalk.yellow(`⚠ RTK install failed: ${err instanceof Error ? err.message : String(err)} (non-fatal)`),
+    );
+    return false;
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 /**
  * Per-hook-type detection of whether a Panopticon hook is already registered.
  * PAN-800: rewritten from an all-or-nothing short-circuit to a delta-install
@@ -111,11 +229,44 @@ function isHookConfigured(
   );
 }
 
+export function addPanopticonHookIfMissing(
+  settings: ClaudeSettings,
+  hookType: keyof NonNullable<ClaudeSettings['hooks']>,
+  binDir: string,
+  scriptName: string,
+  matcher: string = '.*',
+): boolean {
+  if (!settings.hooks) {
+    settings.hooks = {};
+  }
+  if (isHookConfigured(settings, hookType, binDir, scriptName)) return false;
+  const list = (settings.hooks[hookType] ??= []);
+  list.push({
+    matcher,
+    hooks: [{ type: 'command', command: join(binDir, scriptName) }],
+  });
+  return true;
+}
+
+
+export interface SetupHooksOptions {
+  /**
+   * Preview the proposed settings.json diff and exit without writing.
+   * Hook scripts and directories are still installed; only the
+   * settings.json mutation is skipped. (PAN-1137)
+   */
+  dryRun?: boolean;
+}
+
 /**
  * Setup Claude Code hooks for Panopticon heartbeat
  */
-export async function setupHooksCommand(): Promise<void> {
+export async function setupHooksCommand(opts: SetupHooksOptions = {}): Promise<void> {
+  const dryRun = opts.dryRun === true;
   console.log(chalk.bold('Setting up Panopticon heartbeat hooks\n'));
+  if (dryRun) {
+    console.log(chalk.cyan('— dry run: no settings.json write will be performed —\n'));
+  }
 
   // 1. Check for jq dependency
   if (!checkJqInstalled()) {
@@ -158,33 +309,25 @@ export async function setupHooksCommand(): Promise<void> {
     'notification-hook',      // PAN-800: Notification — emits agent.waiting_started
     'specialist-stop-hook',
     'work-agent-stop-hook',   // PAN-800: chained from stop-hook; emits agent.resolution_changed
-    'session-start-hook',     // PAN-800: SessionStart — emits agent.activity_changed(idle) + agent.model_set
+    'session-start-hook',          // PAN-800: SessionStart — emits agent.activity_changed(idle) + agent.model_set
+    'user-prompt-submit-hook',     // UserPromptSubmit — clears waiting state, records message_received, restarts spinner
+    'pre-compact-hook',            // PreCompact — emits activity=working/compact so dashboard shows compacting indicator
+    'post-compact-hook',           // PostCompact — emits activity=idle to clear compacting state
     'record-cost-event.js',
     'tldr-read-enforcer',
     'tldr-post-edit',
+    'rtk-bash-filter',
+    'permission-event-hook',   // PermissionRequest — emits conversation.permission_changed(waiting)
   ];
-  const { fileURLToPath } = await import('url');
-  const { dirname } = await import('path');
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-
   for (const scriptName of hookScripts) {
-    // Find the script in the Panopticon installation
-    const devSource = join(process.cwd(), 'scripts', scriptName);
-    const installedSource = join(__dirname, '..', '..', '..', 'scripts', scriptName);
+    // Hook scripts ship under sync-sources/hooks/ (PAN-1201). SYNC_SOURCES.hooks
+    // resolves correctly from both a checkout and an installed package.
+    const sourcePath = join(SYNC_SOURCES.hooks, scriptName);
     const scriptDest = join(binDir, scriptName);
 
-    // Check if script exists (try dev mode first, then installed mode)
-    let sourcePath: string | null = null;
-    if (existsSync(devSource)) {
-      sourcePath = devSource;
-    } else if (existsSync(installedSource)) {
-      sourcePath = installedSource;
-    }
-
-    if (!sourcePath) {
+    if (!existsSync(sourcePath)) {
       console.log(chalk.red(`✗ Could not find ${scriptName} script`));
-      console.log(chalk.dim(`  Checked: ${devSource}`));
-      console.log(chalk.dim(`  Checked: ${installedSource}`));
+      console.log(chalk.dim(`  Checked: ${sourcePath}`));
       process.exit(1);
     }
 
@@ -198,17 +341,17 @@ export async function setupHooksCommand(): Promise<void> {
   const claudeDir = join(homedir(), '.claude');
   const settingsPath = join(claudeDir, 'settings.json');
 
-  let settings: ClaudeSettings = {};
+  // PAN-1137: refuse to proceed on parse failure. Previous behavior reset
+  // settings to `{}` on JSON.parse error and wrote it back, erasing every
+  // user customization (statusLine, theme, mcpServers, etc.).
+  const settingsBefore: ClaudeSettings = readSettingsOrAbortSync(settingsPath);
+  // Deep clone the pre-mutation snapshot for the dry-run diff. Cheap —
+  // settings.json is small.
+  const beforeSnapshot: ClaudeSettings = JSON.parse(JSON.stringify(settingsBefore));
+  let settings: ClaudeSettings = settingsBefore;
 
   if (existsSync(settingsPath)) {
-    try {
-      const settingsContent = readFileSync(settingsPath, 'utf-8');
-      settings = JSON.parse(settingsContent);
-      console.log(chalk.green('✓ Read existing Claude Code settings'));
-    } catch (error) {
-      console.log(chalk.yellow('⚠ Could not parse settings.json, creating new file'));
-      settings = {};
-    }
+    console.log(chalk.green('✓ Read existing Claude Code settings'));
   } else {
     console.log(chalk.dim('No existing settings.json found, creating new file'));
     if (!existsSync(claudeDir)) {
@@ -267,24 +410,25 @@ export async function setupHooksCommand(): Promise<void> {
     scriptName: string,
     matcher: string = '.*',
   ): void => {
-    if (isHookConfigured(settings, hookType, binDir, scriptName)) return;
-    const list = (settings.hooks![hookType] ??= []);
-    list.push({
-      matcher,
-      hooks: [{ type: 'command', command: join(binDir, scriptName) }],
-    });
-    added.push(`${hookType}:${scriptName}`);
+    if (addPanopticonHookIfMissing(settings, hookType, binDir, scriptName, matcher)) {
+      added.push(`${hookType}:${scriptName}`);
+    }
   };
 
-  // Core runtime hooks.
+  // PAN-1402: Tool-event hooks briefly lived in per-agent frontmatter during
+  // PAN-982, but Claude Code did not honor them when Panopticon invoked agents
+  // with path-form `--agent roles/<role>.md`, so these registrations are global again.
   addHookIfMissing('PreToolUse', 'pre-tool-hook');
   addHookIfMissing('PostToolUse', 'heartbeat-hook');
+  addHookIfMissing('PostToolUse', 'permission-event-hook');
   addHookIfMissing('Stop', 'stop-hook');
-  // PAN-800: SessionStart + Notification hooks.
+  addHookIfMissing('Stop', 'permission-event-hook');
   addHookIfMissing('SessionStart', 'session-start-hook');
   addHookIfMissing('Notification', 'notification-hook');
-
-  // TLDR helpers (optional — only when python3 is available).
+  addHookIfMissing('UserPromptSubmit', 'user-prompt-submit-hook');
+  addHookIfMissing('PreCompact', 'pre-compact-hook');
+  addHookIfMissing('PostCompact', 'post-compact-hook');
+  addHookIfMissing('PermissionRequest', 'permission-event-hook');
   if (python3Available) {
     addHookIfMissing('PreToolUse', 'tldr-read-enforcer', 'Read');
     addHookIfMissing('PostToolUse', 'tldr-post-edit', 'Edit|Write');
@@ -300,13 +444,16 @@ export async function setupHooksCommand(): Promise<void> {
   // 8. Install caveman hook files and compress scripts to ~/.panopticon/hooks/caveman/
   try {
     const { setupCavemanHooks, setupCavemanCompressScripts } = await import('../../../lib/caveman/setup.js');
-    const cavemanOk = setupCavemanHooks();
+    const { Effect } = await import('effect');
+    const cavemanOk = await Effect.runPromise(
+      setupCavemanHooks().pipe(Effect.match({ onFailure: () => false, onSuccess: () => true })),
+    );
     if (cavemanOk) {
       console.log(chalk.green('✓ Installed caveman hook files to ~/.panopticon/hooks/caveman/'));
     } else {
       console.log(chalk.yellow('⚠ Caveman hook files not found — skipping (non-fatal)'));
     }
-    const compressOk = setupCavemanCompressScripts();
+    const compressOk = await Effect.runPromise(setupCavemanCompressScripts());
     if (compressOk) {
       console.log(chalk.green('✓ Installed caveman-compress scripts to ~/.panopticon/hooks/caveman-compress/'));
     }
@@ -314,22 +461,40 @@ export async function setupHooksCommand(): Promise<void> {
     console.log(chalk.yellow(`⚠ Caveman hook install failed: ${err instanceof Error ? err.message : String(err)} (non-fatal)`));
   }
 
-  // 9. Write updated settings
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  console.log(chalk.green('✓ Updated Claude Code settings.json'));
+  await installRtk(binDir);
+
+  // 9. Write updated settings — PAN-1137: backup + atomic write + dry-run
+  if (dryRun) {
+    console.log(chalk.cyan('\nProposed settings.json diff:'));
+    console.log(diffJson(beforeSnapshot, settings));
+    console.log(chalk.cyan('\nDry run complete — no file changes written.'));
+  } else {
+    const backupPath = backupSettingsSync(settingsPath);
+    if (backupPath) {
+      console.log(chalk.dim(`✓ Backed up settings.json → ${backupPath}`));
+    }
+    atomicWriteJsonSync(settingsPath, settings);
+    pruneBackupsSync(settingsPath);
+    console.log(chalk.green('✓ Updated Claude Code settings.json'));
+  }
 
   // 10. Success message
   console.log(chalk.green.bold('\n✓ Setup complete!\n'));
   console.log(chalk.dim('Claude Code hooks are now configured:'));
-  console.log(chalk.dim('  • PreToolUse  - Sets agent state to "active"'));
-  console.log(chalk.dim('  • PostToolUse - Logs activity to activity.jsonl'));
-  console.log(chalk.dim('  • Stop        - Sets agent state to "idle"'));
+  console.log(chalk.dim('  • PreToolUse        - Records tool usage before tools run'));
+  console.log(chalk.dim('  • PostToolUse       - Emits heartbeats and tool/permission events'));
+  console.log(chalk.dim('  • Stop              - Records session stop and permission lifecycle events'));
+  console.log(chalk.dim('  • SessionStart      - Bootstraps agent state, emits model_set'));
+  console.log(chalk.dim('  • UserPromptSubmit  - Clears waiting state, restarts spinner'));
+  console.log(chalk.dim('  • PreCompact/Post   - Tracks compaction lifecycle'));
+  console.log(chalk.dim('  • Notification      - Emits agent.waiting_started events'));
+  console.log(chalk.dim('  • PermissionRequest - Surfaces permission prompts to dashboard'));
   if (python3Available) {
-    console.log(chalk.dim('  • TLDR Read   - Intercepts large file reads → TLDR summaries'));
-    console.log(chalk.dim('  • TLDR Edit   - Tracks dirty files → auto re-warm'));
-    console.log(chalk.dim('  • TLDR MCP    - Token-efficient code analysis'));
+    console.log(chalk.dim('  • TLDR hooks        - Enforce token-efficient reads and post-edit updates'));
+    console.log(chalk.dim('  • TLDR MCP          - Token-efficient code analysis'));
   }
-  console.log(chalk.dim('  • Caveman     - Compressed output hooks (activate with agents.caveman.enabled: true)'));
+  console.log(chalk.dim('  • Caveman           - Compressed output hooks (activate with agents.caveman.enabled: true)'));
+  console.log(chalk.dim('  • RTK Bash filter   - Token-efficient Bash output hooks (activate with agents.rtk.enabled: true)'));
   console.log('');
   console.log(chalk.dim('When you run agents via `pan start`, they will report'));
   console.log(chalk.dim('their status in real-time to the Panopticon dashboard.\n'));

@@ -8,7 +8,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Bell, BellOff, AlertTriangle, StopCircle, Settings, Zap, RefreshCw } from 'lucide-react';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { useDashboardStore, selectAgentList } from '../lib/store';
+import { useDashboardStore, selectAgents } from '../lib/store';
 
 interface CloisterStatus {
   running: boolean;
@@ -21,6 +21,24 @@ interface CloisterStatus {
     total: number;
   };
   agentsNeedingAttention: string[];
+}
+
+interface DashboardSettings {
+  tts?: {
+    enabled?: boolean;
+  };
+}
+
+interface TtsHealthStatus {
+  ok: boolean;
+  running: boolean;
+  pid: number | null;
+  queue?: unknown;
+  queueDepth?: number;
+  model?: unknown;
+  uptimeSeconds?: number;
+  gpuMemoryUsedMb?: number;
+  error?: string;
 }
 
 async function fetchCloisterStatus(): Promise<CloisterStatus> {
@@ -49,6 +67,32 @@ async function fetchConversations(): Promise<{ sessionAlive: boolean }[]> {
   const res = await fetch('/api/conversations');
   if (!res.ok) return [];
   return res.json();
+}
+
+async function fetchDashboardSettings(): Promise<DashboardSettings> {
+  const res = await fetch('/api/settings');
+  if (!res.ok) throw new Error('Failed to fetch settings');
+  return res.json();
+}
+
+async function fetchTtsHealth(): Promise<TtsHealthStatus> {
+  const res = await fetch('/api/tts/health');
+  if (!res.ok) throw new Error('Failed to fetch TTS health');
+  return res.json();
+}
+
+function formatTtsHealthTitle(health: TtsHealthStatus | undefined, failed: boolean): string {
+  if (failed) return 'TTS: Health check failed';
+  if (!health) return 'TTS: Checking daemon';
+  if (!health.ok) return health.error ? `TTS: ${health.error}` : 'TTS: Daemon offline';
+
+  const details = [
+    health.model !== undefined ? `model: ${String(health.model)}` : undefined,
+    health.queueDepth !== undefined ? `queue: ${String(health.queueDepth)}` : health.queue !== undefined ? `queue: ${String(health.queue)}` : undefined,
+    typeof health.pid === 'number' ? `pid: ${health.pid}` : undefined,
+    health.gpuMemoryUsedMb !== undefined ? `VRAM: ${health.gpuMemoryUsedMb}MB` : undefined,
+  ].filter(Boolean);
+  return details.length > 0 ? `TTS: Running (${details.join(', ')})` : 'TTS: Running';
 }
 
 export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => void }) {
@@ -84,7 +128,22 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
     refetchInterval: 10000,
   });
 
-  const agents = useDashboardStore(selectAgentList);
+  const { data: settings } = useQuery({
+    queryKey: ['settings'],
+    queryFn: fetchDashboardSettings,
+    retry: false,
+  });
+  const ttsEnabled = settings?.tts?.enabled === true;
+
+  const { data: ttsHealth, isError: ttsHealthFailed } = useQuery({
+    queryKey: ['tts-health'],
+    queryFn: fetchTtsHealth,
+    enabled: ttsEnabled,
+    refetchInterval: 10000,
+    retry: false,
+  });
+
+  const agents = useDashboardStore(selectAgents);
   const runningAgentCount = agents.filter(a => a.status === 'running').length;
   const aliveConversationCount = conversations.filter(c => c.sessionAlive).length;
 
@@ -162,6 +221,11 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
 
   const hasWarnings = status.summary.warning > 0 || status.summary.stuck > 0;
   const needsAttention = status.agentsNeedingAttention.length;
+  const ttsDotClass = ttsHealthFailed
+    ? 'bg-destructive'
+    : ttsHealth?.ok
+    ? 'bg-success'
+    : 'bg-muted-foreground';
 
   return (
     <div className="flex items-center gap-1.5 shrink-0">
@@ -170,7 +234,7 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
         {status.running ? (
           <Bell className="w-3.5 h-3.5 text-success" />
         ) : (
-          <BellOff className="w-3.5 h-3.5 text-content-muted" />
+          <BellOff className="w-3.5 h-3.5 text-muted-foreground" />
         )}
       </div>
 
@@ -207,6 +271,17 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
         </span>
       )}
 
+      {ttsEnabled && (
+        <span
+          data-testid="tts-health-badge"
+          className="flex items-center gap-1 rounded bg-popover px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+          title={formatTtsHealthTitle(ttsHealth, ttsHealthFailed)}
+        >
+          <span data-testid="tts-health-dot" className={`h-1.5 w-1.5 rounded-full ${ttsDotClass}`} />
+          TTS
+        </span>
+      )}
+
       {/* Control Buttons */}
       <div className="flex items-center gap-1">
         {/* Toggle Monitoring */}
@@ -215,10 +290,10 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
           disabled={isToggling}
           className={`px-2 py-0.5 rounded text-xs transition-colors ${
             isToggling
-              ? 'bg-surface-emphasis text-content-subtle cursor-wait'
+              ? 'bg-card text-muted-foreground cursor-wait'
               : status.running
-              ? 'bg-surface-overlay text-content-body hover:bg-surface-emphasis'
-              : 'bg-primary text-white hover:bg-primary/90'
+              ? 'bg-popover text-foreground hover:bg-card'
+              : 'bg-primary text-primary-foreground hover:bg-primary/90'
           }`}
         >
           {isToggling
@@ -230,7 +305,7 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
         <button
           ref={buttonRef}
           onClick={() => showRestartPopover ? setShowRestartPopover(false) : openPopover()}
-          className="p-1 rounded text-xs bg-surface-overlay text-content-body border border-border hover:bg-surface-emphasis transition-colors"
+          className="p-1 rounded text-xs bg-popover text-foreground border border-border hover:bg-card transition-colors"
           title="Restart sessions"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${restartMutation.isPending ? 'animate-spin' : ''}`} />
@@ -275,7 +350,7 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
                 <button
                   onClick={handleRestart}
                   disabled={restartMutation.isPending || (!restartConversations && !restartAgents)}
-                  className="px-2 py-1 rounded text-xs text-white bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="px-2 py-1 rounded text-xs text-primary-foreground bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {restartMutation.isPending ? 'Restarting...' : 'Restart'}
                 </button>
@@ -303,13 +378,13 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
             <span className="text-xs text-destructive">Kill all?</span>
             <button
               onClick={handleEmergencyStop}
-              className="px-1.5 py-0.5 rounded text-xs bg-destructive text-white hover:bg-destructive/90"
+              className="px-1.5 py-0.5 rounded text-xs bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               Yes
             </button>
             <button
               onClick={() => setShowEmergencyConfirm(false)}
-              className="px-1.5 py-0.5 rounded text-xs bg-surface-overlay text-content-body hover:bg-surface-emphasis"
+              className="px-1.5 py-0.5 rounded text-xs bg-popover text-foreground hover:bg-card"
             >
               No
             </button>
@@ -319,7 +394,7 @@ export function CloisterStatusBar({ onOpenSettings }: { onOpenSettings?: () => v
         {/* Settings — navigates to Settings page */}
         <button
           onClick={onOpenSettings}
-          className="p-1 rounded text-xs bg-surface-overlay text-content-body hover:bg-surface-emphasis transition-colors"
+          className="p-1 rounded text-xs bg-popover text-foreground hover:bg-card transition-colors"
           title="Open Settings"
         >
           <Settings className="w-3.5 h-3.5" />

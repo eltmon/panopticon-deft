@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { toast } from 'sonner';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { X, Loader2, CheckCircle2, AlertCircle, Sparkles, Play, Terminal, Square, FileText, ExternalLink, List, RefreshCw } from 'lucide-react';
+import { X, Loader2, CheckCircle2, AlertCircle, Sparkles, Play, Terminal, Square, List, RefreshCw } from 'lucide-react';
 import { Rnd } from 'react-rnd';
 import { useDashboardStore } from '../lib/store';
 import { Issue } from '../types';
@@ -9,6 +9,7 @@ import { XTerminal } from './XTerminal';
 import { BeadsTasksPanel } from './BeadsTasksPanel';
 import { useConfirm } from './DialogProvider';
 import { PlanSetupScreen, type SetupProgressEvent } from './PlanSetupScreen';
+import { canUsePickerHarness, ModelHarnessPicker, type Harness, type HarnessPolicyDecisions, type ModelGroup } from './shared/ModelPicker';
 
 interface PlanDialogProps {
   issue: Issue;
@@ -16,6 +17,7 @@ interface PlanDialogProps {
   onClose: () => void;
   onComplete: () => void;
   onTerminalReleased?: () => void;
+  autoStart?: boolean;
 }
 
 interface StartPlanningResult {
@@ -50,7 +52,28 @@ interface PlanningStatus {
   hasCompletionMarker?: boolean;
 }
 
-type Step = 'checking' | 'ready' | 'starting' | 'setting-up' | 'planning' | 'complete' | 'error';
+type Step = 'checking' | 'ready' | 'starting' | 'setting-up' | 'planning' | 'error';
+
+type SettingsResponse = {
+  workhorses?: Record<string, string>;
+  roles?: {
+    plan?: {
+      model?: string;
+      // PAN-1055: per-role harness override surfaced through Settings → Roles.
+      harness?: 'claude-code' | 'pi';
+    };
+  };
+};
+
+function resolveSettingsModelRef(
+  modelRef: string | undefined,
+  workhorses: Record<string, string> | undefined,
+): string | undefined {
+  if (!modelRef) return undefined;
+  if (!modelRef.startsWith('workhorse:')) return modelRef;
+  const slot = modelRef.slice('workhorse:'.length);
+  return workhorses?.[slot] ?? modelRef;
+}
 
 // Default for startDocker - can be overridden by localStorage
 const getDefaultStartDocker = (): boolean => {
@@ -64,7 +87,7 @@ const getDefaultWorkspaceLocation = (): 'local' | 'remote' => {
   return stored === 'remote' ? 'remote' : 'local'; // Default to local
 };
 
-export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalReleased }: PlanDialogProps) {
+export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalReleased, autoStart = false }: PlanDialogProps) {
   const [step, setStep] = useState<Step>('checking');
   const [result, setResult] = useState<StartPlanningResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,32 +98,46 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
   const [workspaceLocation, setWorkspaceLocation] = useState<'local' | 'remote'>(getDefaultWorkspaceLocation);
   const [shadowMode, setShadowMode] = useState(false);
   const [modelOverride, setModelOverride] = useState<string>(''); // '' = use settings default
+  const [harnessOverride, setHarnessOverride] = useState<Harness>('claude-code');
+  const harnessOverrideTouched = useRef(false);
   const [effort, setEffort] = useState<'low' | 'medium' | 'high'>('medium');
   const [watchPlanning, setWatchPlanning] = useState(true);
   // Ref so async SSE callbacks always read the live checkbox value, not a stale closure copy
   const watchPlanningRef = useRef(true);
   const [showTasksPanel, setShowTasksPanel] = useState(false);
-  const [beadsWarning, setBeadsWarning] = useState<string | null>(null);
   const [setupSteps, setSetupSteps] = useState<SetupProgressEvent[]>([]);
   const [setupSessionName, setSetupSessionName] = useState<string | null>(null);
+  const autoStartTriggered = useRef(false);
 
-  // Track if we've actually connected to a planning session in THIS dialog instance
-  // This prevents stale cache from incorrectly triggering 'complete' state
+  // Track if we've actually connected to a planning session in THIS dialog instance.
   const hasConnectedToSession = useRef(false);
   const queryClient = useQueryClient();
   const confirm = useConfirm();
 
-  // Fetch settings to know the default planning-agent model
+  // Fetch settings to know the default plan role model.
   const settingsQuery = useQuery({
     queryKey: ['settings'],
     queryFn: async () => {
       const res = await fetch('/api/settings');
       if (!res.ok) throw new Error('Failed to load settings');
-      return res.json() as Promise<{ models: { overrides: Record<string, string> } }>;
+      return res.json() as Promise<SettingsResponse>;
     },
     staleTime: 60000,
   });
-  const defaultPlanningModel = settingsQuery.data?.models?.overrides?.['planning-agent'] || 'claude-opus-4-6';
+  const defaultPlanningModel = resolveSettingsModelRef(
+    settingsQuery.data?.roles?.plan?.model,
+    settingsQuery.data?.workhorses,
+  ) || 'claude-opus-4-7';
+  // PAN-1055: Honor the role-level harness override so PlanDialog opens with
+  // the harness configured for the plan role under Settings → Roles.
+  const defaultPlanningHarness = settingsQuery.data?.roles?.plan?.harness;
+
+  useEffect(() => {
+    if (harnessOverrideTouched.current) return;
+    if (defaultPlanningHarness === 'pi' || defaultPlanningHarness === 'claude-code') {
+      setHarnessOverride(defaultPlanningHarness);
+    }
+  }, [defaultPlanningHarness]);
 
   // Fetch available models from all configured providers
   const availableModelsQuery = useQuery({
@@ -120,12 +157,51 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     minimax: 'MiniMax',
     zai: 'Z.AI',
     kimi: 'Kimi',
+    nous: 'Nous Portal',
+    dashscope: 'Alibaba DashScope',
     openrouter: 'OpenRouter',
   };
 
+
+  const planningModelGroups: ModelGroup[] = availableModelsQuery.data
+    ? Object.entries(availableModelsQuery.data)
+      .filter(([, models]) => models.length > 0)
+      .map(([provider, models]) => ({
+        provider,
+        label: PROVIDER_LABELS[provider] || provider,
+        models: models.map((model) => ({
+          id: model.id,
+          label: model.name,
+          provider,
+          costPer1MTokens: model.costPer1MTokens,
+        })),
+      }))
+    : [];
+  const planningPolicyQuery = useQuery({
+    queryKey: ['harness-policy', planningModelGroups.map((group) => group.models.map((model) => model.id).join('|')).join('|')],
+    queryFn: async () => {
+      const modelIds = planningModelGroups.flatMap((group) => group.models.map((model) => model.id));
+      if (modelIds.length === 0) return {} as HarnessPolicyDecisions;
+      const res = await fetch(`/api/settings/harness-policy?models=${encodeURIComponent(modelIds.join(','))}`);
+      if (!res.ok) throw new Error('Failed to load harness policy');
+      const data = await res.json() as { decisions?: HarnessPolicyDecisions };
+      return data.decisions ?? {};
+    },
+    enabled: planningModelGroups.length > 0,
+    staleTime: 60000,
+  });
+
+  const effectivePlanningModel = modelOverride || defaultPlanningModel;
+  const planningHarnessDecision = canUsePickerHarness(
+    harnessOverride,
+    effectivePlanningModel,
+    planningPolicyQuery.data,
+  );
+  const effectivePlanningHarness = planningHarnessDecision.allowed ? harnessOverride : 'claude-code';
+
   // Start planning via SSE stream — replaces the old fire-and-forget mutation.
   // Uses fetch with streaming body parsing since EventSource only supports GET.
-  const startPlanningViaSSE = useCallback(async () => {
+  const startPlanningViaSSE = useCallback(async (auto = false) => {
     setStep('setting-up');
     setSetupSteps([]);
     setSetupSessionName(null);
@@ -135,7 +211,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
       const res = await fetch(`/api/issues/${issue.identifier}/start-planning`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ startDocker, workspaceLocation, shadowMode, model: modelOverride || undefined, effort }),
+        body: JSON.stringify({ startDocker, workspaceLocation, shadowMode, model: modelOverride || undefined, harness: effectivePlanningHarness, effort, auto }),
       });
 
       if (!res.ok) {
@@ -236,7 +312,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
       setError(err.message || 'Connection failed');
       setStep('error');
     }
-  }, [issue.identifier, startDocker, workspaceLocation, shadowMode, modelOverride, effort, watchPlanning, queryClient, onClose]);
+  }, [issue.identifier, startDocker, workspaceLocation, shadowMode, modelOverride, effectivePlanningHarness, effort, queryClient, onClose]);
 
   // Legacy mutation wrapper — keeps the same handleStartPlanning interface
   const startPlanningMutation = {
@@ -271,8 +347,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     refetchInterval: step === 'planning' ? 4000 : false,
   });
   const planningHasPlan = planningStateQuery.data?.hasPlan ?? false;
-  const planningBeadsCount = planningStateQuery.data?.beadsCount ?? 0;
-  const tasksNeedGeneration = planningHasPlan && planningBeadsCount === 0;
+  const planningHasBeads = planningStateQuery.data?.hasBeads ?? false;
+  const tasksNeedGeneration = planningHasPlan && !planningHasBeads;
 
   const generateTasksMutation = useMutation({
     mutationFn: async () => {
@@ -321,11 +397,11 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     onSuccess: (data: any) => {
       queryClient.invalidateQueries({ queryKey: ['issues'] });
       if (data?.beadsWarning) {
-        setBeadsWarning(data.beadsWarning);
         toast.warning(data.beadsWarning, { duration: 10000 });
       }
-      setStep('complete');
       onTerminalReleased?.();
+      onComplete();
+      onClose();
     },
     onError: (err: Error) => {
       console.error('Stop planning failed:', err);
@@ -357,31 +433,6 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     },
   });
 
-  // Start agent mutation - spawns work agent and updates status to "In Progress"
-  const startAgentMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch('/api/agents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issueId: issue.identifier, phase: 'implementation' }),
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Failed to start agent');
-      }
-      return res.json();
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['agents'] });
-      queryClient.invalidateQueries({ queryKey: ['issues'] });
-      onComplete();
-      onClose();
-    },
-    onError: (err: Error) => {
-      setError(`Failed to start agent: ${err.message}`);
-    },
-  });
-
   // Track previous issue to detect switches
   const prevIssueRef = useRef<string | null>(null);
 
@@ -397,6 +448,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
       setMinimized(false);
       setSetupSteps([]);
       setSetupSessionName(null);
+      setWatchPlanning(true);
+      watchPlanningRef.current = true;
       hasConnectedToSession.current = false;
     } else if (issueChanged) {
       // Switching to a different issue - reset state and unminimize
@@ -406,10 +459,12 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
       setMinimized(false);
       setSetupSteps([]);
       setSetupSessionName(null);
+      setWatchPlanning(true);
+      watchPlanningRef.current = true;
       hasConnectedToSession.current = false;
       queryClient.invalidateQueries({ queryKey: ['planningStatus', issue.identifier] });
     } else {
-      // Dialog is opening - invalidate stale cache to prevent false 'complete' transitions
+      // Dialog is opening - invalidate stale cache before checking session status
       queryClient.invalidateQueries({ queryKey: ['planningStatus', issue.identifier] });
       hasConnectedToSession.current = false;
     }
@@ -429,19 +484,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
             if (data.sessionName) setSetupSessionName(data.sessionName);
             hasConnectedToSession.current = true;
             setStep('planning');
-          } else if (data.planningCompleted) {
-            // Planning was done but not marked complete - go directly to complete step
-            // This allows user to click "Done Planning" without restarting
-            setStep('complete');
-          } else if (data.sessionName && data.hasPromptFile && ['In Planning', 'Planning', 'Discovery'].includes(issue.status)) {
-            // Issue is in planning state with a known session that actually started work
-            // (hasPromptFile confirms workspace was created successfully)
-            if (!watchPlanningRef.current) { onClose(); return; }
-            if (data.sessionName) setSetupSessionName(data.sessionName);
-            hasConnectedToSession.current = true;
-            setStep('planning');
           } else {
-            // No active session and no completed planning - show ready step
+            // No active session - show the planning dialog so the user can resume or start.
             setStep('ready');
           }
         })
@@ -452,15 +496,21 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     }
   }, [isOpen, issue.identifier, step]);
 
-  // DELIBERATE: No automatic transition to 'complete' based on session status.
+  // DELIBERATE: No automatic completion screen based on session status.
   // Previous attempts to auto-detect session ending via polling caused persistent
-  // premature 'complete' transitions due to stale cache, Docker network disruption
-  // (PAN-207), and PTY disconnect race conditions. The ONLY paths to 'complete' are:
-  // 1. User clicks "Done" button → stopPlanningMutation.onSuccess
-  // 2. Initial check finds .planning-complete marker → step set in checking effect
+  // premature transitions due to stale cache, Docker network disruption
+  // (PAN-207), and PTY disconnect race conditions.
 
-  const handleStartPlanning = () => {
-    startPlanningViaSSE();
+  useEffect(() => {
+    if (!autoStart || autoStartTriggered.current || step !== 'ready') return;
+    autoStartTriggered.current = true;
+    setWatchPlanning(false);
+    watchPlanningRef.current = false;
+    void startPlanningViaSSE(true);
+  }, [autoStart, step, startPlanningViaSSE]);
+
+  const handleStartPlanning = (auto = false) => {
+    startPlanningViaSSE(auto);
   };
 
   const handleStopPlanning = () => {
@@ -481,11 +531,6 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
     if (confirmed) {
       abortPlanningMutation.mutate();
     }
-  };
-
-  const handleComplete = () => {
-    // Spawn the work agent - this also updates status to "In Progress"
-    startAgentMutation.mutate();
   };
 
   // Watch for planning failures via domain events (applied to store by EventRouter).
@@ -511,38 +556,17 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
   const centeredX = position.x === -1 ? (window.innerWidth - size.width) / 2 : position.x;
   const centeredY = position.y === -1 ? (window.innerHeight - size.height) / 2 : position.y;
 
-  // Get PRD path based on workspace path
-  const getPrdPath = () => {
-    const workspacePath = result?.workspace?.path || statusQuery.data?.workspacePath;
-    if (!workspacePath) return null;
-    return `${workspacePath}/docs/${issue.identifier}-plan.md`;
-  };
-
   // When minimized, only render the floating bar (no full-screen wrapper)
   if (minimized) {
     return (
       <div
-        className="fixed bottom-4 right-4 z-50 bg-surface-raised rounded-lg shadow-2xl border border-divider px-4 py-2 flex items-center gap-3 cursor-pointer hover:bg-surface-overlay transition-colors"
-        onClick={async () => {
-          // Recheck session status when unminimizing — recover to planning
-          // if session is still active but step was prematurely set to 'complete'
-          if (step === 'complete') {
-            try {
-              const res = await fetch(`/api/planning/${issue.identifier}/status`);
-              const data = await res.json();
-              if (data.active) {
-                hasConnectedToSession.current = true;
-                setStep('planning');
-              }
-            } catch {}
-          }
-          setMinimized(false);
-        }}
+        className="fixed bottom-4 right-4 z-50 bg-card rounded-lg shadow-2xl border border-border px-4 py-2 flex items-center gap-3 cursor-pointer hover:bg-popover transition-colors"
+        onClick={() => setMinimized(false)}
       >
         <div className="w-6 h-6 rounded bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center">
-          <Sparkles className="w-3 h-3 text-content" />
+          <Sparkles className="w-3 h-3 text-foreground" />
         </div>
-        <span className="text-sm text-content font-medium">Plan: {issue.identifier}</span>
+        <span className="text-sm text-foreground font-medium">Plan: {issue.identifier}</span>
         {step === 'setting-up' && (
           <>
             <Loader2 className="w-3 h-3 text-signal-review animate-spin" />
@@ -555,12 +579,9 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
             {statusQuery.data?.isRemote ? (
               <span className="px-1.5 py-0.5 badge-bg-primary text-primary text-xs rounded">Remote</span>
             ) : (
-              <span className="px-1.5 py-0.5 bg-muted text-content-subtle text-xs rounded">Local</span>
+              <span className="px-1.5 py-0.5 bg-muted text-muted-foreground text-xs rounded">Local</span>
             )}
           </>
-        )}
-        {step === 'complete' && (
-          <span className="px-1.5 py-0.5 badge-bg-success text-success-foreground text-xs rounded">Done</span>
         )}
       </div>
     );
@@ -595,16 +616,16 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
             topLeft: true,
           }}
         >
-          <div className="w-full h-full bg-surface-raised rounded-xl shadow-2xl border border-divider overflow-hidden flex flex-col">
+          <div className="w-full h-full bg-card rounded-xl shadow-2xl border border-border overflow-hidden flex flex-col">
             {/* Header - drag handle */}
-            <div className="drag-handle flex items-center justify-between px-6 py-4 border-b border-divider cursor-move">
+            <div className="drag-handle flex items-center justify-between px-6 py-4 border-b border-border cursor-move">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center">
-                  <Sparkles className="w-5 h-5 text-content" />
+                  <Sparkles className="w-5 h-5 text-foreground" />
                 </div>
                 <div>
-                  <h2 className="text-lg font-semibold text-content">Plan: {issue.identifier}</h2>
-                  <p className="text-sm text-content-subtle line-clamp-1">{issue.title}</p>
+                  <h2 className="text-lg font-semibold text-foreground">Plan: {issue.identifier}</h2>
+                  <p className="text-sm text-muted-foreground line-clamp-1">{issue.title}</p>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -619,7 +640,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         Remote
                       </span>
                     ) : (
-                      <span className="px-2 py-1 bg-muted text-content-subtle text-xs rounded-full">
+                      <span className="px-2 py-1 bg-muted text-muted-foreground text-xs rounded-full">
                         Local
                       </span>
                     )}
@@ -636,7 +657,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                 )}
                 <button
                   onClick={onClose}
-                  className="p-2 text-content-subtle hover:text-content hover:bg-surface-overlay rounded-lg transition-colors"
+                  className="p-2 text-muted-foreground hover:text-foreground hover:bg-popover rounded-lg transition-colors"
                   title="Close (planning continues in background)"
                 >
                   <X className="w-5 h-5" />
@@ -650,12 +671,12 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
               {step === 'checking' && (
                 <div className="flex-1 flex flex-col items-center justify-center p-8">
                   <Loader2 className="w-12 h-12 text-signal-review animate-spin mb-4" />
-                  <p className="text-content-body">
+                  <p className="text-foreground">
                     {['In Planning', 'Planning', 'Discovery'].includes(issue.status)
                       ? 'Reconnecting to active planning session...'
                       : 'Checking session status...'}
                   </p>
-                  <p className="text-content-muted text-sm mt-2">
+                  <p className="text-muted-foreground text-sm mt-2">
                     {['In Planning', 'Planning', 'Discovery'].includes(issue.status)
                       ? 'Loading terminal for your planning agent'
                       : 'Looking for an existing session'}
@@ -670,17 +691,17 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                     <Terminal className="w-10 h-10 text-signal-review" />
                   </div>
                   {/* Check if already in planning state */}
-                  {['In Planning', 'Planning', 'Planned', 'Discovery'].includes(issue.status) ? (
+                  {(['In Planning', 'Planning', 'Planned', 'Discovery'].includes(issue.status) || issue.labels?.some(l => l.toLowerCase() === 'planning')) ? (
                     <>
-                      <h3 className="text-xl font-semibold text-content mb-2">Resume Planning Session</h3>
-                      <p className="text-content-subtle text-center max-w-md mb-6">
+                      <h3 className="text-xl font-semibold text-foreground mb-2">Resume Planning Session</h3>
+                      <p className="text-muted-foreground text-center max-w-md mb-6">
                         This issue is in <span className="text-signal-review font-medium">"In Planning"</span> state.
                         You can resume planning or abort to return to Todo.
                       </p>
 
-                      <div className="bg-surface-overlay/50 rounded-lg p-4 mb-6 max-w-md w-full">
-                        <h4 className="text-sm font-medium text-content-body mb-2">Options:</h4>
-                        <ul className="space-y-2 text-sm text-content-subtle">
+                      <div className="bg-popover/50 rounded-lg p-4 mb-6 max-w-md w-full">
+                        <h4 className="text-sm font-medium text-foreground mb-2">Options:</h4>
+                        <ul className="space-y-2 text-sm text-muted-foreground">
                           <li className="flex items-center gap-2">
                             <Play className="w-4 h-4 text-signal-review" />
                             <span><strong className="text-signal-review">Resume</strong> - Start a new planning agent session</span>
@@ -698,11 +719,11 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                             type="checkbox"
                             checked={watchPlanning}
                             onChange={(e) => { setWatchPlanning(e.target.checked); watchPlanningRef.current = e.target.checked; }}
-                            className="w-4 h-4 rounded border-border bg-surface-overlay text-signal-review focus:ring-signal-review focus:ring-offset-background"
+                            className="w-4 h-4 rounded border-border bg-popover text-signal-review focus:ring-signal-review focus:ring-offset-background"
                           />
-                          <span className="text-sm text-content-body">
+                          <span className="text-sm text-foreground">
                             Stay and watch planning
-                            <span className="text-content-muted ml-1">(keep dialog open; you&apos;ll see INPUT when agent needs you)</span>
+                            <span className="text-muted-foreground ml-1">(keep dialog open; you&apos;ll see INPUT when agent needs you)</span>
                           </span>
                         </label>
                       </div>
@@ -717,8 +738,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                           {abortPlanningMutation.isPending ? 'Aborting...' : 'Abort Planning'}
                         </button>
                         <button
-                          onClick={handleStartPlanning}
-                          className="flex items-center gap-2 px-6 py-3 bg-signal-review hover:bg-signal-review/90 text-white rounded-lg transition-colors font-medium"
+                          onClick={() => handleStartPlanning()}
+                          className="flex items-center gap-2 px-6 py-3 bg-signal-review hover:bg-signal-review/90 text-signal-review-foreground rounded-lg transition-colors font-medium"
                         >
                           <Play className="w-5 h-5" />
                           Resume Planning
@@ -727,15 +748,15 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                     </>
                   ) : (
                     <>
-                      <h3 className="text-xl font-semibold text-content mb-2">Start Planning Session</h3>
-                      <p className="text-content-subtle text-center max-w-md mb-6">
+                      <h3 className="text-xl font-semibold text-foreground mb-2">Start Planning Session</h3>
+                      <p className="text-muted-foreground text-center max-w-md mb-6">
                         This will move the issue to <span className="text-signal-review font-medium">"In Planning"</span>,
                         create a workspace, and start an AI discovery session to help define the implementation plan.
                       </p>
 
-                      <div className="bg-surface-overlay/50 rounded-lg p-4 mb-6 max-w-md w-full">
-                        <h4 className="text-sm font-medium text-content-body mb-2">What happens:</h4>
-                        <ul className="space-y-2 text-sm text-content-subtle">
+                      <div className="bg-popover/50 rounded-lg p-4 mb-6 max-w-md w-full">
+                        <h4 className="text-sm font-medium text-foreground mb-2">What happens:</h4>
+                        <ul className="space-y-2 text-sm text-muted-foreground">
                           <li className="flex items-center gap-2">
                             <CheckCircle2 className="w-4 h-4 text-success" />
                             Issue moves to "In Planning" in {issue.source === 'github' ? 'GitHub' : 'Linear'}
@@ -755,7 +776,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                       <div className="w-full max-w-md space-y-4 mb-6">
                         {/* Workspace location */}
                         <div>
-                          <label className="text-sm font-medium text-content-body mb-2 block">Workspace Location</label>
+                          <label className="text-sm font-medium text-foreground mb-2 block">Workspace Location</label>
                           <div className="flex gap-4">
                             <label className="flex items-center gap-2 cursor-pointer">
                               <input
@@ -767,9 +788,9 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                                   setWorkspaceLocation('local');
                                   localStorage.setItem('panopticon.planning.workspaceLocation', 'local');
                                 }}
-                                className="w-4 h-4 border-border bg-surface-overlay text-signal-review focus:ring-signal-review focus:ring-offset-background"
+                                className="w-4 h-4 border-border bg-popover text-signal-review focus:ring-signal-review focus:ring-offset-background"
                               />
-                              <span className="text-sm text-content-body">Local</span>
+                              <span className="text-sm text-foreground">Local</span>
                             </label>
                             <label className="flex items-center gap-2 cursor-pointer">
                               <input
@@ -781,9 +802,9 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                                   setWorkspaceLocation('remote');
                                   localStorage.setItem('panopticon.planning.workspaceLocation', 'remote');
                                 }}
-                                className="w-4 h-4 border-border bg-surface-overlay text-signal-review focus:ring-signal-review focus:ring-offset-background"
+                                className="w-4 h-4 border-border bg-popover text-signal-review focus:ring-signal-review focus:ring-offset-background"
                               />
-                              <span className="text-sm text-content-body">Remote (Fly.io)</span>
+                              <span className="text-sm text-foreground">Remote (Fly.io)</span>
                             </label>
                           </div>
                         </div>
@@ -794,11 +815,11 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                             type="checkbox"
                             checked={watchPlanning}
                             onChange={(e) => { setWatchPlanning(e.target.checked); watchPlanningRef.current = e.target.checked; }}
-                            className="w-4 h-4 rounded border-border bg-surface-overlay text-signal-review focus:ring-signal-review focus:ring-offset-background"
+                            className="w-4 h-4 rounded border-border bg-popover text-signal-review focus:ring-signal-review focus:ring-offset-background"
                           />
-                          <span className="text-sm text-content-body">
+                          <span className="text-sm text-foreground">
                             Stay and watch planning
-                            <span className="text-content-muted ml-1">(keep dialog open; you&apos;ll see INPUT when agent needs you)</span>
+                            <span className="text-muted-foreground ml-1">(keep dialog open; you&apos;ll see INPUT when agent needs you)</span>
                           </span>
                         </label>
 
@@ -807,11 +828,11 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                             type="checkbox"
                             checked={shadowMode}
                             onChange={(e) => setShadowMode(e.target.checked)}
-                            className="w-4 h-4 rounded border-border bg-surface-overlay text-primary focus:ring-primary focus:ring-offset-background"
+                            className="w-4 h-4 rounded border-border bg-popover text-primary focus:ring-primary focus:ring-offset-background"
                           />
-                          <span className="text-sm text-content-body">
+                          <span className="text-sm text-foreground">
                             Shadow Engineering
-                            <span className="text-content-muted ml-1">(AI observes your workflow, doesn&apos;t modify code)</span>
+                            <span className="text-muted-foreground ml-1">(AI observes your workflow, doesn&apos;t modify code)</span>
                           </span>
                         </label>
 
@@ -823,40 +844,40 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                               setStartDocker(e.target.checked);
                               localStorage.setItem('panopticon.planning.startDocker', String(e.target.checked));
                             }}
-                            className="w-4 h-4 rounded border-border bg-surface-overlay text-signal-review focus:ring-signal-review focus:ring-offset-background"
+                            className="w-4 h-4 rounded border-border bg-popover text-signal-review focus:ring-signal-review focus:ring-offset-background"
                           />
-                          <span className="text-sm text-content-body">
+                          <span className="text-sm text-foreground">
                             Start Docker containers
-                            <span className="text-content-muted ml-1">(dev environment ready for testing)</span>
+                            <span className="text-muted-foreground ml-1">(dev environment ready for testing)</span>
                           </span>
                         </label>
 
-                        {/* Model override */}
-                        <div>
-                          <label className="text-sm font-medium text-content-body mb-1.5 block">Model</label>
-                          <select
-                            value={modelOverride}
-                            onChange={(e) => setModelOverride(e.target.value)}
-                            className="w-full px-3 py-2 bg-surface-overlay border border-border rounded-lg text-sm text-content-body focus:outline-none focus:ring-1 focus:ring-signal-review"
-                          >
-                            <option value="">Settings default ({defaultPlanningModel})</option>
-                            {availableModelsQuery.data && Object.entries(availableModelsQuery.data)
-                              .filter(([, models]) => models.length > 0)
-                              .map(([provider, models]) => (
-                                <optgroup key={provider} label={PROVIDER_LABELS[provider] || provider}>
-                                  {models.map((model) => (
-                                    <option key={model.id} value={model.id}>
-                                      {model.name}
-                                    </option>
-                                  ))}
-                                </optgroup>
-                              ))}
-                          </select>
-                        </div>
+                        <ModelHarnessPicker
+                          model={effectivePlanningModel}
+                          harness={effectivePlanningHarness}
+                          onModelChange={(model) => setModelOverride(model === defaultPlanningModel ? '' : model)}
+                          onHarnessChange={(harness) => {
+                            harnessOverrideTouched.current = true;
+                            setHarnessOverride(harness);
+                          }}
+                          groups={planningModelGroups}
+                          harnessPolicy={planningPolicyQuery.data}
+                          modelLabel="Model"
+                        />
+                        {/* PAN-1048: surface that no per-spawn override is set so
+                            users can tell at a glance which model is being used. */}
+                        {!modelOverride && defaultPlanningModel && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            Settings default ({defaultPlanningModel})
+                          </p>
+                        )}
+                        {!planningHarnessDecision.allowed && (
+                          <p className="text-xs text-warning mt-1">{planningHarnessDecision.reason}</p>
+                        )}
 
                         {/* Effort level */}
                         <div>
-                          <label className="text-sm font-medium text-content-body mb-1.5 block">Effort</label>
+                          <label className="text-sm font-medium text-foreground mb-1.5 block">Effort</label>
                           <div className="flex gap-2">
                             {(['low', 'medium', 'high'] as const).map((level) => (
                               <button
@@ -866,14 +887,14 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                                 className={`flex-1 py-1.5 text-sm rounded-lg border transition-colors capitalize ${
                                   effort === level
                                     ? 'bg-signal-review/20 border-signal-review text-signal-review font-medium'
-                                    : 'bg-surface-overlay border-border text-content-subtle hover:text-content-body hover:border-border/80'
+                                    : 'bg-popover border-border text-muted-foreground hover:text-foreground hover:border-border/80'
                                 }`}
                               >
                                 {level}
                               </button>
                             ))}
                           </div>
-                          <p className="text-xs text-content-muted mt-1">
+                          <p className="text-xs text-muted-foreground mt-1">
                             {effort === 'low' && 'Quick planning — concise tasks, minimal exploration'}
                             {effort === 'medium' && 'Balanced — standard planning depth (default)'}
                             {effort === 'high' && 'Deep analysis — thorough exploration, edge cases, tradeoffs'}
@@ -881,13 +902,23 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         </div>
                       </div>
 
-                      <button
-                        onClick={handleStartPlanning}
-                        className="flex items-center gap-2 px-6 py-3 bg-signal-review hover:bg-signal-review/90 text-white rounded-lg transition-colors font-medium"
-                      >
-                        <Play className="w-5 h-5" />
-                        Start Planning
-                      </button>
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => handleStartPlanning()}
+                          className="flex items-center gap-2 px-6 py-3 bg-signal-review hover:bg-signal-review/90 text-signal-review-foreground rounded-lg transition-colors font-medium"
+                        >
+                          <Play className="w-5 h-5" />
+                          Start Planning
+                        </button>
+                        <button
+                          onClick={() => handleStartPlanning(true)}
+                          className="flex items-center gap-2 px-6 py-3 bg-primary hover:bg-primary/90 text-primary-foreground rounded-lg transition-colors font-medium"
+                          title="Run planning without interactive questions"
+                        >
+                          <Sparkles className="w-5 h-5" />
+                          Auto-plan
+                        </button>
+                      </div>
                     </>
                   )}
                 </div>
@@ -897,8 +928,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
               {step === 'starting' && (
                 <div className="flex-1 flex flex-col items-center justify-center p-8">
                   <Loader2 className="w-12 h-12 text-signal-review animate-spin mb-4" />
-                  <p className="text-content-body">Starting planning session...</p>
-                  <p className="text-sm text-content-muted mt-2">Moving to In Planning, creating workspace, spawning agent</p>
+                  <p className="text-foreground">Starting planning session...</p>
+                  <p className="text-sm text-muted-foreground mt-2">Moving to In Planning, creating workspace, spawning agent</p>
                 </div>
               )}
 
@@ -918,7 +949,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                   {/* Toggle between terminal and tasks panel */}
                   <div className="flex-1 bg-black relative overflow-hidden" style={{ minHeight: '400px' }}>
                     {showTasksPanel ? (
-                      <div className="h-full overflow-auto bg-surface">
+                      <div className="h-full overflow-auto bg-card">
                         <BeadsTasksPanel issueId={issue.identifier} />
                       </div>
                     ) : (
@@ -941,8 +972,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         ) : (
                           <div className="flex flex-col items-center justify-center h-full gap-2">
                             <Loader2 className="w-5 h-5 animate-spin text-signal-review" />
-                            <p className="text-sm text-content-body">Attaching to planning session...</p>
-                            <p className="text-xs text-content-muted font-mono">planning-{issue.identifier.toLowerCase()}</p>
+                            <p className="text-sm text-foreground">Attaching to planning session...</p>
+                            <p className="text-xs text-muted-foreground font-mono">planning-{issue.identifier.toLowerCase()}</p>
                           </div>
                         )}
                       </>
@@ -958,7 +989,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                       <AlertCircle className="w-5 h-5 text-warning-foreground mt-0.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-warning-foreground">Tasks not yet generated</p>
-                        <p className="text-xs text-content-subtle mt-0.5">
+                        <p className="text-xs text-muted-foreground mt-0.5">
                           A vBRIEF plan exists but no beads have been created. Generate tasks to finish planning so the Done button unlocks.
                         </p>
                       </div>
@@ -976,8 +1007,8 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                   )}
 
                   {/* Footer with controls */}
-                  <div className="border-t border-divider px-4 py-2 flex items-center justify-between bg-surface-raised">
-                    <div className="flex items-center gap-2 text-sm text-content-subtle">
+                  <div className="border-t border-border px-4 py-2 flex items-center justify-between bg-card">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Terminal className="w-4 h-4" />
                       Interactive planning session
                     </div>
@@ -987,7 +1018,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         className={`flex items-center gap-1 px-3 py-1 text-sm rounded transition-colors ${
                           showTasksPanel
                             ? 'badge-bg-signal-review text-signal-review-foreground hover:bg-signal-review/30'
-                            : 'bg-surface-overlay hover:bg-surface-emphasis text-content-body'
+                            : 'bg-popover hover:bg-card text-foreground'
                         }`}
                         title={showTasksPanel ? 'Back to terminal' : 'View vBRIEF tasks and dependency graph'}
                       >
@@ -1003,7 +1034,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         <Square className="w-4 h-4" />
                         Stop
                       </button>
-                      {/* Done appears only when the planning agent has written .planning/.planning-complete via `pan plan finalize`. Tmux liveness is not consulted — Stop kills the session, Done finalizes the plan. */}
+                      {/* Done appears only when the workspace plan reports completed planning state. Tmux liveness is not consulted — Stop kills the session, Done finalizes the plan. */}
                       {(statusQuery.data && statusQuery.data.hasCompletionMarker) && (
                         <button
                           onClick={() => {
@@ -1023,98 +1054,22 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                 </>
               )}
 
-              {/* Complete step */}
-              {step === 'complete' && (
-                <div className="flex-1 flex flex-col overflow-hidden">
-                  {/* Scrollable content area */}
-                  <div className="flex-1 overflow-y-auto p-8 flex flex-col items-center">
-                    <div className="w-16 h-16 rounded-full badge-bg-success flex items-center justify-center mb-4">
-                      <CheckCircle2 className="w-10 h-10 text-success" />
-                    </div>
-                    <h3 className="text-xl font-semibold text-content mb-2">Planning Complete</h3>
-                    <p className="text-content-subtle text-center max-w-md mb-6">
-                      The planning session has ended. Review the plan and start the execution agent.
-                    </p>
-
-                    {/* Beads warning — shown when beads creation failed during planning */}
-                    {beadsWarning && (
-                      <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 mb-6 max-w-md w-full">
-                        <div className="flex items-start gap-3">
-                          <AlertCircle className="w-5 h-5 text-yellow-400 mt-0.5 shrink-0" />
-                          <p className="text-sm text-yellow-300">{beadsWarning}</p>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* PRD Link */}
-                    {getPrdPath() && (
-                      <div className="badge-bg-signal-review border badge-border-signal-review rounded-lg p-4 mb-6 max-w-md w-full">
-                        <div className="flex items-center gap-3">
-                          <FileText className="w-8 h-8 text-signal-review" />
-                          <div className="flex-1">
-                            <p className="text-sm text-content-body font-medium">Feature Plan</p>
-                            <p className="text-xs text-content-muted font-mono truncate">{getPrdPath()}</p>
-                          </div>
-                          <a
-                            href={`vscode://file${getPrdPath()}`}
-                            className="flex items-center gap-1 px-3 py-1.5 bg-signal-review hover:bg-signal-review/90 text-white text-sm rounded-lg transition-colors"
-                            title="Open in VS Code"
-                          >
-                            <ExternalLink className="w-4 h-4" />
-                            Open
-                          </a>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tasks Panel - inline vBRIEF view */}
-                    <div className="w-full max-w-2xl mb-6 max-h-64 overflow-auto rounded-lg border border-divider">
-                      <BeadsTasksPanel issueId={issue.identifier} />
-                    </div>
-
-                  </div>
-
-                  {/* Pinned footer with action buttons */}
-                  <div className="border-t border-divider px-8 py-4 flex justify-center gap-3 bg-surface-raised">
-                    <button
-                      onClick={onClose}
-                      disabled={startAgentMutation.isPending}
-                      className="px-4 py-2 bg-surface-overlay hover:bg-surface-emphasis text-content rounded-lg transition-colors disabled:opacity-50"
-                    >
-                      Close
-                    </button>
-                    <button
-                      onClick={handleComplete}
-                      disabled={startAgentMutation.isPending}
-                      className="flex items-center gap-2 px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-lg transition-colors disabled:opacity-50"
-                    >
-                      {startAgentMutation.isPending ? (
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                      ) : (
-                        <Play className="w-5 h-5" />
-                      )}
-                      {startAgentMutation.isPending ? 'Starting Agent...' : 'Start Agent'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
               {/* Error step */}
               {step === 'error' && (
                 <div className="flex-1 flex flex-col items-center justify-center p-8">
                   <div className="w-16 h-16 rounded-full badge-bg-destructive flex items-center justify-center mb-4">
                     <AlertCircle className="w-10 h-10 text-destructive" />
                   </div>
-                  <h3 className="text-xl font-semibold text-content mb-2">Planning Failed</h3>
+                  <h3 className="text-xl font-semibold text-foreground mb-2">Planning Failed</h3>
                   <p className="text-destructive text-center max-w-md mb-2">{error}</p>
-                  <p className="text-sm text-content-muted text-center max-w-md mb-6">
+                  <p className="text-sm text-muted-foreground text-center max-w-md mb-6">
                     The planning agent could not start. You can retry or abort to return the issue to Todo.
                   </p>
 
                   <div className="flex gap-3">
                     <button
                       onClick={onClose}
-                      className="px-4 py-2 bg-surface-overlay hover:bg-surface-emphasis text-content rounded-lg transition-colors"
+                      className="px-4 py-2 bg-popover hover:bg-card text-foreground rounded-lg transition-colors"
                     >
                       Close
                     </button>
@@ -1133,7 +1088,7 @@ export function PlanDialog({ issue, isOpen, onClose, onComplete, onTerminalRelea
                         startPlanningMutation.mutate();
                       }}
                       disabled={startPlanningMutation.isPending}
-                      className="flex items-center gap-2 px-4 py-2 bg-signal-review hover:bg-signal-review/90 text-white rounded-lg transition-colors disabled:opacity-50"
+                      className="flex items-center gap-2 px-4 py-2 bg-signal-review hover:bg-signal-review/90 text-signal-review-foreground rounded-lg transition-colors disabled:opacity-50"
                     >
                       <RefreshCw className="w-4 h-4" />
                       {startPlanningMutation.isPending ? 'Retrying...' : 'Retry'}

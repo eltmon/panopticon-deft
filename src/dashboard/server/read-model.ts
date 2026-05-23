@@ -11,17 +11,20 @@
 
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { Effect, Layer, ServiceMap } from 'effect';
-import type { DashboardSnapshot, DomainEvent } from '@panopticon/contracts';
+import { Effect, Layer, Context } from 'effect';
+import type { DashboardSnapshot, DomainEvent, TurnDiffSummary } from '@panctl/contracts';
 import { AGENTS_DIR } from '../../lib/paths.js';
 import {
   type ReadModelState,
   INITIAL_READ_MODEL_STATE,
   applyEvent as applyEventReducer,
-} from '@panopticon/contracts';
-import type { AgentSnapshot, AgentStatus, AgentPhase, AgentResolution, ReviewStatusSnapshot, SpecialistSnapshot, SpecialistType, SpecialistState, ReviewStatusValue, TestStatusValue, MergeStatusValue, VerificationStatusValue } from '@panopticon/contracts';
+  getMaxTurnDiffSummariesPerAgent,
+  isTerminalTurnDiffSummaryStatus,
+  trimTurnDiffSummaries,
+} from '@panctl/contracts';
+import type { AgentSnapshot, AgentStatus, Role, AgentResolution, ReviewStatusSnapshot, ReviewStatusValue, TestStatusValue, UatStatusValue, MergeStatusValue, VerificationStatusValue, ResourceStats } from '@panctl/contracts';
 import type { ReviewStatus } from '../../lib/review-status.js';
-import { logDeaconEvent } from '../../lib/persistent-logger.js';
+import { logDeaconEventSync } from '../../lib/persistent-logger.js';
 
 // ─── Exported async helpers (used by bootstrap Effect + tests) ───────────────
 
@@ -36,41 +39,86 @@ export async function discoverNewAgentIds(agentsDir: string, cachedIds: Set<stri
   return entries.filter(e => !cachedIds.has(e) && existsSync(join(agentsDir, e, 'state.json')));
 }
 
+export function shouldSkipCheckpointReconciliation(agent: Pick<AgentSnapshot, 'status' | 'workspace'>): boolean {
+  return !agent.workspace || isTerminalTurnDiffSummaryStatus(agent.status)
+}
+
 // ─── Cached event store reference (avoids async dynamic import on each pushUpdated) ──
 let _cachedEventStore: any = null;
+
+type Jsonish = null | boolean | number | string | Jsonish[] | { [key: string]: Jsonish };
+
+function toJsonish(value: unknown, seen = new WeakSet<object>()): Jsonish | undefined {
+  if (value == null) return null;
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    const next: Jsonish[] = [];
+    for (const item of value) {
+      const clean = toJsonish(item, seen);
+      if (clean !== undefined) next.push(clean);
+    }
+    return next;
+  }
+  if (typeof value === 'object') {
+    if (seen.has(value)) return null;
+    seen.add(value);
+    const next: { [key: string]: Jsonish } = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const clean = toJsonish(item, seen);
+      if (clean !== undefined) next[key] = clean;
+    }
+    seen.delete(value);
+    return next;
+  }
+  return undefined;
+}
+
+function cleanIssues(issues: unknown[]): unknown[] {
+  return issues.map((issue) => toJsonish(issue) ?? null);
+}
 
 // ─── Value validators for strict literal types ──────────────────────────────
 
 const VALID_AGENT_STATUSES = new Set<AgentStatus>(["starting", "running", "stopped", "error", "unknown"]);
-const VALID_AGENT_PHASES = new Set<AgentPhase>(["planning", "exploration", "implementation", "testing", "documentation", "pre_push", "post_push", "review", "review-response", "merge"]);
-const VALID_RESOLUTIONS = new Set<AgentResolution>(["working", "done", "needs_input", "stuck", "completed", "unclear"]);
-const VALID_SPECIALIST_TYPES = new Set<SpecialistType>(["review-agent", "test-agent", "merge-agent", "inspect-agent", "uat-agent"]);
-const VALID_SPECIALIST_STATES = new Set<SpecialistState>(["active", "sleeping", "uninitialized"]);
+const VALID_ROLES = new Set<Role>(["plan", "work", "review", "test", "ship", "flywheel"]);
+const VALID_RESOLUTIONS = new Set<AgentResolution>(["working", "done", "needs_input", "stuck", "completed", "unclear", "abandoned", "api_error"]);
+type SpecialistAgentName = 'review-agent' | 'test-agent' | 'merge-agent' | 'inspect-agent' | 'uat-agent';
+type SpecialistLifecycleState = 'active' | 'sleeping' | 'uninitialized';
+
+const VALID_SPECIALIST_NAMES = new Set<SpecialistAgentName>(["review-agent", "test-agent", "merge-agent", "inspect-agent", "uat-agent"]);
+const VALID_SPECIALIST_LIFECYCLE_STATES = new Set<SpecialistLifecycleState>(["active", "sleeping", "uninitialized"]);
 const VALID_REVIEW_STATUSES = new Set<ReviewStatusValue>(["pending", "reviewing", "passed", "failed", "blocked"]);
 const VALID_TEST_STATUSES = new Set<TestStatusValue>(["pending", "testing", "passed", "failed", "skipped", "dispatch_failed"]);
+const VALID_UAT_STATUSES = new Set<UatStatusValue>(["pending", "testing", "passed", "failed"]);
 const VALID_MERGE_STATUSES = new Set<MergeStatusValue>(["pending", "queued", "merging", "verifying", "merged", "failed"]);
 const VALID_VERIFICATION_STATUSES = new Set<VerificationStatusValue>(["pending", "running", "passed", "failed", "skipped"]);
 
 export function toAgentStatus(v: unknown): AgentStatus {
   return VALID_AGENT_STATUSES.has(v as AgentStatus) ? v as AgentStatus : "unknown";
 }
-export function toAgentPhase(v: unknown): AgentPhase | undefined {
-  return v && VALID_AGENT_PHASES.has(v as AgentPhase) ? v as AgentPhase : undefined;
+export function toRole(v: unknown): Role | undefined {
+  return v && VALID_ROLES.has(v as Role) ? v as Role : undefined;
 }
+
 export function toAgentResolution(v: unknown): AgentResolution | undefined {
   return v && VALID_RESOLUTIONS.has(v as AgentResolution) ? v as AgentResolution : undefined;
 }
-export function toSpecialistType(v: unknown): SpecialistType | undefined {
-  return VALID_SPECIALIST_TYPES.has(v as SpecialistType) ? v as SpecialistType : undefined;
+export function toSpecialistAgentName(v: unknown): SpecialistAgentName | undefined {
+  return VALID_SPECIALIST_NAMES.has(v as SpecialistAgentName) ? v as SpecialistAgentName : undefined;
 }
-export function toSpecialistState(v: unknown): SpecialistState {
-  return VALID_SPECIALIST_STATES.has(v as SpecialistState) ? v as SpecialistState : "uninitialized";
+export function toSpecialistLifecycleState(v: unknown): SpecialistLifecycleState {
+  return VALID_SPECIALIST_LIFECYCLE_STATES.has(v as SpecialistLifecycleState) ? v as SpecialistLifecycleState : "uninitialized";
 }
 export function toReviewStatus(v: unknown): ReviewStatusValue | undefined {
   return v && VALID_REVIEW_STATUSES.has(v as ReviewStatusValue) ? v as ReviewStatusValue : undefined;
 }
 export function toTestStatus(v: unknown): TestStatusValue | undefined {
   return v && VALID_TEST_STATUSES.has(v as TestStatusValue) ? v as TestStatusValue : undefined;
+}
+export function toUatStatus(v: unknown): UatStatusValue | undefined {
+  return v && VALID_UAT_STATUSES.has(v as UatStatusValue) ? v as UatStatusValue : undefined;
 }
 export function toMergeStatus(v: unknown): MergeStatusValue | undefined {
   return v && VALID_MERGE_STATUSES.has(v as MergeStatusValue) ? v as MergeStatusValue : undefined;
@@ -79,19 +127,28 @@ export function toVerificationStatus(v: unknown): VerificationStatusValue | unde
   return v && VALID_VERIFICATION_STATUSES.has(v as VerificationStatusValue) ? v as VerificationStatusValue : undefined;
 }
 
-export function toReviewStatusSnapshot(status: Pick<ReviewStatus, 'issueId' | 'reviewStatus' | 'testStatus' | 'mergeStatus' | 'verificationStatus' | 'verificationNotes' | 'verificationCycleCount' | 'readyForMerge' | 'updatedAt' | 'prUrl' | 'stuck' | 'stuckReason' | 'stuckAt' | 'stuckDetails' | 'reviewedAtCommit' | 'reviewSpawnedAt' | 'testRetryCount' | 'reviewRetryCount' | 'recoveryStartedAt' | 'deaconIgnored' | 'deaconIgnoredAt' | 'deaconIgnoredReason'> & { reviewSessionNames?: string[]; reviewSubStatuses?: Record<string, 'running' | 'done'> }): ReviewStatusSnapshot {
+type ReviewStatusSnapshotInput = ReviewStatus & {
+  reviewCoordinatorSessionName?: string;
+  reviewSessionNames?: string[];
+  reviewSubStatuses?: Record<string, 'running' | 'done'>;
+  activeSpecialist?: string;
+};
+
+export function toReviewStatusSnapshot(status: ReviewStatusSnapshotInput): ReviewStatusSnapshot {
   return {
     issueId: status.issueId,
     reviewStatus: toReviewStatus(status.reviewStatus),
     testStatus: toTestStatus(status.testStatus),
+    uatStatus: toUatStatus(status.uatStatus),
+    uatNotes: status.uatNotes || undefined,
     mergeStatus: toMergeStatus(status.mergeStatus),
     verificationStatus: toVerificationStatus(status.verificationStatus),
     verificationNotes: status.verificationNotes || undefined,
     verificationCycleCount: typeof status.verificationCycleCount === 'number' ? status.verificationCycleCount : undefined,
-    readyForMerge: status.readyForMerge === true,
+    readyForMerge: !!status.readyForMerge,
     updatedAt: status.updatedAt,
     prUrl: status.prUrl || undefined,
-    stuck: status.stuck === true ? true : undefined,
+    stuck: !!status.stuck ? true : undefined,
     stuckReason: status.stuckReason || undefined,
     stuckAt: status.stuckAt || undefined,
     stuckDetails: status.stuckDetails || undefined,
@@ -100,11 +157,18 @@ export function toReviewStatusSnapshot(status: Pick<ReviewStatus, 'issueId' | 'r
     testRetryCount: typeof status.testRetryCount === 'number' ? status.testRetryCount : undefined,
     reviewRetryCount: typeof status.reviewRetryCount === 'number' ? status.reviewRetryCount : undefined,
     recoveryStartedAt: status.recoveryStartedAt || undefined,
-    deaconIgnored: status.deaconIgnored === true ? true : undefined,
+    deaconIgnored: !!status.deaconIgnored ? true : undefined,
     deaconIgnoredAt: status.deaconIgnoredAt || undefined,
     deaconIgnoredReason: status.deaconIgnoredReason || undefined,
+    reviewCoordinatorSessionName: status.reviewCoordinatorSessionName || undefined,
     reviewSessionNames: status.reviewSessionNames && status.reviewSessionNames.length > 0 ? status.reviewSessionNames : undefined,
     reviewSubStatuses: status.reviewSubStatuses,
+    queuePosition: typeof status.queuePosition === 'number' ? status.queuePosition : undefined,
+    activeSpecialist: status.activeSpecialist || undefined,
+    mergeRetryCount: typeof status.mergeRetryCount === 'number' ? status.mergeRetryCount : undefined,
+    mergeNotes: status.mergeNotes || undefined,
+    blockerReasons: status.blockerReasons && status.blockerReasons.length > 0 ? status.blockerReasons : undefined,
+    autoRequeueCount: typeof status.autoRequeueCount === 'number' ? status.autoRequeueCount : undefined,
   };
 }
 
@@ -113,13 +177,25 @@ export function toReviewStatusSnapshot(status: Pick<ReviewStatus, 'issueId' | 'r
 export interface ReadModelServiceShape {
   /** Return the current read model state as a DashboardSnapshot. */
   readonly getSnapshot: Effect.Effect<DashboardSnapshot>;
+  /** Return a single pending channel permission request without rebuilding a full snapshot. */
+  readonly getChannelPermissionRequest: (
+    requestId: string,
+  ) => Effect.Effect<import('@panctl/contracts').ChannelPermissionRequestSnapshot | null>;
+  /** Return a recent resolved channel permission decision for safe delivery retries. */
+  readonly getResolvedChannelPermissionDecision: (
+    requestId: string,
+  ) => Effect.Effect<import('@panctl/contracts').ResolvedChannelPermissionDecision | null>;
+  /** Return in-memory turn diff summaries for a single agent. */
+  readonly getTurnDiffSummaries: (agentId: string) => Effect.Effect<TurnDiffSummary[]>;
+  /** Return the agentId for a given sessionId (from agent snapshot or runtime claudeSessionId). */
+  readonly getAgentIdBySessionId: (sessionId: string) => Effect.Effect<string | null>;
   /** Apply a domain event to the read model (called by event store on append). */
   readonly applyEvent: (event: DomainEvent) => void;
   /** Bootstrap the read model from existing lib module state. */
   readonly bootstrap: Effect.Effect<void>;
 }
 
-export class ReadModelService extends ServiceMap.Service<
+export class ReadModelService extends Context.Service<
   ReadModelService,
   ReadModelServiceShape
 >()('panopticon/dashboard/ReadModelService') {}
@@ -134,14 +210,50 @@ export const ReadModelServiceLive = Layer.effect(
     // Reference to projection cache — set during bootstrap once the event store initializes it
     let projectionCache: import('./services/projection-cache.js').ProjectionCache | null = null;
 
+    function cloneTurnDiffSummaries(summaries: TurnDiffSummary[] | undefined): TurnDiffSummary[] {
+      if (!summaries || summaries.length === 0) return [];
+      return summaries.map(summary => ({
+        ...summary,
+        files: summary.files.map(file => ({ ...file })),
+        assistantMessageId: summary.assistantMessageId ?? undefined,
+        checkpointRef: summary.checkpointRef ?? undefined,
+      }));
+    }
+
     function buildSnapshot(): DashboardSnapshot {
+      // turnDiffSummariesByAgentId is intentionally excluded from the snapshot.
+      //
+      // Per-agent checkpoint history can grow to thousands of turns × hundreds
+      // of files; in production we measured 484 MB across 44 agents, which the
+      // browser's WebSocket client rejects as "Max payload size exceeded" and
+      // closes the socket with code 1006 — leaving the kanban and command deck
+      // perpetually empty. The data is still maintained in `state` and served
+      // on-demand via GET /api/agents/:id/diffs, so chat-timeline components
+      // fetch it only for the agent the user is actually viewing.
       return {
         sequence: state.sequence,
         agents: Object.values(state.agentsById),
-        specialists: Object.values(state.specialistsByName),
+        // PAN-1048 — specialistsByName projection retired. The DashboardSnapshot
+        // schema still has a `specialists` field for backward compat with the
+        // wire format; we always send an empty array and clients derive the
+        // same data from agentsById filtered by role.
+        specialists: [],
         reviewStatuses: Object.values(state.reviewStatusByIssueId),
+        agentRuntimeById: state.agentRuntimeById,
+        channelPermissionRequests: Object.values(state.channelPermissionRequestsById ?? {}),
         issues: state.issuesRaw,
         resources: state.resources ?? undefined,
+        memory: {
+          observationsByIssueId: state.observationsByIssueId,
+          statusByIssueId: state.statusByIssueId,
+          rollupsByIssueId: state.rollupsByIssueId,
+          resetMarkersByScopeId: state.resetMarkersByScopeId,
+          healthByIssueId: state.healthByIssueId,
+        },
+        scanProgress: state.scanProgress,
+        enrichStats: state.enrichStats,
+        enrichProgressBySessionId: state.enrichProgressBySessionId,
+        embedProgressBySessionId: state.embedProgressBySessionId,
         timestamp: new Date().toISOString(),
       };
     }
@@ -153,38 +265,6 @@ export const ReadModelServiceLive = Layer.effect(
     };
 
     const getSnapshot: Effect.Effect<DashboardSnapshot> = Effect.gen(function* () {
-      // Refresh review statuses from DB before building snapshot.
-      // Defensive: the event-driven path should keep these in sync, but if an
-      // event is lost (e.g. pipeline notifier throws silently) the read model
-      // can drift. Reloading from SQLite guarantees the snapshot is authoritative.
-      try {
-        const { loadReviewStatuses: loadStatuses } = yield* Effect.promise(
-          () => import('../../lib/review-status.js'),
-        );
-        const { enrichReviewStatusFromSessions } = yield* Effect.promise(
-          () => import('../../lib/review-status-enrichment.js'),
-        );
-        const { listSessionNamesAsync } = yield* Effect.promise(
-          () => import('../../lib/tmux.js'),
-        );
-        const statusMap = loadStatuses();
-        // One tmux call for all issues — O(1) tmux cost per snapshot build.
-        const allSessions = yield* Effect.promise(() => listSessionNamesAsync()).pipe(
-          Effect.catchAll(() => Effect.succeed([] as string[])),
-        );
-        state = {
-          ...state,
-          reviewStatusByIssueId: Object.fromEntries(
-            Object.values(statusMap).map((status) => {
-              const enriched = enrichReviewStatusFromSessions(status.issueId, status, allSessions);
-              return [status.issueId, toReviewStatusSnapshot(enriched)];
-            }),
-          ),
-        };
-      } catch (err) {
-        console.error('[ReadModel] Failed to refresh review statuses for snapshot:', err);
-      }
-
       // Refresh issues from the shared issue service before building snapshot.
       // IssueDataService polls trackers in the background; its cached issues are
       // the freshest available without blocking on API calls.
@@ -193,7 +273,7 @@ export const ReadModelServiceLive = Layer.effect(
           () => import('./services/issue-service-singleton.js'),
         );
         const issueService = getSharedIssueService();
-        const currentIssues = JSON.parse(JSON.stringify(issueService.getIssues()));
+        const currentIssues = cleanIssues(issueService.getIssues());
         if (currentIssues.length > 0 || state.issuesRaw.length === 0) {
           state = { ...state, issuesRaw: currentIssues };
         }
@@ -203,6 +283,22 @@ export const ReadModelServiceLive = Layer.effect(
 
       return buildSnapshot();
     });
+
+    const getChannelPermissionRequest = (
+      requestId: string,
+    ): Effect.Effect<import('@panctl/contracts').ChannelPermissionRequestSnapshot | null> =>
+      Effect.succeed(state.channelPermissionRequestsById?.[requestId] ?? null);
+
+    const getResolvedChannelPermissionDecision = (
+      requestId: string,
+    ): Effect.Effect<import('@panctl/contracts').ResolvedChannelPermissionDecision | null> =>
+      Effect.succeed(state.resolvedChannelPermissionDecisionsById?.[requestId] ?? null);
+
+    const getTurnDiffSummaries = (agentId: string): Effect.Effect<TurnDiffSummary[]> =>
+      Effect.sync(() => cloneTurnDiffSummaries(state.turnDiffSummariesByAgentId[agentId]));
+
+    const getAgentIdBySessionId = (sessionId: string): Effect.Effect<string | null> =>
+      Effect.sync(() => state.agentIdBySessionId[sessionId] ?? null);
 
     // ── Bootstrap inline during layer construction ───────────────────────────
     yield* Effect.gen(function* () {
@@ -260,17 +356,90 @@ export const ReadModelServiceLive = Layer.effect(
           }
 
           const allAgents = [...validAgents, ...newAgents];
+
+          // Reconcile cached agent statuses against ground truth (state.json + tmux).
+          // The projection cache may be stale if an agent's tmux session died while
+          // the server was down — the cache still says 'running' but state.json says
+          // 'stopped'. Without this step the dashboard shows incorrect action buttons.
+          const { listRunningAgents: listRunningForReconcile } = yield* Effect.promise(
+            () => import('../../lib/agents.js'),
+          );
+          const groundTruthAgents = yield* listRunningForReconcile();
+          const cachedAgentById = new Map(allAgents.map((a: any) => [a.id, a]));
+          const agentsById: Record<string, AgentSnapshot> = {};
+          for (const a of groundTruthAgents) {
+            const cachedAgent = cachedAgentById.get(a.id);
+            let reconciled = a.status as AgentStatus | string;
+            if (a.tmuxActive && a.status === 'stopped') {
+              reconciled = 'running';
+              logDeaconEventSync(`readModel cache-reconcile: ${a.id} stopped→running (tmux session alive, resumed outside API)`);
+            } else if (!a.tmuxActive && a.status === 'running') {
+              reconciled = 'stopped';
+              logDeaconEventSync(`readModel cache-reconcile: ${a.id} running→stopped (tmux session dead, likely reboot/crash)`);
+            }
+            if (cachedAgent && cachedAgent.status !== toAgentStatus(reconciled)) {
+              console.log(`[ReadModel] Reconciled ${a.id}: ${cachedAgent.status} → ${reconciled} (tmux=${a.tmuxActive}, state=${a.status})`);
+            }
+            agentsById[a.id] = {
+              ...cachedAgent,
+              id: a.id,
+              issueId: a.issueId,
+              workspace: a.workspace || undefined,
+              // PAN-1048 review feedback 004 (C3): AgentState carries `harness`,
+              // not `runtime`. The snapshot field consumed by getHarness() is
+              // `runtime` (packages/contracts/src/types.ts:54-60). Without this
+              // mapping, every Pi agent rendered as Claude Code in the
+              // dashboard because runtime defaulted to undefined → claude-code.
+              // The legacy `runtime` field is read first for backward compat
+              // with state.json files written before the rename.
+              runtime: (a as { runtime?: string }).runtime || a.harness || undefined,
+              model: a.model || undefined,
+              status: toAgentStatus(reconciled),
+              startedAt: a.startedAt || undefined,
+              lastActivity: a.lastActivity || undefined,
+              branch: a.branch || undefined,
+              costSoFar: a.costSoFar,
+              sessionId: a.sessionId || undefined,
+              role: toRole((a as { role?: unknown }).role),
+              stoppedByUser: a.stoppedByUser,
+              paused: a.paused,
+              pausedReason: a.pausedReason,
+              pausedAt: a.pausedAt,
+              troubled: a.troubled,
+              troubledAt: a.troubledAt,
+              consecutiveFailures: a.consecutiveFailures,
+              firstFailureInRunAt: a.firstFailureInRunAt,
+              lastFailureAt: a.lastFailureAt,
+              lastFailureReason: a.lastFailureReason,
+              lastFailureNextRetryAt: a.lastFailureNextRetryAt,
+              runtimeState: cachedAgent?.runtimeState,
+              hasPendingQuestion: cachedAgent?.hasPendingQuestion,
+              pendingQuestionCount: cachedAgent?.pendingQuestionCount,
+              pendingQuestionPrompt: cachedAgent?.pendingQuestionPrompt,
+              pendingQuestionReason: cachedAgent?.pendingQuestionReason,
+              resolution: cachedAgent?.resolution,
+              resolutionCount: cachedAgent?.resolutionCount,
+            };
+          }
+
           const statusMap = loadReviewStatuses();
+          const cachedMemory = cached.memory as Partial<ReadModelState> | undefined;
           state = {
             ...INITIAL_READ_MODEL_STATE,
             sequence: cached.sequence,
-            agentsById: Object.fromEntries(allAgents.map((a: any) => [a.id, a])),
-            specialistsByName: Object.fromEntries((cached.specialists ?? []).map((s) => [s.name, s])),
+            agentsById,
+            // PAN-1048 — specialistsByName projection retired; consumers derive
+            // from agentsById filtered by role.
             reviewStatusByIssueId: Object.fromEntries(
               Object.values(statusMap).map((status) => [status.issueId, toReviewStatusSnapshot(status)]),
             ),
-            issuesRaw: cached.issues ?? [],
-            resources: cached.resources,
+            issuesRaw: [...(cached.issues ?? [])] as unknown[],
+            resources: (cached.resources as ResourceStats | null) ?? null,
+            observationsByIssueId: cachedMemory?.observationsByIssueId ?? INITIAL_READ_MODEL_STATE.observationsByIssueId,
+            statusByIssueId: cachedMemory?.statusByIssueId ?? INITIAL_READ_MODEL_STATE.statusByIssueId,
+            rollupsByIssueId: cachedMemory?.rollupsByIssueId ?? INITIAL_READ_MODEL_STATE.rollupsByIssueId,
+            resetMarkersByScopeId: cachedMemory?.resetMarkersByScopeId ?? INITIAL_READ_MODEL_STATE.resetMarkersByScopeId,
+            healthByIssueId: cachedMemory?.healthByIssueId ?? INITIAL_READ_MODEL_STATE.healthByIssueId,
           };
           usedProjectionCache = true;
           console.log(
@@ -285,19 +454,20 @@ export const ReadModelServiceLive = Layer.effect(
       // ── Slow path: bootstrap from lib modules ────────────────────────────────
       if (!usedProjectionCache) {
         // Lazy imports to avoid circular dependency issues
-        const [{ listRunningAgentsAsync, warnOnBareNumericIssueIds }, { getAllSpecialists, getSpecialistState }, { getReviewStatus }, { computeAgentEnrichment }] =
+        const [{ listRunningAgents, warnOnBareNumericIssueIds }, { getReviewStatusSync }, { computeAgentEnrichment }] =
           yield* Effect.all([
             Effect.promise(() => import('../../lib/agents.js')),
-            Effect.promise(() => import('../../lib/cloister/specialists.js')),
             Effect.promise(() => import('../../lib/review-status.js')),
             Effect.promise(() => import('../../lib/agent-enrichment.js')),
           ]);
 
-        // Warn on legacy state files with bare numeric issueIds (PAN-489)
-        warnOnBareNumericIssueIds();
+        // Warn on legacy state files with bare numeric issueIds (PAN-489).
+        // PAN-1048 P2: async to avoid blocking the dashboard event loop on
+        // startup while it scans agent state files and kills stale tmux.
+        yield* Effect.promise(() => warnOnBareNumericIssueIds());
 
         // ── Agents ────────────────────────────────────────────────────────────
-        const running = yield* Effect.promise(() => listRunningAgentsAsync());
+        const running = yield* listRunningAgents();
         const agentsById: Record<string, AgentSnapshot> = {};
 
         // Compute enrichment for all agents in parallel during bootstrap
@@ -305,13 +475,13 @@ export const ReadModelServiceLive = Layer.effect(
         const enrichmentResults = yield* Effect.promise(() =>
           Promise.all(
             running.map(async (a) => {
-              const reviewStatus = getReviewStatus(a.issueId)
+              const reviewStatus = getReviewStatusSync(a.issueId)
               const hasActiveSpecialist =
                 reviewStatus?.reviewStatus === 'reviewing' ||
                 reviewStatus?.testStatus === 'testing' ||
                 reviewStatus?.mergeStatus === 'merging'
               try {
-                return await computeAgentEnrichment(a.id, a.startedAt, hasActiveSpecialist)
+                return await Effect.runPromise(computeAgentEnrichment(a.id, a.startedAt, hasActiveSpecialist))
               } catch {
                 return undefined
               }
@@ -332,7 +502,11 @@ export const ReadModelServiceLive = Layer.effect(
             id: a.id,
             issueId: a.issueId,
             workspace: a.workspace || undefined,
-            runtime: a.runtime || undefined,
+            // PAN-1048 review feedback 004 (C3): same mapping as the cached
+            // path above — surface AgentState.harness as snapshot.runtime so
+            // getHarness() returns the actual harness instead of defaulting
+            // every agent to claude-code.
+            runtime: (a as { runtime?: string }).runtime || a.harness || undefined,
             model: a.model || undefined,
             // Reconcile on-disk status with live tmux state:
             // - tmux active but state.json says 'stopped' → actually running (resumed outside API)
@@ -341,10 +515,10 @@ export const ReadModelServiceLive = Layer.effect(
               let reconciled = a.status as AgentStatus | string;
               if (a.tmuxActive && a.status === 'stopped') {
                 reconciled = 'running';
-                logDeaconEvent(`readModel bootstrap: ${a.id} reconciled stopped→running (tmux session alive, resumed outside API)`);
+                logDeaconEventSync(`readModel bootstrap: ${a.id} reconciled stopped→running (tmux session alive, resumed outside API)`);
               } else if (!a.tmuxActive && a.status === 'running') {
                 reconciled = 'stopped';
-                logDeaconEvent(`readModel bootstrap: ${a.id} reconciled running→stopped (tmux session dead, likely reboot/crash)`);
+                logDeaconEventSync(`readModel bootstrap: ${a.id} reconciled running→stopped (tmux session dead, likely reboot/crash)`);
               }
               return toAgentStatus(reconciled);
             })(),
@@ -353,29 +527,25 @@ export const ReadModelServiceLive = Layer.effect(
             branch: a.branch || undefined,
             costSoFar: a.costSoFar,
             sessionId: a.sessionId || undefined,
-            phase: toAgentPhase(a.phase),
+            role: toRole((a as { role?: unknown }).role),
+            paused: a.paused,
+            pausedReason: a.pausedReason,
+            pausedAt: a.pausedAt,
+            troubled: a.troubled,
+            troubledAt: a.troubledAt,
+            consecutiveFailures: a.consecutiveFailures,
+            firstFailureInRunAt: a.firstFailureInRunAt,
+            lastFailureAt: a.lastFailureAt,
+            lastFailureReason: a.lastFailureReason,
+            lastFailureNextRetryAt: a.lastFailureNextRetryAt,
             runtimeState: completedNormally ? 'completed' : undefined,
             // Enrichment fields (PAN-440)
-            agentPhase: enrichment ? toAgentPhase(enrichment.agentPhase) : undefined,
             hasPendingQuestion: enrichment?.hasPendingQuestion,
             pendingQuestionCount: enrichment?.pendingQuestionCount,
+            pendingQuestionPrompt: enrichment?.pendingQuestionPrompt,
+            pendingQuestionReason: enrichment?.pendingQuestionReason,
             resolution: enrichment ? toAgentResolution(enrichment.resolution) : undefined,
             resolutionCount: enrichment?.resolutionCount,
-          };
-        }
-
-        // ── Specialists ────────────────────────────────────────────────────────
-        const allSpecs = getAllSpecialists();
-        const specialistsByName: Record<string, SpecialistSnapshot> = {};
-        for (const s of allSpecs) {
-          const specType = toSpecialistType(s.name);
-          if (!specType) continue; // Skip unknown specialist types
-          const specState = getSpecialistState(s.name);
-          specialistsByName[s.name] = {
-            name: specType,
-            state: toSpecialistState(specState),
-            isRunning: specState === 'active',
-            lastWake: s.lastWake || undefined,
           };
         }
 
@@ -403,17 +573,106 @@ export const ReadModelServiceLive = Layer.effect(
           ...INITIAL_READ_MODEL_STATE,
           sequence,
           agentsById,
-          specialistsByName,
+          // PAN-1048 — specialistsByName projection retired; consumers derive
+          // from agentsById filtered by role.
           reviewStatusByIssueId,
           issuesRaw: [],
         };
 
         console.log(
           `[ReadModel] Bootstrapped: ${Object.keys(agentsById).length} agents, ` +
-          `${Object.keys(specialistsByName).length} specialists, ` +
           `${Object.keys(reviewStatusByIssueId).length} review statuses, seq=${sequence}`,
         );
       }
+
+      // ── Checkpoint reconciliation (deferred — non-blocking) ──────────────────
+      // Fire-and-forget: scan workspaces for git checkpoints in the background
+      // so the ReadModel layer resolves immediately and the dashboard starts fast.
+      void (async () => {
+        try {
+          const { listCheckpoints, diffCheckpointFiles, getCheckpointTimestamp, deleteLegacyCheckpointRefs } = await import('../../lib/checkpoint/checkpoint-manager.js');
+
+          const agents = Object.values(state.agentsById);
+
+          // One-time: clean up unscoped legacy refs from before per-agent namespacing.
+          // Run against the first agent's workspace (all worktrees share the same parent .git).
+          const firstAgentWithWorkspace = agents.find(a => a.workspace);
+          if (firstAgentWithWorkspace?.workspace) {
+            const deleted = await Effect.runPromise(deleteLegacyCheckpointRefs(firstAgentWithWorkspace.workspace));
+            if (deleted > 0) {
+              console.log(`[ReadModel] Deleted ${deleted} legacy unscoped checkpoint refs`);
+            }
+          }
+          let reconciled = 0;
+          for (const agent of agents) {
+            if (shouldSkipCheckpointReconciliation(agent)) continue;
+
+            const workspace = agent.workspace;
+            if (!workspace) continue;
+            const existingSummaries = state.turnDiffSummariesByAgentId[agent.id];
+            if (existingSummaries && existingSummaries.length > 0) continue;
+
+            try {
+              const checkpoints = await Effect.runPromise(listCheckpoints(workspace, agent.id));
+              if (checkpoints.length === 0) continue;
+
+              const maxRetainedSummaries = getMaxTurnDiffSummariesPerAgent();
+              const retainedCheckpoints = checkpoints.length > maxRetainedSummaries
+                ? checkpoints.slice(-maxRetainedSummaries)
+                : checkpoints;
+              const checkpointOffset = checkpoints.length - retainedCheckpoints.length;
+
+              const summaries: Array<{
+                turnId: string;
+                completedAt: string;
+                files: Array<{ path: string; kind?: string; additions?: number; deletions?: number }>;
+                checkpointRef?: string;
+                assistantMessageId?: string;
+                checkpointTurnCount?: number;
+              }> = [];
+
+              for (let i = 0; i < retainedCheckpoints.length; i++) {
+                const absoluteIndex = checkpointOffset + i;
+                const turnId = retainedCheckpoints[i];
+                if (!turnId) continue;
+                const prevTurnId = absoluteIndex > 0 ? checkpoints[absoluteIndex - 1] ?? null : null;
+                let files: Array<{ path: string; kind?: string; additions?: number; deletions?: number }> = [];
+                if (prevTurnId) {
+                  try {
+                    files = await Effect.runPromise(diffCheckpointFiles(workspace, agent.id, prevTurnId, turnId));
+                  } catch { /* checkpoint might be stale */ }
+                }
+                const completedAt = await Effect.runPromise(getCheckpointTimestamp(workspace, agent.id, turnId));
+                summaries.push({
+                  turnId,
+                  completedAt,
+                  files,
+                  checkpointRef: `refs/pan/turn/${agent.id}/${turnId}`,
+                  checkpointTurnCount: absoluteIndex + 1,
+                });
+              }
+
+              if (summaries.length > 0) {
+                state = {
+                  ...state,
+                  turnDiffSummariesByAgentId: {
+                    ...state.turnDiffSummariesByAgentId,
+                    [agent.id]: trimTurnDiffSummaries(summaries),
+                  },
+                };
+                reconciled++;
+              }
+            } catch { /* agent workspace may not be a git repo */ }
+          }
+
+          if (reconciled > 0) {
+            console.log(`[ReadModel] Reconciled checkpoints for ${reconciled} agent(s)`);
+            projectionCache?.save(buildSnapshot());
+          }
+        } catch (err) {
+          console.warn('[ReadModel] Checkpoint reconciliation failed:', err);
+        }
+      })();
 
       // ── Issue listener (always) ──────────────────────────────────────────────
       // Issues come from external trackers (Linear/GitHub) with unpredictable shapes.
@@ -425,7 +684,7 @@ export const ReadModelServiceLive = Layer.effect(
         const issueService = getSharedIssueService();
 
         // Get current issues (may already have fresh data from background fetch)
-        const currentIssues = JSON.parse(JSON.stringify(issueService.getIssues()));
+        const currentIssues = cleanIssues(issueService.getIssues());
         if (currentIssues.length > 0 || !usedProjectionCache) {
           state = { ...state, issuesRaw: currentIssues };
         }
@@ -434,7 +693,7 @@ export const ReadModelServiceLive = Layer.effect(
         // update the read model directly AND emit to event store for
         // WebSocket subscribers (PAN-433).
         issueService.onIssuesChanged((issues) => {
-          const cleaned = JSON.parse(JSON.stringify(issues));
+          const cleaned = cleanIssues(issues);
           state = { ...state, issuesRaw: cleaned };
           // Persist updated snapshot to projection cache
           projectionCache?.save(buildSnapshot());
@@ -470,6 +729,14 @@ export const ReadModelServiceLive = Layer.effect(
       }
     });
 
-    return { getSnapshot, applyEvent, bootstrap: Effect.void };
+    return {
+      getSnapshot,
+      getChannelPermissionRequest,
+      getResolvedChannelPermissionDecision,
+      getTurnDiffSummaries,
+      getAgentIdBySessionId,
+      applyEvent,
+      bootstrap: Effect.void,
+    };
   }),
 );

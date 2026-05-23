@@ -1,8 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
-import { buildMiniMaxFormData } from '../SettingsPage';
-import { MODELS_BY_PROVIDER } from '../AgentCards/ModelOverrideModal';
-import { getEffectiveModelId, DEFAULT_MODELS_BY_WORK_TYPE, FALLBACK_DEFAULT_MODEL } from '../modelDefaults';
-import { WORK_TYPE_CATEGORIES } from '../types';
+import { buildMiniMaxFormData, buildTtsAutosavePayload } from '../SettingsPage';
+import { MODELS_BY_PROVIDER } from '../modelCatalog';
 import type { SettingsConfig } from '../types';
 
 const MINIMAX_DEFAULTS: SettingsConfig = {
@@ -14,10 +15,13 @@ const MINIMAX_DEFAULTS: SettingsConfig = {
       minimax: true,
       zai: false,
       kimi: false,
+      mimo: false,
       openrouter: false,
+      nous: false,
+      dashscope: false,
     },
     overrides: {
-      'issue-agent:implementation': 'minimax-m2.7-highspeed',
+      'legacy.route': 'minimax-m2.7-highspeed',
     },
     gemini_thinking_level: 3,
   },
@@ -33,13 +37,89 @@ const DEPRECATED_MODEL_IDS = [
   'gpt-5.2-codex',
   'o3-deep-research',
   'gemini-3-pro-preview',
-  'gemini-3-flash-preview',
   'gemini-2.5-pro',
   'gemini-2.5-flash',
   'kimi-k2',
   'glm-4.7',
   'glm-4.7-flash',
 ];
+
+const SETTINGS_PAGE_SOURCE = readFileSync(
+  resolve(fileURLToPath(import.meta.url), '../../SettingsPage.tsx'),
+  'utf8',
+);
+
+describe('SettingsPage role model routing panels', () => {
+  it('renders WorkhorsePanel before RolesPanel and does not mount AgentCardsPanel', () => {
+    const workhorseIndex = SETTINGS_PAGE_SOURCE.indexOf('<WorkhorsePanel />');
+    const rolesIndex = SETTINGS_PAGE_SOURCE.indexOf('<RolesPanel />');
+
+    expect(workhorseIndex).toBeGreaterThanOrEqual(0);
+    expect(rolesIndex).toBeGreaterThan(workhorseIndex);
+    expect(SETTINGS_PAGE_SOURCE).not.toContain('<AgentCardsPanel');
+    expect(SETTINGS_PAGE_SOURCE).not.toContain("from './AgentCards'");
+  });
+
+  it('includes the TTS sidebar item and settings section controls', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain("{ id: 'tts', label: 'TTS'");
+    expect(SETTINGS_PAGE_SOURCE).toContain('id="tts"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ enabled:');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ volume:');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ rate:');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ maxChars:');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ dropInfoWhenFull:');
+    expect(SETTINGS_PAGE_SOURCE).toContain('<TtsSystemVoicePicker');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ voice: voiceId })');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ statusVoice: voiceId })');
+  });
+
+  it('includes advanced TTS voice map, muted sources, and template controls', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain('fetchTtsVoices');
+    expect(SETTINGS_PAGE_SOURCE).toContain('TTS_EVENT_KEYS.map');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsVoiceMapChange(eventKey');
+    expect(SETTINGS_PAGE_SOURCE).toContain('ACTIVITY_SOURCE_OPTIONS.map');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsMutedSourceChange(source');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleAddTtsTemplate');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsTemplateChange(eventKey');
+  });
+
+  it('serializes TTS settings autosaves through a TTS-only latest-snapshot queue', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain('pendingTtsSaveRef = useRef<TtsConfig | null>(null)');
+    expect(SETTINGS_PAGE_SOURCE).toContain('ttsSaveInFlightRef');
+    expect(SETTINGS_PAGE_SOURCE).toContain('const latest = await fetchSettings()');
+    expect(SETTINGS_PAGE_SOURCE).toContain('saveSettings(buildTtsAutosavePayload(latest, snapshot))');
+    expect(SETTINGS_PAGE_SOURCE).toContain('scheduleTtsSave(nextTts, options.debounce === true)');
+  });
+
+  it('debounces high-frequency TTS autosaves', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain('const TTS_AUTOSAVE_DEBOUNCE_MS = 400');
+    expect(SETTINGS_PAGE_SOURCE).toContain('ttsSaveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)');
+    expect(SETTINGS_PAGE_SOURCE).toContain('setTimeout(() => {');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ volume: Number(e.target.value) }, { debounce: true })');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ rate: Number(e.target.value) }, { debounce: true })');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ maxChars: Number(e.target.value) }, { debounce: true })');
+  });
+
+  it('surfaces memory settings, feature toggles, and environment override precedence', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain("{ id: 'memory', label: 'Memory'");
+    expect(SETTINGS_PAGE_SOURCE).toContain('PANOPTICON_MEMORY_PROVIDER and PANOPTICON_MEMORY_MODEL override these UI values');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Extraction provider');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Fallback provider');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Daily cost cap');
+    expect(SETTINGS_PAGE_SOURCE).toContain('0 disables the cap');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Disable memory observations"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Toggle prompt-time memory injection"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Rollup threshold');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Sidebar refresh interval');
+  });
+
+  it('surfaces the RTK Bash compression toggle in experimental settings', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain('RTK Bash compression');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Enable RTK Bash compression"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('data-testid="experimental-rtk-toggle"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleRtkToggle(!formData.agents?.rtk?.enabled)');
+  });
+});
 
 describe('MODELS_BY_PROVIDER', () => {
   it('contains no deprecated model IDs', () => {
@@ -49,36 +129,32 @@ describe('MODELS_BY_PROVIDER', () => {
   });
 });
 
-describe('getEffectiveModelId', () => {
-  it('returns the override when one is set', () => {
-    const result = getEffectiveModelId('issue-agent:implementation', {
-      'issue-agent:implementation': 'minimax-m2.7-highspeed',
+
+describe('buildTtsAutosavePayload', () => {
+  it('overlays only TTS settings onto the latest server snapshot', () => {
+    const latest: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      api_keys: { openai: 'server-key' },
+      tracker_keys: { github: 'server-token' },
+      tmux: { config_mode: 'managed' },
+      tts: { enabled: false, volume: 0.4 },
+    };
+    const result = buildTtsAutosavePayload(latest, { enabled: true, volume: 0.8 });
+
+    expect(result).toEqual({
+      ...latest,
+      tts: { enabled: true, volume: 0.8 },
     });
-    expect(result).toBe('minimax-m2.7-highspeed');
-  });
-
-  it('returns the backend optimal default when no override is set', () => {
-    // Without an override, the settings page must show the backend default — NOT
-    // the generic FALLBACK_DEFAULT_MODEL. Regression for the bug where any
-    // unoverridden card showed gpt-4o-mini regardless of actual routing defaults.
-    const result = getEffectiveModelId('issue-agent:exploration', {});
-    expect(result).toBe(DEFAULT_MODELS_BY_WORK_TYPE['issue-agent:exploration']);
-    expect(result).not.toBe(FALLBACK_DEFAULT_MODEL);
-  });
-
-  it('returns FALLBACK_DEFAULT_MODEL only for work types with no backend default', () => {
-    // A work type unknown to the router should fall through to the generic fallback.
-    const result = getEffectiveModelId('unknown-work-type' as never, {});
-    expect(result).toBe(FALLBACK_DEFAULT_MODEL);
   });
 });
+
 
 describe('buildMiniMaxFormData', () => {
   it('applies MiniMax providers and overrides', () => {
     const result = buildMiniMaxFormData(null, MINIMAX_DEFAULTS);
     expect(result.models.providers.minimax).toBe(true);
     expect(result.models.providers.anthropic).toBe(false);
-    expect(result.models.overrides['issue-agent:implementation']).toBe('minimax-m2.7-highspeed');
+    expect(result.models.overrides['legacy.route']).toBe('minimax-m2.7-highspeed');
   });
 
   it('preserves existing conversations settings from formData', () => {
@@ -101,6 +177,15 @@ describe('buildMiniMaxFormData', () => {
     expect(result.tmux?.config_mode).toBe('inherit-user');
   });
 
+  it('preserves existing memory settings from formData', () => {
+    const existing: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      memory: { provider: 'cliproxy', model: 'gpt-4.1-nano', per_day_cost_cap_usd: 0 },
+    };
+    const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
+    expect(result.memory).toEqual({ provider: 'cliproxy', model: 'gpt-4.1-nano', per_day_cost_cap_usd: 0 });
+  });
+
   it('preserves existing openrouter settings from formData', () => {
     const existing: SettingsConfig = {
       ...MINIMAX_DEFAULTS,
@@ -108,6 +193,24 @@ describe('buildMiniMaxFormData', () => {
     };
     const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
     expect(result.openrouter?.favorites).toEqual(['qwen/qwq-32b']);
+  });
+
+  it('preserves existing TTS settings from formData', () => {
+    const existing: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      tts: { enabled: true, volume: 0.6, rate: 1.2, maxChars: 200, dropInfoWhenFull: false },
+    };
+    const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
+    expect(result.tts).toEqual(existing.tts);
+  });
+
+  it('preserves existing agent settings from formData', () => {
+    const existing: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      agents: { rtk: { enabled: true } },
+    };
+    const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
+    expect(result.agents?.rtk?.enabled).toBe(true);
   });
 
   it('preserves gemini_thinking_level from formData, not from defaults', () => {
@@ -138,50 +241,4 @@ describe('buildMiniMaxFormData', () => {
     expect(result.models.providers.minimax).toBe(true);
   });
 
-  it('review:lightweight can be expressed as a model override in SettingsConfig', () => {
-    // review:lightweight is a real routable backend work type used by the haiku
-    // reviewer alias. The WorkTypeId type must include it so the settings form
-    // can represent and submit overrides — without this, config becomes lossy.
-    const config: SettingsConfig = {
-      ...MINIMAX_DEFAULTS,
-      models: {
-        ...MINIMAX_DEFAULTS.models,
-        overrides: { 'review:lightweight': 'minimax-m2.7-highspeed' },
-      },
-    };
-    expect(config.models.overrides['review:lightweight']).toBe('minimax-m2.7-highspeed');
-  });
-});
-
-describe('WORK_TYPE_CATEGORIES — review:lightweight registration', () => {
-  it('includes review:lightweight in the review category', () => {
-    // review:lightweight is used by the haiku alias in the review pipeline.
-    // It must be listed in the frontend registry so the settings UI can display
-    // and override it — otherwise overrides set by the backend would be silently
-    // dropped by the settings form.
-    const reviewTypes = WORK_TYPE_CATEGORIES['review'];
-    const ids = reviewTypes.map(t => t.id);
-    expect(ids).toContain('review:lightweight');
-  });
-});
-
-describe('DEFAULT_MODELS_BY_WORK_TYPE — review:lightweight default', () => {
-  it('has a haiku-tier default for review:lightweight', () => {
-    const model = DEFAULT_MODELS_BY_WORK_TYPE['review:lightweight'];
-    expect(model).toBeDefined();
-    expect(model).toMatch(/haiku/i);
-  });
-
-  it('getEffectiveModelId returns haiku-tier for review:lightweight with no override', () => {
-    const model = getEffectiveModelId('review:lightweight', {});
-    expect(model).toMatch(/haiku/i);
-    expect(model).not.toBe(FALLBACK_DEFAULT_MODEL);
-  });
-
-  it('getEffectiveModelId returns override when review:lightweight override is set', () => {
-    const result = getEffectiveModelId('review:lightweight', {
-      'review:lightweight': 'minimax-m2.7-highspeed',
-    });
-    expect(result).toBe('minimax-m2.7-highspeed');
-  });
 });

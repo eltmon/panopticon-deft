@@ -6,7 +6,9 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { Data, Effect } from 'effect';
 import { PANOPTICON_HOME } from '../paths.js';
+import { FsError } from '../errors.js';
 import { RuntimeType } from './interface.js';
 
 const METRICS_FILE = join(PANOPTICON_HOME, 'runtime-metrics.json');
@@ -105,7 +107,7 @@ const DEFAULT_METRICS: MetricsData = {
 /**
  * Load metrics from file
  */
-export function loadMetrics(): MetricsData {
+export function loadMetricsSync(): MetricsData {
   try {
     if (existsSync(METRICS_FILE)) {
       const content = readFileSync(METRICS_FILE, 'utf-8');
@@ -120,7 +122,7 @@ export function loadMetrics(): MetricsData {
 /**
  * Save metrics to file
  */
-export function saveMetrics(data: MetricsData): void {
+export function saveMetricsSync(data: MetricsData): void {
   mkdirSync(PANOPTICON_HOME, { recursive: true });
   data.lastUpdated = new Date().toISOString();
   writeFileSync(METRICS_FILE, JSON.stringify(data, null, 2));
@@ -129,8 +131,8 @@ export function saveMetrics(data: MetricsData): void {
 /**
  * Record a completed task
  */
-export function recordTask(task: Omit<TaskRecord, 'id'>): TaskRecord {
-  const data = loadMetrics();
+export function recordTaskSync(task: Omit<TaskRecord, 'id'>): TaskRecord {
+  const data = loadMetricsSync();
 
   const record: TaskRecord = {
     ...task,
@@ -142,7 +144,7 @@ export function recordTask(task: Omit<TaskRecord, 'id'>): TaskRecord {
   // Rebuild aggregates
   rebuildRuntimeMetrics(data, task.runtime);
 
-  saveMetrics(data);
+  saveMetricsSync(data);
   return record;
 }
 
@@ -250,23 +252,23 @@ function rebuildRuntimeMetrics(data: MetricsData, runtime: RuntimeType): void {
 /**
  * Get metrics for a specific runtime
  */
-export function getRuntimeMetrics(runtime: RuntimeType): RuntimeMetrics | null {
-  const data = loadMetrics();
+export function getRuntimeMetricsSync(runtime: RuntimeType): RuntimeMetrics | null {
+  const data = loadMetricsSync();
   return data.runtimes[runtime] || null;
 }
 
 /**
  * Get metrics for all runtimes
  */
-export function getAllRuntimeMetrics(): Partial<Record<RuntimeType, RuntimeMetrics>> {
-  const data = loadMetrics();
+export function getAllRuntimeMetricsSync(): Partial<Record<RuntimeType, RuntimeMetrics>> {
+  const data = loadMetricsSync();
   return data.runtimes;
 }
 
 /**
  * Get aggregated metrics across all runtimes
  */
-export function getAggregatedMetrics(): {
+export function getAggregatedMetricsSync(): {
   totalTasks: number;
   totalCost: number;
   totalTokens: number;
@@ -274,7 +276,7 @@ export function getAggregatedMetrics(): {
   avgDuration: number;
   byRuntime: Partial<Record<RuntimeType, RuntimeMetrics>>;
 } {
-  const data = loadMetrics();
+  const data = loadMetricsSync();
   const runtimes = Object.values(data.runtimes).filter((r): r is RuntimeMetrics => r !== undefined);
 
   const totalTasks = runtimes.reduce((sum, r) => sum + r.totalTasks, 0);
@@ -296,16 +298,16 @@ export function getAggregatedMetrics(): {
 /**
  * Get tasks for a specific issue
  */
-export function getIssueTasks(issueId: string): TaskRecord[] {
-  const data = loadMetrics();
+export function getIssueTasksSync(issueId: string): TaskRecord[] {
+  const data = loadMetricsSync();
   return data.tasks.filter(t => t.issueId === issueId);
 }
 
 /**
  * Get recent tasks
  */
-export function getRecentTasks(limit: number = 50): TaskRecord[] {
-  const data = loadMetrics();
+export function getRecentTasksSync(limit: number = 50): TaskRecord[] {
+  const data = loadMetricsSync();
   return data.tasks
     .sort((a, b) => new Date(b.completedAt).getTime() - new Date(a.completedAt).getTime())
     .slice(0, limit);
@@ -314,6 +316,78 @@ export function getRecentTasks(limit: number = 50): TaskRecord[] {
 /**
  * Clear all metrics (for testing)
  */
-export function clearMetrics(): void {
-  saveMetrics({ ...DEFAULT_METRICS });
+export function clearMetricsSync(): void {
+  saveMetricsSync({ ...DEFAULT_METRICS });
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variants of the sync helpers above. Sync variants are
+// preserved so existing CLI callers keep working; new callers can use the
+// Effect variants to compose with typed error channels.
+
+/** Tagged error for metrics parse failures. */
+export class MetricsParseError extends Data.TaggedError('MetricsParseError')<{
+  readonly path: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `loadMetrics`. Returns DEFAULT_METRICS on any failure. */
+export const loadMetrics = (): Effect.Effect<MetricsData> =>
+  Effect.try({
+    try: () => loadMetricsSync(),
+    catch: () => null,
+  }).pipe(Effect.orElseSucceed(() => ({ ...DEFAULT_METRICS })));
+
+/** Effect variant of `saveMetrics`. Lifts FS errors into the FsError channel. */
+export const saveMetrics = (data: MetricsData): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => saveMetricsSync(data),
+    catch: (cause) =>
+      new FsError({ path: METRICS_FILE, operation: 'write', cause }),
+  });
+
+/** Effect variant of `recordTask`. Lifts FS errors into the FsError channel. */
+export const recordTask = (
+  task: Omit<TaskRecord, 'id'>,
+): Effect.Effect<TaskRecord, FsError> =>
+  Effect.try({
+    try: () => recordTaskSync(task),
+    catch: (cause) =>
+      new FsError({ path: METRICS_FILE, operation: 'recordTask', cause }),
+  });
+
+/** Effect variant of `getRuntimeMetrics`. */
+export const getRuntimeMetrics = (
+  runtime: RuntimeType,
+): Effect.Effect<RuntimeMetrics | null> =>
+  Effect.sync(() => getRuntimeMetricsSync(runtime));
+
+/** Effect variant of `getAllRuntimeMetrics`. */
+export const getAllRuntimeMetrics = (): Effect.Effect<
+  Partial<Record<RuntimeType, RuntimeMetrics>>
+> => Effect.sync(() => getAllRuntimeMetricsSync());
+
+/** Effect variant of `getAggregatedMetrics`. */
+export const getAggregatedMetrics = (): Effect.Effect<
+  ReturnType<typeof getAggregatedMetricsSync>
+> => Effect.sync(() => getAggregatedMetricsSync());
+
+/** Effect variant of `getIssueTasks`. */
+export const getIssueTasks = (
+  issueId: string,
+): Effect.Effect<TaskRecord[]> => Effect.sync(() => getIssueTasksSync(issueId));
+
+/** Effect variant of `getRecentTasks`. */
+export const getRecentTasks = (
+  limit: number = 50,
+): Effect.Effect<TaskRecord[]> => Effect.sync(() => getRecentTasksSync(limit));
+
+/** Effect variant of `clearMetrics`. */
+export const clearMetrics = (): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => clearMetricsSync(),
+    catch: (cause) =>
+      new FsError({ path: METRICS_FILE, operation: 'clearMetrics', cause }),
+  });

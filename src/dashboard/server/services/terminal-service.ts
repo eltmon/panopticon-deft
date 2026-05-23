@@ -11,10 +11,11 @@
  *  - On stream/close: do NOT kill the PTY — just remove from tracking.
  */
 
-import { Cause, Effect, Layer, Queue, ServiceMap, Stream } from 'effect';
+import { Cause, Effect, Layer, Queue, Context, Stream } from 'effect';
 import { homedir } from 'node:os';
-import { PanRpcError, TerminalOutput } from '@panopticon/contracts';
-import { buildTmuxArgs, resizeWindowAsync, sessionExistsAsync } from '../../../lib/tmux.js';
+import { PanRpcError, TerminalOutput } from '@panctl/contracts';
+import { buildTmuxArgs, resizeWindow, sessionExists } from '../../../lib/tmux.js';
+import { buildChildEnvWithoutTmuxSync } from '../../../lib/child-env.js';
 
 // ─── Runtime detection ────────────────────────────────────────────────────────
 
@@ -110,7 +111,7 @@ class NodePtyProcess implements PtyProcess {
 async function waitForTmuxSession(sessionName: string, timeoutMs = 60000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (await sessionExistsAsync(sessionName)) {
+    if (await Effect.runPromise(sessionExists(sessionName))) {
       return;
     }
     await new Promise(r => setTimeout(r, 1000));
@@ -127,7 +128,11 @@ async function getNodePty() {
 
 /** Spawn PTY immediately — caller must ensure tmux session exists. */
 function spawnPtyImmediate(sessionName: string, cols: number, rows: number): PtyProcess {
-  const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', LANG: 'en_US.UTF-8' } as Record<string, string>;
+  const env = buildChildEnvWithoutTmuxSync(process.env, {
+    TERM: 'xterm-256color',
+    COLORTERM: 'truecolor',
+    LANG: 'en_US.UTF-8',
+  });
   const cwd = homedir();
 
   if (isBun()) {
@@ -183,7 +188,7 @@ export interface TerminalServiceShape {
   streamSession(sessionName: string, cols: number, rows: number): Stream.Stream<TerminalOutput, PanRpcError>;
 }
 
-export class TerminalService extends ServiceMap.Service<TerminalService, TerminalServiceShape>()(
+export class TerminalService extends Context.Service<TerminalService, TerminalServiceShape>()(
   'panopticon/dashboard/TerminalService',
 ) {}
 
@@ -227,12 +232,12 @@ export const TerminalServiceLive = Layer.effect(
         setTimeout(() => {
           if (!state.ptyProcess) return;
           try { proc.resize(cols - 1, rows); } catch { return; }
-          resizeWindowAsync(state.sessionName, cols - 1, rows)
+          Effect.runPromise(resizeWindow(state.sessionName, cols - 1, rows))
             .then(() => new Promise<void>((r) => setTimeout(r, 50)))
             .then(() => {
               if (!state.ptyProcess) return;
               try { proc.resize(cols, rows); } catch { return; }
-              return resizeWindowAsync(state.sessionName, cols, rows);
+              return Effect.runPromise(resizeWindow(state.sessionName, cols, rows));
             })
             .catch(() => {});
         }, 200);
@@ -244,8 +249,8 @@ export const TerminalServiceLive = Layer.effect(
             if (exitCode !== 0) {
               // Non-zero exit (e.g., tmux session doesn't exist yet) — fail with error
               // so WsTransport.subscribe() retries instead of treating it as clean end.
-              Queue.failUnsafe(Queue.asEnqueue(state.queue),
-                new PanRpcError({ message: `PTY exited with code ${exitCode}`, code: 'TERMINAL_PTY_EXIT' }),
+              Queue.failCauseUnsafe(Queue.asEnqueue(state.queue),
+                Cause.fail(new PanRpcError({ message: `PTY exited with code ${exitCode}`, code: 'TERMINAL_PTY_EXIT' })),
               );
             } else {
               Queue.endUnsafe(Queue.asEnqueue(state.queue));
@@ -331,8 +336,8 @@ export const TerminalServiceLive = Layer.effect(
         state.lastRows = rows;
         if (state.ptyProcess) {
           try { state.ptyProcess.resize(cols, rows); } catch { return; /* PTY dead */ }
-          yield* Effect.promise(() =>
-            resizeWindowAsync(sessionName, cols, rows).catch(() => {}),
+          yield* resizeWindow(sessionName, cols, rows).pipe(
+            Effect.catch(() => Effect.void),
           );
         }
       });

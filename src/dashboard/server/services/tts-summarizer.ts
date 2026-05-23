@@ -2,16 +2,16 @@
  * TTS Summarizer Service
  *
  * Batches recent activity.entry events and sends them to a cheap model
- * (default: gpt-5.4-nano) to produce concise, natural-language TTS utterances.
+ * (default: gpt-5.4-mini) to produce concise, natural-language TTS utterances.
  *
  * - Off by default — enabled via tts.summarizer.enabled in ~/.panopticon/config.yaml
  * - Configurable model and batch window
  * - Emits activity.tts events that pan-tts consumes
  */
 
-import { loadConfig } from '../../../lib/config-yaml.js';
-import { getEventStore, type StoredEvent } from '../event-store.js';
-import { emitActivityTts } from '../../../lib/activity-logger.js';
+import { loadConfigSync } from '../../../lib/config-yaml.js';
+import { initEventStore, type StoredEvent } from '../event-store.js';
+import { emitActivityTtsSync } from '../../../lib/activity-logger.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ async function callSummarizer(
 // ─── Flush logic ──────────────────────────────────────────────────────────────
 
 async function flush(): Promise<void> {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
   if (!config.ttsSummarizer.enabled) return;
 
   const items = state.buffer.splice(0);
@@ -142,7 +142,12 @@ async function flush(): Promise<void> {
   const priority = hasError ? 0 : hasWarn ? 1 : 2;
 
   try {
-    emitActivityTts({ utterance, priority });
+    emitActivityTtsSync({
+      utterance,
+      priority,
+      source: 'tts-summarizer',
+      eventType: 'ttsSummary.generated',
+    });
   } catch {
     // Non-fatal
   }
@@ -176,16 +181,18 @@ function onEvent(event: StoredEvent): void {
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
-export function startTtsSummarizer(): void {
+export async function startTtsSummarizer(): Promise<void> {
   if (state.timer !== null) return; // Already running
 
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
   if (!config.ttsSummarizer.enabled) {
     console.log('[tts-summarizer] Disabled (tts.summarizer.enabled=false)');
     return;
   }
 
-  const store = getEventStore();
+  // Ensure the shared event store is fully initialized before subscribing —
+  // main.ts starts the summarizer before route handlers can trigger lazy init.
+  const store = await initEventStore();
   state.unsubscribe = store.subscribe(onEvent);
 
   const intervalMs = config.ttsSummarizer.batchWindowSeconds * 1000;

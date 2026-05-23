@@ -31,7 +31,7 @@ import {
   getRemoteAgentOutput,
   sendToRemoteAgent,
 } from '../../../lib/remote/index.js';
-import { loadConfig as loadPanConfig } from '../../../lib/config.js';
+import { loadConfigSync as loadPanConfig } from '../../../lib/config.js';
 import { EventStoreService } from '../services/domain-services.js';
 import { httpHandler } from './http-handler.js';
 
@@ -107,10 +107,9 @@ const getRemoteStatusRoute = HttpRouter.add(
     }
 
     const fly = createFlyProviderFromConfig(remoteConfig);
-    const vms = yield* Effect.tryPromise({
-      try: () => fly.listVms(),
-      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
-    });
+    const vms = yield* fly.listVms().pipe(
+      Effect.catch((err: unknown) => Effect.fail(new Error(err instanceof Error ? err.message : String(err)))),
+    );
 
     return jsonResponse({
       enabled: true,
@@ -133,7 +132,9 @@ const listRemoteWorkspacesRoute = HttpRouter.add(
     const fly = createFlyProviderFromConfig(config.remote);
 
     // Best-effort: if listing VMs fails, return workspaces without status
-    const vms = yield* Effect.promise(() => fly.listVms().catch(() => [] as Array<{ name: string; status: string }>));
+    const vms = yield* fly.listVms().pipe(
+      Effect.catch(() => Effect.succeed([] as Array<{ name: string; status: string }>)),
+    );
 
     const enriched = (workspaces as Array<{ vmName?: string } & Record<string, unknown>>).map(ws => ({
       ...ws,
@@ -163,8 +164,8 @@ const getRemoteWorkspaceRoute = HttpRouter.add(
     const fly = createFlyProviderFromConfig(config.remote);
 
     // Best-effort: ignore errors when getting VM status
-    const vmStatus = yield* Effect.promise(() =>
-      fly.getStatus(metadata.vmName!).catch(() => 'unknown')
+    const vmStatus = yield* fly.getStatus(metadata.vmName!).pipe(
+      Effect.catch(() => Effect.succeed('unknown' as const)),
     );
 
     let agentStatus = null;
@@ -201,8 +202,8 @@ const startRemoteWorkspaceRoute = HttpRouter.add(
 
     yield* Effect.tryPromise({
       try: async () => {
-        await fly.startVm(metadata.vmName!);
-        await fly.ssh(metadata.vmName!, 'cd /workspace && docker compose up -d 2>/dev/null || true');
+        await Effect.runPromise(fly.startVm(metadata.vmName!));
+        await Effect.runPromise(fly.ssh(metadata.vmName!, 'cd /workspace && docker compose up -d 2>/dev/null || true'));
       },
       catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
     });
@@ -232,8 +233,8 @@ const stopRemoteWorkspaceRoute = HttpRouter.add(
 
     yield* Effect.tryPromise({
       try: async () => {
-        await fly.ssh(metadata.vmName!, 'docker compose down 2>/dev/null || true');
-        await fly.stopVm(metadata.vmName!);
+        await Effect.runPromise(fly.ssh(metadata.vmName!, 'docker compose down 2>/dev/null || true'));
+        await Effect.runPromise(fly.stopVm(metadata.vmName!));
       },
       catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
     });
@@ -266,7 +267,7 @@ const startRemoteAgentRoute = HttpRouter.add(
     const state = yield* Effect.tryPromise({
       try: async () => {
         await fly.syncAllCredentials(metadata.vmName!);
-        return spawnRemoteAgent({ issueId, workspace: metadata, prompt, model });
+        return spawnRemoteAgent({ issueId, workspace: metadata as unknown as Parameters<typeof spawnRemoteAgent>[0]['workspace'], prompt, model });
       },
       catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
     });

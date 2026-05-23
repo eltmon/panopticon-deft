@@ -1,7 +1,9 @@
 import chalk from 'chalk';
-import { existsSync, readdirSync, readFileSync } from 'fs';
-import { execSync } from 'child_process';
-import { listSessionNames } from '../../lib/tmux.js';
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
+import { exec, execSync } from 'child_process';
+import { promisify } from 'util';
+import { listSessionNamesSync } from '../../lib/tmux.js';
+import { listProjectsSync } from '../../lib/projects.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
@@ -10,9 +12,91 @@ import {
   COMMANDS_DIR,
   AGENTS_DIR,
   CLAUDE_DIR,
+  packageRoot,
 } from '../../lib/paths.js';
 
-interface CheckResult {
+// Minimum supported Pi binary version for the Pi harness (PAN-636).
+// Bump in lockstep with packages/pi-extension API surface compatibility.
+export const SUPPORTED_PI_VERSION_MIN = '0.73.0';
+
+const execAsync = promisify(exec);
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map((n) => parseInt(n, 10));
+  const pb = b.split('.').map((n) => parseInt(n, 10));
+  for (let i = 0; i < 3; i++) {
+    const da = pa[i] ?? 0;
+    const db = pb[i] ?? 0;
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+
+export function checkPi(strict: boolean): CheckResult[] {
+  const out: CheckResult[] = [];
+  if (!checkCommand('pi')) {
+    out.push({
+      name: 'Pi Coding Agent',
+      status: strict ? 'error' : 'warn',
+      message: 'Not installed (optional alternative harness)',
+      fix: 'Install: npm install -g @mariozechner/pi-coding-agent',
+    });
+    return out;
+  }
+
+  const version = readPiVersion();
+  if (!version) {
+    out.push({
+      name: 'Pi Coding Agent',
+      status: 'warn',
+      message: 'Detected but `pi --version` did not return a version string',
+      fix: 'Reinstall: npm install -g @mariozechner/pi-coding-agent',
+    });
+  } else if (compareSemver(version, SUPPORTED_PI_VERSION_MIN) < 0) {
+    out.push({
+      name: 'Pi Coding Agent',
+      status: 'error',
+      message: `v${version} (too old — requires >= ${SUPPORTED_PI_VERSION_MIN})`,
+      fix: 'Upgrade: npm install -g @mariozechner/pi-coding-agent@latest',
+    });
+  } else {
+    out.push({
+      name: 'Pi Coding Agent',
+      status: 'ok',
+      message: `v${version}`,
+    });
+  }
+
+  const extensionDist = join(packageRoot, 'packages', 'pi-extension', 'dist', 'index.js');
+  if (!existsSync(extensionDist)) {
+    out.push({
+      name: 'Pi Extension Bundle',
+      status: 'warn',
+      message: 'packages/pi-extension/dist/index.js not found',
+      fix: 'Build it: cd packages/pi-extension && npm run build',
+    });
+  } else {
+    out.push({
+      name: 'Pi Extension Bundle',
+      status: 'ok',
+      message: 'packages/pi-extension/dist/index.js present',
+    });
+  }
+  return out;
+}
+
+function readPiVersion(): string | null {
+  // Pi prints its version to stderr, not stdout — merge both streams.
+  try {
+    const out = execSync('pi --version 2>&1', { encoding: 'utf-8', stdio: 'pipe' }).trim();
+    const m = out.match(/(\d+\.\d+\.\d+)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface CheckResult {
   name: string;
   status: 'ok' | 'warn' | 'error';
   message: string;
@@ -32,6 +116,90 @@ function checkDirectory(path: string): boolean {
   return existsSync(path);
 }
 
+export async function checkGraphifyFreshness(projectPath: string): Promise<CheckResult | null> {
+  const summaryPath = join(projectPath, 'graphify-out', 'GRAPH_SUMMARY.md');
+  if (!existsSync(summaryPath)) {
+    return null;
+  }
+
+  let headTimeMs: number;
+  try {
+    const { stdout } = await execAsync('git log -1 --format=%ct', { cwd: projectPath, encoding: 'utf-8' });
+    headTimeMs = Number(stdout.trim()) * 1000;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: 'Graphify graph freshness',
+      status: 'warn',
+      message: `Could not read HEAD timestamp: ${message}`,
+      fix: `Run: git status from ${projectPath}`,
+    };
+  }
+
+  if (!Number.isFinite(headTimeMs)) {
+    return {
+      name: 'Graphify graph freshness',
+      status: 'warn',
+      message: 'Could not parse HEAD timestamp',
+      fix: `Run: git log -1 --format=%ct from ${projectPath}`,
+    };
+  }
+
+  const summaryMtimeMs = statSync(summaryPath).mtimeMs;
+  if (summaryMtimeMs >= headTimeMs) {
+    return {
+      name: 'Graphify graph freshness',
+      status: 'ok',
+      message: 'Fresh — updated since HEAD',
+    };
+  }
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  const days = Math.max(1, Math.ceil((headTimeMs - summaryMtimeMs) / dayMs));
+  return {
+    name: 'Graphify graph freshness',
+    status: 'warn',
+    message: `Stale — ${days} day${days === 1 ? '' : 's'} older than HEAD`,
+    fix: `Run: graphify update . from ${projectPath}; or wait for the next merge to refresh automatically`,
+  };
+}
+
+interface ComposeDriftEntry {
+  container: string;
+  missingPath: string;
+}
+
+/**
+ * Check whether any running Docker containers reference compose file paths
+ * that no longer exist on disk (PAN-956). This happens when .devcontainer/
+ * is deleted after containers were created, leaving orphaned containers with
+ * stale com.docker.compose.project.config_files labels.
+ */
+function checkComposeLabelDrift(): ComposeDriftEntry[] {
+  try {
+    const output = execSync(
+      `docker ps --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'`,
+      { encoding: 'utf-8', stdio: 'pipe' },
+    );
+    const drift: ComposeDriftEntry[] = [];
+    for (const line of output.trim().split('\n').filter(Boolean)) {
+      const sep = line.indexOf('|');
+      if (sep === -1) continue;
+      const containerName = line.slice(0, sep);
+      const configFiles = line.slice(sep + 1);
+      if (!configFiles) continue;
+      for (const filePath of configFiles.split(',').map((s: string) => s.trim()).filter(Boolean)) {
+        if (!existsSync(filePath)) {
+          drift.push({ container: containerName, missingPath: filePath });
+        }
+      }
+    }
+    return drift;
+  } catch {
+    return [];
+  }
+}
+
 function countItems(path: string): number {
   if (!existsSync(path)) return 0;
   try {
@@ -41,7 +209,11 @@ function countItems(path: string): number {
   }
 }
 
-export async function doctorCommand(): Promise<void> {
+export interface DoctorOptions {
+  strict?: boolean;
+}
+
+export async function doctorCommand(options: DoctorOptions = {}): Promise<void> {
   console.log(chalk.bold('\nPanopticon Doctor\n'));
   console.log(chalk.dim('Checking system health...\n'));
 
@@ -77,6 +249,11 @@ export async function doctorCommand(): Promise<void> {
       checks.push({ name, status: 'warn', message: 'Not installed (optional)', fix });
     }
   }
+
+  // Pi Coding Agent (alternative harness — PAN-636).
+  // Pi is optional: missing → warn (or error under --strict). When installed, version
+  // is compared against SUPPORTED_PI_VERSION_MIN and the bundled extension is checked.
+  for (const c of checkPi(options.strict ?? false)) checks.push(c);
 
   // Check Panopticon directories
   const directories = [
@@ -159,7 +336,7 @@ export async function doctorCommand(): Promise<void> {
 
   // Check tmux sessions
   try {
-    const agentSessions = listSessionNames().filter((s) => s.includes('agent-')).length;
+    const agentSessions = listSessionNamesSync().filter((s) => s.includes('agent-')).length;
     checks.push({
       name: 'Running Agents',
       status: 'ok',
@@ -171,6 +348,66 @@ export async function doctorCommand(): Promise<void> {
       status: 'ok',
       message: '0 agent sessions',
     });
+  }
+
+  // Check smee-client webhook relay
+  try {
+    const { isSmeeProcessRunningSync } = await import('../../lib/smee.js');
+    const smeeUrlPath = join(homedir(), '.panopticon', 'github-app', 'smee-url');
+    if (!existsSync(smeeUrlPath)) {
+      checks.push({
+        name: 'smee-client Webhook Relay',
+        status: 'warn',
+        message: 'Not configured (optional)',
+        fix: 'Create ~/.panopticon/github-app/smee-url with your smee.io channel URL',
+      });
+    } else if (isSmeeProcessRunningSync()) {
+      checks.push({
+        name: 'smee-client Webhook Relay',
+        status: 'ok',
+        message: 'Running',
+      });
+    } else {
+      checks.push({
+        name: 'smee-client Webhook Relay',
+        status: 'warn',
+        message: 'Configured but not running',
+        fix: 'Run `pan up` to start the webhook relay',
+      });
+    }
+  } catch {
+    checks.push({
+      name: 'smee-client Webhook Relay',
+      status: 'warn',
+      message: 'Status check failed',
+    });
+  }
+
+  for (const { config } of listProjectsSync()) {
+    const graphifyCheck = await checkGraphifyFreshness(config.path);
+    if (graphifyCheck) {
+      checks.push(graphifyCheck);
+    }
+  }
+
+  // Check Docker compose label drift (PAN-956)
+  if (checkCommand('docker')) {
+    const drift = checkComposeLabelDrift();
+    if (drift.length === 0) {
+      checks.push({
+        name: 'Docker Compose Labels',
+        status: 'ok',
+        message: 'No compose path drift detected',
+      });
+    } else {
+      const details = drift.map((d) => `${d.container}: ${d.missingPath}`).join('; ');
+      checks.push({
+        name: 'Docker Compose Labels',
+        status: 'warn',
+        message: `${drift.length} container(s) reference missing compose path(s)`,
+        fix: `Re-render .devcontainer/ for affected workspaces, then restart containers. Drift: ${details}`,
+      });
+    }
   }
 
   // Check for legacy command invocations in shell rc files (PAN-705)
@@ -255,4 +492,11 @@ export async function doctorCommand(): Promise<void> {
     console.log(chalk.green('All systems operational!'));
   }
   console.log('');
+
+  if (hasErrors) {
+    process.exit(1);
+  }
+  if (options.strict && hasWarnings) {
+    process.exit(1);
+  }
 }

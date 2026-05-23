@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { List, GitBranch, Code2 } from 'lucide-react';
-import type { VBriefDocument } from './types';
+import type { VBriefDocument, VBriefInspectionPolicy } from './types';
 import { VBriefHeader } from './VBriefHeader';
 import { VBriefNarratives } from './VBriefNarratives';
 import { VBriefReferences } from './VBriefReferences';
@@ -20,9 +20,11 @@ interface VBriefViewerProps {
   doc: VBriefDocument | null;
   /** Optional override for active tab */
   initialTab?: VBriefViewTab;
+  onInspectionPolicyChange?: (policy: VBriefInspectionPolicy) => void;
+  isUpdatingInspectionPolicy?: boolean;
 }
 
-export function VBriefViewer({ doc, initialTab }: VBriefViewerProps) {
+export function VBriefViewer({ doc, initialTab, onInspectionPolicyChange, isUpdatingInspectionPolicy = false }: VBriefViewerProps) {
   const [tab, setTab] = useState<VBriefViewTab>(() => {
     if (initialTab) return initialTab;
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -35,7 +37,7 @@ export function VBriefViewer({ doc, initialTab }: VBriefViewerProps) {
 
   if (!doc) {
     return (
-      <div className="flex items-center justify-center h-32 text-text-muted text-sm">
+      <div className="flex items-center justify-center h-32 text-muted-foreground text-sm">
         No plan available
       </div>
     );
@@ -54,7 +56,7 @@ export function VBriefViewer({ doc, initialTab }: VBriefViewerProps) {
             className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium transition-colors ${
               tab === id
                 ? 'text-foreground border-b-2 border-primary'
-                : 'text-text-muted hover:text-text-secondary'
+                : 'text-muted-foreground hover:text-muted-foreground'
             }`}
           >
             <Icon className="w-4 h-4" />
@@ -63,11 +65,15 @@ export function VBriefViewer({ doc, initialTab }: VBriefViewerProps) {
         ))}
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto">
+      {/* Content — DAG tab needs overflow-hidden so ReactFlow gets a real height */}
+      <div className={`flex-1 ${tab === 'dag' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
         {tab === 'list' && (
           <>
-            <VBriefHeader doc={doc} />
+            <VBriefHeader
+              doc={doc}
+              onInspectionPolicyChange={onInspectionPolicyChange}
+              isUpdatingInspectionPolicy={isUpdatingInspectionPolicy}
+            />
             {doc.plan.narratives && <VBriefNarratives narratives={doc.plan.narratives} />}
             {doc.plan.references && doc.plan.references.length > 0 && (
               <VBriefReferences references={doc.plan.references} />
@@ -77,7 +83,7 @@ export function VBriefViewer({ doc, initialTab }: VBriefViewerProps) {
         )}
 
         {tab === 'dag' && (
-          <div className="h-full p-4">
+          <div style={{ height: 'calc(100vh - 280px)', minHeight: 400 }}>
             <DAGPlaceholder issueId={doc.plan.id} />
           </div>
         )}
@@ -104,7 +110,7 @@ function DAGPlaceholder({ issueId }: { issueId: string }) {
 
   if (!DAGViewer) {
     return (
-      <div className="flex items-center justify-center h-32 text-text-muted text-sm">
+      <div className="flex items-center justify-center h-32 text-muted-foreground text-sm">
         Loading DAG...
       </div>
     );

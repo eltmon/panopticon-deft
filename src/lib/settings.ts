@@ -1,14 +1,36 @@
+import { Effect } from 'effect';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { SETTINGS_FILE } from './paths.js';
+import { FsError } from './errors.js';
 
 // Model identifiers
 export type AnthropicModel = 'claude-opus-4-7' | 'claude-opus-4-6' | 'claude-sonnet-4-6' | 'claude-sonnet-4-5' | 'claude-haiku-4-5';
-export type OpenAIModel = 'gpt-5.5' | 'gpt-5.5-mini' | 'gpt-5.5-nano' | 'gpt-5.5-pro' | 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.4-nano' | 'gpt-5.4-pro' | 'o3' | 'o4-mini' | 'gpt-5.2-codex' | 'o3-deep-research' | 'gpt-4o' | 'gpt-4o-mini';
-export type GoogleModel = 'gemini-3.1-pro-preview' | 'gemini-3-flash' | 'gemini-3.1-flash-lite-preview' | 'gemini-3-pro-preview' | 'gemini-3-flash-preview' | 'gemini-2.5-pro' | 'gemini-2.5-flash';
+export type OpenAIModel =
+  // Supported (Codex CLI catalog, 2026-05-23)
+  | 'gpt-5.5'
+  | 'gpt-5.4'
+  | 'gpt-5.4-mini'
+  | 'gpt-5.3-codex'
+  | 'gpt-5.3-codex-spark'
+  | 'gpt-5.2'
+  // Retired — kept in the type for backward-compat with saved configs and
+  // for the deprecation migration in src/lib/model-capabilities.ts. New
+  // configs and UI dropdowns must not surface these.
+  | 'gpt-5.5-pro'
+  | 'gpt-5.4-pro'
+  | 'o3'
+  | 'o4-mini'
+  | 'o3-deep-research'
+  | 'gpt-4o'
+  | 'gpt-4o-mini';
+export type GoogleModel = 'gemini-3.1-pro-preview' | 'gemini-3.1-flash-lite-preview' | 'gemini-3-pro-preview' | 'gemini-3-flash-preview' | 'gemini-2.5-pro' | 'gemini-2.5-flash';
 export type KimiModel = 'kimi-k2.6' | 'kimi-k2.5' | 'K2.6-code-preview' | 'kimi-k2';
 export type MiniMaxModel = 'minimax-m2.7' | 'minimax-m2.7-highspeed';
 export type ZAIModel = 'glm-5.1' | 'glm-4.7' | 'glm-4.7-flash';
-export type ModelId = AnthropicModel | OpenAIModel | GoogleModel | KimiModel | MiniMaxModel | ZAIModel;
+export type MimoModel = 'mimo-v2.5-pro' | 'mimo-v2.5';
+export type NousModel = 'qwen/qwen3.6-plus';
+export type DashScopeModel = 'qwen3-max' | 'qwen3-coder-plus' | 'qwen3-plus' | 'qwen3.7-max';
+export type ModelId = AnthropicModel | OpenAIModel | GoogleModel | KimiModel | MiniMaxModel | ZAIModel | MimoModel | NousModel | DashScopeModel;
 
 // Task complexity levels
 export type ComplexityLevel = 'trivial' | 'simple' | 'medium' | 'complex' | 'expert';
@@ -38,6 +60,9 @@ export interface ApiKeysConfig {
   google?: string;
   kimi?: string;
   minimax?: string;
+  mimo?: string;
+  nous?: string;
+  dashscope?: string;
 }
 
 // Complete settings structure
@@ -105,11 +130,11 @@ function deepMerge<T extends object>(defaults: T, overrides: Partial<T>): T {
  * Returns default settings if file doesn't exist or is invalid
  * Also loads API keys from environment variables as fallback
  */
-export function loadSettings(): SettingsConfig {
+export function loadSettingsSync(): SettingsConfig {
   let settings: SettingsConfig;
 
   if (!existsSync(SETTINGS_FILE)) {
-    settings = getDefaultSettings();
+    settings = getDefaultSettingsSync();
   } else {
     try {
       const content = readFileSync(SETTINGS_FILE, 'utf8');
@@ -117,7 +142,7 @@ export function loadSettings(): SettingsConfig {
       settings = deepMerge(DEFAULT_SETTINGS, parsed);
     } catch (error) {
       console.error('Warning: Failed to parse settings.json, using defaults');
-      settings = getDefaultSettings();
+      settings = getDefaultSettingsSync();
     }
   }
 
@@ -127,7 +152,11 @@ export function loadSettings(): SettingsConfig {
   if (process.env.OPENAI_API_KEY) envApiKeys.openai = process.env.OPENAI_API_KEY;
   if (process.env.GOOGLE_API_KEY) envApiKeys.google = process.env.GOOGLE_API_KEY;
   if (process.env.MINIMAX_API_KEY) envApiKeys.minimax = process.env.MINIMAX_API_KEY;
-  if (process.env.KIMI_API_KEY) envApiKeys.kimi = process.env.KIMI_API_KEY;
+  if (process.env.KIMI_CODING_API_KEY) envApiKeys.kimi = process.env.KIMI_CODING_API_KEY;
+  else if (process.env.KIMI_API_KEY) envApiKeys.kimi = process.env.KIMI_API_KEY;
+  if (process.env.MIMO_API_KEY) envApiKeys.mimo = process.env.MIMO_API_KEY;
+  if (process.env.NOUS_API_KEY) envApiKeys.nous = process.env.NOUS_API_KEY;
+  if (process.env.DASHSCOPE_API_KEY) envApiKeys.dashscope = process.env.DASHSCOPE_API_KEY;
 
   // Merge env vars as fallback (settings.json takes precedence)
   settings.api_keys = {
@@ -142,7 +171,7 @@ export function loadSettings(): SettingsConfig {
  * Save settings to ~/.panopticon/settings.json
  * Writes with pretty formatting (2-space indent)
  */
-export function saveSettings(settings: SettingsConfig): void {
+export function saveSettingsSync(settings: SettingsConfig): void {
   const content = JSON.stringify(settings, null, 2);
   writeFileSync(SETTINGS_FILE, content, 'utf8');
 }
@@ -151,7 +180,7 @@ export function saveSettings(settings: SettingsConfig): void {
  * Validate settings structure and model IDs
  * Returns error message if invalid, null if valid
  */
-export function validateSettings(settings: SettingsConfig): string | null {
+export function validateSettingsSync(settings: SettingsConfig): string | null {
   // Validate models structure
   if (!settings.models) {
     return 'Missing models configuration';
@@ -189,7 +218,7 @@ export function validateSettings(settings: SettingsConfig): string | null {
 /**
  * Get a deep copy of the default settings
  */
-export function getDefaultSettings(): SettingsConfig {
+export function getDefaultSettingsSync(): SettingsConfig {
   return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
 }
 
@@ -197,12 +226,15 @@ export function getDefaultSettings(): SettingsConfig {
  * Get available models for a provider based on configured API keys
  * Returns empty array if provider API key is not configured
  */
-export function getAvailableModels(settings: SettingsConfig): {
+export function getAvailableModelsSync(settings: SettingsConfig): {
   anthropic: AnthropicModel[];
   openai: OpenAIModel[];
   google: GoogleModel[];
   kimi: KimiModel[];
   minimax: MiniMaxModel[];
+  mimo: MimoModel[];
+  nous: NousModel[];
+  dashscope: DashScopeModel[];
 } {
   const anthropicModels: AnthropicModel[] = [
     'claude-opus-4-6',
@@ -211,11 +243,11 @@ export function getAvailableModels(settings: SettingsConfig): {
   ];
 
   const openaiModels: OpenAIModel[] = settings.api_keys.openai
-    ? ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-nano', 'gpt-5.5-pro', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5.4-pro', 'o3', 'o4-mini']
+    ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2']
     : [];
 
   const googleModels: GoogleModel[] = settings.api_keys.google
-    ? ['gemini-3.1-pro-preview', 'gemini-3-flash', 'gemini-3.1-flash-lite-preview']
+    ? ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview']
     : [];
 
   const kimiModels: KimiModel[] = settings.api_keys.kimi
@@ -226,12 +258,27 @@ export function getAvailableModels(settings: SettingsConfig): {
     ? ['minimax-m2.7', 'minimax-m2.7-highspeed']
     : [];
 
+  const mimoModels: MimoModel[] = settings.api_keys.mimo
+    ? ['mimo-v2.5-pro', 'mimo-v2.5']
+    : [];
+
+  const nousModels: NousModel[] = settings.api_keys.nous
+    ? ['qwen/qwen3.6-plus']
+    : [];
+
+  const dashscopeModels: DashScopeModel[] = settings.api_keys.dashscope
+    ? ['qwen3-max', 'qwen3-coder-plus', 'qwen3-plus', 'qwen3.7-max']
+    : [];
+
   return {
     anthropic: anthropicModels,
     openai: openaiModels,
     google: googleModels,
     kimi: kimiModels,
     minimax: minimaxModels,
+    mimo: mimoModels,
+    nous: nousModels,
+    dashscope: dashscopeModels,
   };
 }
 
@@ -239,7 +286,7 @@ export function getAvailableModels(settings: SettingsConfig): {
  * Check if a model ID is an Anthropic model
  * Anthropic models can be run directly with `claude` CLI
  */
-export function isAnthropicModel(modelId: ModelId | string): boolean {
+export function isAnthropicModelSync(modelId: ModelId | string): boolean {
   return modelId.startsWith('claude-');
 }
 
@@ -247,7 +294,7 @@ export function isAnthropicModel(modelId: ModelId | string): boolean {
  * Get the Claude CLI model flag for an Anthropic model
  * Maps our model IDs to Claude's expected format
  */
-export function getClaudeModelFlag(modelId: ModelId | string): string {
+export function getClaudeModelFlagSync(modelId: ModelId | string): string {
   const modelMap: Record<string, string> = {
     'claude-opus-4-6': 'opus',
     'claude-sonnet-4-6': 'sonnet',
@@ -262,11 +309,11 @@ export function getClaudeModelFlag(modelId: ModelId | string): string {
  * Always uses 'claude' CLI — non-Anthropic models work via ANTHROPIC_BASE_URL env var
  * pointing to their Anthropic-compatible endpoint.
  */
-export function getAgentCommand(modelId: ModelId | string): { command: string; args: string[] } {
-  if (isAnthropicModel(modelId)) {
+export function getAgentCommandSync(modelId: ModelId | string): { command: string; args: string[] } {
+  if (isAnthropicModelSync(modelId)) {
     return {
       command: 'claude',
-      args: ['--model', getClaudeModelFlag(modelId)],
+      args: ['--model', getClaudeModelFlagSync(modelId)],
     };
   }
   // Non-Anthropic direct providers: use claude CLI with the model name as-is.
@@ -276,3 +323,51 @@ export function getAgentCommand(modelId: ModelId | string): { command: string; a
     args: ['--model', modelId],
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// Sync FS wrappers (CLI-only by design); pure helpers stay Effect.sync.
+
+/** Load settings.json (returns defaults if missing). Pure-ish (logs on parse error). */
+export const loadSettings = (): Effect.Effect<SettingsConfig> =>
+  Effect.sync(() => loadSettingsSync());
+
+/** Persist settings.json; surfaces FsError on failure. */
+export const saveSettings = (
+  settings: SettingsConfig,
+): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => saveSettingsSync(settings),
+    catch: (cause) =>
+      new FsError({ path: SETTINGS_FILE, operation: 'save-settings', cause }),
+  });
+
+/** Validate a settings object; returns null when valid, error message otherwise. Pure. */
+export const validateSettings = (
+  settings: SettingsConfig,
+): Effect.Effect<string | null> => Effect.sync(() => validateSettingsSync(settings));
+
+/** Default settings template. Pure. */
+export const getDefaultSettings = (): Effect.Effect<SettingsConfig> =>
+  Effect.sync(() => getDefaultSettingsSync());
+
+/** Compute the available-model breakdown for a settings object. Pure. */
+export const getAvailableModels = (
+  settings: SettingsConfig,
+): Effect.Effect<ReturnType<typeof getAvailableModelsSync>> =>
+  Effect.sync(() => getAvailableModelsSync(settings));
+
+/** True if the model id maps to an Anthropic model. Pure. */
+export const isAnthropicModel = (
+  modelId: ModelId | string,
+): Effect.Effect<boolean> => Effect.sync(() => isAnthropicModelSync(modelId));
+
+/** Resolve the `--model` flag value for `claude` CLI. Pure. */
+export const getClaudeModelFlag = (
+  modelId: ModelId | string,
+): Effect.Effect<string> => Effect.sync(() => getClaudeModelFlagSync(modelId));
+
+/** Resolve the full spawn command + args for a model. Pure. */
+export const getAgentCommand = (
+  modelId: ModelId | string,
+): Effect.Effect<{ command: string; args: string[] }> =>
+  Effect.sync(() => getAgentCommandSync(modelId));

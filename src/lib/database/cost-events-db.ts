@@ -3,10 +3,60 @@
  *
  * Provides SQLite-backed storage for CostEvent records.
  * Deduplication is enforced via UNIQUE index on request_id.
+ *
+ * PAN-1249: Effect migration pass — synchronous public API preserved so
+ * existing call sites stay unchanged. The hot insert paths are wrapped in
+ * Effect.try with a local DatabaseError tag, matching prior best-effort
+ * semantics (insert failures are logged and surfaced as `null`).
+ * Full conversion to @effect/sql-sqlite-bun is deferred to PAN-447.
  */
 
+import { Data, Effect } from 'effect';
 import { getDatabase } from './index.js';
 import type { CostEvent } from '../costs/events.js';
+
+/** A SQLite operation against panopticon.db failed. */
+class DatabaseError extends Data.TaggedError('DatabaseError')<{
+  readonly operation: string;
+  readonly cause?: unknown;
+}> {}
+
+// ============== Daily spend cache (avoids sync SQLite on event loop) ==============
+
+const DAILY_SPEND_CACHE_TTL_MS = 30_000;
+const dailySpendCache = new Map<string, { total: number; updatedAt: number }>();
+
+function dailySpendCacheKey(issueId: string, startTs: string): string {
+  return `${issueId}:${startTs}`;
+}
+
+function startOfLocalDayIso(ts: string): string {
+  const d = new Date(ts);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
+}
+
+export function recordMemoryExtractionSpend(issueId: string, startTs: string, cost: number): void {
+  const key = dailySpendCacheKey(issueId, startTs);
+  const existing = dailySpendCache.get(key);
+  if (existing) {
+    existing.total += cost;
+    existing.updatedAt = Date.now();
+  } else {
+    dailySpendCache.set(key, { total: cost, updatedAt: Date.now() });
+  }
+}
+
+export function invalidateMemorySpendCache(issueId: string, startTs: string): void {
+  dailySpendCache.delete(dailySpendCacheKey(issueId, startTs));
+}
+
+export function getCachedMemoryExtractionCostUsd(opts: { issueId: string; startTs: string }): number | null {
+  const cached = dailySpendCache.get(dailySpendCacheKey(opts.issueId, opts.startTs));
+  if (cached && Date.now() - cached.updatedAt < DAILY_SPEND_CACHE_TTL_MS) {
+    return cached.total;
+  }
+  return null;
+}
 
 // ============== Write operations ==============
 
@@ -15,44 +65,57 @@ import type { CostEvent } from '../costs/events.js';
  * Deduplication is handled by the UNIQUE index on request_id.
  */
 export function insertCostEvent(event: CostEvent, sourceFile?: string): number | null {
-  const db = getDatabase();
-  try {
-    const result = db.prepare(`
-      INSERT OR IGNORE INTO cost_events (
-        ts, agent_id, issue_id, session_type, provider, model,
-        input, output, cache_read, cache_write, cost, request_id,
-        session_id,
-        tldr_interceptions, tldr_bypasses, tldr_tokens_saved, tldr_bypass_reasons,
-        source_file, caveman_variant
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      event.ts,
-      event.agentId,
-      event.issueId,
-      event.sessionType || 'unknown',
-      event.provider || 'anthropic',
-      event.model,
-      event.input,
-      event.output,
-      event.cacheRead,
-      event.cacheWrite,
-      event.cost,
-      event.requestId ?? null,
-      event.sessionId ?? null,
-      event.tldrInterceptions ?? null,
-      event.tldrBypasses ?? null,
-      event.tldrTokensSaved ?? null,
-      event.tldrBypassReasons ? JSON.stringify(event.tldrBypassReasons) : null,
-      sourceFile ?? null,
-      event.cavemanVariant ?? null,
-    );
-    if (result.changes === 0) return null; // Duplicate
-    return result.lastInsertRowid as number;
-  } catch (err) {
-    // Handle non-requestId duplicates gracefully
-    console.error('[cost-events-db] Insert failed:', err);
-    return null;
-  }
+  return Effect.runSync(
+    Effect.try({
+      try: () => {
+        const db = getDatabase();
+        const result = db.prepare(`
+          INSERT OR IGNORE INTO cost_events (
+            ts, agent_id, issue_id, session_type, provider, model,
+            input, output, cache_read, cache_write, cost, request_id,
+            session_id,
+            tldr_interceptions, tldr_bypasses, tldr_tokens_saved, tldr_bypass_reasons,
+            source_file, caveman_variant
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          event.ts,
+          event.agentId,
+          event.issueId,
+          event.sessionType || 'unknown',
+          event.provider || 'anthropic',
+          event.model,
+          event.input,
+          event.output,
+          event.cacheRead,
+          event.cacheWrite,
+          event.cost,
+          event.requestId ?? null,
+          event.sessionId ?? null,
+          event.tldrInterceptions ?? null,
+          event.tldrBypasses ?? null,
+          event.tldrTokensSaved ?? null,
+          event.tldrBypassReasons ? JSON.stringify(event.tldrBypassReasons) : null,
+          event.source ?? sourceFile ?? null,
+          event.cavemanVariant ?? null,
+        );
+        if (result.changes === 0) return null; // Duplicate
+
+        // Keep the daily spend cache warm for memory-extraction events
+        if (event.source === 'memory-extraction' || sourceFile === 'memory-extraction') {
+          recordMemoryExtractionSpend(event.issueId, startOfLocalDayIso(event.ts), event.cost);
+        }
+
+        return result.lastInsertRowid as number;
+      },
+      catch: (cause) => new DatabaseError({ operation: 'insertCostEvent', cause }),
+    }).pipe(
+      Effect.catchTag('DatabaseError', (err) => {
+        // Handle non-requestId duplicates gracefully (preserves prior behaviour)
+        console.error('[cost-events-db] Insert failed:', err.cause);
+        return Effect.succeed<number | null>(null);
+      }),
+    ),
+  );
 }
 
 /**
@@ -97,7 +160,7 @@ export function insertCostEvents(
         ev.tldrBypasses ?? null,
         ev.tldrTokensSaved ?? null,
         ev.tldrBypassReasons ? JSON.stringify(ev.tldrBypassReasons) : null,
-        sourceFile ?? null,
+        ev.source ?? sourceFile ?? null,
         ev.cavemanVariant ?? null,
       );
       if (result.changes > 0) {
@@ -117,6 +180,43 @@ export function insertCostEvents(
 /**
  * Get all cost events, optionally filtered.
  */
+export function queryMemoryExtractionCostUsd(opts: {
+  issueId: string;
+  startTs: string;
+  endTs?: string;
+}): number {
+  // Fast-path: cached daily total avoids sync SQLite on the event loop
+  if (!opts.endTs) {
+    const cached = getCachedMemoryExtractionCostUsd(opts);
+    if (cached !== null) return cached;
+  }
+
+  const db = getDatabase();
+  const conditions = [
+    'UPPER(issue_id) = UPPER(?)',
+    "source_file = 'memory-extraction'",
+    'ts >= ?',
+  ];
+  const params: string[] = [opts.issueId, opts.startTs];
+  if (opts.endTs) {
+    conditions.push('ts <= ?');
+    params.push(opts.endTs);
+  }
+
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(cost), 0) AS total
+    FROM cost_events
+    WHERE ${conditions.join(' AND ')}
+  `).get(...params) as { total: number } | undefined;
+  const result = row?.total ?? 0;
+
+  if (!opts.endTs) {
+    dailySpendCache.set(dailySpendCacheKey(opts.issueId, opts.startTs), { total: result, updatedAt: Date.now() });
+  }
+
+  return result;
+}
+
 export function queryCostEvents(opts: {
   issueId?: string;
   agentId?: string;
@@ -162,7 +262,9 @@ export function queryCostEvents(opts: {
   const sql = `
     SELECT ts, agent_id, issue_id, session_type, provider, model,
            input, output, cache_read, cache_write, cost, request_id,
-           tldr_interceptions, tldr_bypasses, tldr_tokens_saved, tldr_bypass_reasons
+           session_id,
+           tldr_interceptions, tldr_bypasses, tldr_tokens_saved, tldr_bypass_reasons,
+           source_file
     FROM cost_events
     ${where}
     ORDER BY ts ASC
@@ -449,10 +551,12 @@ interface DbCostRow {
   cache_write: number;
   cost: number;
   request_id: string | null;
+  session_id: string | null;
   tldr_interceptions: number | null;
   tldr_bypasses: number | null;
   tldr_tokens_saved: number | null;
   tldr_bypass_reasons: string | null;
+  source_file: string | null;
   caveman_variant: string | null;
 }
 
@@ -481,6 +585,8 @@ function rowToCostEvent(row: DbCostRow): CostEvent {
     cacheWrite: row.cache_write,
     cost: row.cost,
     requestId: row.request_id ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    source: row.source_file ?? undefined,
     tldrInterceptions: row.tldr_interceptions ?? undefined,
     tldrBypasses: row.tldr_bypasses ?? undefined,
     tldrTokensSaved: row.tldr_tokens_saved ?? undefined,

@@ -37,6 +37,7 @@
 :root {
   color-scheme: light;
   --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
 
   /* Surfaces */
   --background: #ffffff;
@@ -49,18 +50,18 @@
   /* Interactive */
   --primary: oklch(0.488 0.217 264);
   --primary-foreground: #ffffff;
-  --secondary: rgba(0, 0, 0, 0.04);
+  --secondary: color-mix(in srgb, black 4%, transparent);
   --secondary-foreground: #1f2937;
-  --accent: rgba(0, 0, 0, 0.04);
+  --accent: color-mix(in srgb, black 4%, transparent);
   --accent-foreground: #1f2937;
 
   /* Muted */
-  --muted: rgba(0, 0, 0, 0.04);
+  --muted: color-mix(in srgb, black 4%, transparent);
   --muted-foreground: #6b7280;
 
   /* Borders & inputs */
-  --border: rgba(0, 0, 0, 0.08);
-  --input: rgba(0, 0, 0, 0.10);
+  --border: color-mix(in srgb, black 8%, transparent);
+  --input: color-mix(in srgb, black 10%, transparent);
   --ring: oklch(0.488 0.217 264);
 
   /* Semantic signal colors */
@@ -76,44 +77,6 @@
   --signal-review-foreground: #7e22ce;
   --signal-cost: #06b6d4;
   --signal-cost-foreground: #0e7490;
-
-  /* ─── Extended surface tokens ─────────────────────────────────── */
-  /* Surface hierarchy (lightest to most elevated) */
-  --surface: #ffffff;
-  --surface-raised: #f9fafb;
-  --surface-2: #f5f6f8;
-  --surface-active: #f3f4f6;
-  --surface-hover: #f3f4f6;
-  --surface-overlay: #ffffff;
-  --surface-emphasis: #eff1f4;
-
-  /* Extended border tokens */
-  --divider: rgba(0, 0, 0, 0.08);
-  --divider-strong: rgba(0, 0, 0, 0.14);
-  --divider-focus: oklch(0.488 0.217 264);
-
-  /* Extended input token */
-  --input-bg: #f9fafb;
-
-  /* Extended text tokens (for components using explicit text-* naming) */
-  --text-primary: #1f2937;
-  --text-secondary: #4b5563;
-  --text-muted: #9ca3af;
-
-  /* Content text hierarchy (for components using content-* naming) */
-  --content: #1f2937;
-  --content-body: #374151;
-  --content-muted: #6b7280;
-  --content-subtle: #9ca3af;
-
-  /* Muted accent (tinted interactive highlight) */
-  --accent-muted: rgba(99, 102, 241, 0.08);
-
-  /* Legacy pan-* aliases — map to new system until bead 6kg migration */
-  --pan-panel-left: #f9fafb;
-  --pan-panel-right: #ffffff;
-  --pan-border: rgba(0, 0, 0, 0.08);
-  --pan-text-secondary: #4b5563;
 }
 
 /* ─── Dark mode ─── */
@@ -122,27 +85,27 @@
 
   /* Surfaces */
   --background: #080b10;
-  --foreground: #f3f4f6;
+  --foreground: #e5e7eb;
   --card: #0c1018;
-  --card-foreground: #f3f4f6;
+  --card-foreground: #e5e7eb;
   --popover: #0c1018;
-  --popover-foreground: #f3f4f6;
+  --popover-foreground: #e5e7eb;
 
   /* Interactive */
   --primary: oklch(0.588 0.217 264);
   --primary-foreground: #ffffff;
-  --secondary: rgba(255, 255, 255, 0.04);
-  --secondary-foreground: #f3f4f6;
-  --accent: rgba(255, 255, 255, 0.04);
-  --accent-foreground: #f3f4f6;
+  --secondary: color-mix(in srgb, white 6%, transparent);
+  --secondary-foreground: #e5e7eb;
+  --accent: color-mix(in srgb, white 8%, transparent);
+  --accent-foreground: #e5e7eb;
 
   /* Muted */
-  --muted: rgba(255, 255, 255, 0.04);
+  --muted: color-mix(in srgb, white 4%, transparent);
   --muted-foreground: #9ca3af;
 
   /* Borders & inputs */
-  --border: rgba(255, 255, 255, 0.06);
-  --input: rgba(255, 255, 255, 0.08);
+  --border: color-mix(in srgb, white 6%, transparent);
+  --input: color-mix(in srgb, white 8%, transparent);
   --ring: oklch(0.588 0.217 264);
 
   /* Semantic signal colors — foreground lightens for dark mode */
@@ -158,43 +121,12 @@
   --signal-review-foreground: #c084fc;
   --signal-cost: #06b6d4;
   --signal-cost-foreground: #22d3ee;
-
-  /* ─── Extended surface tokens (dark) ─────────────────────────── */
-  --surface: #0c1018;
-  --surface-raised: #111520;
-  --surface-2: #0e1320;
-  --surface-active: #1a2132;
-  --surface-hover: #161d2b;
-  --surface-overlay: #13192a;
-  --surface-emphasis: #1e2640;
-
-  --divider: rgba(255, 255, 255, 0.06);
-  --divider-strong: rgba(255, 255, 255, 0.12);
-  --divider-focus: oklch(0.588 0.217 264);
-
-  --input-bg: rgba(255, 255, 255, 0.06);
-
-  --text-primary: #f3f4f6;
-  --text-secondary: #c9d1e0;
-  --text-muted: #8899aa;
-
-  --content: #f3f4f6;
-  --content-body: #e5e7eb;
-  --content-muted: #9ca3af;
-  --content-subtle: #6b7280;
-
-  --accent-muted: rgba(139, 92, 246, 0.15);
-
-  --pan-panel-left: #111520;
-  --pan-panel-right: #0c1018;
-  --pan-border: rgba(255, 255, 255, 0.06);
-  --pan-text-secondary: #c9d1e0;
 }
 
 @layer base {
   body {
     @apply bg-background text-foreground;
-    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-family: "DM Sans", system-ui, sans-serif;
     margin: 0;
     padding: 0;
     min-height: 100vh;
@@ -253,7 +185,7 @@ body::after {
 }
 
 .terminal-output {
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
+  font-family: 'SF Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   font-size: 13px;
   line-height: 1.5;
 }
@@ -309,6 +241,61 @@ body::after {
   .badge-border-info {
     border-color: color-mix(in srgb, var(--info) 32%, transparent);
   }
+  .drawer-gate-border-pass {
+    border-color: color-mix(in srgb, var(--success) 32%, transparent);
+  }
+  .drawer-gate-border-fail {
+    border-color: color-mix(in srgb, var(--destructive) 32%, transparent);
+  }
+  .pulse {
+    animation: pulse 1.6s ease-out infinite;
+  }
+  .drawer-bead-current-ping {
+    animation: drawer-bead-current-ping 1.6s ease-out infinite;
+  }
+}
+
+@keyframes drawer-bead-current-ping {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 1;
+  }
+  80% {
+    box-shadow: 0 0 0 6px transparent;
+    opacity: 0.5;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 1;
+  }
+}
+
+@keyframes issue-drawer-slide-in {
+  0% {
+    transform: translateX(24px) scale(0.98);
+    opacity: 0;
+  }
+  100% {
+    transform: translateX(0) scale(1);
+    opacity: 1;
+  }
+}
+
+@layer components {
+  .issue-card-surface {
+    background: color-mix(in srgb, var(--background) 92%, var(--color-white));
+  }
 }
 
 /* ─── Ready-to-merge shimmer animation ─── */
@@ -328,6 +315,100 @@ body::after {
     background-size: 250% 100%;
     animation: badge-shimmer 2.8s ease-in-out infinite;
   }
+}
+
+/* ─── Command Deck liveness keyframes (PAN-830) ─── */
+@keyframes alive-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.85); }
+}
+
+@keyframes kf-stuck-shake {
+  0%, 100% { transform: translateX(0); }
+  25%      { transform: translateX(-1px); }
+  75%      { transform: translateX(1px); }
+}
+
+@keyframes kf-error-shake {
+  0%, 100% { transform: translateX(0); }
+  25%      { transform: translateX(-3px); }
+  75%      { transform: translateX(3px); }
+}
+
+@keyframes kf-row-flash {
+  0%   { background: color-mix(in srgb, var(--primary) 20%, transparent); }
+  100% { background: transparent; }
+}
+
+@keyframes kf-round-active {
+  0%   { background-position: 150% 50%; }
+  100% { background-position: -50% 50%; }
+}
+
+@layer utilities {
+  .anim-alive-dot-active   { animation: alive-dot 1.6s ease-in-out infinite; }
+  .anim-alive-dot-thinking { animation: alive-dot 2.0s ease-in-out infinite; }
+  .anim-alive-dot-waiting  { animation: alive-dot 1.5s ease-in-out infinite; }
+  .anim-alive-dot-idle     { animation: alive-dot 4.0s ease-in-out infinite; }
+  .anim-stuck-shake        { animation: kf-stuck-shake 1.5s ease-in-out infinite; }
+  .anim-error-shake        { animation: kf-error-shake 200ms ease-in-out 1; }
+  .anim-row-flash          { animation: kf-row-flash 600ms ease-out 1; }
+  .anim-round-active {
+    background: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--primary) 6%, transparent) 0%,
+      color-mix(in srgb, var(--primary) 22%, transparent) 50%,
+      color-mix(in srgb, var(--primary) 6%, transparent) 100%
+    );
+    background-size: 250% 100%;
+    animation: kf-round-active 2.4s ease-in-out infinite;
+  }
+}
+
+/* ─── Accessibility: honor prefers-reduced-motion (PAN-830) ────────────────────
+ * Users who set their OS to "reduce motion" must not see the constant pulsing
+ * dots, shimmer gradients, or shake animations. This rule disables every ambient
+ * keyframe animation while preserving instantaneous state changes (color, layout). */
+@media (prefers-reduced-motion: reduce) {
+  .anim-alive-dot-active,
+  .anim-alive-dot-thinking,
+  .anim-alive-dot-waiting,
+  .anim-alive-dot-idle,
+  .anim-stuck-shake,
+  .anim-error-shake,
+  .anim-row-flash,
+  .anim-round-active,
+  .drawer-bead-current-ping {
+    animation: none !important;
+  }
+  .anim-round-active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+  }
+}
+
+/* ─── Radix context menu animations ────────────────────────────────────────── */
+@keyframes context-menu-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes context-menu-out {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.95); }
+}
+
+[data-radix-context-menu-content],
+[data-radix-context-menu-subcontent] {
+  transform-origin: var(--radix-context-menu-content-transform-origin);
+}
+
+[data-radix-context-menu-content][data-state="open"],
+[data-radix-context-menu-subcontent][data-state="open"] {
+  animation: context-menu-in 120ms ease-out;
+}
+
+[data-radix-context-menu-content][data-state="closed"],
+[data-radix-context-menu-subcontent][data-state="closed"] {
+  animation: context-menu-out 80ms ease-in;
 }
 
 /* ─── Prose notes (review/test notes in inspector) ─────────────────────────── */

@@ -23,9 +23,11 @@
 import { readFileSync, existsSync, readdirSync, openSync, readSync, fstatSync, closeSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
+import { Effect } from 'effect';
 import { getDatabase } from '../database/index.js';
 import { insertCostEvents } from '../database/cost-events-db.js';
-import { calculateCost, getPricing, type AIProvider, type TokenUsage } from '../cost.js';
+import { calculateCostSync, getPricingSync, type AIProvider, type TokenUsage } from '../cost.js';
+import { FsError } from '../errors.js';
 
 // ============== Types ==============
 
@@ -121,21 +123,24 @@ function buildSessionIndex(): Map<string, SessionMapping> {
       } catch { /* skip */ }
     }
 
-    // Read state.json for issue/workspace context and phase
+    // Read state.json for issue/workspace context and role.
     const stateFile = join(agentPath, 'state.json');
     let issueId = inferIssueId(agentDir) || 'UNKNOWN';
-    let statePhase: string | undefined;
+    let stateRole: string | undefined;
     if (existsSync(stateFile)) {
       try {
         const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
         if (state.issueId) issueId = state.issueId;
-        if (state.phase) statePhase = state.phase;
+        if (state.role) stateRole = state.role;
       } catch { /* use inferred */ }
     }
 
-    // Determine session type: prefer state.json phase, then infer from agent directory name
-    let sessionType = statePhase || 'implementation';
-    if (agentDir.startsWith('planning-')) {
+    // Determine session type: prefer state.json role, then infer from agent directory name
+    let sessionType = stateRole || 'work';
+    const reviewSubRole = agentDir.match(/-review-(security|correctness|performance|requirements)$/i)?.[1]?.toLowerCase();
+    if (reviewSubRole) {
+      sessionType = `review.${reviewSubRole}`;
+    } else if (agentDir.startsWith('planning-')) {
       sessionType = 'planning';
     } else if (agentDir.includes('review')) {
       sessionType = 'review';
@@ -288,11 +293,11 @@ function extractCostEvents(
 
       // Strip claudish prefix for pricing lookup: "oai@gpt-5.4" → "gpt-5.4"
       const pricingModel = model.replace(/^(?:oai|cx|go)@/, '');
-      const pricing = getPricing(provider, pricingModel);
+      const pricing = getPricingSync(provider, pricingModel);
       if (!pricing) continue;
 
       const tokenUsage: TokenUsage = { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cacheTTL: '5m' };
-      const cost = calculateCost(tokenUsage, pricing);
+      const cost = calculateCostSync(tokenUsage, pricing);
       const timestamp = entry.timestamp || entry.ts || entry.created_at || new Date().toISOString();
 
       events.push({
@@ -317,17 +322,7 @@ function extractCostEvents(
   }
 
   return events;
-}
-
-// ============== Main Reconcile ==============
-
-/**
- * Run a full reconciliation sweep.
- *
- * Scans ~/.claude/projects/ directly to find ALL transcript files,
- * then uses the session-to-agent index and path inference for attribution.
- */
-export async function reconcile(): Promise<ReconcileResult> {
+}async function reconcilePromise(): Promise<ReconcileResult> {
   const result: ReconcileResult = {
     sessionsScanned: 0,
     sessionsWithNewData: 0,
@@ -467,3 +462,16 @@ export async function reconcile(): Promise<ReconcileResult> {
 
   return result;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect variant of reconcile. Per-file errors are still surfaced via
+ * `result.errors`; only catastrophic failures (e.g. SQLite open failure)
+ * surface on the Effect error channel.
+ */
+export const reconcile = (): Effect.Effect<ReconcileResult, FsError> =>
+  Effect.tryPromise({
+    try: () => reconcilePromise(),
+    catch: (cause) => new FsError({ path: '<reconciler>', operation: 'reconcile', cause }),
+  });

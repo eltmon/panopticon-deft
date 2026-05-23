@@ -9,10 +9,12 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { Effect, Layer } from 'effect';
-import { HttpServerResponse } from 'effect/unstable/http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { HttpServerResponse as HttpServerResponseModule } from 'effect/unstable/http';
+
+type HttpServerResponse = HttpServerResponseModule.HttpServerResponse;
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { httpHandler } from '../http-handler.js';
 import { EventStoreService, EventStoreServiceLive } from '../../services/domain-services.js';
 import { ReadModelServiceLive } from '../../read-model.js';
@@ -20,7 +22,7 @@ import { jsonResponse } from '../../http-helpers.js';
 
 /** Run a route effect and return the response status and parsed JSON body. */
 async function runRoute(
-  effect: Effect.Effect<typeof HttpServerResponse.Type, unknown, never>
+  effect: Effect.Effect<HttpServerResponse, unknown, never>
 ): Promise<{ status: number; body: unknown }> {
   const response = await Effect.runPromise(httpHandler(effect));
   const body = response.body as { body: Uint8Array } | null;
@@ -30,40 +32,34 @@ async function runRoute(
 
 describe('Effect.promise async FS pattern', () => {
   it('returns 200 when async operation succeeds', async () => {
-    const effect = httpHandler(
-      Effect.promise(async () => {
-        // Simulate async FS read
-        const data = await Promise.resolve({ value: 42 });
-        return jsonResponse(data);
-      })
-    );
+    const effect = Effect.promise(async () => {
+      // Simulate async FS read
+      const data = await Promise.resolve({ value: 42 });
+      return jsonResponse(data);
+    });
     const { status, body } = await runRoute(effect);
     expect(status).toBe(200);
     expect((body as { value: number }).value).toBe(42);
   });
 
   it('maps async rejection to 500 via httpHandler catchCause', async () => {
-    const effect = httpHandler(
-      Effect.promise(async () => {
-        throw new Error('async FS failure');
-      }) as Effect.Effect<typeof HttpServerResponse.Type, never, never>
-    );
+    const effect = Effect.promise(async () => {
+      throw new Error('async FS failure');
+    }) as Effect.Effect<HttpServerResponse, never, never>;
     const { status, body } = await runRoute(effect);
     expect(status).toBe(500);
     expect((body as { error: string }).error).toContain('async FS failure');
   });
 
   it('inline try/catch returns error response without failing Effect', async () => {
-    const effect = httpHandler(
-      Effect.promise(async () => {
-        try {
-          throw new Error('handled error');
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return jsonResponse({ error: msg }, { status: 500 });
-        }
-      })
-    );
+    const effect = Effect.promise(async () => {
+      try {
+        throw new Error('handled error');
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return jsonResponse({ error: msg }, { status: 500 });
+      }
+    });
     const { status, body } = await runRoute(effect);
     expect(status).toBe(500);
     expect((body as { error: string }).error).toBe('handled error');
@@ -72,12 +68,15 @@ describe('Effect.promise async FS pattern', () => {
 
 describe('EventStoreServiceLive + ReadModelServiceLive end-to-end', () => {
   it('appends and reads back an event using Live layers with real SQLite', async () => {
+    // ReadModelServiceLive bootstrap can take >10s under parallel test load
+    // (it initializes 100+ agents from SQLite). Give it room to finish.
     const tmpDir = mkdtempSync(join(tmpdir(), 'pan-470-test-'));
     const originalHome = process.env['PANOPTICON_HOME'];
     process.env['PANOPTICON_HOME'] = tmpDir;
 
     try {
       // Use vi.resetModules so initEventStore picks up PANOPTICON_HOME
+      vi.resetModules();
       const { EventStoreService: ESS, EventStoreServiceLive: ESL } = await import(
         '../../services/domain-services.js'
       );
@@ -99,6 +98,17 @@ describe('EventStoreServiceLive + ReadModelServiceLive end-to-end', () => {
       process.env['PANOPTICON_HOME'] = originalHome;
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  }, 30000);
+});
+
+describe('Effect-returning helper composition', () => {
+  it('does not wrap review temp cleanup Effect in Effect.promise', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/dashboard/server/routes/workspaces.ts'), 'utf8');
+
+    expect(source).not.toMatch(/Effect\.promise\(\(\) => cleanupReviewTempStash\(/);
+    expect(source).not.toMatch(/Effect\.promise\(\(\) => getWorkspaceGitInfo\(/);
+    expect(source).toMatch(/yield\* cleanupReviewTempStash\(issueId, wsInfo\.localPath!\)/);
+    expect(source).toMatch(/yield\* getWorkspaceGitInfo\(workspacePath\)/);
   });
 });
 
@@ -115,14 +125,14 @@ describe('EventStoreService.append via yield*', () => {
 
     const testLayer = Layer.succeed(EventStoreService, mockEventStore as any);
 
-    const routeEffect = Effect.gen(function* () {
+    const routeProgram = Effect.gen(function* () {
       const eventStore = yield* EventStoreService;
       yield* eventStore.append({ type: 'test.event', timestamp: new Date().toISOString(), payload: {} });
       return jsonResponse({ ok: true });
     });
 
     const response = await Effect.runPromise(
-      Effect.provide(httpHandler(routeEffect), testLayer)
+      Effect.provide(httpHandler(routeProgram), testLayer)
     );
     const body = response.body as { body: Uint8Array } | null;
     const text = body?.body ? new TextDecoder().decode(body.body) : '{}';

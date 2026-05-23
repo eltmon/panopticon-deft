@@ -1,27 +1,38 @@
 /**
  * Shared activity logger — emits activity.entry events to the SQLite event store.
  *
- * Replaces flat-file logActivity() in merge-agent.ts and provides a unified
- * activity logging API for all Panopticon components (merge-agent, cloister,
- * specialists, dashboard).
+ * Replaces flat-file logActivity() in the ship-role merge path and provides a unified
+ * activity logging API for all Panopticon components (roles, cloister, dashboard).
  *
  * Activity entries are persisted to the event store and flow through:
  *   event store → PubSub → WebSocket → EventRouter → Zustand store → ActivityPanel
  *
  * Usage:
  *   import { emitActivityEntry } from '../lib/activity-logger.js';
- *   emitActivityEntry({ source: 'merge-agent', level: 'info', message: '...', issueId: 'PAN-123' });
+ *   emitActivityEntry({ source: 'ship', level: 'info', message: '...', issueId: 'PAN-123' });
  */
 
 import { randomUUID } from 'crypto';
+import { Effect } from 'effect';
 import { getEventStore } from '../dashboard/server/event-store.js';
-import type { DomainEvent } from '@panopticon/contracts';
+import type { DomainEvent } from '@panctl/contracts';
+import type { Role } from './agents.js';
 
 export type ActivityLevel = 'info' | 'warn' | 'error' | 'success';
-export type ActivitySource = 'merge-agent' | 'cloister' | 'review-specialist' | 'test-specialist' | 'dashboard' | 'deploy-script';
+export type ActivitySource =
+  | Role
+  | 'cloister'
+  | 'dashboard'
+  | 'planning-agent'
+  | 'work-agent'
+  | 'review-specialist'
+  | 'test-specialist'
+  | 'merge-agent'
+  | 'tts-summarizer'
+  | 'deploy-script';
 
 export interface EmitActivityOptions {
-  source: ActivitySource;
+  source: Role | 'cloister' | 'dashboard';
   level: ActivityLevel;
   message: string;
   details?: string;
@@ -41,6 +52,8 @@ export interface EmitTtsOptions {
   utterance: string;
   priority?: number; // 0=error (interrupt), 1=warn/success, 2=info
   issueId?: string;
+  source?: ActivitySource;
+  eventType?: string;
 }
 
 /**
@@ -50,7 +63,7 @@ export interface EmitTtsOptions {
  * The event is persisted to SQLite immediately and PubSub notifies all
  * WebSocket subscribers so the ActivityPanel updates in real-time.
  */
-export function emitActivityEntry(options: EmitActivityOptions): void {
+export function emitActivityEntrySync(options: EmitActivityOptions): void {
   try {
     const store = getEventStore();
     const entry = {
@@ -65,7 +78,7 @@ export function emitActivityEntry(options: EmitActivityOptions): void {
         issueId: options.issueId,
       },
     };
-    store.append(entry);
+    void store.appendAsync(entry).catch(() => undefined);
   } catch {
     // Non-fatal — event store may not be initialized during early boot
   }
@@ -75,7 +88,7 @@ export function emitActivityEntry(options: EmitActivityOptions): void {
  * Emit a detailed activity log entry — auto-generated from domain state changes.
  * Use for fine-grained visibility into agent lifecycle, plan changes, pipeline transitions.
  */
-export function emitActivityDetailed(options: EmitDetailedOptions): void {
+export function emitActivityDetailedSync(options: EmitDetailedOptions): void {
   try {
     const store = getEventStore();
     const entry = {
@@ -91,17 +104,23 @@ export function emitActivityDetailed(options: EmitDetailedOptions): void {
         triggeringEvent: options.triggeringEvent,
       },
     };
-    store.append(entry);
+    void store.appendAsync(entry).catch(() => undefined);
   } catch {
     // Non-fatal
   }
+}
+
+function normalizeForSpeech(utterance: string): string {
+  return utterance.replace(/\b([A-Z]{2,})-(\d+)/g, (_match, prefix, num) =>
+    `${prefix.toLowerCase()} ${num}`
+  );
 }
 
 /**
  * Emit a TTS activity log entry — upleveled utterance for text-to-speech.
  * Keep utterances short (<140 chars), human-friendly, and speakable.
  */
-export function emitActivityTts(options: EmitTtsOptions): void {
+export function emitActivityTtsSync(options: EmitTtsOptions): void {
   try {
     const store = getEventStore();
     const entry = {
@@ -109,12 +128,14 @@ export function emitActivityTts(options: EmitTtsOptions): void {
       timestamp: new Date().toISOString(),
       payload: {
         id: randomUUID(),
-        utterance: options.utterance,
+        utterance: normalizeForSpeech(options.utterance),
         priority: options.priority ?? 2,
         issueId: options.issueId,
+        source: options.source,
+        eventType: options.eventType,
       },
     };
-    store.append(entry);
+    void store.appendAsync(entry).catch(() => undefined);
   } catch {
     // Non-fatal
   }
@@ -122,9 +143,9 @@ export function emitActivityTts(options: EmitTtsOptions): void {
 
 /**
  * Emit a dashboard lifecycle event (started, completed, failed).
- * Used by pending-lifecycle.ts and merge-agent.ts.
+ * Used by pending-lifecycle.ts and the ship-role merge path.
  */
-export function emitDashboardLifecycle(
+export function emitDashboardLifecycleSync(
   status: 'started' | 'completed' | 'failed',
   options: {
     reason: string;
@@ -175,3 +196,36 @@ export function emitDashboardLifecycle(
     // Non-fatal
   }
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect-native emit of an activity.entry domain event. Non-failing — the
+ * underlying append is fire-and-forget and silently swallows any event-store
+ * errors to match the Promise contract.
+ */
+export const emitActivityEntry = (
+  options: EmitActivityOptions,
+): Effect.Effect<void> => Effect.sync(() => emitActivityEntrySync(options));
+
+/** Effect-native variant of emitActivityDetailed. */
+export const emitActivityDetailed = (
+  options: EmitDetailedOptions,
+): Effect.Effect<void> => Effect.sync(() => emitActivityDetailedSync(options));
+
+/** Effect-native variant of emitActivityTts. */
+export const emitActivityTts = (
+  options: EmitTtsOptions,
+): Effect.Effect<void> => Effect.sync(() => emitActivityTtsSync(options));
+
+/** Effect-native variant of emitDashboardLifecycle. */
+export const emitDashboardLifecycle = (
+  status: 'started' | 'completed' | 'failed',
+  options: {
+    reason: string;
+    issueId?: string;
+    trigger?: string;
+    durationMs?: number;
+    error?: string;
+  },
+): Effect.Effect<void> => Effect.sync(() => emitDashboardLifecycleSync(status, options));

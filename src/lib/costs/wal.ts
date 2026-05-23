@@ -9,8 +9,10 @@
 
 import { existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
-import { listProjects } from '../projects.js';
-import { extractPrefix } from '../issue-id.js';
+import { Effect } from 'effect';
+import { listProjectsSync } from '../projects.js';
+import { extractPrefixSync } from '../issue-id.js';
+import { FsError } from '../errors.js';
 import type { CostEvent } from './events.js';
 
 const DEFAULT_EVENTS_SUBDIR = '.pan/events';
@@ -20,11 +22,11 @@ const DEFAULT_EVENTS_SUBDIR = '.pan/events';
  * Returns null if no matching project is found.
  */
 export function resolveWalDir(issueId: string): string | null {
-  const projects = listProjects();
+  const projects = listProjectsSync();
 
   // Find which project this issueId belongs to.
   // Match by issue prefix (e.g. "PAN" in "PAN-335") against project key or name.
-  const issuePrefix = extractPrefix(issueId);
+  const issuePrefix = extractPrefixSync(issueId);
   if (!issuePrefix) return null;
 
   for (const { key, config } of projects) {
@@ -49,7 +51,7 @@ export function resolveWalDir(issueId: string): string | null {
  * Returns true if the event was written, false if no matching project was found.
  * Never throws — WAL writes are best-effort.
  */
-export function appendToWal(event: CostEvent): boolean {
+export function appendToWalSync(event: CostEvent): boolean {
   try {
     const walDir = resolveWalDir(event.issueId);
     if (!walDir) return false;
@@ -68,3 +70,31 @@ export function appendToWal(event: CostEvent): boolean {
     return false;
   }
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect variant of appendToWal. Failures surface as typed FsError on the
+ * error channel; the sync variant swallows errors and returns false. Effect
+ * callers that need to distinguish "no matching project" from "write failed"
+ * should prefer this variant.
+ */
+export const appendToWal = (
+  event: CostEvent,
+): Effect.Effect<boolean, FsError> =>
+  Effect.try({
+    try: () => {
+      const walDir = resolveWalDir(event.issueId);
+      if (!walDir) return false;
+
+      if (!existsSync(walDir)) {
+        mkdirSync(walDir, { recursive: true });
+      }
+
+      const walFile = join(walDir, `${event.issueId.toUpperCase()}.jsonl`);
+      const line = JSON.stringify(event) + '\n';
+      appendFileSync(walFile, line, 'utf-8');
+      return true;
+    },
+    catch: (cause) => new FsError({ path: event.issueId, operation: 'appendToWal', cause }),
+  });

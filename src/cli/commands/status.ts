@@ -1,14 +1,81 @@
 import chalk from 'chalk';
+import { Effect } from 'effect';
 import { existsSync, readFileSync, statSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
-import { listRunningAgents, getAgentDir } from '../../lib/agents.js';
+import { listRunningAgentsSync, getAgentDir, type AgentState } from '../../lib/agents.js';
 import { isShadowed, getShadowState } from '../../lib/shadow-state.js';
-import { getTldrMetrics, getTldrDaemonService } from '../../lib/tldr-daemon.js';
+import { getDashboardApiUrlSync } from '../../lib/config.js';
+import { isNoResumeValueEnabled } from '../../lib/cloister/no-resume-mode.js';
+import { getTldrMetricsSync, getTldrDaemonServiceSync } from '../../lib/tldr-daemon.js';
+import {
+  collectDockerContainerLifecycleSnapshot,
+  getWorkspaceStackHealth,
+  inferIssueIdFromStackContainerName,
+} from '../../lib/workspace/stack-health.js';
+import { readRestartStatus, type RestartStatus } from '../../lib/restart-status.js';
 
 interface StatusOptions {
   json?: boolean;
   tldr?: boolean;
   context?: boolean;
+}
+
+function issueKey(issueId: string): string {
+  return issueId.toUpperCase();
+}
+
+function formatRestartAge(ts: string): string {
+  const ageMs = Date.now() - new Date(ts).getTime();
+  if (!Number.isFinite(ageMs) || ageMs < 0) return 'unknown age';
+  if (ageMs < 60_000) return `${Math.floor(ageMs / 1000)}s ago`;
+  if (ageMs < 3_600_000) return `${Math.floor(ageMs / 60_000)}m ago`;
+  if (ageMs < 86_400_000) return `${Math.floor(ageMs / 3_600_000)}h ago`;
+  return `${Math.floor(ageMs / 86_400_000)}d ago`;
+}
+
+function formatRestartDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function renderRestartStatus(status: RestartStatus | null): void {
+  if (!status) return;
+  const marker = status.success ? chalk.green('✓ ok') : chalk.red(status.gaveUp ? '⚠ FAILED — watchdog gave up' : '⚠ FAILED');
+  const base = `Last dashboard restart: ${marker} (${status.trigger}, ${formatRestartAge(status.ts)}, ${formatRestartDuration(status.durationMs)})`;
+  console.log(base);
+  if (status.error) {
+    console.log(`  ${chalk.dim(status.error)}`);
+  }
+  console.log('');
+}
+
+async function isBootNoResumeModeActive(): Promise<boolean> {
+  if (isNoResumeValueEnabled(process.env.PANOPTICON_NO_RESUME)) return true;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 250);
+  try {
+    const response = await fetch(`${getDashboardApiUrlSync()}/api/no-resume-mode`, { signal: controller.signal });
+    if (!response.ok) return false;
+    const payload = await response.json() as { active?: unknown };
+    return payload.active === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function formatGatingReason(agent: AgentState & { tmuxActive: boolean }, noResumeModeActive: boolean): string {
+  if (agent.tmuxActive) return '';
+  if (agent.paused === true) return agent.pausedReason ? `Paused (${agent.pausedReason})` : 'Paused';
+  if (agent.troubled === true) {
+    const failureCount = agent.consecutiveFailures ?? 0;
+    return `Troubled (${failureCount} failure${failureCount === 1 ? '' : 's'})`;
+  }
+  if (noResumeModeActive) return 'Boot --no-resume';
+  if (agent.stoppedByUser === true) return 'Manual';
+  return '';
 }
 
 export function readContextPercent(agentId: string): number | null {
@@ -30,21 +97,47 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
     return;
   }
 
+  const restartStatus = await Effect.runPromise(readRestartStatus());
+
   // Filter out invalid agent states (missing required fields)
-  const agents = listRunningAgents().filter(agent =>
+  const agents = listRunningAgentsSync().filter(agent =>
     agent.id && agent.issueId && agent.workspace
   );
+  const noResumeModeActive = await isBootNoResumeModeActive();
+  const dockerContainers = await Effect.runPromise(collectDockerContainerLifecycleSnapshot());
+  const issueIds = new Map<string, string>();
+  for (const agent of agents) {
+    issueIds.set(issueKey(agent.issueId!), agent.issueId!);
+  }
+  for (const container of dockerContainers) {
+    const issueId = inferIssueIdFromStackContainerName(container.name);
+    if (issueId) issueIds.set(issueKey(issueId), issueId);
+  }
+
+  const stackHealthByIssue = new Map(await Promise.all(
+    Array.from(issueIds, async ([key, issueId]) => [
+      key,
+      await Effect.runPromise(getWorkspaceStackHealth(issueId, { containers: dockerContainers })),
+    ] as const)
+  ));
+  const agentIssueKeys = new Set(agents.map(agent => issueKey(agent.issueId!)));
+  const brokenStacksWithoutAgent = Array.from(issueIds)
+    .filter(([key]) => !agentIssueKeys.has(key))
+    .map(([key, issueId]) => ({ issueId, stackHealth: stackHealthByIssue.get(key) }))
+    .filter((entry): entry is { issueId: string; stackHealth: NonNullable<typeof entry.stackHealth> } => Boolean(entry.stackHealth && !entry.stackHealth.healthy));
 
   if (options.json) {
     // Add shadow mode info and optional context % to JSON output
     const agentsWithShadow = await Promise.all(agents.map(async agent => {
-      const shadowed = agent.issueId ? await isShadowed(agent.issueId) : false;
-      const shadowState = shadowed && agent.issueId ? await getShadowState(agent.issueId) : null;
+      const shadowed = agent.issueId ? await Effect.runPromise(isShadowed(agent.issueId)) : false;
+      const shadowState = shadowed && agent.issueId ? await Effect.runPromise(getShadowState(agent.issueId)) : null;
       return {
         ...agent,
         shadowMode: shadowed,
         shadowStatus: shadowState?.shadowStatus,
         trackerStatus: shadowState?.trackerStatus,
+        stackHealth: agent.issueId ? stackHealthByIssue.get(issueKey(agent.issueId)) : undefined,
+        gatingReason: formatGatingReason(agent, noResumeModeActive) || undefined,
         ...(options.context ? { contextPercent: readContextPercent(agent.id) } : {}),
       };
     }));
@@ -52,13 +145,17 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
     return;
   }
 
-  if (agents.length === 0) {
+  renderRestartStatus(restartStatus);
+
+  if (agents.length === 0 && brokenStacksWithoutAgent.length === 0) {
     console.log(chalk.dim('No running agents.'));
     console.log(chalk.dim('Use "pan start <id>" to spawn one.'));
     return;
   }
 
-  console.log(chalk.bold('\nRunning Agents\n'));
+  if (agents.length > 0) {
+    console.log(chalk.bold('\nRunning Agents\n'));
+  }
 
   for (const agent of agents) {
     const statusColor = agent.tmuxActive ? chalk.green : chalk.red;
@@ -68,12 +165,17 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
     const duration = Math.floor((Date.now() - startedAt.getTime()) / 1000 / 60);
 
     // Check shadow mode (only if issueId exists)
-    const shadowed = agent.issueId ? await isShadowed(agent.issueId) : false;
-    const shadowState = shadowed && agent.issueId ? await getShadowState(agent.issueId) : null;
+    const shadowed = agent.issueId ? await Effect.runPromise(isShadowed(agent.issueId)) : false;
+    const shadowState = shadowed && agent.issueId ? await Effect.runPromise(getShadowState(agent.issueId)) : null;
+
+    const gatingReason = formatGatingReason(agent, noResumeModeActive);
 
     console.log(`${chalk.cyan(agent.id)}`);
     console.log(`  Issue:    ${agent.issueId}`);
     console.log(`  Status:   ${statusColor(status)}`);
+    if (gatingReason) {
+      console.log(`  Gate:     ${chalk.yellow(gatingReason)}`);
+    }
 
     if (shadowed && shadowState) {
       const statusStr = `${shadowState.shadowStatus}${shadowState.trackerStatus !== shadowState.shadowStatus ? ` (tracker: ${shadowState.trackerStatus})` : ''}`;
@@ -86,13 +188,20 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
       console.log(`  Context:  ${ctxStr}`);
     }
 
-    console.log(`  Runtime:  ${agent.runtime} (${agent.model})`);
+    console.log(`  Harness:  ${agent.harness ?? 'claude-code'}`);
+    console.log(`  Model:    ${agent.model}`);
+    console.log(`  Role:     ${agent.role}`);
     console.log(`  Duration: ${duration} min`);
     console.log(`  Workspace: ${chalk.dim(agent.workspace)}`);
 
+    const stackHealth = agent.issueId ? stackHealthByIssue.get(issueKey(agent.issueId)) : undefined;
+    if (stackHealth && !stackHealth.healthy) {
+      console.log(`  Stack:    ${chalk.red('STACK BROKEN')} ${stackHealth.reasons.join('; ')}`);
+    }
+
     // Show TLDR session metrics if a .tldr/ dir exists in the workspace
     try {
-      const tldr = getTldrMetrics(agent.workspace);
+      const tldr = getTldrMetricsSync(agent.workspace);
       if (tldr.interceptions > 0 || tldr.bypasses > 0) {
         const savedK = Math.round(tldr.estimatedTokensSaved / 1000);
         const bypassStr = tldr.bypasses > 0 ? ` (${tldr.bypasses} bypassed)` : '';
@@ -103,9 +212,18 @@ export async function statusCommand(options: StatusOptions): Promise<void> {
     console.log('');
   }
 
+  if (brokenStacksWithoutAgent.length > 0) {
+    console.log(chalk.bold('Broken Workspace Stacks\n'));
+    for (const { issueId, stackHealth } of brokenStacksWithoutAgent) {
+      console.log(`${chalk.cyan(issueId)}`);
+      console.log(`  Stack:    ${chalk.red('STACK BROKEN')} ${stackHealth.reasons.join('; ')}`);
+      console.log('');
+    }
+  }
+
   // Show legend
   const shadowChecks = await Promise.all(
-    agents.map(async agent => agent.issueId ? await isShadowed(agent.issueId) : false)
+    agents.map(async agent => agent.issueId ? await Effect.runPromise(isShadowed(agent.issueId)) : false),
   );
   const anyShadowed = shadowChecks.some(Boolean);
   if (anyShadowed) {
@@ -194,7 +312,7 @@ export async function tldrIndexStatusCommand(projectRoot = process.cwd()): Promi
 
   const mainVenvPath = join(projectRoot, '.venv');
   if (existsSync(mainVenvPath)) {
-    const service = getTldrDaemonService(projectRoot, mainVenvPath);
+    const service = getTldrDaemonServiceSync(projectRoot, mainVenvPath);
     const status = await service.getStatus();
     const { fileCount, edgeCount, ageMs } = readTldrIndexData(projectRoot);
     mainEntries.push({ label: `Main (${projectName})`, running: status.running, fileCount, edgeCount, ageMs });
@@ -208,7 +326,7 @@ export async function tldrIndexStatusCommand(projectRoot = process.cwd()): Promi
       const wsPath = join(workspacesDir, ws.name);
       const wsVenvPath = join(wsPath, '.venv');
       if (existsSync(wsVenvPath)) {
-        const service = getTldrDaemonService(wsPath, wsVenvPath);
+        const service = getTldrDaemonServiceSync(wsPath, wsVenvPath);
         const status = await service.getStatus();
         const { fileCount, edgeCount, ageMs } = readTldrIndexData(wsPath);
         workspaceEntries.push({ label: ws.name, running: status.running, fileCount, edgeCount, ageMs });

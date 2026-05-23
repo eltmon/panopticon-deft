@@ -1,11 +1,14 @@
+import { Effect } from 'effect';
 import chalk from 'chalk';
 import { existsSync } from 'fs';
 import { getConversationById, getConversationByName } from '../../lib/database/conversations-db.js';
-import { createSummaryFork } from '../../lib/conversations/summary-fork.js';
+import { createSummaryFork, type SummaryForkMode } from '../../lib/conversations/summary-fork.js';
+import { sessionFilePath } from '../../lib/paths.js';
 
 interface ForkOptions {
   model?: string;
   cwd?: string;
+  plain?: boolean;
 }
 
 export async function forkCommand(
@@ -25,16 +28,23 @@ export async function forkCommand(
     process.exit(1);
   }
 
-  if (!conv.sessionFile || !existsSync(conv.sessionFile)) {
+  const sessionFile = conv.claudeSessionId ? sessionFilePath(conv.cwd, conv.claudeSessionId) : null;
+  if (!sessionFile || !existsSync(sessionFile)) {
     console.log(chalk.yellow(`No session file found for conversation ${conv.name}`));
     process.exit(1);
   }
 
-  console.log(chalk.gray(`Creating summary fork from conversation: ${conv.name} (${conv.title || 'untitled'})`));
+  const forkMode: SummaryForkMode = options.plain ? 'plain' : 'summary';
+  const modeLabel = forkMode === 'plain' ? 'plain fork' : 'summary fork';
+  console.log(chalk.gray(`Creating ${modeLabel} from conversation: ${conv.name} (${conv.title || 'untitled'})`));
 
-  const newConv = (await createSummaryFork(conv, options)).conversation;
+  const newConv = (await Effect.runPromise(createSummaryFork(conv, {
+    model: options.model,
+    cwd: options.cwd,
+    forkMode,
+  }))).conversation;
 
-  console.log(chalk.green(`Summary-forked conversation ${conv.name} → ${newConv.name}`));
+  console.log(chalk.green(`${modeLabel.charAt(0).toUpperCase() + modeLabel.slice(1)}ed conversation ${conv.name} → ${newConv.name}`));
   console.log(chalk.gray(`  Conv ID: ${newConv.id}`));
   console.log(chalk.gray(`  Session: ${newConv.tmuxSession}`));
   console.log(chalk.gray(`  Model: ${newConv.model || 'default'}`));

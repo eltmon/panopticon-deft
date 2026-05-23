@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { Effect } from 'effect';
 import { getLinearApiKey } from '../../../lib/shadow-utils.js';
 
 interface LinearState {
@@ -127,7 +128,7 @@ interface CleanupOptions {
 }
 
 export async function listStatesCommand(options: ListOptions): Promise<void> {
-  const apiKey = getLinearApiKey();
+  const apiKey = await Effect.runPromise(getLinearApiKey());
   if (!apiKey) {
     console.error(chalk.red('LINEAR_API_KEY not found in ~/.panopticon.env or environment'));
     process.exit(1);
@@ -142,16 +143,16 @@ export async function listStatesCommand(options: ListOptions): Promise<void> {
     console.log('');
 
     // Group by type
-    const grouped = states.reduce((acc, state) => {
-      if (!acc[state.type]) acc[state.type] = [];
-      acc[state.type].push(state);
+    const grouped = states.reduce((acc, workflowState) => {
+      if (!acc[workflowState.type]) acc[workflowState.type] = [];
+      acc[workflowState.type].push(workflowState);
       return acc;
     }, {} as Record<string, LinearState[]>);
 
     for (const [type, typeStates] of Object.entries(grouped)) {
       console.log(chalk.cyan(`${type}:`));
-      for (const state of typeStates.sort((a, b) => a.position - b.position)) {
-        console.log(`  ${state.name} (position: ${state.position})`);
+      for (const workflowState of typeStates.sort((a, b) => a.position - b.position)) {
+        console.log(`  ${workflowState.name} (position: ${workflowState.position})`);
       }
       console.log('');
     }
@@ -162,8 +163,8 @@ export async function listStatesCommand(options: ListOptions): Promise<void> {
 
     if (customStates.length > 0) {
       console.log(chalk.yellow('Custom states (may need cleanup):'));
-      for (const state of customStates) {
-        console.log(`  - ${state.name} (type: ${state.type})`);
+      for (const workflowState of customStates) {
+        console.log(`  - ${workflowState.name} (type: ${workflowState.type})`);
       }
     }
   } catch (error: any) {
@@ -173,7 +174,7 @@ export async function listStatesCommand(options: ListOptions): Promise<void> {
 }
 
 export async function cleanupStatesCommand(options: CleanupOptions): Promise<void> {
-  const apiKey = getLinearApiKey();
+  const apiKey = await Effect.runPromise(getLinearApiKey());
   if (!apiKey) {
     console.error(chalk.red('LINEAR_API_KEY not found in ~/.panopticon.env or environment'));
     process.exit(1);

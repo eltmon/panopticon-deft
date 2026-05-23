@@ -14,14 +14,17 @@ import {
   TRAEFIK_DYNAMIC_DIR,
   TRAEFIK_CERTS_DIR,
   SKILLS_DIR,
-  SOURCE_TRAEFIK_TEMPLATES,
-  SOURCE_SKILLS_DIR
+  SYNC_SOURCES,
 } from '../../lib/paths.js';
-import { getDefaultConfig, saveConfig, loadConfig } from '../../lib/config.js';
+import { getDefaultConfigSync, saveConfigSync, loadConfigSync } from '../../lib/config.js';
+import { Effect } from 'effect';
 import { detectPlatform } from '../../lib/platform.js';
 import { detectDnsSyncMethod, ensureBaseDomain, syncDnsToWindows } from '../../lib/dns.js';
-import { generatePanopticonTraefikConfig, cleanupTemplateFiles, ensureProjectCerts, generateTlsConfig } from '../../lib/traefik.js';
-import { refreshCache } from '../../lib/sync.js';
+import { generatePanopticonTraefikConfigSync, cleanupTemplateFilesSync, ensureProjectCertsSync, generateTlsConfigSync } from '../../lib/traefik.js';
+import { refreshCacheSync } from '../../lib/sync.js';
+import { ensureGlobalLayer } from '../../lib/context-layers/index.js';
+import { setupHooksCommand } from './setup/hooks.js';
+import { installTtsDaemonDependencies } from '../../lib/tts-daemon.js';
 
 export function registerInstallCommand(program: Command): void {
   program
@@ -32,8 +35,8 @@ export function registerInstallCommand(program: Command): void {
     .option('--skip-mkcert', 'Skip mkcert/HTTPS setup')
     .option('--skip-docker', 'Skip Docker network setup')
     .option('--skip-beads', 'Skip beads CLI installation')
-    .option('--skip-claudish', 'Skip claudish installation')
-    .option('--skip-sageox', 'Skip SageOx CLI installation')
+    .option('--skip-moonshine', 'Skip Moonshine voice sidecar build (AutoPreso + Voice STT will not work without it)')
+    .option('--skip-tts-daemon', 'Skip Qwen TTS daemon venv install (CUDA torch download is large)')
     .action(installCommand);
 }
 
@@ -43,8 +46,8 @@ interface InstallOptions {
   skipMkcert?: boolean;
   skipDocker?: boolean;
   skipBeads?: boolean;
-  skipClaudish?: boolean;
-  skipSageox?: boolean;
+  skipMoonshine?: boolean;
+  skipTtsDaemon?: boolean;
 }
 
 interface PrereqResult {
@@ -54,7 +57,7 @@ interface PrereqResult {
   fix?: string;
 }
 
-// detectPlatform() is now in src/lib/platform.ts
+// Effect.runSync(detectPlatform()) is now in src/lib/platform.ts
 
 /**
  * Recursively copy directory contents
@@ -159,25 +162,7 @@ function checkPrerequisites(): { results: PrereqResult[]; allPassed: boolean } {
     name: 'Beads CLI (bd)',
     passed: hasBeads,
     message: hasBeads ? `v${beadsVersion}` : 'not found (will auto-install)',
-    fix: 'curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash',
-  });
-
-  // claudish (optional - will be auto-installed)
-  const hasClaudish = checkCommand('claudish');
-  results.push({
-    name: 'claudish',
-    passed: hasClaudish,
-    message: hasClaudish ? 'installed' : 'not found (will auto-install)',
-    fix: 'brew install claudish  # macOS, or download from github.com/eltmon/claudish/releases',
-  });
-
-  // SageOx CLI (optional - will be auto-installed)
-  const hasOx = checkCommand('ox');
-  results.push({
-    name: 'SageOx CLI (ox)',
-    passed: hasOx,
-    message: hasOx ? 'installed' : 'not found (will auto-install)',
-    fix: 'curl -sL https://github.com/eltmon/ox/releases/download/latest/ox-linux-amd64 -o ~/.local/bin/ox && chmod +x ~/.local/bin/ox',
+    fix: 'curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash',
   });
 
   // jq (JSON processor — used by statusline, beads, merge-agent, review-agent, dashboard)
@@ -198,10 +183,19 @@ function checkPrerequisites(): { results: PrereqResult[]; allPassed: boolean } {
     fix: 'brew install ttyd / Download from https://github.com/tsl0922/ttyd/releases',
   });
 
+  // ast-grep (AST-based code search)
+  const hasAstGrep = checkCommand('sg');
+  results.push({
+    name: 'ast-grep',
+    passed: hasAstGrep,
+    message: hasAstGrep ? 'installed' : 'not found (will auto-install)',
+    fix: 'npm install -g @ast-grep/cli',
+  });
+
   return {
     results,
-    // mkcert, ttyd, beads, and claudish are optional (will be auto-installed or skipped)
-    allPassed: results.filter((r) => r.name !== 'mkcert' && r.name !== 'ttyd' && r.name !== 'Beads CLI (bd)' && r.name !== 'claudish' && r.name !== 'SageOx CLI (ox)').every((r) => r.passed),
+    // mkcert, ttyd, and beads are optional (will be auto-installed or skipped)
+    allPassed: results.filter((r) => r.name !== 'mkcert' && r.name !== 'ttyd' && r.name !== 'Beads CLI (bd)').every((r) => r.passed),
   };
 }
 
@@ -222,7 +216,7 @@ function printPrereqStatus(prereqs: { results: PrereqResult[]; allPassed: boolea
 async function installCommand(options: InstallOptions): Promise<void> {
   console.log(chalk.bold('\nPanopticon Installation\n'));
 
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   console.log(`Platform: ${chalk.cyan(plat)}\n`);
 
   // Step 1: Check prerequisites
@@ -251,7 +245,7 @@ async function installCommand(options: InstallOptions): Promise<void> {
   // Step 2b: Refresh cache — copy all skills/agents/rules from repo to ~/.panopticon/
   spinner.start('Refreshing skill cache...');
   try {
-    const cacheResult = refreshCache();
+    const cacheResult = refreshCacheSync();
     const parts = [];
     if (cacheResult.skills.copied > 0) parts.push(`${cacheResult.skills.copied} skills`);
     if (cacheResult.agents.copied > 0) parts.push(`${cacheResult.agents.copied} agents`);
@@ -260,6 +254,18 @@ async function installCommand(options: InstallOptions): Promise<void> {
   } catch (error) {
     spinner.warn(`Failed to refresh cache: ${error}`);
   }
+
+  // Step 2c: Seed the global context layer (PAN-1201). `pan sync` renders it
+  // into ~/.claude/CLAUDE.md; seed it here so it exists right after install.
+  try {
+    if (ensureGlobalLayer()) {
+      console.log(chalk.dim('  Seeded ~/.panopticon/context/global.md (starter template)'));
+    }
+  } catch {
+    // Non-fatal — `pan sync` / `pan context edit` will seed it later.
+  }
+
+  await setupHooksCommand();
 
   // Step 3: Docker network
   if (!options.skipDocker) {
@@ -278,7 +284,7 @@ async function installCommand(options: InstallOptions): Promise<void> {
     if (!hasMkcert) {
       spinner.start('Installing mkcert...');
       try {
-        const plat = detectPlatform();
+        const plat = await Effect.runPromise(detectPlatform());
         if (plat === 'darwin') {
           execSync('brew install mkcert', { stdio: 'pipe', timeout: 120000 });
           spinner.succeed('mkcert installed via Homebrew');
@@ -323,11 +329,11 @@ async function installCommand(options: InstallOptions): Promise<void> {
         spinner.succeed('Wildcard certificates generated (*.pan.localhost, *.localhost)');
 
         // Generate certs for registered projects and build tls.yml
-        const generatedDomains = ensureProjectCerts();
+        const generatedDomains = ensureProjectCertsSync();
         for (const domain of generatedDomains) {
           spinner.succeed(`Generated wildcard cert for *.${domain}`);
         }
-        if (generateTlsConfig()) {
+        if (generateTlsConfigSync()) {
           spinner.succeed('TLS config generated (tls.yml)');
         }
       } catch (error) {
@@ -348,7 +354,7 @@ async function installCommand(options: InstallOptions): Promise<void> {
       const ttydPath = join(binDir, 'ttyd');
 
       // Determine platform and download appropriate binary
-      const plat = detectPlatform();
+      const plat = await Effect.runPromise(detectPlatform());
       let downloadUrl = '';
       if (plat === 'darwin') {
         // macOS - try homebrew first
@@ -378,6 +384,31 @@ async function installCommand(options: InstallOptions): Promise<void> {
     spinner.info('ttyd already installed');
   }
 
+  // Step 5c: Install ast-grep (AST-based code search)
+  const hasAstGrepNow = checkCommand('sg');
+  if (!hasAstGrepNow) {
+    spinner.start('Installing ast-grep...');
+    try {
+      const plat = await Effect.runPromise(detectPlatform());
+      if (plat === 'darwin') {
+        try {
+          execSync('brew install ast-grep', { stdio: 'pipe', timeout: 120000 });
+          spinner.succeed('ast-grep installed via Homebrew');
+        } catch {
+          execSync('npm install -g @ast-grep/cli', { stdio: 'pipe', timeout: 120000 });
+          spinner.succeed('ast-grep installed via npm');
+        }
+      } else {
+        execSync('npm install -g @ast-grep/cli', { stdio: 'pipe', timeout: 120000 });
+        spinner.succeed('ast-grep installed via npm');
+      }
+    } catch (error) {
+      spinner.warn('ast-grep installation failed — install manually: npm install -g @ast-grep/cli');
+    }
+  } else {
+    spinner.info('ast-grep already installed');
+  }
+
   // Step 5b: Install beads CLI (git-backed issue tracker)
   if (options.skipBeads) {
     spinner.info('Skipping beads installation (--skip-beads)');
@@ -386,34 +417,34 @@ async function installCommand(options: InstallOptions): Promise<void> {
     if (!hasBeadsNow) {
     spinner.start('Installing beads CLI (bd)...');
     try {
-      const plat = detectPlatform();
+      const plat = await Effect.runPromise(detectPlatform());
       if (plat === 'darwin') {
         // macOS - try homebrew
         try {
-          execSync('brew install steveyegge/beads/bd', { stdio: 'pipe', timeout: 120000 });
+          execSync('brew install gastownhall/beads/bd', { stdio: 'pipe', timeout: 120000 });
           spinner.succeed('beads installed via Homebrew');
         } catch {
           // Fall back to curl script
           try {
-            execSync('curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash', {
+            execSync('curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash', {
               stdio: 'pipe',
               timeout: 120000,
             });
             spinner.succeed('beads installed via install script');
           } catch {
-            spinner.warn('beads installation failed - install manually: brew install steveyegge/beads/bd');
+            spinner.warn('beads installation failed - install manually: brew install gastownhall/beads/bd');
           }
         }
       } else {
         // Linux/WSL - use install script
         try {
-          execSync('curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash', {
+          execSync('curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash', {
             stdio: 'pipe',
             timeout: 120000,
           });
           spinner.succeed('beads installed via install script');
         } catch (error) {
-          spinner.warn('beads installation failed - install manually: curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash');
+          spinner.warn('beads installation failed - install manually: curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash');
         }
       }
     } catch (error) {
@@ -427,76 +458,69 @@ async function installCommand(options: InstallOptions): Promise<void> {
       if (match) {
         const [, major, minor, patch] = match.map(Number);
         const currentVersion = major * 10000 + minor * 100 + patch;
-        const recommendedVersion = 47 * 100 + 1; // v0.47.1 has worktree isolation fix
+        const recommendedVersion = 1 * 10000 + 0 * 100 + 4; // v1.0.4 required for ping, doctor, prune
         if (currentVersion < recommendedVersion) {
-          spinner.info(`beads v${major}.${minor}.${patch} installed (v0.47.1+ recommended for worktree isolation)`);
+          spinner.start(`Upgrading beads from v${major}.${minor}.${patch} to v1.0.4+...`);
+          const plat = await Effect.runPromise(detectPlatform());
+          if (plat === 'darwin') {
+            execSync('brew upgrade gastownhall/beads/bd', { stdio: 'pipe', timeout: 120000 });
+          } else {
+            execSync('curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash', {
+              stdio: 'pipe',
+              timeout: 120000,
+            });
+          }
+          spinner.succeed('beads upgraded');
         } else {
           spinner.info(`beads v${major}.${minor}.${patch} installed`);
         }
       } else {
         spinner.info('beads already installed');
       }
-    } catch {
-      spinner.info('beads already installed');
+    } catch (error) {
+      spinner.warn('beads version check or upgrade failed - install manually: curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash');
     }
     }
   }
 
-  // Step 5c: Install claudish (multi-model router with OAuth support)
-  if (options.skipClaudish) {
-    spinner.info('Skipping claudish installation (--skip-claudish)');
-  } else {
-    const hasClaudishNow = checkCommand('claudish');
-    if (!hasClaudishNow) {
-      const plat = detectPlatform();
-      if (plat === 'darwin') {
-        spinner.info('Install claudish on macOS via Homebrew: brew install eltmon/claudish/claudish');
+  // Step 5d: Build Moonshine voice sidecar (AutoPreso + Voice STT)
+  // Linux x64 only — the build script enforces this. Skip silently on other platforms.
+  if (options.skipMoonshine) {
+    spinner.info('Skipping Moonshine sidecar build (--skip-moonshine)');
+  } else if (process.platform === 'linux' && process.arch === 'x64') {
+    const repoRoot = process.cwd();
+    const moonshineBin = join(repoRoot, 'packages', 'moonshine-linux-x64', 'bin', 'moonshine-sidecar');
+    if (existsSync(moonshineBin)) {
+      spinner.info('Moonshine sidecar already built (delete packages/moonshine-linux-x64/bin/moonshine-sidecar to rebuild)');
+    } else {
+      const hasPython = checkCommand('python3');
+      if (!hasPython) {
+        spinner.warn('python3 not found — skipping Moonshine sidecar build (install python3 then run `npm run build:sidecar`)');
       } else {
-        // Linux: download binary from GitHub releases
-        const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : 'x64';
-        const binDir = join(homedir(), '.local', 'bin');
-        const claudishPath = join(binDir, 'claudish');
-        spinner.start('Installing claudish (Linux binary)...');
+        spinner.start('Building Moonshine voice sidecar (creates venv + pyinstaller bundle, ~2-3 min on first run)...');
         try {
-          mkdirSync(binDir, { recursive: true });
-          execSync(
-            `curl -sL "https://github.com/eltmon/claudish/releases/latest/download/claudish-linux-${arch}" -o "${claudishPath}" && chmod +x "${claudishPath}"`,
-            { stdio: 'pipe', timeout: 60000 }
-          );
-          spinner.succeed('claudish installed to ~/.local/bin/claudish');
-        } catch {
-          spinner.warn('claudish installation failed - download manually from github.com/eltmon/claudish/releases');
+          execSync('npm run build:sidecar', { stdio: 'pipe', timeout: 600000, cwd: repoRoot });
+          spinner.succeed('Moonshine sidecar built (AutoPreso + Voice STT ready)');
+        } catch (error) {
+          spinner.warn('Moonshine sidecar build failed — AutoPreso and Voice STT will not work. Re-run: npm run build:sidecar');
         }
       }
-    } else {
-      spinner.info('claudish already installed');
     }
+  } else {
+    spinner.info(`Skipping Moonshine sidecar build (platform=${process.platform}/${process.arch}, only linux/x64 supported)`);
   }
 
-  // Step 5d: Install SageOx CLI (team context capture)
-  if (options.skipSageox) {
-    spinner.info('Skipping SageOx installation (--skip-sageox)');
+  if (options.skipTtsDaemon) {
+    spinner.info('Skipping Qwen TTS daemon install (--skip-tts-daemon)');
   } else {
-    const hasOxNow = checkCommand('ox');
-    if (!hasOxNow) {
-      spinner.start('Installing SageOx CLI (ox)...');
-      try {
-        const binDir = join(homedir(), '.local', 'bin');
-        mkdirSync(binDir, { recursive: true });
-        const oxPath = join(binDir, 'ox');
-        const arch = process.arch === 'x64' ? 'amd64' : process.arch;
-        const plat = detectPlatform();
-        const platform = plat === 'darwin' ? 'darwin' : 'linux';
-        execSync(`curl -sL "https://github.com/eltmon/ox/releases/download/latest/ox-${platform}-${arch}" -o "${oxPath}" && chmod +x "${oxPath}"`, {
-          stdio: 'pipe',
-          timeout: 60000,
-        });
-        spinner.succeed(`SageOx CLI installed to ${oxPath}`);
-      } catch {
-        spinner.warn('SageOx installation failed - install manually from https://github.com/eltmon/ox/releases');
-      }
+    spinner.start('Installing Qwen TTS daemon dependencies (creates venv, CUDA torch download is large)...');
+    const result = await Effect.runPromise(installTtsDaemonDependencies());
+    if (result.status === 'installed') {
+      spinner.succeed(result.message);
+    } else if (result.status === 'skipped') {
+      spinner.info(result.reason);
     } else {
-      spinner.info('SageOx CLI already installed');
+      spinner.warn(`Qwen TTS daemon install failed: ${result.reason}`);
     }
   }
 
@@ -508,21 +532,21 @@ async function installCommand(options: InstallOptions): Promise<void> {
       // Copy static Traefik files (docker-compose.yml, traefik.yml, certs)
       // Only copy if files don't already exist
       if (!existsSync(join(TRAEFIK_DIR, 'docker-compose.yml'))) {
-        copyDirectoryRecursive(SOURCE_TRAEFIK_TEMPLATES, TRAEFIK_DIR);
+        copyDirectoryRecursive(SYNC_SOURCES.traefikTemplates, TRAEFIK_DIR);
         // Remove .template files from runtime dir (they stay in source only)
-        cleanupTemplateFiles();
+        cleanupTemplateFilesSync();
         spinner.succeed('Traefik configuration created from templates');
       } else {
         spinner.info('Traefik static config already exists (skipping)');
       }
 
       // Always regenerate panopticon.yml from template to pick up config changes
-      if (generatePanopticonTraefikConfig()) {
+      if (generatePanopticonTraefikConfigSync()) {
         spinner.succeed('Traefik dynamic config generated (panopticon.yml)');
       }
 
       // Always regenerate tls.yml from discovered certs
-      if (generateTlsConfig()) {
+      if (generateTlsConfigSync()) {
         spinner.succeed('TLS config generated (tls.yml)');
       }
 
@@ -557,7 +581,7 @@ async function installCommand(options: InstallOptions): Promise<void> {
   }
 
   // Load existing config (or defaults if none exists)
-  const config = configExists ? loadConfig() : getDefaultConfig();
+  const config = configExists ? loadConfigSync() : getDefaultConfigSync();
 
   // Configure Traefik based on minimal flag (always update this section)
   if (options.minimal) {
@@ -632,12 +656,12 @@ async function installCommand(options: InstallOptions): Promise<void> {
   }
 
   spinner.start('Saving configuration...');
-  saveConfig(config);
+  saveConfigSync(config);
   spinner.succeed(configExists ? 'Config updated' : 'Config created');
 
   // Regenerate Traefik dynamic config now that config is saved
   if (config.traefik?.enabled) {
-    generatePanopticonTraefikConfig();
+    generatePanopticonTraefikConfigSync();
   }
 
   // Ensure base domain DNS entry

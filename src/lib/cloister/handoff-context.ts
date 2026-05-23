@@ -8,11 +8,16 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { Data, Effect } from 'effect';
 import type { TokenUsage } from '../runtimes/types.js';
 import type { ComplexityLevel } from './complexity.js';
 import type { AgentState } from '../agents.js';
-import { getAgentDir } from '../agents.js';
 import { renderPrompt } from './prompts.js';
+import { resolveProjectFromIssueSync } from '../projects.js';
+import { resolveVBriefDir } from '../vbrief/lifecycle.js';
+import { readContinueStateSync, type ContinueState } from '../vbrief/continue-state.js';
+import { readWorkspaceContinue } from '../pan-dir/index.js';
+import { withBdMutex } from '../bd-mutex.js';
 
 const execAsync = promisify(exec);
 
@@ -44,7 +49,8 @@ export interface HandoffContext {
   previousSessionId?: string;
 
   // Files
-  stateFile?: string;           // .planning/STATE.md content
+  /** Parsed scope continue file. */
+  continueState?: ContinueState;
   claudeMd?: string;            // CLAUDE.md content
 
   // Git state
@@ -71,17 +77,7 @@ export interface HandoffContext {
   // New agent target
   targetModel: string;
   reason: string;
-}
-
-/**
- * Capture full handoff context from an agent
- *
- * @param agentState - Current agent state
- * @param targetModel - Model to hand off to
- * @param reason - Reason for handoff
- * @returns Handoff context
- */
-export async function captureHandoffContext(
+}async function captureHandoffContextPromise(
   agentState: AgentState,
   targetModel: string,
   reason: string
@@ -95,12 +91,12 @@ export async function captureHandoffContext(
     previousSessionId: agentState.sessionId,
     targetModel,
     reason,
-    handoffCount: agentState.handoffCount || 0,
+    handoffCount: 0,
     costSoFar: agentState.costSoFar || 0,
   };
 
-  // Capture files (STATE.md, CLAUDE.md)
-  await captureFiles(context, agentState.workspace);
+  // Capture files (continue file, CLAUDE.md)
+  await captureFiles(context, agentState.workspace, agentState.issueId);
 
   // Capture git state
   await captureGitState(context, agentState.workspace);
@@ -112,14 +108,36 @@ export async function captureHandoffContext(
 }
 
 /**
- * Capture workspace files (STATE.md, CLAUDE.md)
+ * Capture workspace files (continue file, CLAUDE.md)
  */
-async function captureFiles(context: HandoffContext, workspace: string): Promise<void> {
+async function captureFiles(
+  context: HandoffContext,
+  workspace: string,
+  issueId: string,
+): Promise<void> {
   try {
-    // Read STATE.md if it exists
-    const stateFile = join(workspace, '.planning/STATE.md');
-    if (existsSync(stateFile)) {
-      context.stateFile = readFileSync(stateFile, 'utf-8');
+    // Read the live workspace continue state first, then migration fallbacks.
+    let continueState: ContinueState | null = null;
+    try {
+      continueState = await Effect.runPromise(readWorkspaceContinue(workspace));
+    } catch { /* ignore */ }
+    if (!continueState) {
+      const resolved = resolveProjectFromIssueSync(issueId);
+      if (resolved) {
+        for (const dir of ['active', 'proposed', 'completed', 'cancelled'] as const) {
+          try {
+            const lifecycleDir = resolveVBriefDir(resolved.projectPath, dir);
+            const cs = readContinueStateSync(lifecycleDir, issueId);
+            if (cs) {
+              continueState = cs;
+              break;
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    }
+    if (continueState) {
+      context.continueState = continueState;
     }
 
     // Read CLAUDE.md if it exists
@@ -255,12 +273,12 @@ export function serializeHandoffContext(context: HandoffContext): string {
     lines.push('');
   }
 
-  // STATE.md content
-  if (context.stateFile) {
-    lines.push('## Current State (STATE.md)');
+  // Continue file content (structured planning state)
+  if (context.continueState) {
+    lines.push('## Current State (continue.vbrief.json)');
     lines.push('');
-    lines.push('```markdown');
-    lines.push(context.stateFile);
+    lines.push('```json');
+    lines.push(JSON.stringify(context.continueState, null, 2));
     lines.push('```');
     lines.push('');
   }
@@ -308,7 +326,7 @@ export function buildHandoffPrompt(
   context: HandoffContext,
   additionalInstructions?: string
 ): string {
-  return renderPrompt({
+  return Effect.runSync(renderPrompt({
     name: 'handoff-to-work',
     vars: {
       ISSUE_ID: context.issueId,
@@ -317,5 +335,35 @@ export function buildHandoffPrompt(
       HANDOFF_CONTEXT: serializeHandoffContext(context),
       ADDITIONAL_INSTRUCTIONS_BLOCK: additionalInstructions || '',
     },
-  });
+  }));
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variants. The async variants above stay so existing
+// callers keep working; Effect-based callers can compose without runPromise.
+
+/** Tagged error for handoff-context Effect variants. */
+export class HandoffContextError extends Data.TaggedError('HandoffContextError')<{
+  readonly issueId: string;
+  readonly stage: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `captureHandoffContext`. */
+export const captureHandoffContext = (
+  agentState: AgentState,
+  targetModel: string,
+  reason: string,
+): Effect.Effect<HandoffContext, HandoffContextError> =>
+  Effect.tryPromise({
+    try: () => captureHandoffContextPromise(agentState, targetModel, reason),
+    catch: (cause) =>
+      new HandoffContextError({
+        issueId: agentState.issueId,
+        stage: 'captureHandoffContext',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });

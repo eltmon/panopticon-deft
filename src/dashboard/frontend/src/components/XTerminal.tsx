@@ -12,8 +12,28 @@ function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): (.
   };
 }
 
+// Optional /ws/terminal cold-path profiling. Enable with
+// `localStorage.PANOPTICON_TERMINAL_PROFILE = '1'` (then reload) — pairs with
+// the server-side PANOPTICON_TERMINAL_PROFILE env var.
+const TERMINAL_PROFILE_ENABLED = (() => {
+  try {
+    return localStorage.getItem('PANOPTICON_TERMINAL_PROFILE') === '1';
+  } catch {
+    return false;
+  }
+})();
+function profMark(sessionName: string, t0: number, label: string, extra?: string): void {
+  if (!TERMINAL_PROFILE_ENABLED) return;
+  const now = performance.now();
+  const ms = now - t0;
+  const clickT = (window as unknown as { __panTerminalClickAt?: number }).__panTerminalClickAt;
+  const sinceClick = clickT ? ` clickΔ=${(now - clickT).toFixed(1)}ms` : '';
+  console.log(`[xterm-prof] ${sessionName} +${ms.toFixed(1)}ms t=${now.toFixed(1)}${sinceClick} ${label}${extra ? ' ' + extra : ''}`);
+}
+
 interface XTerminalProps {
   sessionName: string;
+  token?: string;
   onDisconnect?: () => void;
   autoCopyOnSelect?: boolean;
 }
@@ -45,7 +65,7 @@ const AUTOCOPY_STORAGE_KEY = 'panopticon.terminal.autoCopyOnSelect';
 // Check if platform is Mac
 const isMac = navigator.platform.toLowerCase().includes('mac');
 
-export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCopyProp }: XTerminalProps) {
+export function XTerminal({ sessionName, token, onDisconnect, autoCopyOnSelect: autoCopyProp }: XTerminalProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const terminalInstance = useRef<Terminal | null>(null);
   const fitAddon = useRef<FitAddon | null>(null);
@@ -246,6 +266,8 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
 
   const connect = useCallback(() => {
     if (!terminalRef.current || !sessionName) return;
+    const tProf = performance.now();
+    profMark(sessionName, tProf, 'connect() entered');
 
     // Clear any pending reconnect timer
     if (reconnectTimer.current) {
@@ -257,9 +279,11 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
     const container = terminalRef.current;
     if (container.clientWidth === 0 || container.clientHeight === 0) {
       console.warn('XTerminal: Container has no size, retrying in 100ms');
+      profMark(sessionName, tProf, 'container 0x0, retry in 100ms');
       setTimeout(() => connect(), 100);
       return;
     }
+    profMark(sessionName, tProf, 'container sized', `${container.clientWidth}x${container.clientHeight}`);
 
     console.log('XTerminal: Creating terminal, container size:', container.clientWidth, 'x', container.clientHeight);
 
@@ -296,7 +320,7 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
         cursorStyle: 'bar',
         cursorInactiveStyle: 'none',
         fontSize: 14,
-        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+        fontFamily: "'SF Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace",
         cols: 120,
         rows: 29,  // Match typical fitted size to avoid row mismatch with tmux status bar
         scrollback: 0,  // tmux is the source of truth for history; local scrollback duplicates content
@@ -393,8 +417,12 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
 
     // Connect to WebSocket on same port as the page (frontend and API are served together)
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal?session=${encodeURIComponent(sessionName)}`;
+    let wsUrl = `${protocol}//${window.location.host}/ws/terminal?session=${encodeURIComponent(sessionName)}`;
+    if (token) {
+      wsUrl += `&token=${encodeURIComponent(token)}`;
+    }
 
+    profMark(sessionName, tProf, 'new WebSocket()');
     const ws = new WebSocket(wsUrl);
     // IMPORTANT: Use arraybuffer for synchronous binary processing
     // Default 'blob' requires async handling which can cause out-of-order writes
@@ -402,6 +430,7 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
     wsRef.current = ws;
 
     ws.onopen = () => {
+      profMark(sessionName, tProf, 'ws.onopen');
       console.log('XTerminal: WebSocket opened');
       readyForLiveData.current = false;
       remoteSize.current = null;
@@ -410,6 +439,7 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
       requestedSize.current = measured;
       console.log('XTerminal: Sending attach dimensions:', measured.cols, 'x', measured.rows);
       ws.send(JSON.stringify({ type: 'attach', cols: measured.cols, rows: measured.rows }));
+      profMark(sessionName, tProf, 'attach sent', `${measured.cols}x${measured.rows}`);
     };
 
     // DEBUG: Enable detailed logging to diagnose terminal corruption
@@ -437,43 +467,28 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
       };
     }
 
-    // Write queue: serialize writes to avoid race conditions in xterm.js.
-    // Smart auto-scroll: only snap to bottom after a write if the user hasn't scrolled up.
-    const writeQueue: string[] = [];
-    let isWriting = false;
-
-    const processWriteQueue = () => {
-      if (isWriting || writeQueue.length === 0 || !term) return;
-
-      isWriting = true;
-      const data = writeQueue.shift()!;
-
+    // Write live PTY data directly to xterm.js — its internal WriteBuffer
+    // handles pacing (yields ~every 12ms so the browser can process keystrokes
+    // and other events between parse chunks). The previous approach gated writes
+    // behind an `isWriting` flag, creating a snowball: data accumulated while
+    // xterm.js parsed the current batch, producing an ever-larger next batch
+    // that blocked the main thread and caused multi-second typing lag.
+    const queueLiveData = (data: string) => {
+      reconnectAttempts.current = 0;
+      if (!term) return;
       if (DEBUG_TERMINAL) {
         console.log(`XTerminal-debug: WRITE len=${data.length}`);
       }
-
-      // Use write callback to know when this write completes
-      term.write(data, () => {
-        // With tmux-managed history, keep the viewport pinned to the live bottom.
-        // Local xterm scrollback is disabled, so scrolling is delegated to tmux.
-        term!.scrollToBottom();
-
-        isWriting = false;
-        // Process next item in queue
-        if (writeQueue.length > 0) {
-          // Use setTimeout(0) to avoid deep recursion
-          setTimeout(processWriteQueue, 0);
-        }
-      });
+      term.write(data);
     };
 
-    const queueLiveData = (data: string) => {
-      reconnectAttempts.current = 0;
-      writeQueue.push(data);
-      processWriteQueue();
-    };
-
+    let firstMessageLogged = false;
+    let firstLiveByteLogged = false;
     ws.onmessage = (event) => {
+      if (!firstMessageLogged) {
+        firstMessageLogged = true;
+        profMark(sessionName, tProf, 'first ws message received');
+      }
       let dataStr = '';
 
       // Normalize data to string
@@ -502,21 +517,27 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
         }
 
         if (control?.type === 'snapshot') {
+          profMark(sessionName, tProf, 'snapshot decoded', `cols=${control.cols} rows=${control.rows} bytes=${control.data.length}`);
           remoteSize.current = { cols: control.cols, rows: control.rows };
           requestedSize.current = { cols: control.cols, rows: control.rows };
           readyForLiveData.current = false;
-          writeQueue.length = 0;
-          isWriting = false;
 
           const resettable = term as Terminal & { reset?: () => void };
           resettable.reset?.();
           term!.resize(control.cols, control.rows);
+          // Kick off snapshot write; don't wait for xterm.js callback to send ready.
+          // In background tabs xterm.js's setTimeout-based parser stalls, which would
+          // let the server's pending buffer grow unbounded and then flood us on resume.
+          const tWrite = performance.now();
           term!.write(control.data, () => {
+            profMark(sessionName, tProf, 'snapshot xterm-parse done', `took=${(performance.now() - tWrite).toFixed(1)}ms`);
+            term!.scrollToBottom();
             readyForLiveData.current = true;
-            reconnectAttempts.current = 0;
-            ws.send(JSON.stringify({ type: 'ready' }));
             sendResizeIfNeeded();
           });
+          reconnectAttempts.current = 0;
+          ws.send(JSON.stringify({ type: 'ready' }));
+          profMark(sessionName, tProf, 'ready sent');
           return;
         }
 
@@ -529,6 +550,10 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
         }
       }
 
+      if (!firstLiveByteLogged) {
+        firstLiveByteLogged = true;
+        profMark(sessionName, tProf, 'first live data byte', `len=${dataStr.length}`);
+      }
       queueLiveData(dataStr);
     };
 
@@ -541,11 +566,17 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
         return;
       }
 
-      // Always attempt reconnection when shouldReconnect is true, even for
-      // code 1000 (normal close). The server sends 1000 when the PTY exits,
-      // which can happen if the tmux session is killed and recreated during
-      // workspace setup retries. The session may be alive again by the time
-      // we reconnect.
+      // 4404 = session not found on the server (tmux session doesn't exist).
+      // Do NOT retry — the session is gone. Retrying just hammers the server.
+      if (event.code === 4404) {
+        term!.writeln(`\r\n\x1b[33m● Session \x1b[1m${sessionName}\x1b[0m\x1b[33m has ended.\x1b[0m`);
+        onDisconnectRef.current?.();
+        return;
+      }
+
+      // For normal close (1000) or unexpected close, attempt reconnection.
+      // The server sends 1000 when the PTY exits, which can happen if the
+      // tmux session is killed and recreated during workspace setup retries.
       if (reconnectAttempts.current < maxReconnectAttempts) {
         const delay = getReconnectDelay(reconnectAttempts.current);
         reconnectAttempts.current += 1;
@@ -572,8 +603,20 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
     }, 200);
     window.addEventListener('resize', handleResize);
 
+    // If the tab was hidden while a snapshot was being written, xterm.js's
+    // setTimeout-driven parser stalls and the ready message never goes out.
+    // Force it through on visibility restore so the server flushes its buffer
+    // promptly instead of dumping hours of backlog at once.
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && !readyForLiveData.current && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ready' }));
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       window.removeEventListener('resize', handleResize);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       terminalRef.current?.removeEventListener('mousedown', handleForcedSelectionMouseDown, true);
       terminalRef.current?.removeEventListener('contextmenu', handleContextMenu);
       setShouldReconnect(false);
@@ -581,6 +624,10 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
       }
+      // Prevent the old ws.onclose handler (which closes over the stale
+      // shouldReconnect value) from scheduling an orphaned reconnect timer
+      // after the component has already remounted.
+      ws.onclose = null;
       ws.close();
       wsRef.current = null;
       term?.dispose();
@@ -590,21 +637,17 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
   }, [sessionName, shouldReconnect, autoCopyOnSelect, handleKeyDown, handleContextMenu, handleTerminalWheel, getMeasuredSize, sendResizeIfNeeded]);
 
   useEffect(() => {
-    let cancelled = false;
-    let cleanupFn: (() => void) | undefined;
-
-    const timeoutId = setTimeout(() => {
-      if (!cancelled) {
-        cleanupFn = connect();
-      }
-    }, 50);
-
+    const tMount = performance.now();
+    profMark(sessionName, tMount, 'XTerminal mount effect');
+    // The container-zero-size race the old 50ms setTimeout guarded against is
+    // already handled by the clientWidth/Height check inside connect() (which
+    // retries every 100ms until sized). Connecting synchronously saves 50ms on
+    // every Terminal click.
+    const cleanupFn = connect();
     return () => {
-      cancelled = true;
-      clearTimeout(timeoutId);
       cleanupFn?.();
     };
-  }, [connect]);
+  }, [connect, sessionName]);
 
   useEffect(() => {
     const debouncedFit = debounce(() => {
@@ -632,7 +675,7 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
       <div className="absolute top-2 right-2 z-10 flex gap-2">
         <button
           onClick={() => setShowSettings(!showSettings)}
-          className="p-1.5 rounded bg-surface-raised/80 hover:bg-surface-active/80 text-text-secondary transition-colors"
+          className="p-1.5 rounded bg-card/80 hover:bg-accent/80 text-muted-foreground transition-colors"
           title="Terminal settings"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -653,9 +696,9 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
               onChange={(e) => setAutoCopyOnSelect(e.target.checked)}
               className="w-4 h-4 rounded border-border bg-input text-primary focus:ring-primary"
             />
-            <span className="text-sm text-text-secondary">Auto-copy on selection</span>
+            <span className="text-sm text-muted-foreground">Auto-copy on selection</span>
           </label>
-          <p className="text-xs text-text-muted mt-2">
+          <p className="text-xs text-muted-foreground mt-2">
             Automatically copy selected text to clipboard
           </p>
         </div>
@@ -688,26 +731,26 @@ export function XTerminal({ sessionName, onDisconnect, autoCopyOnSelect: autoCop
           {contextMenu.canCopy && (
             <button
               onClick={handleContextCopy}
-              className="w-full px-4 py-2 text-left text-sm text-foreground hover:bg-surface-raised transition-colors flex items-center gap-2"
+              className="w-full px-4 py-2 text-left text-sm text-foreground hover:bg-card transition-colors flex items-center gap-2"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
               </svg>
               Copy
-              <span className="ml-auto text-xs text-text-muted">
+              <span className="ml-auto text-xs text-muted-foreground">
                 {isMac ? '⌘C' : 'Ctrl+C'}
               </span>
             </button>
           )}
           <button
             onClick={handleContextPaste}
-            className="w-full px-4 py-2 text-left text-sm text-foreground hover:bg-surface-raised transition-colors flex items-center gap-2"
+            className="w-full px-4 py-2 text-left text-sm text-foreground hover:bg-card transition-colors flex items-center gap-2"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
             </svg>
             Paste
-            <span className="ml-auto text-xs text-text-muted">
+            <span className="ml-auto text-xs text-muted-foreground">
               {isMac ? '⌘V' : 'Ctrl+V'}
             </span>
           </button>

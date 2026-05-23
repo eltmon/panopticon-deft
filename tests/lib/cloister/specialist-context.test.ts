@@ -1,6 +1,7 @@
+import { Effect } from 'effect';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as childProcess from 'child_process';
@@ -32,37 +33,41 @@ vi.mock('child_process', async () => {
 });
 
 // Mock projects module
-vi.mock('../../../src/lib/projects.js', () => ({
-  getProject: vi.fn((projectKey: string) => {
-    if (projectKey === 'testproject') {
-      return {
-        key: 'testproject',
-        name: 'Test Project',
-        specialists: {
-          context_runs: 3,
-          digest_model: 'claude-sonnet-4-5',
-        },
-      };
-    }
-    return null;
-  }),
+const mockGetProject = vi.hoisted(() => vi.fn((projectKey: string) => {
+  if (projectKey === 'testproject') {
+    return {
+      key: 'testproject',
+      name: 'Test Project',
+      specialists: {
+        context_runs: 3,
+        digest_model: 'claude-sonnet-4-5',
+      },
+    };
+  }
+  return null;
 }));
 
-// Mock work-type-router module
-vi.mock('../../../src/lib/work-type-router.js', () => ({
-  getModelId: vi.fn(() => 'claude-sonnet-4-5'),
+vi.mock('../../../src/lib/projects.js', () => ({
+  getProject: mockGetProject,
+  getProjectSync: mockGetProject,
 }));
+
+vi.mock('../../../src/lib/config-yaml.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/lib/config-yaml.js')>('../../../src/lib/config-yaml.js');
+  return {
+    ...actual,
+    loadConfig: vi.fn(() => ({ config: { roles: actual.DEFAULT_ROLES, workhorses: actual.DEFAULT_WORKHORSES } })),
+    loadConfigSync: vi.fn(() => ({ config: { roles: actual.DEFAULT_ROLES, workhorses: actual.DEFAULT_WORKHORSES } })),
+  };
+});
 
 describe('specialist-context', () => {
-  const testDir = join(tmpdir(), 'panopticon-test-context');
+  let testDir: string;
   const originalPanopticonHome = process.env.PANOPTICON_HOME;
 
   beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'panopticon-test-context-'));
     process.env.PANOPTICON_HOME = testDir;
-    if (existsSync(testDir)) {
-      rmSync(testDir, { recursive: true, force: true });
-    }
-    mkdirSync(testDir, { recursive: true });
     vi.clearAllMocks();
   });
 
@@ -217,7 +222,7 @@ describe('specialist-context', () => {
     it('should return null if no recent runs and not forced', async () => {
       vi.spyOn(specialistLogs, 'getRecentRunLogs').mockReturnValue([]);
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
       expect(digest).toBeNull();
     });
 
@@ -227,12 +232,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: '# Generated Digest\n\nTest digest content', stderr: '' } as any);
+          callback(null, '# Generated Digest\n\nTest digest content', '');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent', { force: true });
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent', { force: true }));
       expect(digest).toBeTruthy();
       expect(digest).toContain('Generated Digest');
     });
@@ -241,12 +246,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: '# Test Digest\n\nDigest content here', stderr: '' } as any);
+          callback(null, '# Test Digest\n\nDigest content here', '');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
 
       expect(digest).toBeTruthy();
       expect(digest).toContain('Test Digest');
@@ -264,12 +269,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'digest', stderr: '' } as any);
+          callback(null, 'digest', '');
         }
         return {} as any;
       });
 
-      await generateContextDigest('testproject', 'review-agent', { runCount: 10 });
+      await Effect.runPromise(generateContextDigest('testproject', 'review-agent', { runCount: 10 }));
 
       expect(mockGetRecentRuns).toHaveBeenCalledWith('testproject', 'review-agent', 10);
     });
@@ -278,12 +283,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'digest', stderr: '' } as any);
+          callback(null, 'digest', '');
         }
         return {} as any;
       });
 
-      await generateContextDigest('testproject', 'review-agent', { model: 'claude-opus-4-6' });
+      await Effect.runPromise(generateContextDigest('testproject', 'review-agent', { model: 'claude-opus-4-6' }));
 
       expect(mockExec).toHaveBeenCalledWith(
         expect.stringContaining('--model claude-opus-4-6'),
@@ -296,12 +301,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(new Error('Exec failed'), { stdout: '', stderr: 'Error' } as any);
+          callback(new Error('Exec failed'), '', 'Error');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
       expect(digest).toBeNull();
     });
 
@@ -309,12 +314,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: '   \n  ', stderr: '' } as any);
+          callback(null, '   \n  ', '');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
       expect(digest).toBeNull();
     });
 
@@ -325,12 +330,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'digest', stderr: '' } as any);
+          callback(null, 'digest', '');
         }
         return {} as any;
       });
 
-      await generateContextDigest('testproject', 'review-agent');
+      await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
 
       expect(existsSync(contextDir)).toBe(true);
     });
@@ -341,16 +346,15 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'digest', stderr: 'some error output' } as any);
+          callback(null, 'digest', 'some error output');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
       expect(digest).toBe('digest');
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Claude stderr'),
-        expect.any(String)
+        expect.stringContaining('[claude-invoke] STDERR purpose=specialist-digest')
       );
 
       consoleErrorSpy.mockRestore();
@@ -362,12 +366,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'digest', stderr: 'warning: something' } as any);
+          callback(null, 'digest', 'warning: something');
         }
         return {} as any;
       });
 
-      const digest = await generateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(generateContextDigest('testproject', 'review-agent'));
       expect(digest).toBe('digest');
       expect(consoleErrorSpy).not.toHaveBeenCalled();
 
@@ -382,12 +386,12 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(null, { stdout: 'regenerated digest', stderr: '' } as any);
+          callback(null, 'regenerated digest', '');
         }
         return {} as any;
       });
 
-      const digest = await regenerateContextDigest('testproject', 'review-agent');
+      const digest = await Effect.runPromise(regenerateContextDigest('testproject', 'review-agent'));
       expect(digest).toBe('regenerated digest');
     });
   });
@@ -416,7 +420,7 @@ describe('specialist-context', () => {
       mockExec.mockImplementation((cmd, options, callback) => {
         execCalled = true;
         if (callback) {
-          callback(null, { stdout: 'scheduled digest', stderr: '' } as any);
+          callback(null, 'scheduled digest', '');
         }
         return {} as any;
       });
@@ -453,7 +457,7 @@ describe('specialist-context', () => {
       const mockExec = vi.mocked(childProcess.exec);
       mockExec.mockImplementation((cmd, options, callback) => {
         if (callback) {
-          callback(new Error('Scheduled generation failed'), { stdout: '', stderr: '' } as any);
+          callback(new Error('Scheduled generation failed'), '', '');
         }
         return {} as any;
       });
@@ -465,8 +469,7 @@ describe('specialist-context', () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to generate digest'),
-        expect.any(String)
+        expect.stringContaining('[claude-invoke] FAILED purpose=specialist-digest')
       );
 
       consoleErrorSpy.mockRestore();

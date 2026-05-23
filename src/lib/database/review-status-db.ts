@@ -6,9 +6,20 @@
  * TOCTOU race in the JSON-backed implementation.
  */
 
+import { Data, Effect } from 'effect';
 import { getDatabase } from './index.js';
 import type { ReviewStatus, StatusHistoryEntry } from '../review-status.js';
-import { normalizeReviewStatus } from '../review-status-normalize.js';
+import { normalizeReviewStatusSync } from '../review-status-normalize.js';
+
+/**
+ * PAN-1249: Local typed error for SQLite failures against review_status.
+ * Used by the *Async wrappers; sync functions still throw at the boundary.
+ * Full conversion to @effect/sql-sqlite-bun is deferred to PAN-447.
+ */
+export class DatabaseError extends Data.TaggedError('DatabaseError')<{
+  readonly operation: string;
+  readonly cause?: unknown;
+}> {}
 
 // ============== Write operations ==============
 
@@ -16,10 +27,14 @@ import { normalizeReviewStatus } from '../review-status-normalize.js';
  * Upsert a review status record atomically.
  * Replaces the JSON read-modify-write cycle with a single transaction.
  */
-export function upsertReviewStatus(status: ReviewStatus): void {
+export function upsertReviewStatusSync(status: ReviewStatus): void {
   const db = getDatabase();
 
   const upsert = db.transaction((s: ReviewStatus) => {
+    // Normalize issueId to uppercase so SQLite's case-sensitive PRIMARY KEY
+    // doesn't create duplicate rows (e.g. pan-457 vs PAN-457).
+    s.issueId = s.issueId.toUpperCase();
+
     // Upsert main record
     db.prepare(`
       INSERT INTO review_status (
@@ -28,6 +43,7 @@ export function upsertReviewStatus(status: ReviewStatus): void {
         verification_cycle_count, verification_max_cycles,
         review_notes, test_notes, merge_notes,
         updated_at, ready_for_merge, auto_requeue_count, merge_retry_count, pr_url,
+        pr_head_sha, pr_number,
         stuck, stuck_reason, stuck_at, stuck_details,
         reviewed_at_commit,
         review_spawned_at,
@@ -36,9 +52,12 @@ export function upsertReviewStatus(status: ReviewStatus): void {
         recovery_started_at,
         deacon_ignored,
         deacon_ignored_at,
-        deacon_ignored_reason
+        deacon_ignored_reason,
+        blocker_reasons,
+        last_verified_commit,
+        merge_step
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(issue_id) DO UPDATE SET
         review_status         = excluded.review_status,
@@ -56,6 +75,8 @@ export function upsertReviewStatus(status: ReviewStatus): void {
         auto_requeue_count    = excluded.auto_requeue_count,
         merge_retry_count     = excluded.merge_retry_count,
         pr_url                = excluded.pr_url,
+        pr_head_sha           = excluded.pr_head_sha,
+        pr_number             = excluded.pr_number,
         stuck                 = excluded.stuck,
         stuck_reason          = excluded.stuck_reason,
         stuck_at              = excluded.stuck_at,
@@ -67,7 +88,10 @@ export function upsertReviewStatus(status: ReviewStatus): void {
         recovery_started_at   = excluded.recovery_started_at,
         deacon_ignored        = excluded.deacon_ignored,
         deacon_ignored_at     = excluded.deacon_ignored_at,
-        deacon_ignored_reason = excluded.deacon_ignored_reason
+        deacon_ignored_reason = excluded.deacon_ignored_reason,
+        blocker_reasons       = excluded.blocker_reasons,
+        last_verified_commit  = excluded.last_verified_commit,
+        merge_step            = excluded.merge_step
     `).run(
       s.issueId,
       s.reviewStatus,
@@ -85,6 +109,8 @@ export function upsertReviewStatus(status: ReviewStatus): void {
       s.autoRequeueCount ?? null,
       s.mergeRetryCount ?? null,
       s.prUrl ?? null,
+      s.prHeadSha ?? null,
+      s.prNumber ?? null,
       s.stuck ? 1 : 0,
       s.stuckReason ?? null,
       s.stuckAt ?? null,
@@ -97,6 +123,9 @@ export function upsertReviewStatus(status: ReviewStatus): void {
       s.deaconIgnored ? 1 : 0,
       s.deaconIgnoredAt ?? null,
       s.deaconIgnoredReason ?? null,
+      s.blockerReasons ? JSON.stringify(s.blockerReasons) : null,
+      s.lastVerifiedCommit ?? null,
+      s.mergeStep ?? null,
     );
 
     // Append new history entries (deduplicate by timestamp to avoid re-inserting)
@@ -122,12 +151,57 @@ export function deleteReviewStatus(issueId: string): void {
   db.prepare('DELETE FROM review_status WHERE issue_id = ?').run(issueId);
 }
 
+// ============== Async wrappers (dashboard-reachable code) ==============
+// better-sqlite3 is synchronous. These wrappers defer execution via
+// setImmediate so the Node event loop can process other I/O (HTTP,
+// WebSocket, terminal) between SQLite operations. This satisfies the
+// "No Blocking Calls" dashboard rule (PAN-70 / PAN-446) for the
+// webhook ingestion path.
+//
+// The failure mode is typed (DatabaseError) for Effect-native callers.
+
+export const upsertReviewStatus = (
+  status: ReviewStatus,
+): Effect.Effect<void, DatabaseError> =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<void>((resolve, reject) => {
+        setImmediate(() => {
+          try {
+            upsertReviewStatusSync(status);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }),
+    catch: (cause) => new DatabaseError({ operation: 'upsertReviewStatus', cause }),
+  });
+
+export const getReviewStatusFromDb = (
+  issueId: string,
+): Effect.Effect<ReviewStatus | null, DatabaseError> =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<ReviewStatus | null>((resolve, reject) => {
+        setImmediate(() => {
+          try {
+            resolve(getReviewStatusFromDbSync(issueId));
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }),
+    catch: (cause) => new DatabaseError({ operation: 'getReviewStatusFromDb', cause }),
+  });
+
+
 // ============== Read operations ==============
 
 /**
  * Get a single review status by issue ID.
  */
-export function getReviewStatusFromDb(issueId: string): ReviewStatus | null {
+export function getReviewStatusFromDbSync(issueId: string): ReviewStatus | null {
   const db = getDatabase();
   const normalizedId = issueId.toUpperCase();
 
@@ -143,16 +217,77 @@ export function getReviewStatusFromDb(issueId: string): ReviewStatus | null {
 
 /**
  * Get all review statuses.
+ *
+ * Loads history in a single query (2 total) to avoid N+1 on bulk reads.
  */
 export function getAllReviewStatusesFromDb(): Record<string, ReviewStatus> {
   const db = getDatabase();
 
   const rows = db.prepare('SELECT * FROM review_status ORDER BY updated_at DESC').all() as DbReviewStatusRow[];
-  const result: Record<string, ReviewStatus> = {};
 
+  // Bulk-load all history rows in one query, then bucket by issue_id
+  const historyRows = db.prepare(`
+    SELECT issue_id, type, status, timestamp, notes
+    FROM status_history
+    ORDER BY issue_id, timestamp ASC
+  `).all() as Array<{ issue_id: string; type: string; status: string; timestamp: string; notes: string | null }>;
+
+  const historyByIssue = new Map<string, StatusHistoryEntry[]>();
+  for (const row of historyRows) {
+    const bucket = historyByIssue.get(row.issue_id) ?? [];
+    bucket.push({
+      type: row.type as StatusHistoryEntry['type'],
+      status: row.status,
+      timestamp: row.timestamp,
+      ...(row.notes ? { notes: row.notes } : {}),
+    });
+    historyByIssue.set(row.issue_id, bucket);
+  }
+
+  const result: Record<string, ReviewStatus> = {};
   for (const row of rows) {
-    const history = getHistoryFromDb(row.issue_id);
-    result[row.issue_id] = rowToReviewStatus(row, history);
+    result[row.issue_id] = rowToReviewStatus(row, historyByIssue.get(row.issue_id) ?? []);
+  }
+
+  return result;
+}
+
+export function getReviewStatusesFromDb(issueIds: string[]): Record<string, ReviewStatus> {
+  const normalizedIds = [...new Set(issueIds.map((id) => id.toUpperCase()).filter(Boolean))];
+  if (normalizedIds.length === 0) return {};
+
+  const db = getDatabase();
+  const placeholders = normalizedIds.map(() => '?').join(', ');
+  const rows = db.prepare(`
+    SELECT * FROM review_status
+    WHERE issue_id IN (${placeholders})
+    ORDER BY updated_at DESC
+  `).all(...normalizedIds) as DbReviewStatusRow[];
+
+  if (rows.length === 0) return {};
+
+  const historyRows = db.prepare(`
+    SELECT issue_id, type, status, timestamp, notes
+    FROM status_history
+    WHERE issue_id IN (${placeholders})
+    ORDER BY issue_id, timestamp ASC
+  `).all(...normalizedIds) as Array<{ issue_id: string; type: string; status: string; timestamp: string; notes: string | null }>;
+
+  const historyByIssue = new Map<string, StatusHistoryEntry[]>();
+  for (const row of historyRows) {
+    const bucket = historyByIssue.get(row.issue_id) ?? [];
+    bucket.push({
+      type: row.type as StatusHistoryEntry['type'],
+      status: row.status,
+      timestamp: row.timestamp,
+      ...(row.notes ? { notes: row.notes } : {}),
+    });
+    historyByIssue.set(row.issue_id, bucket);
+  }
+
+  const result: Record<string, ReviewStatus> = {};
+  for (const row of rows) {
+    result[row.issue_id] = rowToReviewStatus(row, historyByIssue.get(row.issue_id) ?? []);
   }
 
   return result;
@@ -217,11 +352,20 @@ interface DbReviewStatusRow {
   deacon_ignored: number;
   deacon_ignored_at: string | null;
   deacon_ignored_reason: string | null;
+  // PAN-905: tracked PR identity for webhook correlation
+  pr_head_sha: string | null;
+  pr_number: number | null;
+  // PAN-905: GitHub-native merge blocker reasons (JSON array)
+  blocker_reasons: string | null;
+  // Pre-review verification gate commit SHA
+  last_verified_commit: string | null;
+  // Current merge pipeline step
+  merge_step: string | null;
 }
 
 function rowToReviewStatus(row: DbReviewStatusRow, history: StatusHistoryEntry[]): ReviewStatus {
-  return normalizeReviewStatus({
-    issueId: row.issue_id,
+  return normalizeReviewStatusSync({
+    issueId: row.issue_id.toUpperCase(),
     reviewStatus: row.review_status as ReviewStatus['reviewStatus'],
     testStatus: row.test_status as ReviewStatus['testStatus'],
     mergeStatus: row.merge_status as ReviewStatus['mergeStatus'] ?? undefined,
@@ -237,6 +381,8 @@ function rowToReviewStatus(row: DbReviewStatusRow, history: StatusHistoryEntry[]
     autoRequeueCount: row.auto_requeue_count ?? undefined,
     mergeRetryCount: row.merge_retry_count ?? undefined,
     prUrl: row.pr_url ?? undefined,
+    prHeadSha: row.pr_head_sha ?? undefined,
+    prNumber: row.pr_number ?? undefined,
     stuck: row.stuck === 1 ? true : undefined,
     stuckReason: row.stuck_reason ?? undefined,
     stuckAt: row.stuck_at ?? undefined,
@@ -249,6 +395,9 @@ function rowToReviewStatus(row: DbReviewStatusRow, history: StatusHistoryEntry[]
     deaconIgnored: row.deacon_ignored === 1 ? true : undefined,
     deaconIgnoredAt: row.deacon_ignored_at ?? undefined,
     deaconIgnoredReason: row.deacon_ignored_reason ?? undefined,
+    blockerReasons: row.blocker_reasons ? JSON.parse(row.blocker_reasons) : undefined,
+    lastVerifiedCommit: row.last_verified_commit ?? undefined,
+    mergeStep: row.merge_step ?? undefined,
     history: history.length > 0 ? history : undefined,
   });
 }

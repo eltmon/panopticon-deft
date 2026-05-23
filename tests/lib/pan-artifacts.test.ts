@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { migratePanopticonToPan, ensurePanGitignore } from '../../src/lib/workspace-manager.js';
-import { mergePanSkillsIntoWorkspace } from '../../src/lib/skills-merge.js';
+import { migratePanopticonToPanSync, ensurePanGitignoreSync } from '../../src/lib/workspace-manager.js';
+import { mergePanSkillsIntoWorkspaceSync } from '../../src/lib/skills-merge.js';
 
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), 'pan-artifacts-test-'));
@@ -17,33 +17,37 @@ describe('ensurePanGitignore', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('creates .gitignore with required entries when file does not exist', () => {
-    ensurePanGitignore(dir);
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
     expect(content).toContain('.pan/events/');
     expect(content).toContain('.pan/review/');
     expect(content).toContain('.pan/prompts/');
+    expect(content).toContain('.claude/skills/');
   });
 
   it('appends missing entries to an existing .gitignore', () => {
     writeFileSync(join(dir, '.gitignore'), 'node_modules/\n', 'utf-8');
-    ensurePanGitignore(dir);
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
     expect(content).toContain('node_modules/');
     expect(content).toContain('.pan/events/');
     expect(content).toContain('.pan/review/');
     expect(content).toContain('.pan/prompts/');
+    expect(content).toContain('.claude/skills/');
   });
 
   it('does not duplicate entries if already present', () => {
-    writeFileSync(join(dir, '.gitignore'), '.pan/events/\n.pan/review/\n.pan/prompts/\n', 'utf-8');
-    ensurePanGitignore(dir);
+    writeFileSync(join(dir, '.gitignore'), '.pan/events/\n.pan/review/\n.pan/prompts/\n.claude/skills/\n', 'utf-8');
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
-    const matches = (content.match(/\.pan\/events\//g) || []).length;
-    expect(matches).toBe(1);
+    const panMatches = (content.match(/\.pan\/events\//g) || []).length;
+    const skillsMatches = (content.match(/\.claude\/skills\//g) || []).length;
+    expect(panMatches).toBe(1);
+    expect(skillsMatches).toBe(1);
   });
 
   it('does not add .pan/ itself (only runtime subdirs)', () => {
-    ensurePanGitignore(dir);
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
     // Must not gitignore .pan/ at root level (would block .pan/skills/)
     const lines = content.split('\n').map(l => l.trim());
@@ -51,17 +55,19 @@ describe('ensurePanGitignore', () => {
   });
 
   it('does not add .planning/ to .gitignore', () => {
-    ensurePanGitignore(dir);
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
     expect(content).not.toContain('.planning/');
   });
 
   it('is idempotent across multiple calls', () => {
-    ensurePanGitignore(dir);
-    ensurePanGitignore(dir);
+    ensurePanGitignoreSync(dir);
+    ensurePanGitignoreSync(dir);
     const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
-    const matches = (content.match(/\.pan\/events\//g) || []).length;
-    expect(matches).toBe(1);
+    const panMatches = (content.match(/\.pan\/events\//g) || []).length;
+    const skillsMatches = (content.match(/\.claude\/skills\//g) || []).length;
+    expect(panMatches).toBe(1);
+    expect(skillsMatches).toBe(1);
   });
 });
 
@@ -73,7 +79,7 @@ describe('migratePanopticonToPan', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('returns empty result when no .panopticon/ subdirs exist', () => {
-    const result = migratePanopticonToPan(dir);
+    const result = migratePanopticonToPanSync(dir);
     expect(result.migrated).toHaveLength(0);
     expect(result.skipped).toHaveLength(0);
     expect(result.errors).toHaveLength(0);
@@ -84,7 +90,7 @@ describe('migratePanopticonToPan', () => {
     mkdirSync(oldDir, { recursive: true });
     writeFileSync(join(oldDir, 'PAN-1.jsonl'), '{}', 'utf-8');
 
-    const result = migratePanopticonToPan(dir);
+    const result = migratePanopticonToPanSync(dir);
     expect(result.migrated.some(m => m.includes('.panopticon/events'))).toBe(true);
     expect(existsSync(join(dir, '.pan', 'events', 'PAN-1.jsonl'))).toBe(true);
     expect(existsSync(join(dir, '.panopticon', 'events'))).toBe(false);
@@ -94,7 +100,7 @@ describe('migratePanopticonToPan', () => {
     mkdirSync(join(dir, '.panopticon', 'triage'), { recursive: true });
     writeFileSync(join(dir, '.panopticon', 'triage', 'out.md'), 'triage', 'utf-8');
 
-    migratePanopticonToPan(dir);
+    migratePanopticonToPanSync(dir);
     expect(existsSync(join(dir, '.pan', 'review'))).toBe(true);
   });
 
@@ -102,7 +108,7 @@ describe('migratePanopticonToPan', () => {
     mkdirSync(join(dir, '.panopticon', 'health'), { recursive: true });
     writeFileSync(join(dir, '.panopticon', 'health', 'out.md'), 'health', 'utf-8');
 
-    migratePanopticonToPan(dir);
+    migratePanopticonToPanSync(dir);
     expect(existsSync(join(dir, '.pan', 'review'))).toBe(true);
   });
 
@@ -110,7 +116,7 @@ describe('migratePanopticonToPan', () => {
     mkdirSync(join(dir, '.panopticon', 'prompts'), { recursive: true });
     writeFileSync(join(dir, '.panopticon', 'prompts', 'agent.md'), 'prompt', 'utf-8');
 
-    migratePanopticonToPan(dir);
+    migratePanopticonToPanSync(dir);
     expect(existsSync(join(dir, '.pan', 'prompts', 'agent.md'))).toBe(true);
   });
 
@@ -118,7 +124,7 @@ describe('migratePanopticonToPan', () => {
     mkdirSync(join(dir, '.panopticon', 'events'), { recursive: true });
     mkdirSync(join(dir, '.pan', 'events'), { recursive: true });
 
-    const result = migratePanopticonToPan(dir);
+    const result = migratePanopticonToPanSync(dir);
     expect(result.skipped).toContain('.panopticon/events');
     // Old dir not removed
     expect(existsSync(join(dir, '.panopticon', 'events'))).toBe(true);
@@ -126,7 +132,7 @@ describe('migratePanopticonToPan', () => {
 
   it('never touches paths outside the project directory', () => {
     // Verify ~/.panopticon is untouched by confirming migration only checks project path
-    const result = migratePanopticonToPan(dir);
+    const result = migratePanopticonToPanSync(dir);
     // No errors from attempting to access global ~/.panopticon/
     expect(result.errors).toHaveLength(0);
   });
@@ -134,7 +140,7 @@ describe('migratePanopticonToPan', () => {
   it('removes empty .panopticon/ directory after migration', () => {
     mkdirSync(join(dir, '.panopticon', 'events'), { recursive: true });
 
-    migratePanopticonToPan(dir);
+    migratePanopticonToPanSync(dir);
     expect(existsSync(join(dir, '.panopticon'))).toBe(false);
   });
 });
@@ -157,7 +163,7 @@ describe('mergePanSkillsIntoWorkspace', () => {
   });
 
   it('returns empty result when .pan/skills/ does not exist', () => {
-    const result = mergePanSkillsIntoWorkspace(projectDir, workspaceDir);
+    const result = mergePanSkillsIntoWorkspaceSync(projectDir, workspaceDir);
     expect(result.added).toHaveLength(0);
   });
 
@@ -166,7 +172,7 @@ describe('mergePanSkillsIntoWorkspace', () => {
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, 'SKILL.md'), '# My Skill\nContent', 'utf-8');
 
-    const result = mergePanSkillsIntoWorkspace(projectDir, workspaceDir);
+    const result = mergePanSkillsIntoWorkspaceSync(projectDir, workspaceDir);
     expect(result.added.length).toBeGreaterThan(0);
     expect(existsSync(join(workspaceDir, '.claude', 'skills', 'my-skill', 'SKILL.md'))).toBe(true);
   });
@@ -181,7 +187,7 @@ describe('mergePanSkillsIntoWorkspace', () => {
     mkdirSync(existingDir, { recursive: true });
     writeFileSync(join(existingDir, 'SKILL.md'), '# User Owned', 'utf-8');
 
-    const result = mergePanSkillsIntoWorkspace(projectDir, workspaceDir);
+    const result = mergePanSkillsIntoWorkspaceSync(projectDir, workspaceDir);
     expect(result.skipped.some(s => s.includes('my-skill'))).toBe(true);
     // Content must be unchanged
     const content = readFileSync(join(existingDir, 'SKILL.md'), 'utf-8');
@@ -195,7 +201,7 @@ describe('mergePanSkillsIntoWorkspace', () => {
       writeFileSync(join(d, 'SKILL.md'), `# ${name}`, 'utf-8');
     }
 
-    const result = mergePanSkillsIntoWorkspace(projectDir, workspaceDir);
+    const result = mergePanSkillsIntoWorkspaceSync(projectDir, workspaceDir);
     expect(result.overlayed).toHaveLength(3);
     expect(existsSync(join(workspaceDir, '.claude', 'skills', 'skill-a'))).toBe(true);
     expect(existsSync(join(workspaceDir, '.claude', 'skills', 'skill-b'))).toBe(true);

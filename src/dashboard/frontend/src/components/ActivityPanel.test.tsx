@@ -7,23 +7,37 @@
  *   - applyPinWarnings(): warn/error pinned to top
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import React from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { inferCategory, mergeActivitiesById, applyPinWarnings, ActivityPanel } from './ActivityPanel';
-import type { ActivityEntry } from './ActivityPanel';
+import type { ActivityEntry, TtsEntry } from './ActivityPanel';
 
 // ── ActivityPanel component tests ─────────────────────────────────────────────
 
-vi.mock('../lib/store', () => ({
-  useDashboardStore: (selector: (s: { recentActivity: unknown[] }) => unknown) =>
-    selector({ recentActivity: [] }),
+const dashboardState: {
+  recentActivity: ActivityEntry[];
+  detailedActivity: ActivityEntry[];
+  ttsActivity: TtsEntry[];
+} = {
+  recentActivity: [],
+  detailedActivity: [],
+  ttsActivity: [],
+};
+
+vi.mock('sonner', () => ({
+  toast: { error: vi.fn() },
 }));
 
-function renderPanel() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] }));
+vi.mock('../lib/store', () => ({
+  useDashboardStore: (selector: (s: typeof dashboardState) => unknown) => selector(dashboardState),
+}));
+
+function renderPanel(fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => [] })) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  vi.stubGlobal('fetch', fetchImpl);
   return render(
     <QueryClientProvider client={client}>
       <ActivityPanel onClose={vi.fn()} />
@@ -31,9 +45,16 @@ function renderPanel() {
   );
 }
 
-describe('ActivityPanel — Clear button', () => {
+describe('ActivityPanel', () => {
   beforeEach(() => {
+    dashboardState.recentActivity = [];
+    dashboardState.detailedActivity = [];
+    dashboardState.ttsActivity = [];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('does not show Clear button when all filters are at defaults', () => {
@@ -87,6 +108,53 @@ describe('ActivityPanel — Clear button', () => {
     // Other filters reset
     expect((screen.getAllByRole('combobox')[0] as HTMLSelectElement).value).toBe('all');
   });
+
+  it('replays TTS utterances from the TTS tab', async () => {
+    dashboardState.ttsActivity = [{
+      id: 'tts-1',
+      timestamp: new Date().toISOString(),
+      utterance: 'PAN-829 is ready to merge',
+      priority: 1,
+      issueId: 'PAN-829',
+    }];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (input.toString() === '/api/tts/speak') return { ok: true, json: async () => ({ spoken: true, result: 'spoken' }) } as Response;
+      return { ok: true, json: async () => [] } as Response;
+    });
+    renderPanel(fetchMock);
+
+    fireEvent.click(screen.getByRole('button', { name: 'TTS' }));
+    expect(screen.getByText('PAN-829 is ready to merge')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('tts-activity-replay-tts-1'));
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith('/api/tts/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'PAN-829 is ready to merge' }),
+      });
+    });
+  });
+
+  it('reports TTS replay no-op responses as errors', async () => {
+    dashboardState.ttsActivity = [{
+      id: 'tts-1',
+      timestamp: new Date().toISOString(),
+      utterance: 'PAN-829 is muted',
+      priority: 1,
+      issueId: 'PAN-829',
+    }];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (input.toString() === '/api/tts/speak') return { ok: true, json: async () => ({ spoken: false, result: 'muted' }) } as Response;
+      return { ok: true, json: async () => [] } as Response;
+    });
+    renderPanel(fetchMock);
+
+    fireEvent.click(screen.getByRole('button', { name: 'TTS' }));
+    fireEvent.click(screen.getByTestId('tts-activity-replay-tts-1'));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Failed to replay TTS: TTS did not speak (muted)'));
+  });
 });
 
 function makeEntry(partial: Partial<ActivityEntry> & { id: string }): ActivityEntry {
@@ -111,20 +179,12 @@ describe('inferCategory', () => {
     expect(inferCategory(makeEntry({ id: '1', source: 'git' }))).toBe('git');
   });
 
-  it('returns "specialist" for source containing "specialist"', () => {
-    expect(inferCategory(makeEntry({ id: '1', source: 'test-specialist' }))).toBe('specialist');
-  });
-
-  it('returns "specialist" for source containing "merge-agent"', () => {
-    expect(inferCategory(makeEntry({ id: '1', source: 'merge-agent' }))).toBe('specialist');
-  });
-
-  it('returns "specialist" for source containing "review"', () => {
-    expect(inferCategory(makeEntry({ id: '1', source: 'review-specialist' }))).toBe('specialist');
-  });
-
-  it('returns "specialist" for source containing "test" (not specialist)', () => {
-    expect(inferCategory(makeEntry({ id: '1', source: 'test-runner' }))).toBe('specialist');
+  it('returns "role" for role sources', () => {
+    expect(inferCategory(makeEntry({ id: '1', source: 'plan' }))).toBe('role');
+    expect(inferCategory(makeEntry({ id: '2', source: 'work' }))).toBe('role');
+    expect(inferCategory(makeEntry({ id: '3', source: 'review' }))).toBe('role');
+    expect(inferCategory(makeEntry({ id: '4', source: 'test' }))).toBe('role');
+    expect(inferCategory(makeEntry({ id: '5', source: 'ship' }))).toBe('role');
   });
 
   it('returns "sync" for source containing "sync"', () => {

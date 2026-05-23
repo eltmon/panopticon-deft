@@ -16,7 +16,9 @@ const mockResolveGitHubIssue = vi.fn();
 
 vi.mock('../../../../lib/tracker-utils.js', () => ({
   resolveTrackerType: mockResolveTrackerType,
+  resolveTrackerTypeSync: mockResolveTrackerType,
   resolveGitHubIssue: mockResolveGitHubIssue,
+  resolveGitHubIssueSync: mockResolveGitHubIssue,
 }));
 
 // ─── Mock issue-service-singleton (cache patching) ────────────────────────────
@@ -28,13 +30,13 @@ vi.mock('../issue-service-singleton.js', () => ({
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function runEffect<A, E>(effect: Effect.Effect<A, E, never>): Promise<A> {
+async function runProgram<A, E>(effect: Effect.Effect<A, E, never>): Promise<A> {
   const exit = await Effect.runPromise(Effect.exit(effect));
   if (Exit.isSuccess(exit)) return exit.value;
   throw Cause.squash(exit.cause);
 }
 
-async function runEffectFail<A, E>(effect: Effect.Effect<A, E, never>): Promise<E> {
+async function runProgramFail<A, E>(effect: Effect.Effect<A, E, never>): Promise<E> {
   const exit = await Effect.runPromise(Effect.exit(effect));
   if (Exit.isSuccess(exit))
     throw new Error('Expected effect to fail, got: ' + JSON.stringify(exit.value));
@@ -54,6 +56,7 @@ const mockGitHubAddLabel = vi.fn();
 const mockGitHubRemoveLabel = vi.fn();
 const mockGitHubCloseIssue = vi.fn();
 const mockGitHubReopenIssue = vi.fn();
+const mockGitHubEnsureLabel = vi.fn();
 const mockRallyUpdateState = vi.fn();
 
 async function makeTestLayer() {
@@ -67,6 +70,7 @@ async function makeTestLayer() {
     getTeamStates: mockLinearGetTeamStates,
     updateState: mockLinearUpdateState,
     addComment: vi.fn(),
+    getComments: vi.fn(),
     findOrCreateLabel: vi.fn(),
     addLabel: vi.fn(),
     removeLabel: vi.fn(),
@@ -78,13 +82,14 @@ async function makeTestLayer() {
     removeLabel: mockGitHubRemoveLabel,
     closeIssue: mockGitHubCloseIssue,
     reopenIssue: mockGitHubReopenIssue,
-    ensureLabel: vi.fn(),
+    ensureLabel: mockGitHubEnsureLabel,
     addComment: vi.fn(),
     getComments: vi.fn(),
   });
 
   const rallyLayer = Layer.succeed(RallyClient, {
     getIssue: vi.fn(),
+    getChildIssues: vi.fn(),
     updateState: mockRallyUpdateState,
     addComment: vi.fn(),
   });
@@ -124,6 +129,7 @@ describe('IssueLifecycle — integration', () => {
     mockGitHubRemoveLabel.mockReturnValue(ok(undefined));
     mockGitHubCloseIssue.mockReturnValue(ok(undefined));
     mockGitHubReopenIssue.mockReturnValue(ok(undefined));
+    mockGitHubEnsureLabel.mockReturnValue(ok({ id: 1, name: 'label', color: 'fbca04' }));
     mockRallyUpdateState.mockReturnValue(ok(undefined));
   });
 
@@ -137,7 +143,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('MIN-1', 'in_progress');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockLinearUpdateState).toHaveBeenCalledWith('uuid-1', 'state-inprogress');
     });
 
@@ -150,7 +156,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('MIN-1', 'in_progress');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockPatchIssue).toHaveBeenCalledWith('MIN-1', expect.objectContaining({ canonicalStatus: 'in_progress' }));
     });
 
@@ -173,7 +179,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('MIN-1', 'in_progress');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockLinearUpdateState).not.toHaveBeenCalled();
     });
   });
@@ -191,7 +197,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('org/repo#1', 'in_progress');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockGitHubAddLabel).toHaveBeenCalledWith('org', 'repo', 1, 'in-progress');
     });
 
@@ -207,7 +213,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('org/repo#1', 'canceled');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockGitHubAddLabel).toHaveBeenCalledWith('org', 'repo', 1, 'wontfix');
       expect(mockGitHubCloseIssue).toHaveBeenCalledWith('org', 'repo', 1);
     });
@@ -223,7 +229,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('MIN-1', 'canceled');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockLinearUpdateState).toHaveBeenCalledWith('uuid-1', 'state-canceled');
       expect(mockPatchIssue).toHaveBeenCalledWith('MIN-1', expect.objectContaining({ canonicalStatus: 'canceled' }));
     });
@@ -239,7 +245,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.close('MIN-1');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockLinearUpdateState).toHaveBeenCalledWith('uuid-1', 'state-done');
     });
 
@@ -252,7 +258,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.close('MIN-1');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockPatchIssue).toHaveBeenCalledWith('MIN-1', expect.objectContaining({ canonicalStatus: 'closed' }));
     });
 
@@ -268,7 +274,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.close('org/repo#42');
       }).pipe(Effect.provide(layer));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockGitHubRemoveLabel).toHaveBeenCalledWith('org', 'repo', 42, 'in-review');
       expect(mockGitHubRemoveLabel).toHaveBeenCalledWith('org', 'repo', 42, 'in-planning');
       expect(mockGitHubCloseIssue).toHaveBeenCalledWith('org', 'repo', 42);
@@ -290,6 +296,7 @@ describe('IssueLifecycle — integration', () => {
         getTeamStates: () => fail,
         updateState: () => fail,
         addComment: vi.fn(),
+        getComments: vi.fn(),
         findOrCreateLabel: vi.fn(),
         addLabel: vi.fn(),
         removeLabel: vi.fn(),
@@ -308,6 +315,7 @@ describe('IssueLifecycle — integration', () => {
 
       const rallyLayer = Layer.succeed(RallyClient, {
         getIssue: vi.fn(),
+        getChildIssues: vi.fn(),
         updateState: vi.fn(),
         addComment: vi.fn(),
       });
@@ -323,7 +331,7 @@ describe('IssueLifecycle — integration', () => {
         yield* lifecycle.transitionTo('MIN-1', 'in_progress');
       }).pipe(Effect.provide(layer));
 
-      const err = await runEffectFail(program);
+      const err = await runProgramFail(program);
       expect((err as any)._tag).toBe('TrackerNotConfigured');
     });
   });

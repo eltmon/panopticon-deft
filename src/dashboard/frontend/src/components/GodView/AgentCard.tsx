@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
+import { useSharedTick } from '../../lib/useSharedTick';
+import { formatRelativeTime } from '../../lib/formatRelativeTime';
 import { motion } from 'framer-motion';
-import { Clock, GitBranch, Cpu, AlertTriangle, CheckCircle, XCircle, Minus } from 'lucide-react';
+import { Clock, GitBranch, Cpu, AlertTriangle, CheckCircle, XCircle, Minus, Radio } from 'lucide-react';
 import { CanvasTerminal } from './CanvasTerminal';
 import { selectGodViewAgentOutput, selectGodViewAgentStatuses } from '../../hooks/useGodViewSocket';
 import { useDashboardStore } from '../../lib/store';
@@ -18,6 +20,7 @@ const STATUS_ICONS: Record<string, React.ReactNode> = {
   stuck: <AlertTriangle className="w-3 h-3" />,
   dead: <XCircle className="w-3 h-3" />,
   stopped: <Minus className="w-3 h-3" />,
+  running: <CheckCircle className="w-3 h-3" />,
 };
 
 const STATUS_GLOW: Record<string, string> = {
@@ -26,13 +29,16 @@ const STATUS_GLOW: Record<string, string> = {
   stuck: 'gv-breathe-stuck',
   dead: 'gv-breathe-dead',
   stopped: 'gv-breathe-dead',
+  running: 'gv-breathe-healthy',
 };
 
-const PHASE_COLORS: Record<string, string> = {
-  planning: 'var(--gv-amber)',
-  implementation: 'var(--gv-blue)',
-  exploration: 'var(--gv-purple)',
-  testing: 'var(--gv-green)',
+// PAN-1048: colors are now keyed by Role, not legacy phase strings.
+const ROLE_COLORS: Record<string, string> = {
+  plan: 'var(--gv-amber)',
+  work: 'var(--gv-blue)',
+  review: 'var(--gv-purple)',
+  test: 'var(--gv-green)',
+  ship: 'var(--gv-orange)',
 };
 
 function UptimeCounter({ startedAt }: { startedAt: string }) {
@@ -52,13 +58,46 @@ function UptimeCounter({ startedAt }: { startedAt: string }) {
   return <span className="gv-mono text-[10px]" style={{ color: 'var(--gv-text-secondary)' }}>{elapsed}</span>;
 }
 
+function stalenessColor(ms: number): string {
+  if (ms < 2 * 60_000) return 'var(--gv-green)';
+  if (ms < 10 * 60_000) return 'var(--gv-amber)';
+  if (ms < 30 * 60_000) return 'var(--gv-orange)';
+  return 'var(--gv-pink)';
+}
+
+function LastHeardCounter({ lastActivity }: { lastActivity?: string }) {
+  const now = useSharedTick();
+  if (!lastActivity) return null;
+  const ms = now.getTime() - new Date(lastActivity).getTime();
+  if (ms < 1000) return null;
+  const label = formatRelativeTime(lastActivity, now);
+  return (
+    <span className="gv-mono text-[10px]" style={{ color: stalenessColor(ms) }}>
+      {label}
+    </span>
+  );
+}
+
 export function AgentCard({ agent, onClick, 'data-agent-id': dataAgentId }: AgentCardProps) {
   const agentOutput = useDashboardStore(selectGodViewAgentOutput);
   const agentStatuses = useDashboardStore(selectGodViewAgentStatuses);
   const terminalLines = agentOutput[agent.id] || [];
   const liveStatus = agentStatuses[agent.id] || agent.status;
 
-  const phaseColor = agent.agentPhase ? PHASE_COLORS[agent.agentPhase] || 'var(--gv-blue)' : 'var(--gv-blue)';
+  const roleColor = agent.role ? ROLE_COLORS[agent.role] || 'var(--gv-blue)' : 'var(--gv-blue)';
+
+  const now = useSharedTick();
+  const lastHeardTooltip = (() => {
+    if (!agent.lastActivity) return '';
+    const ms = now.getTime() - new Date(agent.lastActivity).getTime();
+    if (ms < 1000) return '';
+    return `Last heard: ${formatRelativeTime(agent.lastActivity, now)}`;
+  })();
+  const cardTooltip = [
+    agent.issueId || agent.id,
+    agent.role ? `Role: ${agent.role}` : '',
+    lastHeardTooltip,
+  ].filter(Boolean).join(' · ');
 
   return (
     <motion.div
@@ -70,13 +109,14 @@ export function AgentCard({ agent, onClick, 'data-agent-id': dataAgentId }: Agen
       whileHover={{ scale: 1.02, transition: { duration: 0.15 } }}
       transition={{ duration: 0.2 }}
       onClick={onClick}
+      title={cardTooltip}
       className={`gv-glass cursor-pointer p-3 flex flex-col gap-2 relative overflow-hidden ${STATUS_GLOW[liveStatus] || ''}`}
-      style={{ borderColor: phaseColor + '44' }}
+      style={{ borderColor: roleColor + '44' }}
     >
       {/* Project color border accent (left) */}
       <div
         className="absolute left-0 top-0 bottom-0 w-0.5"
-        style={{ backgroundColor: phaseColor }}
+        style={{ backgroundColor: roleColor }}
       />
 
       {/* Header row */}
@@ -84,16 +124,16 @@ export function AgentCard({ agent, onClick, 'data-agent-id': dataAgentId }: Agen
         <div className="flex items-center gap-1.5 min-w-0">
           <span
             className="text-xs font-bold truncate"
-            style={{ color: phaseColor, fontFamily: 'var(--gv-font-mono)' }}
+            style={{ color: roleColor, fontFamily: 'var(--gv-font-mono)' }}
           >
             {agent.issueId || agent.id}
           </span>
-          {agent.agentPhase && (
+          {agent.role && (
             <span
               className="text-[9px] px-1.5 py-0.5 rounded font-medium uppercase"
-              style={{ color: phaseColor, background: phaseColor + '22' }}
+              style={{ color: roleColor, background: roleColor + '22' }}
             >
-              {agent.agentPhase}
+              {agent.role}
             </span>
           )}
         </div>
@@ -130,7 +170,7 @@ export function AgentCard({ agent, onClick, 'data-agent-id': dataAgentId }: Agen
         </div>
       )}
 
-      {/* Bottom row: model, cost, uptime */}
+      {/* Bottom row: model, uptime, last heard */}
       <div className="flex items-center justify-between pl-2 mt-auto">
         <div className="flex items-center gap-1.5">
           <Cpu className="w-3 h-3" style={{ color: 'var(--gv-text-dim)' }} />
@@ -139,9 +179,17 @@ export function AgentCard({ agent, onClick, 'data-agent-id': dataAgentId }: Agen
           </span>
         </div>
 
-        <div className="flex items-center gap-1">
-          <Clock className="w-3 h-3" style={{ color: 'var(--gv-text-dim)' }} />
-          <UptimeCounter startedAt={agent.startedAt} />
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
+            <Clock className="w-3 h-3" style={{ color: 'var(--gv-text-dim)' }} />
+            <UptimeCounter startedAt={agent.startedAt} />
+          </div>
+          {agent.lastActivity && (
+            <div className="flex items-center gap-1" title={lastHeardTooltip}>
+              <Radio className="w-3 h-3" style={{ color: 'var(--gv-text-dim)' }} />
+              <LastHeardCounter lastActivity={agent.lastActivity} />
+            </div>
+          )}
         </div>
       </div>
 

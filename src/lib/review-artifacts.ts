@@ -2,17 +2,21 @@ import { exec } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Data, Effect } from 'effect';
+import { findPlanSync } from './vbrief/io.js';
 import { promisify } from 'node:util';
+import { queryBeadsForIssue } from './beads-query.js';
 import { getForgeAdapter } from './forge.js';
-import { extractNumber } from './issue-id.js';
+import { extractNumberSync } from './issue-id.js';
 import {
-  ensureMergeSetForIssue,
-  upsertMergeSet,
-  withRepoArtifactUrl,
-  withRepoState,
+  ensureMergeSetForIssueSync,
+  upsertMergeSetSync,
+  withRepoArtifactUrlSync,
+  withRepoStateSync,
   type MergeSet,
   type MergeSetRepoState,
 } from './merge-set.js';
+import { emitActivityEntrySync } from './activity-logger.js';
 
 const execAsync = promisify(exec);
 
@@ -27,19 +31,15 @@ export interface ReviewArtifactCreationResult {
   }>;
 }
 
-/**
- * Build the PR/MR body from the workspace planning artifacts.
- * Shared by both `pan done` and dashboard review startup.
- */
-export async function buildRichReviewArtifactBody(issueId: string, workspacePath: string): Promise<string> {
+async function buildRichReviewArtifactBodyPromise(issueId: string, workspacePath: string): Promise<string> {
   const lines: string[] = [];
 
-  lines.push(`#${extractNumber(issueId) ?? issueId}`);
+  lines.push(`#${extractNumberSync(issueId) ?? issueId}`);
   lines.push('');
 
   try {
-    const planPath = join(workspacePath, '.planning', 'plan.vbrief.json');
-    if (existsSync(planPath)) {
+    const planPath = findPlanSync(workspacePath);
+    if (planPath && existsSync(planPath)) {
       const raw = await readFile(planPath, 'utf-8');
       const doc = JSON.parse(raw);
       const items: Array<{ status: string; title: string }> = doc?.plan?.items ?? [];
@@ -58,38 +58,15 @@ export async function buildRichReviewArtifactBody(issueId: string, workspacePath
   }
 
   try {
-    let beadsPath: string | null = null;
-    const redirectPath = join(workspacePath, '.beads', 'redirect');
-    if (existsSync(redirectPath)) {
-      const redirectTarget = (await readFile(redirectPath, 'utf-8')).trim();
-      const resolvedPath = redirectTarget.startsWith('/')
-        ? redirectTarget
-        : join(workspacePath, '.beads', redirectTarget);
-      beadsPath = join(resolvedPath, 'issues.jsonl');
-    }
-
-    const localBeadsPath = join(workspacePath, '.beads', 'issues.jsonl');
-    if (!beadsPath && existsSync(localBeadsPath)) beadsPath = localBeadsPath;
-
-    if (beadsPath && existsSync(beadsPath)) {
-      const issueLower = issueId.toLowerCase();
-      const beads = (await readFile(beadsPath, 'utf-8'))
-        .split('\n')
-        .filter(line => line.trim())
-        .map(line => {
-          try { return JSON.parse(line); } catch { return null; }
-        })
-        .filter(bead => bead && bead.labels?.some((label: string) => label.toLowerCase() === issueLower));
-
-      if (beads.length > 0) {
-        lines.push('## Implementation Tasks');
-        lines.push('');
-        for (const bead of beads) {
-          const checked = bead.status === 'closed' ? 'x' : ' ';
-          lines.push(`- [${checked}] ${bead.title.replace(/^[^:]+:\s*/, '')}`);
-        }
-        lines.push('');
+    const beads = await Effect.runPromise(queryBeadsForIssue(workspacePath, issueId));
+    if (beads.length > 0) {
+      lines.push('## Implementation Tasks');
+      lines.push('');
+      for (const bead of beads) {
+        const checked = bead.status === 'closed' ? 'x' : ' ';
+        lines.push(`- [${checked}] ${bead.title.replace(/^[^:]+:\s*/, '')}`);
       }
+      lines.push('');
     }
   } catch {
     // Optional body enrichment only.
@@ -130,16 +107,16 @@ async function repoHasChanges(repoWorkspacePath: string, targetBranch: string): 
   }
 }
 
-export async function createReviewArtifactsForIssue(
+async function createReviewArtifactsForIssuePromise(
   issueId: string,
-  workspacePath: string
+  workspacePath: string,
 ): Promise<ReviewArtifactCreationResult> {
-  let mergeSet = ensureMergeSetForIssue(issueId);
+  let mergeSet = ensureMergeSetForIssueSync(issueId);
   if (!mergeSet) {
     return { mergeSet: null, artifacts: [] };
   }
 
-  const body = await buildRichReviewArtifactBody(issueId, workspacePath);
+  const body = await Effect.runPromise(buildRichReviewArtifactBody(issueId, workspacePath));
   const artifacts: ReviewArtifactCreationResult['artifacts'] = [];
 
   for (const repo of mergeSet.repos) {
@@ -147,7 +124,7 @@ export async function createReviewArtifactsForIssue(
     const hasChanges = await repoHasChanges(repoWorkspacePath, repo.targetBranch);
 
     if (!hasChanges) {
-      mergeSet = withRepoState(mergeSet, repo.repoKey, {
+      mergeSet = withRepoStateSync(mergeSet, repo.repoKey, {
         reviewStatus: 'skipped',
         testStatus: 'skipped',
         rebaseStatus: 'skipped',
@@ -168,9 +145,9 @@ export async function createReviewArtifactsForIssue(
     });
 
     if (artifact.url) {
-      mergeSet = withRepoArtifactUrl(mergeSet, repo.repoKey, artifact.url, artifact.id);
+      mergeSet = withRepoArtifactUrlSync(mergeSet, repo.repoKey, artifact.url, artifact.id);
     }
-    mergeSet = withRepoState(mergeSet, repo.repoKey, {
+    mergeSet = withRepoStateSync(mergeSet, repo.repoKey, {
       artifactId: artifact.id,
       reviewStatus: 'pending',
       testStatus: 'pending',
@@ -178,6 +155,16 @@ export async function createReviewArtifactsForIssue(
       verificationStatus: 'pending',
       mergeStatus: 'pending',
     });
+    if (artifact.created) {
+      const repoSuffix = mergeSet.repos.length > 1 ? ` (${repo.repoKey})` : '';
+      emitActivityEntrySync({
+        source: 'ship',
+        level: 'info',
+        message: `Merge request created for ${issueId}${repoSuffix}`,
+        details: artifact.url,
+        issueId,
+      });
+    }
     artifacts.push({
       repoKey: repo.repoKey,
       created: artifact.created,
@@ -192,7 +179,50 @@ export async function createReviewArtifactsForIssue(
     status: 'reviewing',
     updatedAt: new Date().toISOString(),
   };
-  upsertMergeSet(mergeSet);
+  upsertMergeSetSync(mergeSet);
 
   return { mergeSet, artifacts };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Tagged error for review-artifacts Effect variants. */
+export class ReviewArtifactError extends Data.TaggedError('ReviewArtifactError')<{
+  readonly issueId: string;
+  readonly stage: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `buildRichReviewArtifactBody`. */
+export const buildRichReviewArtifactBody = (
+  issueId: string,
+  workspacePath: string,
+): Effect.Effect<string, ReviewArtifactError> =>
+  Effect.tryPromise({
+    try: () => buildRichReviewArtifactBodyPromise(issueId, workspacePath),
+    catch: (cause) =>
+      new ReviewArtifactError({
+        issueId,
+        stage: 'buildRichReviewArtifactBody',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `createReviewArtifactsForIssue`. */
+export const createReviewArtifactsForIssue = (
+  issueId: string,
+  workspacePath: string,
+): Effect.Effect<ReviewArtifactCreationResult, ReviewArtifactError> =>
+  Effect.tryPromise({
+    try: () => createReviewArtifactsForIssuePromise(issueId, workspacePath),
+    catch: (cause) =>
+      new ReviewArtifactError({
+        issueId,
+        stage: 'createReviewArtifactsForIssue',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+

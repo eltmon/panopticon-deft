@@ -10,8 +10,8 @@
 
 import { Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
-import { DomainEvent } from '@panopticon/contracts'
-import { bodyToEvent } from '../../src/dashboard/server/routes/agents'
+import { DomainEvent } from '@panctl/contracts'
+import { bodyToEvent } from '../../src/dashboard/server/services/agent-event-utils'
 
 const AGENT = 'agent-800'
 const TS = '2026-04-22T06:00:00.000Z'
@@ -64,6 +64,59 @@ describe('PAN-800 bodyToEvent + DomainEvent decode', () => {
     const decoded = decodeCandidate(ev)!
     expect(decoded._tag).toBe('Success')
     expect((ev as any).type).toBe('agent.resolution_changed')
+  })
+
+  it('channel_reply → agent.channel_reply', () => {
+    const ev = bodyToEvent(
+      AGENT,
+      {
+        kind: 'channel_reply',
+        reply: {
+          kind: 'needs_input',
+          summary: 'Need user answer',
+          artifactRefs: [{ uri: 'file:///tmp/question.md', label: 'question' }],
+        },
+      },
+      TS,
+    )
+    const decoded = decodeCandidate(ev)!
+    expect(decoded._tag).toBe('Success')
+    expect((ev as any).type).toBe('agent.channel_reply')
+    expect((ev as any).payload.reply.reportedAt).toBe(TS)
+  })
+
+  it('channel_reply rejects invalid kind with targeted error', () => {
+    expect(() =>
+      bodyToEvent(
+        AGENT,
+        {
+          kind: 'channel_reply',
+          reply: {
+            kind: 'bogus',
+            summary: 'Need user answer',
+            artifactRefs: [],
+          },
+        },
+        TS,
+      ),
+    ).toThrow('reply.kind must be one of: status, done, needs_input')
+  })
+
+  it('channel_reply rejects oversized summaries before DomainEvent decode', () => {
+    expect(() =>
+      bodyToEvent(
+        AGENT,
+        {
+          kind: 'channel_reply',
+          reply: {
+            kind: 'status',
+            summary: 'x'.repeat(4097),
+            artifactRefs: [],
+          },
+        },
+        TS,
+      ),
+    ).toThrow('reply.summary must be at most 4096 characters')
   })
 
   it('current_issue_set → agent.current_issue_set', () => {

@@ -10,6 +10,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { Effect } from "effect";
 import { detectPlatform } from "../platform.js";
 
 const execAsync = promisify(exec);
@@ -21,7 +22,7 @@ export const PREREQ_REGISTRY = {
   openInteractiveTerminal: ["ttyd"],
   enableHttps: ["mkcert", "docker", "traefik"],
   enableBeads: ["bd"],
-  useClaudeCodeRoutedAgents: ["claudish"],
+  useClaudeCodeRoutedAgents: [],
   useOxAgents: ["ox"],
 } as const;
 
@@ -34,7 +35,6 @@ export const INSTALLABLE_TOOLS: readonly PrereqTool[] = [
   "ttyd",
   "mkcert",
   "bd",
-  "claudish",
   "ox",
 ];
 
@@ -91,8 +91,6 @@ export async function installTool(tool: PrereqTool): Promise<InstallResult> {
         return await installMkcert();
       case "bd":
         return await installBeads();
-      case "claudish":
-        return await installClaudish();
       case "ox":
         return await installOx();
       default:
@@ -114,7 +112,7 @@ export async function installTool(tool: PrereqTool): Promise<InstallResult> {
 // ─── Per-tool installers ──────────────────────────────────────────────────────
 
 async function installTmux(): Promise<InstallResult> {
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   if (plat === "darwin") {
     await execAsync("brew install tmux", { timeout: 120000 });
   } else {
@@ -126,7 +124,7 @@ async function installTmux(): Promise<InstallResult> {
 }
 
 async function installTtyd(): Promise<InstallResult> {
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   const binDir = join(homedir(), "bin");
   mkdirSync(binDir, { recursive: true });
   const ttydPath = join(binDir, "ttyd");
@@ -152,7 +150,7 @@ async function installTtyd(): Promise<InstallResult> {
 }
 
 async function installMkcert(): Promise<InstallResult> {
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   if (plat === "darwin") {
     await execAsync("brew install mkcert", { timeout: 120000 });
     await execAsync("mkcert -install", { timeout: 30000 });
@@ -181,10 +179,10 @@ async function installMkcert(): Promise<InstallResult> {
 }
 
 async function installBeads(): Promise<InstallResult> {
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   if (plat === "darwin") {
     try {
-      await execAsync("brew install steveyegge/beads/bd", {
+      await execAsync("brew install gastownhall/beads/bd", {
         timeout: 120000,
       });
       return {
@@ -198,7 +196,7 @@ async function installBeads(): Promise<InstallResult> {
   }
 
   await execAsync(
-    "curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash",
+    "curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash",
     { timeout: 120000 }
   );
   return {
@@ -208,39 +206,8 @@ async function installBeads(): Promise<InstallResult> {
   };
 }
 
-async function installClaudish(): Promise<InstallResult> {
-  const plat = detectPlatform();
-  if (plat === "darwin") {
-    return {
-      tool: "claudish",
-      success: false,
-      message: "Install manually: brew install eltmon/claudish/claudish",
-    };
-  }
-
-  const arch =
-    process.arch === "x64"
-      ? "x64"
-      : process.arch === "arm64"
-        ? "arm64"
-        : "x64";
-  const binDir = join(homedir(), ".local", "bin");
-  const claudishPath = join(binDir, "claudish");
-  mkdirSync(binDir, { recursive: true });
-
-  await execAsync(
-    `curl -sL "https://github.com/eltmon/claudish/releases/latest/download/claudish-linux-${arch}" -o "${claudishPath}" && chmod +x "${claudishPath}"`,
-    { timeout: 60000 }
-  );
-  return {
-    tool: "claudish",
-    success: true,
-    message: "claudish installed to ~/.local/bin/claudish",
-  };
-}
-
 async function installOx(): Promise<InstallResult> {
-  const plat = detectPlatform();
+  const plat = await Effect.runPromise(detectPlatform());
   const arch = process.arch === "x64" ? "amd64" : process.arch;
   const platform = plat === "darwin" ? "darwin" : "linux";
   const binDir = join(homedir(), ".local", "bin");

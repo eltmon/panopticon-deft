@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * Tests for PAN-464: workspace container health monitoring.
  *
@@ -12,7 +13,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, rmSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -20,7 +21,9 @@ import { homedir } from 'os';
 // vi.hoisted() — must come before vi.mock() calls that reference these fns
 // ---------------------------------------------------------------------------
 
-const { mockExec, mockSendKeysAsync } = vi.hoisted(() => {
+const { testHome, mockExec, mockSendKeysAsync } = vi.hoisted(() => {
+  const testHome = `/tmp/pan-464-container-health-${process.pid}-${Math.random().toString(36).slice(2)}`;
+
   // Create a callback-style mock.
   // We add util.promisify.custom so that promisify(mockExec) returns a function
   // that resolves with { stdout, stderr } matching the real child_process.exec interface.
@@ -37,6 +40,7 @@ const { mockExec, mockSendKeysAsync } = vi.hoisted(() => {
   (mockExec as Record<symbol, unknown>)[Symbol.for('nodejs.util.promisify.custom')] = customPromisify;
 
   return {
+    testHome,
     mockExec,
     mockSendKeysAsync: vi.fn().mockResolvedValue(undefined),
   };
@@ -51,49 +55,82 @@ vi.mock('child_process', () => ({
   execFile: vi.fn(),
 }));
 
-vi.mock('../../../src/lib/tmux.js', () => ({
-  sessionExists: vi.fn().mockReturnValue(true),
-  sessionExistsAsync: vi.fn().mockResolvedValue(true),
-  sendKeysAsync: mockSendKeysAsync,
-  buildTmuxCommandString: vi.fn().mockReturnValue(''),
-  capturePaneAsync: vi.fn().mockResolvedValue(''),
-  createSessionAsync: vi.fn().mockResolvedValue(undefined),
-  killSession: vi.fn(),
-  killSessionAsync: vi.fn().mockResolvedValue(undefined),
-  listPaneValues: vi.fn().mockReturnValue([]),
-  listPaneValuesAsync: vi.fn().mockResolvedValue([]),
-  listSessionNamesAsync: vi.fn().mockResolvedValue([]),
-}));
+vi.mock('../../../src/lib/tmux.js', async () => {
+  const { Effect } = await import('effect');
+  const effectMock = (initial?: unknown) => {
+    const wrap = (value: unknown) => {
+      if (value && typeof value === 'object' && 'pipe' in value) return value;
+      return Effect.succeed(value);
+    };
+    const fn: any = vi.fn(() => wrap(typeof initial === 'function' ? (initial as () => unknown)() : initial));
+    fn.mockResolvedValue = (value: unknown) => fn.mockReturnValue(Effect.succeed(value));
+    fn.mockRejectedValue = (error: unknown) => fn.mockReturnValue(Effect.fail(error));
+    fn.mockResolvedValueOnce = (value: unknown) => fn.mockReturnValueOnce(Effect.succeed(value));
+    fn.mockRejectedValueOnce = (error: unknown) => fn.mockReturnValueOnce(Effect.fail(error));
+    return fn;
+  };
+  return {
+    sessionExists: vi.fn().mockReturnValue(true),
+    sessionExistsSync: vi.fn().mockReturnValue(true),
+    sessionExists: effectMock(true),
+    sessionExistsSync: effectMock(true),
+    sendKeys: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    sendKeysProgram: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    buildTmuxCommandString: vi.fn().mockReturnValue(''),
+    capturePane: effectMock(''),
+    createSession: effectMock(undefined),
+    isPaneDead: effectMock(false),
+    killSession: vi.fn(),
+  killSessionSync: vi.fn(),
+    killSession: effectMock(undefined),
+    listPaneValues: vi.fn().mockReturnValue([]),
+    listPaneValues: effectMock([]),
+    listSessionNames: effectMock([]),
+  };
+});
 
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
   getEnabledSpecialists: vi.fn().mockReturnValue([]),
   getTmuxSessionName: vi.fn().mockReturnValue('mock-session'),
   isRunning: vi.fn().mockResolvedValue(false),
   initializeSpecialist: vi.fn(),
-  wakeSpecialist: vi.fn(),
-  clearSessionId: vi.fn(),
   spawnEphemeralSpecialist: vi.fn(),
-  wakeSpecialistWithTask: vi.fn(),
   getAllProjectSpecialistStatuses: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock('os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('os')>();
+  return {
+    ...actual,
+    homedir: vi.fn(() => testHome),
+  };
+});
+
 vi.mock('../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: vi.fn().mockReturnValue(null),
+  getAgentRuntimeStateSync: vi.fn().mockReturnValue(null),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
   listRunningAgents: vi.fn().mockResolvedValue([]),
+  listRunningAgentsSync: vi.fn().mockResolvedValue([]),
   getAgentDir: vi.fn().mockReturnValue('/tmp'),
   getAgentState: vi.fn().mockReturnValue(null),
+  getAgentStateSync: vi.fn().mockReturnValue(null),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
 }));
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: vi.fn().mockReturnValue(null),
+  resolveProjectFromIssueSync: vi.fn().mockReturnValue(null),
   findProjectByPath: vi.fn().mockReturnValue(null),
+  findProjectByPathSync: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock('../../../src/lib/review-status.js', () => ({
+  getReviewStatusSync: vi.fn().mockReturnValue(null),
   setReviewStatus: vi.fn(),
+  setReviewStatusSync: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -105,19 +142,19 @@ import {
   checkWorkspaceContainerHealth,
   type DeaconState,
 } from '../../../src/lib/cloister/deacon.js';
-import { sessionExistsAsync } from '../../../src/lib/tmux.js';
+import { sessionExists } from '../../../src/lib/tmux.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const STATE_FILE = join(homedir(), '.panopticon', 'deacon', 'health-state.json');
+const STATE_FILE = join(testHome, '.panopticon', 'deacon', 'health-state.json');
 
 const CONTAINER = 'panopticon-feature-pan-464-frontend-1';
 const AGENT_ID = 'agent-pan-464';
 
 function writeState(state: Partial<DeaconState>): void {
-  mkdirSync(join(homedir(), '.panopticon', 'deacon'), { recursive: true });
+  mkdirSync(join(testHome, '.panopticon', 'deacon'), { recursive: true });
   const full: DeaconState = {
     specialists: {} as DeaconState['specialists'],
     patrolCycle: 0,
@@ -217,6 +254,7 @@ describe('checkWorkspaceContainerHealth', () => {
     } else if (existsSync(STATE_FILE)) {
       unlinkSync(STATE_FILE);
     }
+    rmSync(testHome, { recursive: true, force: true });
   });
 
   // -------------------------------------------------------------------------
@@ -355,7 +393,7 @@ describe('checkWorkspaceContainerHealth', () => {
     setupExec({
       'docker ps -a': { stdout: `${CONTAINER}|Exited (1) 2 minutes ago\n` },
     });
-    vi.mocked(sessionExistsAsync).mockResolvedValueOnce(false);
+    vi.mocked(sessionExists).mockResolvedValueOnce(false);
 
     const actions = await checkWorkspaceContainerHealth();
 

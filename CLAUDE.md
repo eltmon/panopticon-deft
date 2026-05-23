@@ -58,6 +58,39 @@ The goal is autonomous correctness. Every manual intervention is a system bug.
 - Code that programmatically deletes JSONL files (e.g., `fs.unlinkSync` on a session path) must NEVER be written without explicit user instruction
 - When cleaning up failed forks or orphaned conversations, leave the JSONL files intact
 
+## Commit and Push When Working on Main
+
+When working directly on `main` (not in a Panopticon workspace), commit completed changes and push to `origin` before ending the session. Agent PRs merge to `origin/main` through the pipeline — unpushed local commits cause divergence that requires manual merge resolution. Don't commit half-done work; finish the change, verify it builds, then commit and push.
+
+## CRITICAL: Releases Go Through `pan release stable` — Never Manual
+
+**To cut a new release of `@panctl/*`, ALWAYS use `pan release stable --version X.Y.Z`. NEVER run `git tag v...` manually, never edit `"version"` in any `package.json` directly, never `npm version` or `npm publish`.**
+
+The release tooling does five things atomically that humans (and agents) get wrong piecemeal:
+
+1. Bumps `package.json`, `apps/desktop/package.json`, `packages/contracts/package.json` together (mismatches silently break the npm publish).
+2. Generates rich release notes from `git log <prev-tag>..HEAD` into `.release/<tag>.md`.
+3. Commits everything with the canonical subject `chore: release X.Y.Z`.
+4. Creates an annotated tag.
+5. Lets the CI release pipeline publish to npm via OIDC and create the GitHub Release with attached desktop binaries.
+
+**How to release:**
+
+```bash
+# From a clean main, after the change you want to ship is committed
+pan release stable --version 0.9.4
+git push origin main
+git push origin v0.9.4
+```
+
+**Guards already in place** (if you bypass them, you're working against the system):
+
+- `.husky/pre-push` rejects any `v*` tag whose commit doesn't have matching `package.json` versions and a committed `.release/<tag>.md`.
+- `.github/workflows/release.yml` re-runs the same check on the runner side; tags missing the artifacts cause the release pipeline to fail loudly before any publish.
+- `.husky/commit-msg` rejects commits that change a `package.json` version field unless the subject is `chore: release X.Y.Z`. This catches the failure one step earlier than the push hook.
+
+**If asked to "release", "tag", "bump version", "publish", or anything similar:** the answer is `pan release stable --version X.Y.Z`. Never a workaround, never a manual tag, never `--no-verify`.
+
 ## CRITICAL: No Blocking Calls in Dashboard Server Code
 
 **NEVER use `execSync`, `readFileSync`, `writeFileSync`, `readdirSync`, or `statSync` in any code reachable from the dashboard server** (Effect route handlers in `src/dashboard/server/routes/`, services in `src/dashboard/server/services/`, or any module imported by them).
@@ -71,6 +104,72 @@ These block the Node.js event loop, freezing all HTTP requests, WebSocket connec
 - CLI commands only: sync calls are acceptable since they run in their own process
 - `sleep` via `execSync('sleep 0.3')` is NEVER acceptable in server code — use `await new Promise(r => setTimeout(r, 300))`
 
+## Harnesses
+
+Panopticon supports two coding-agent harnesses: `claude-code` (default) and `pi` (alternative, multi-provider). The harness is picked per spawn at plan kickoff, role runs, work agent start, and the conversation panel; roles read harness/model defaults from Settings. Pi + Anthropic + subscription auth is the only blocked combination (ToS gate in `src/lib/harness-policy.ts`).
+
+See [configuration/harnesses.mdx](configuration/harnesses.mdx) for installation, picker locations, ToS rules, and troubleshooting. The wider field of coding-agent harnesses Panopticon could adopt is surveyed in [reference/harness-landscape.mdx](reference/harness-landscape.mdx). (`docs/HARNESSES.md` is now a redirect stub — the harness docs are published in the Mintlify site.)
+
+## Panopticon Agent Taxonomy
+
+Panopticon's pipeline is expressed as five issue-scoped **roles**:
+
+| Role | Purpose | Instruction source |
+| --- | --- | --- |
+| `plan` | Discover requirements and produce vBRIEF/beads artifacts | `roles/plan.md` |
+| `work` | Implement one bead at a time in the workspace | `roles/work.md` |
+| `review` | Synthesize code review and transition approved/blocked work | `roles/review.md` |
+| `test` | Run automated verification and required browser UAT | `roles/test.md` |
+| `ship` | Rebase/verify/push approved branches for human merge | `roles/ship.md` |
+
+Sub-roles are configuration slots under a role, not standalone pipeline stages. All sub-roles today are delivered as **harness-agnostic prompt templates** that the orchestrator inlines into spawn messages:
+
+- **`review.security` / `review.correctness` / `review.performance` / `review.requirements`** — Panopticon reads `roles/review-<subRole>.md` and inlines the body into each convoy spawn message. Never loaded via Claude's `--agent` flag, never synced into project workspaces.
+- **`work.inspect` / `work.inspect-deep`** — same shape: the inspection prompt is workflow-injected, not auto-discovered.
+
+`.claude/agents/` is **deliberately empty** in this repo. The directory exists in worktrees only as a sync target for the Claude Code harness, but Panopticon ships no ambient subagents there. Two reasons: (1) ambient subagents leak into every Claude Code session and can fire at moments the workflow doesn't intend; (2) ambient subagent definitions can hardcode model assumptions (e.g. `model: haiku`) that break on non-Anthropic-routed agents (CLIProxy → gpt-5.5), since the harness doesn't always thread provider routing through to the subagent call. When a role needs codebase exploration or general-purpose subagent work, it uses Claude Code's built-in subagent types (`Explore`, `general-purpose`), which inherit the parent's model and routing context properly.
+
+`.claude/skills/` is also a workspace sync target, not a source of truth — same gitignore policy (PAN-1090).
+
+The full mental model — Role vs Claude subagent vs Panopticon pipeline agent — lives in [docs/ROLES.md](docs/ROLES.md). For review specifically, see [docs/REVIEW-AGENT-ARCHITECTURE.md](docs/REVIEW-AGENT-ARCHITECTURE.md).
+
+Legacy specialist wake/session/queue machinery has been removed. Use `spawnRun(issueId, role, opts)` and lifecycle state transitions instead of waking named specialists.
+
+## Skills ↔ CLI Convention
+
+The `pan` binary's subcommands and Claude Code's `pan-*` skills follow a strict convention:
+
+- **`pan <verb>`** (CLI subcommand) is wrapped by **`/pan-<verb>`** (a skill at `skills/pan-<verb>/SKILL.md`).
+- The `pan-` prefix is also a namespace for workflow / reference / topical skills (`/pan-workflow`, `/pan-code-review`, `/pan-network`) that don't map 1:1 to a single verb.
+- Not every CLI verb gets a wrapper skill — only verbs where the skill adds non-trivial guidance beyond `--help`. The current exclusion list and the criteria are documented in [docs/SKILLS-CONVENTION.md](docs/SKILLS-CONVENTION.md).
+- **When the CLI changes, the wrapper skill changes in the same commit.** `scripts/lint-skills.sh` (wired into `npm run lint`) enforces this by cross-checking every flag and subcommand a wrapper SKILL.md mentions against the actual `pan <verb> --help` output. Drift fails CI.
+
+See [docs/SKILLS-CONVENTION.md](docs/SKILLS-CONVENTION.md) for the full rules, shapes (CLI-wrapper / CLI-sub-wrapper / Workflow / Reference / Topical), and creating-a-new-skill checklist.
+
+## Planning Modes
+
+Panopticon supports two planning modes:
+
+### Interactive (default)
+```bash
+pan plan <id>
+```
+Launches an interactive planning session where the agent asks Q&A questions before producing a vBRIEF.
+
+### Auto (non-interactive)
+```bash
+pan plan <id> --auto
+```
+Runs the planning agent end-to-end without prompting. If it encounters a contradiction it can't resolve, it escalates to interactive mode. All inferred choices are recorded in `plan.autoDecisions[]` for audit.
+
+### Auto-Start (skip planning)
+```bash
+pan start <id> --auto
+```
+Skips the planning agent entirely. Synthesizes a minimal vBRIEF from the issue title/body, creates beads, and spawns the work agent directly. For trivial issues (typos, version bumps) where full planning is overkill.
+
+**Always verify available flags with `pan <verb> --help`** — the CLI is self-documenting and flags may change between versions.
+
 ## Project Structure
 
 - **Stack**: TypeScript, Node.js 22+, React dashboard, SQLite, Effect.js
@@ -81,6 +180,7 @@ These block the Node.js event loop, freezing all HTTP requests, WebSocket connec
     1. **node-pty** (`@homebridge/node-pty-prebuilt-multiarch`) is a native Node addon. Under Bun's addon compat layer the PTY spawns but exits with code 0 immediately, breaking `/ws/terminal` for all workspaces.
     2. **Circular ESM deps** — the dashboard source has circular imports that Bun tolerates but Node.js strict ESM rejects, so tsx/source-mode also fails under Node.
   - `pan up` handles this automatically — it runs `dist/dashboard/server.js` under Node 22. Run `npm run build` first if the dist is stale.
+  - See [docs/PANOPTICON_DEV_SOP.md](docs/PANOPTICON_DEV_SOP.md) for startup, mode switching, restart guarantees, and failure triage.
 - **Issue tracking**: GitHub Issues (PAN-XXX prefix), NOT Linear
 - **Package manager**: Bun (bun.lock, `bun install`, `bun add`)
 - **Workspaces**: Bun workspaces — `packages/contracts`, `src/dashboard/server`, `src/dashboard/frontend`
@@ -90,8 +190,11 @@ These block the Node.js event loop, freezing all HTTP requests, WebSocket connec
 
 Workspaces are git worktrees at `workspaces/feature-<issue-id>/`. Each worktree has its
 own `node_modules` created by `bun install` — **never symlink node_modules from the main repo**.
-Symlinks break local workspace package resolution (e.g., `@panopticon/contracts` would
+Symlinks break local workspace package resolution (e.g., `@panctl/contracts` would
 resolve to the main repo's stale build instead of the worktree's version).
+
+See [docs/WORKSPACE-CONTAINERS.md](docs/WORKSPACE-CONTAINERS.md) for the workspace
+container contract, stack-health surfaces, spawn gate, and recovery commands.
 
 **Before running builds or tests in a workspace:**
 1. Run `bun install` from the workspace root (creates correct workspace-aware node_modules)
@@ -99,13 +202,28 @@ resolve to the main repo's stale build instead of the worktree's version).
 3. Build commands use the root `node_modules/.bin/` — run from workspace root, not subdirectories
 
 **NEVER symlink node_modules** — `bun install` uses hardlinks from the global cache and is
-nearly instant (~2s). It correctly resolves `@panopticon/contracts` to the worktree's local
+nearly instant (~2s). It correctly resolves `@panctl/contracts` to the worktree's local
 `packages/contracts/` via Bun workspace resolution.
 
 **Quality gates** (must pass before `pan done`):
 - `npm run typecheck` — TypeScript strict mode
 - `npm run lint` — ESLint
 - `npm test` — Vitest (root + frontend)
+
+## tmux Socket — CRITICAL
+
+**Panopticon agents run under a separate tmux socket named `panopticon`.** Always use `-L panopticon` when inspecting agent sessions:
+
+```bash
+# List all agent sessions
+tmux -L panopticon list-sessions
+
+# Attach or capture a specific agent
+tmux -L panopticon capture-pane -t agent-min-846 -p -S -50
+tmux -L panopticon attach -t agent-min-846
+```
+
+The default tmux socket (`/tmp/tmux-1000/default`) is NOT used by agents. Plain `tmux list-sessions` will show "no server running" or list unrelated sessions. This is a common source of false "agent not found" errors.
 
 ## tmux Message Delivery
 
@@ -120,6 +238,51 @@ await execAsync(`tmux send-keys -t ${session} C-m`);  // Enter
 ```
 
 Raw `tmux send-keys "text"` followed immediately by `C-m` is unreliable — Enter arrives before text is processed.
+
+## PTY supervisor for orchestrator delivery
+
+Claude Code work agents and Claude Code conversation sessions use the PTY
+supervisor as the preferred orchestrator-to-agent delivery path. The launcher
+wraps Claude as `node <projectRoot>/dist/pty-supervisor.js claude ...`, exports
+`PANOPTICON_AGENT_ID`, and writes a per-agent `pty-token` under
+`${PANOPTICON_HOME}/agents/<id>/pty-token` before the tmux session starts.
+
+The supervisor is Node 22-only because it owns a real PTY through
+`@homebridge/node-pty-prebuilt-multiarch`; do not run it under Bun. It binds
+`${PANOPTICON_HOME}/sockets/pty-<id>.sock` at mode `0600`, accepts authenticated
+HTTP-on-unix POSTs, writes each delivered message into Claude's PTY input, and
+echoes the message into the tmux transcript so operators can see what was sent.
+
+`deliverAgentMessage(agentId, message, caller?)` is the single delivery
+primitive. In automatic mode it tries, in order:
+
+1. PTY supervisor socket (`path: "supervisor"`)
+2. legacy Claude Code Channels MCP socket for already-wired sessions
+3. tmux paste-buffer fallback
+
+Docker workspaces remain excluded from supervisor wiring until host/container
+socket sharing is designed; Pi keeps using its `rpc.in` FIFO. H1 lifecycle
+semantics apply: the supervisor owns Claude's PTY master fd, so if the
+supervisor process exits, Claude exits with it and the session must be resumed
+through the normal dashboard/Deacon flow.
+
+## Claude Code Channels (experimental legacy fallback)
+
+Reference: https://code.claude.com/docs/en/channels
+
+Claude Code Channels is now a legacy fallback — see the PTY supervisor section
+above for the recommended transport. Channels remains only for already-running
+agents with `state.channelsEnabled = true` and for explicit diagnostic opt-in
+via `experimental.claudeCodeChannelsMcp: true`.
+
+`src/lib/channels/panopticon-bridge.ts` is a per-agent Bun stdio MCP server.
+When the diagnostic override is enabled, Claude is spawned with
+`--mcp-config <workspace>/.pan/agent-mcp.json --dangerously-load-development-channels server:panopticon-bridge`,
+the bridge listens on `${PANOPTICON_HOME}/sockets/agent-<id>.sock`, and
+`deliverAgentMessage` uses it only after the supervisor tier fails. The
+`WARNING: Loading development channels` dialog is dismissed only when that MCP
+config is actually wired; supervisor-only sessions must not receive this Enter
+keystroke.
 
 ## Dashboard Server Architecture (Effect + Raw WebSocket)
 
@@ -153,7 +316,7 @@ The dashboard server uses **Effect.js** for HTTP routes and structured RPC, plus
 - `EventRouter.tsx` → connects to `/ws/rpc`, fetches snapshot via `getSnapshot` RPC,
   subscribes to `subscribeDomainEvents` stream, applies events to Zustand store
 - `WsTransport.ts` — Effect-based RPC client with auto-reconnection
-- Store: Zustand with shared reducers from `@panopticon/contracts`
+- Store: Zustand with shared reducers from `@panctl/contracts`
 
 **Session lifecycle rules:**
 - On WebSocket close, do NOT kill the PTY — the tmux session survives independently.
@@ -165,9 +328,28 @@ The dashboard server uses **Effect.js** for HTTP routes and structured RPC, plus
 ## Verification Gate (PAN-174)
 
 After a work agent signals completion, Cloister runs quality gates from `projects.yaml`
-before waking the review-agent. If typecheck/lint/test fail, feedback is sent to the
+before advancing to the review role. If typecheck/lint/test fail, feedback is sent to the
 agent's tmux session and the completion marker is NOT processed (allowing retry).
 After 3 consecutive failures, verification is bypassed to prevent permanent blocking.
+
+## Agent Auto-Resume Gates
+
+Deacon auto-resume is intentionally suppressible through three gates:
+
+- **Boot no-resume:** `PANOPTICON_NO_RESUME=1`, `pan dev --no-resume`, or
+  `pan up --no-resume` disables orphan recovery and stopped-agent auto-resume for
+  that dashboard boot only. Restart without `--no-resume` to restore patrols.
+- **Manual pause:** `pan pause <id> [--reason <text>]` persists `paused` fields in
+  `~/.panopticon/agents/<agent-id>/state.json` and stops the agent if it is running.
+  `pan unpause <id>` clears the gate without spawning. `pan start <id>` refuses
+  paused agents unless `--force` is passed; `--force` clears the pause gate first.
+- **Troubled gate:** repeated resume/crash failures mark an agent `troubled` and
+  preserve failure counters/backoff state in `state.json`. `pan untroubled <id>`
+  clears the troubled gate and failure fields after the underlying crash cause has
+  been investigated. It does not spawn the agent.
+
+These gates are orthogonal to the global Deacon freeze in SQLite
+(`deacon.globally_paused`) and the per-issue Deacon ignore flag in review status.
 
 ## Project Resolution from Issue IDs
 
@@ -218,13 +400,22 @@ infinite loops. NEVER remove these guards. The loop: specialists/done → onMerg
 → postMergeLifecycle → (re-trigger) → specialists/done burned 24,626 Linear API calls
 before guards were added (PAN-328).
 
-## postMergeLifecycle Docker Cleanup
+## postMergeLifecycle Verify Handoff and Docker Cleanup
 
-`postMergeLifecycle()` in `merge-agent.ts` stops Docker containers and networks after
-merge (step 6). This prevents Docker network pool exhaustion — orphaned networks from
-merged workspaces accumulate and eventually block new workspace creation with
-"all predefined address pools have been fully subnetted". Docker's default pool only
-supports ~31 bridge networks. NEVER remove this cleanup step.
+`postMergeLifecycle()` in `merge-agent.ts` is a non-destructive merge handoff. After
+merge it marks the issue `verifying_on_main`, applies the `verifying-on-main` label,
+pauses the work/planning agents, preserves workspace/state/vBRIEF/branches, and stops
+Docker containers and networks.
+
+Docker cleanup still happens at merge time because orphaned networks from merged
+workspaces accumulate and eventually block new workspace creation with "all predefined
+address pools have been fully subnetted". Docker's default pool only supports ~31 bridge
+networks. NEVER remove this cleanup step.
+
+The destructive/non-reversible completion steps are owned by close-out, not merge:
+`pan close <id>` / dashboard Close Out completes the vBRIEF, archives planning artifacts,
+optionally tears down the workspace or deletes feature branches according to `close_out`
+config, closes the tracker issue, and clears review status.
 
 ## CRITICAL: Deep-Wipe Destroys Everything — NEVER Run Without Explicit User Confirmation
 
@@ -233,14 +424,13 @@ The deep-wipe endpoint (`POST /api/agents/:id/deep-wipe`) with `deleteWorkspace:
 1. **tmux sessions** — all agent sessions killed
 2. **Agent state directories** — `~/.panopticon/agents/<id>/` removed
 3. **Entire workspace directory** — this includes:
-   - `.planning/STATE.md` — planning progress and status
-   - `.planning/plan.vbrief.json` — the **workspace-specific vBRIEF plan** with items, acceptance criteria, and dependencies (generated during planning)
-   - `.planning/beads/` — all task tracking beads
+   - `.pan/spec.vbrief.json` — the **workspace-specific vBRIEF plan**
+   - `.beads/` — all task tracking beads
    - Any implementation work in progress
 4. **Git branches** — both local AND remote `feature/<issue-id>` branches deleted
 5. **Linear/GitHub status** — issue status reset to Todo/Open
 
-**The docs-level PRD** (e.g., `myn/docs/prds/planned/MIN-XXX-*.md`) survives because it's committed to the docs repo, but it is NOT the same as the workspace vBRIEF plan generated during planning. The two workspace planning artifacts are `plan.vbrief.json` (structured plan with acceptance criteria) and `STATE.md` (narrative context and current status).
+**The scope vBRIEF** in `.pan/specs/` on main survives deep-wipe — it's committed to the project repo independently of the workspace. Project-level PRD archives (e.g., a team's own `docs/prds/` if they keep one for narrative archival) also survive; the Panopticon-managed PRD draft at `<projectRoot>/.pan/drafts/<issue>.md` survives too. The workspace `.pan/` directory (spec, continue state) and `.beads/` are destroyed.
 
 **Rules:**
 - **NEVER call deep-wipe programmatically** without the user explicitly requesting it
@@ -281,32 +471,143 @@ When TLDR is available, you'll have these MCP tools:
 
 **Use TLDR liberally to maximize your session effectiveness.**
 
-## vBRIEF Plans
+## Bash Output Compression (RTK)
+
+When `agents.rtk.enabled` is true, Bash outputs the agent sees (git status, npm output, etc.) may be compressed by RTK. Re-run with `PANOPTICON_RTK_ENABLED=0` to regenerate raw command output.
+
+## vBRIEF Plans & Lifecycle
 
 Panopticon uses **vBRIEF v0.5** for machine-readable work plans. Key references:
 
 - **Canonical spec:** [github.com/deftai/vBRIEF](https://github.com/deftai/vBRIEF)
 - **Our fork:** [github.com/eltmon/vBRIEF](https://github.com/eltmon/vBRIEF)
 - **Extension proposal:** [deftai/vBRIEF#1](https://github.com/deftai/vBRIEF/issues/1)
-- **Panopticon docs:** [docs/VBRIEF.md](docs/VBRIEF.md)
+- **Panopticon docs:** [docs/VBRIEF.md](docs/VBRIEF.md) — full schema, lifecycle, and migration notes
 
-### v0.5 Fields Implemented
+### The four-artifact model (PAN-1124: single-spec-on-main)
 
-`vBRIEFInfo`: `author` (tool identifier), `description`
+There are four artifacts. They are distinct — do not conflate them.
 
-`plan`: `uid` (UUID v4), `author` (agent model), `sequence` (write counter), `references` (issue URL + PRDs), `created`, `updated`
+| Artifact | Location | Writer | Mutability |
+| --- | --- | --- | --- |
+| **PRD draft** (`.md`) | `<projectRoot>/.pan/drafts/<issue>.md` | Human or planning agent | Free-form narrative, human-mutable |
+| **vBRIEF spec** (`.json`) on main | `<projectRoot>/.pan/specs/<YYYY-MM-DD>-<ISSUE>-<slug>.vbrief.json` | Pipeline only (single writer) | Immutable after planning — only `plan.status` changes via `updateSpecStatus()` |
+| **Project-side continue state** (`.json`) | `<projectRoot>/.pan/continues/<issue-lowercase>.vbrief.json` | Pipeline | Session resume point, decisions, hazards, sessionHistory, feedback — one canonical file per issue, never moves |
+| **Workspace-side continue state** (`.json`) | `<workspace>/.pan/continue.json` | Pipeline + work agent | Session state + `statusOverrides` map tracking item/subItem completion |
 
-`items`/`subItems`: `created`, `completed` (set on status → completed)
+**The PAN-1124 invariant — the spec on main is immutable after planning.** `findPlan()` resolves the main-side spec via `findSpecByIssue()`. `readWorkspacePlan()` returns a merged view: main spec + `statusOverrides` from workspace continue.json. `updateItemStatus()` and `updateSubItemStatus()` write ONLY to the workspace continue file's `statusOverrides` map — they cannot mutate the spec. The only legal spec mutation is `plan.status` via `updateSpecStatus()` in `pan-dir/specs.ts`. This replaces the old PAN-946 invariant (workspace-spec isolation) with a stronger guarantee: there is no workspace spec to isolate.
+
+**Gitignore policy.** `.pan/continue.json` is listed in `.gitignore` and must NEVER be tracked in main. `.pan/spec.vbrief.json` may still exist in older workspaces (migration compat) but is no longer written by the pipeline. The lifecycle artifacts (`.pan/specs/`, `.pan/continues/`, `.pan/drafts/`) remain tracked — they're the canonical record of plans, continue states, and PRD drafts at rest.
+
+### Status is a JSON field, not a directory
+
+`plan.status` advances through one canonical file via atomic single-commit updates on main. Files do not move between directories.
+
+```
+draft (in .pan/drafts/*.md) ──► proposed ──► approved ──► active/running ──► completed
+                                       │                                          │
+                                       └──────────► cancelled ◄───────────────────┘
+```
+
+| Transition | Trigger | What changes |
+| --- | --- | --- |
+| (new) → draft | `pan plan` starts | Markdown PRD written to `<projectRoot>/.pan/drafts/<issue>.md` |
+| draft → proposed | Planning completes | vBRIEF created in `<projectRoot>/.pan/specs/...` with `plan.status: "proposed"` |
+| proposed → approved/running | `pan start` | Status field flipped on main; work agent reads spec from main via `findPlan()` |
+| running → completed | PR merges | Status field flipped to `"completed"` on main |
+| any → cancelled | Issue closed | Status field flipped to `"cancelled"` on main |
+
+### Legacy paths
+
+PAN-967 unified everything under `.pan/`. The following are gone or read-only legacy:
+
+- `.planning/plan.vbrief.json` — **DELETED.** Replaced by `.pan/spec.vbrief.json`.
+- `docs/prds/planned/`, `docs/prds/active/` — no longer a Panopticon convention. PRD drafts live in `.pan/drafts/`. Projects may keep their own `docs/prds/` for human archival, but Panopticon does not read or write it.
+- `vbrief/{proposed,active,completed,cancelled}/` at the project root — still read by `findLegacyVBriefByIssue` for backward compatibility during migration; pipeline writes target `.pan/specs/` only. Legacy spec files (non-continue) remain at these paths as read-only fallback.
+
+If you see an agent referencing `.planning/`, `docs/prds/planned/*.vbrief.json`, or planning a "copy PRD vBRIEF into workspace .planning" step, the agent is reading a pre-PAN-967 problem statement and needs to be redirected at `docs/VBRIEF.md`.
 
 ### Auto-Behaviors
 
-- `io.ts` (`updateItemStatus`/`updateSubItemStatus`) auto-increments `plan.sequence` and sets `updated` timestamps on every write
-- `complete-planning` copies `STATE.md` and `plan.vbrief.json` to `docs/prds/active/<issue-id>/` (skip if exists)
-- `start-planning` discovers PRDs from `docs/prds/planned/` and `docs/prds/active/` matching the issue ID and copies to `.planning/prd.md`
+- `io.ts` (`updateItemStatus`/`updateSubItemStatus`) write to workspace continue.json `statusOverrides` map — they do NOT mutate the spec.
+- `readWorkspacePlan()` returns a merged view: main spec + `statusOverrides` overlay from workspace continue.json.
+- `complete-planning` writes the vBRIEF to `<projectRoot>/.pan/specs/...` with `plan.status: "proposed"`.
+- `start-agent` flips the main-side status field. Work agents read the spec from main via `findPlan()`.
+- `postMergeLifecycle` marks merged work as `verifying_on_main` and preserves the vBRIEF in its running/active state.
+- `closeOut` flips the main-side `plan.status` to `"completed"` after post-merge verification.
+- `findPlan(workspacePath)` resolves main-side spec via `findSpecByIssue(projectRoot, issueId)`, with fallback to workspace-local `.pan/spec.vbrief.json` for migration compat.
 
 ### Dashboard Viewer
 
 VBriefViewer components at `src/dashboard/frontend/src/components/vbrief/`:
 - Accessible via **vBRIEF button** on kanban issue cards and InspectorPanel
 - List / DAG / Raw JSON tabs
-- Fetches from `GET /api/workspaces/:issueId/plan`
+- Fetches from `GET /api/workspaces/:issueId/plan` (resolves from `.pan/specs/` on main via `findSpecByIssue`, with workspace fallback for migration compat)
+
+## Issue Creation from PRDs
+
+When creating a Linear or GitHub issue from a PRD, **always reference the PRD at the very top of the issue description** -- before any other content. Use a bold label with a repo-relative path and a clickable link:
+
+```
+**PRD:** [`path/to/prd.md`](https link to the file in the repo)
+```
+
+The issue body should then contain a tight summary (vision, motivation, design goals, key capabilities, phases) -- NOT a full copy of the PRD. The PRD is the source of truth for data models, architecture, code samples, and implementation details. Duplicating that content into the issue creates drift.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with community structure and cross-file relationships.
+
+Rules:
+- At task start, read graphify-out/GRAPH_SUMMARY.md (~700 tokens) for orientation — do NOT read the full GRAPH_REPORT.md (35K tokens) unless you need the complete community listing.
+- For cross-module questions, use the CLI instead of reading files: `graphify query "<question>"`, `graphify path "<A>" "<B>"`, `graphify explain "<concept>"` — these traverse EXTRACTED + INFERRED edges and return only relevant nodes.
+- Only read source files once you know exactly which ones to read (from graphify output or the summary).
+
+The graph is refreshed automatically by the merge agent after every merge to main; agents do not need to run `graphify update` manually.
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd dolt push
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->

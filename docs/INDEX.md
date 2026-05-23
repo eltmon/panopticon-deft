@@ -20,19 +20,32 @@
 
 | Document | Description |
 |----------|-------------|
-| [AGENTS.md](../AGENTS.md) | Agent system architecture and lifecycle |
+| [AGENTS.md](./AGENTS.md) | Agent directory structure, naming patterns, standard contents, and cleanup |
 | [Architecture Diagram](./diagrams/panopticon-architecture.png) | Visual overview of Panopticon system architecture (UI → Core → Agents → Infrastructure → Pipeline)
+| [Specialist Pipeline Diagram](./diagrams/panopticon-specialist-pipeline.png) | Visual overview of the work-agent → verification gate → specialist handoff flow |
 | [AGENT_TYPES_INDEX.md](./AGENT_TYPES_INDEX.md) | Newcomer-friendly map of Panopticon agent roles, categories, and where they appear in the workflow |
+| [ROLES.md](./ROLES.md) | Mental model for Roles, sub-roles, and the three on-disk file shapes (`roles/*.md`, `agents/pan-*-agent.md`, `.claude/agents/*.md`) — what each is, when to use it, and how a run actually gets its instructions |
 | [SPECIALIST_WORKFLOW.md](./SPECIALIST_WORKFLOW.md) | Deeper workflow guide for how the work agent and specialist agents interact |
+| [REVIEW-AGENT-ARCHITECTURE.md](./REVIEW-AGENT-ARCHITECTURE.md) | End-to-end code review architecture: synthesis-as-review, convoy reviewers as harness-agnostic prompt templates inlined by the orchestrator, output-file contract, and verdict signaling |
 | [SKILL-DISTRIBUTION-ANALYSIS.md](./SKILL-DISTRIBUTION-ANALYSIS.md) | Skill distribution architecture: Claude Code precedence, symlink issues, proposed changes |
-| [REPO-ARTIFACTS.md](./REPO-ARTIFACTS.md) | What lives in a project's repo: `.pan/`, skills hierarchy, VBRIEFs, STATE.md, multi-tool sync |
+| [SKILLS-INVENTORY.md](./SKILLS-INVENTORY.md) | Installed Claude Code skills inventory, including scope and one-line purpose for each skill |
+| [SKILLS-CONVENTION.md](./SKILLS-CONVENTION.md) | How Panopticon's `pan-*` skills relate to the `pan` CLI binary, the four skill shapes, and the linter that keeps them in sync |
+| [configuration/harnesses.mdx](../configuration/harnesses.mdx) | Operational guide for the two supported coding-agent harnesses (`claude-code`, `pi`): install, picker locations, ToS rules, troubleshooting. *Published — `docs/HARNESSES.md` is now a redirect stub.* |
+| [reference/harness-landscape.mdx](../reference/harness-landscape.mdx) | Planning survey of 13 coding-agent harnesses — extensibility mechanisms, skill/AGENTS.md/MCP support, headless interfaces, and harness-adoption implications |
+| [reference/template-conversations.mdx](../reference/template-conversations.mdx) | Proposal: loading curated skill bundles into a single conversation without touching the global `pan sync` skill set |
+| [REPO-ARTIFACTS.md](./REPO-ARTIFACTS.md) | What lives in a project's repo: `.pan/`, skills hierarchy, `vbrief/` lifecycle dirs, PRD vs vBRIEF, multi-tool sync |
+| [VISION.md](./VISION.md) | Product vision and deployment model roadmap (local → shared → SaaS) |
 | [PRD.md](./PRD.md) | Product requirements document for Panopticon |
 | [PRD-CLOISTER.md](./PRD-CLOISTER.md) | Cloister lifecycle manager requirements (historical — see DEACON doc for current state) |
 | [DEACON-HEALTH-MONITORING.md](./DEACON-HEALTH-MONITORING.md) | Deacon health monitoring: all 10 stuck detection mechanisms, thresholds, escalation, recovery |
 | [PRD-REMOTE-WORKSPACES.md](./PRD-REMOTE-WORKSPACES.md) | Remote workspace requirements |
+| [VBRIEF.md](./VBRIEF.md) | vBRIEF plan format, lifecycle directories, continue state, `pan scope` commands |
 | [HIERARCHICAL-PLANNING.md](./HIERARCHICAL-PLANNING.md) | vBRIEF planning, DAG scheduling, acceptance criteria pipeline |
-| [FIX-ALL-PRD.md](./FIX-ALL-PRD.md) | Fix-All Flywheel PRD: continuous, self-improving mass pan-oversee with `main` always clean |
-| [OPERATION-FIX-ALL.md](./OPERATION-FIX-ALL.md) | Operational manual for mass pan-oversee: phases, classification, bug log template |
+| [SWARM.md](./SWARM.md) | Per-item DAG dispatch, synthesis agents at convergence points, file-overlap serialization, slot-merge auto-advance, `pan swarm` CLI + `--task` operations, HTTP routes, `SwarmRuntime` continue-state shape, DAG library API |
+| [FLYWHEEL.md](./FLYWHEEL.md) | Flywheel contract, lifecycle, role settings, brief authoring, status vs state, and skill → CLI → API → UI mapping |
+| [flywheel-brief.md](./flywheel-brief.md) | Default operating contract the Flywheel orchestrator reads at the start of every run |
+| [FIX-ALL-PRD.md](./FIX-ALL-PRD.md) | Consolidated into `flywheel-brief.md` and `FLYWHEEL.md` (redirect only — original content in git history) |
+| [OPERATION-FIX-ALL.md](./OPERATION-FIX-ALL.md) | Consolidated into `flywheel-brief.md` (redirect only — original content in git history) |
 
 ---
 
@@ -41,6 +54,7 @@
 | Document | Description |
 |----------|-------------|
 | [CONFIGURATION.md](./CONFIGURATION.md) | Capability-based model routing, provider auth, subscription vs API-key setup, overrides, and fallback behavior |
+| [CODEX-AUTH.md](./CODEX-AUTH.md) | Codex CLI OAuth authentication: JWT expiry detection, burned-token handling, and the dashboard re-authentication flow |
 | [WORK-TYPES.md](./WORK-TYPES.md) | Router-backed job settings: every work type, when it runs, and what each override controls |
 | [MODEL_RECOMMENDATIONS.md](./MODEL_RECOMMENDATIONS.md) | Practical guidance for choosing model families for implementation, review, planning, helpers, and CLI work |
 | [projects.mdx](../configuration/projects.mdx) | Project registry and configuration fields (tracker, issue_prefixes, progressive) |
@@ -64,7 +78,7 @@
 | [cost-tracking.md](./cost-tracking.md) | Cost tracking: live recording, reconciler, session-to-agent mapping, SQLite schema |
 | [TLDR.md](./TLDR.md) | TLDR code analysis — architecture, hooks, index lifecycle, API |
 | [CONFIGURATION.md § External Services](./CONFIGURATION.md#external-service-integrations) | Cloudflare tunnels, Hume EVI, and adding new integrations |
-| [VBRIEF.md](./VBRIEF.md) | vBRIEF plan format — spec reference, Panopticon extensions, field reference |
+| [FORKS.md](./FORKS.md) | Conversation forking: summary fork vs plain fork, options, thinking block handling, model switching |
 
 ---
 
@@ -131,6 +145,7 @@
 - **"model routing"** / **"smart selection"** → CONFIGURATION.md, WORK-TYPES.md, MODEL_RECOMMENDATIONS.md
 - **"shadow mode"** / **"pan admin config shadow"** → CONFIGURATION.md, QUICK-REFERENCE.md
 - **"API keys"** / **"environment variables"** / **"subscription auth"** → CONFIGURATION.md
+- **"codex auth"** / **"codex login"** / **"OAuth"** / **"JWT"** / **"re-authenticate"** / **"burned token"** → CODEX-AUTH.md
 - **"providers"** / **"Kimi"** / **"Anthropic"** → CONFIGURATION.md, TESTING-PROVIDERS.md
 - **"work types"** → WORK-TYPES.md
 - **"presets"** / **"overrides"** → CONFIGURATION.md
@@ -147,13 +162,19 @@
 - **"session ID"** / **"session persistence"** → SPECIALIST_WORKFLOW.md (Session Persistence & Memory)
 - **"deterministic UUID"** → SPECIALIST_WORKFLOW.md (Session Persistence & Memory)
 - **"merge"** / **"merge validation"** → PRD-CLOISTER.md (Merge Validation Pipeline section)
-- **"vBRIEF"** / **"DAG"** / **"acceptance criteria"** / **"planning"** → HIERARCHICAL-PLANNING.md, SPECIALIST_WORKFLOW.md
+- **"vBRIEF"** / **"DAG"** / **"acceptance criteria"** / **"planning"** → VBRIEF.md, HIERARCHICAL-PLANNING.md, SPECIALIST_WORKFLOW.md
+- **"swarm"** / **"pan swarm"** / **"per-item dispatch"** / **"synthesis agent"** / **"files_scope"** / **"slot-merged"** / **"SwarmRuntime"** → SWARM.md
 - **"beads conversion"** / **"createBeadsFromVBrief"** → HIERARCHICAL-PLANNING.md
 - **"sync with main"** / **"sync-main"** → SPECIALIST_WORKFLOW.md (Sync with Main section)
 - **"deacon"** / **"health monitor"** / **"health"** / **"patrol"** → DEACON-HEALTH-MONITORING.md
 - **"rollback"** / **"revert"** / **"ORIG_HEAD"** → PRD-CLOISTER.md
 - **"baseline"** / **"test baseline"** → PRD-CLOISTER.md
 - **"review pipeline"** / **"specialist pipeline"** → PRD-CLOISTER.md, SPECIALIST_WORKFLOW.md
+- **"role primitive"** / **"what is a Role"** / **"Role vs subagent"** / **"sub-role"** → ROLES.md
+- **"roles/ directory"** / **"agents/ vs .claude/agents/"** / **"workflow-injected prompt"** → ROLES.md
+- **"review architecture"** / **"review orchestrator"** / **"synthesis model"** / **"review invariants"** → REVIEW-AGENT-ARCHITECTURE.md
+- **"convoy reviewers"** / **"reviewer prompts"** / **"synthesis prompt"** / **"roles/review-*.md"** → REVIEW-AGENT-ARCHITECTURE.md
+- **"dashboard restart"** / **"review survives restart"** → REVIEW-AGENT-ARCHITECTURE.md (invariants)
 - **"planning"** / **"planning agent"** / **"PLANNING_PROMPT"** → SPECIALIST_WORKFLOW.md (Planning → Implementation Transition)
 - **"environment variables"** / **"agent env"** → SPECIALIST_WORKFLOW.md (Agent Environment Variables), CONFIGURATION.md
 - **"suggested prompts"** → SPECIALIST_WORKFLOW.md (Agent Environment Variables)
@@ -209,7 +230,9 @@
 ### Development
 - **"skills"** → README.md, CLAUDE.md, REPO-ARTIFACTS.md
 - **".pan"** / **".pan.yaml"** / **"repo artifacts"** → REPO-ARTIFACTS.md
-- **"STATE.md archive"** / **"vBRIEF archive"** / **"planning artifacts"** → REPO-ARTIFACTS.md, VBRIEF.md
+- **"STATE.md archive"** / **"vBRIEF archive"** / **"planning artifacts"** / **"continue state"** → REPO-ARTIFACTS.md, VBRIEF.md
+- **"lifecycle"** / **"vbrief lifecycle"** / **"proposed"** / **"active"** / **"completed"** / **"cancelled"** → VBRIEF.md, REPO-ARTIFACTS.md
+- **"pan scope"** / **"scope list"** / **"scope approve"** / **"scope restore"** → VBRIEF.md
 - **"also_sync"** / **"multi-tool sync"** / **"cursor sync"** / **"codex sync"** → REPO-ARTIFACTS.md
 - **"commit"** / **"git commit"** → CLAUDE.md
 - **"messaging"** / **"messageAgent"** → CLAUDE.md

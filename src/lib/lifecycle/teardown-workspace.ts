@@ -10,28 +10,42 @@
  * In Phase 2, removeWorkspace() will delegate to this module for the common steps.
  */
 
-import { existsSync, rmSync, unlinkSync } from 'fs';
+import { existsSync } from 'fs';
+import { appendFile, readFile, rm, writeFile } from 'fs/promises';
 import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { Effect } from 'effect';
 import { AGENTS_DIR } from '../paths.js';
-import { killSessionAsync, sessionExists, listSessionNamesAsync } from '../tmux.js';
+import { killSession, sessionExists, listSessionNames } from '../tmux.js';
 import type { LifecycleContext, StepResult, TeardownOptions } from './types.js';
 import { stepOk, stepSkipped, stepFailed } from './types.js';
-import { findWorkspacePath } from './archive-planning.js';
-import { extractPrefix } from '../issue-id.js';
+import { findAllWorkspacePaths, findWorkspacePath } from './archive-planning.js';
+import { getContainersReferencingWorkspacePath } from '../workspace-manager.js';
+import { DEVCONTAINER_DIRNAME } from '../workspace/devcontainer-renderer.js';
 
 const execAsync = promisify(exec);
 
 /**
  * Kill tmux sessions associated with an issue.
  */
-async function killTmuxSessions(issueLower: string): Promise<StepResult> {
+function killTmuxSessions(issueLower: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => killTmuxSessionsImpl(issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:tmux-sessions', `Failed: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function killTmuxSessionsImpl(issueLower: string): Promise<StepResult> {
   const step = 'teardown:tmux-sessions';
   let killed = 0;
 
-  // Exact-match sessions (agent, test, merge, planning)
+  // Exact-match sessions (agent, test, merge, planning).
   const exactPatterns = [
     `agent-${issueLower}`,
     `test-${issueLower}`,
@@ -39,9 +53,9 @@ async function killTmuxSessions(issueLower: string): Promise<StepResult> {
     `planning-${issueLower}`,
   ];
   for (const session of exactPatterns) {
-    if (sessionExists(session)) {
+    if (await Effect.runPromise(sessionExists(session))) {
       try {
-        await killSessionAsync(session);
+        await Effect.runPromise(killSession(session));
         killed++;
       } catch {
         // session may have died between check and kill
@@ -49,22 +63,38 @@ async function killTmuxSessions(issueLower: string): Promise<StepResult> {
     }
   }
 
-  // Review sessions use timestamped names: review-<issue>-<timestamp>-<role>
-  // Use regex to match and kill all review sessions for this issue.
+  // Pattern-match sessions for review coordinators, review specialists, and
+  // canonical specialists. Today's naming uses the UPPER issue ID (PAN-1024)
+  // not the lower form, and includes session families that the prior
+  // single-regex didn't cover. PAN-1024 close-out left
+  // `review-coordinator-PAN-1024-...` and
+  // `specialist-panopticon-cli-PAN-1024-test-agent` alive (2026-05-09).
+  //
+  // Patterns we now match (case-insensitive on the issue ID):
+  //   - review-coordinator-<ISSUE>-<timestamp>
+  //   - review-<ISSUE>-<timestamp>-<role>          (legacy)
+  //   - specialist-<projectKey>-<ISSUE>-<role>     (canonical PAN-830/915)
   try {
-    const allSessions = await listSessionNamesAsync();
-    const reviewRegex = new RegExp(`^review-${issueLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+`);
-    const reviewSessions = allSessions.filter(s => reviewRegex.test(s));
-    for (const session of reviewSessions) {
+    const allSessions = await Effect.runPromise(listSessionNames());
+    const escapedLower = issueLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedUpper = issueLower.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const issuePart = `(${escapedLower}|${escapedUpper})`;
+    const patterns: RegExp[] = [
+      new RegExp(`^review-coordinator-${issuePart}-\\d+`),
+      new RegExp(`^review-${issuePart}-\\d+`),
+      new RegExp(`^specialist-[^-]+(?:-[^-]+)*?-${issuePart}-`),
+    ];
+    const matchedSessions = allSessions.filter(s => patterns.some(p => p.test(s)));
+    for (const session of matchedSessions) {
       try {
-        await killSessionAsync(session);
+        await Effect.runPromise(killSession(session));
         killed++;
       } catch {
         // session may have died between check and kill
       }
     }
   } catch {
-    // listSessionNamesAsync may fail if tmux server is not running
+    // Session listing may fail if tmux server is not running
   }
 
   // NOTE: Per-project ephemeral specialists (specialist-{project}-{type}) are NOT killed here.
@@ -80,15 +110,26 @@ async function killTmuxSessions(issueLower: string): Promise<StepResult> {
 /**
  * Stop TLDR daemon if workspace has a .venv.
  */
-async function stopTldrDaemon(workspacePath: string): Promise<StepResult> {
+function stopTldrDaemon(workspacePath: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => stopTldrDaemonImpl(workspacePath),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch(() =>
+      Effect.succeed(stepSkipped('teardown:tldr-daemon', ['TLDR daemon not running or failed to stop (non-fatal)'])),
+    ),
+  );
+}
+
+async function stopTldrDaemonImpl(workspacePath: string): Promise<StepResult> {
   const step = 'teardown:tldr-daemon';
   const venvPath = join(workspacePath, '.venv');
   if (!existsSync(venvPath)) {
     return stepSkipped(step, ['No .venv found']);
   }
   try {
-    const { getTldrDaemonService } = await import('../tldr-daemon.js');
-    const tldrService = getTldrDaemonService(workspacePath, venvPath);
+    const { getTldrDaemonServiceSync } = await import('../tldr-daemon.js');
+    const tldrService = getTldrDaemonServiceSync(workspacePath, venvPath);
     await tldrService.stop();
     return stepOk(step, ['Stopped TLDR daemon']);
   } catch {
@@ -99,15 +140,28 @@ async function stopTldrDaemon(workspacePath: string): Promise<StepResult> {
 /**
  * Stop Docker containers for the workspace.
  */
-async function stopDocker(
+function stopDocker(
   workspacePath: string,
-  projectName: string,
+  issueLower: string,
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => stopDockerImpl(workspacePath, issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch(() =>
+      Effect.succeed(stepSkipped('teardown:docker', ['Docker cleanup skipped (not running or failed)'])),
+    ),
+  );
+}
+
+async function stopDockerImpl(
+  workspacePath: string,
   issueLower: string,
 ): Promise<StepResult> {
   const step = 'teardown:docker';
   try {
     const { stopWorkspaceDocker } = await import('../workspace-manager.js');
-    await stopWorkspaceDocker(workspacePath, projectName, issueLower);
+    await Effect.runPromise(stopWorkspaceDocker(workspacePath, issueLower));
     return stepOk(step, ['Stopped Docker containers']);
   } catch {
     return stepSkipped(step, ['Docker cleanup skipped (not running or failed)']);
@@ -115,14 +169,33 @@ async function stopDocker(
 }
 
 /**
- * Kill orphaned host processes for a workspace.
- *
- * When workspaces use `./dev all`, Vite/node processes run on the host (not in
- * containers). Docker compose down doesn't touch them, so they leak and exhaust
- * inotify watchers. This step finds and kills processes whose cwd or args
- * reference the workspace path.
+ * Detect whether a PID belongs to a process running inside a Docker container.
+ * Container processes appear in host lsof output when paths are bind-mounted.
  */
-async function killOrphanedProcesses(workspacePath: string): Promise<StepResult> {
+async function isDockerContainerProcess(pid: string): Promise<boolean> {
+  try {
+    const cgroup = await readFile(`/proc/${pid}/cgroup`, 'utf-8');
+    return cgroup.includes('/docker-') || cgroup.includes('/docker/');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Kill orphaned host processes for a workspace.
+ */
+function killOrphanedProcesses(workspacePath: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => killOrphanedProcessesImpl(workspacePath),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch(() =>
+      Effect.succeed(stepSkipped('teardown:orphaned-processes', ['Orphaned process cleanup failed (non-fatal)'])),
+    ),
+  );
+}
+
+async function killOrphanedProcessesImpl(workspacePath: string): Promise<StepResult> {
   const step = 'teardown:orphaned-processes';
   try {
     // Find PIDs with cwd matching the workspace path
@@ -144,8 +217,20 @@ async function killOrphanedProcesses(workspacePath: string): Promise<StepResult>
       return stepSkipped(step, ['No orphaned processes to kill']);
     }
 
-    await execAsync(`kill ${safePids.join(' ')} 2>/dev/null || true`, { encoding: 'utf-8', timeout: 5000 });
-    return stepOk(step, [`Killed ${safePids.length} orphaned process(es)`]);
+    // Filter out Docker container processes — they appear in host lsof due to bind mounts
+    const hostPids: string[] = [];
+    for (const pid of safePids) {
+      if (!(await isDockerContainerProcess(pid))) {
+        hostPids.push(pid);
+      }
+    }
+
+    if (hostPids.length === 0) {
+      return stepSkipped(step, ['No orphaned host processes to kill (all were container processes)']);
+    }
+
+    await execAsync(`kill ${hostPids.join(' ')} 2>/dev/null || true`, { encoding: 'utf-8', timeout: 5000 });
+    return stepOk(step, [`Killed ${hostPids.length} orphaned process(es)`]);
   } catch {
     return stepSkipped(step, ['Orphaned process cleanup failed (non-fatal)']);
   }
@@ -153,9 +238,23 @@ async function killOrphanedProcesses(workspacePath: string): Promise<StepResult>
 
 /**
  * Sync workspace beads to the project-root beads database before workspace deletion.
- * Without this, beads created in the workspace's .beads/dolt/ are lost when the worktree is removed.
  */
-async function syncWorkspaceBeads(
+function syncWorkspaceBeads(
+  projectPath: string,
+  workspacePath: string,
+  issueLower: string,
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => syncWorkspaceBeadsImpl(projectPath, workspacePath, issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:sync-beads', `Failed to sync workspace beads: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function syncWorkspaceBeadsImpl(
   projectPath: string,
   workspacePath: string,
   issueLower: string,
@@ -169,15 +268,14 @@ async function syncWorkspaceBeads(
 
   try {
     // Export workspace beads to JSONL
-    const { stdout: exportOutput } = await execAsync(
+    await execAsync(
       'bd export --output .beads/issues-export.jsonl 2>&1 || true',
       { cwd: workspacePath, encoding: 'utf-8', timeout: 15000 }
     );
 
     const exportPath = join(workspacePath, '.beads', 'issues-export.jsonl');
     if (!existsSync(exportPath)) {
-      // Try syncing directly — bd sync exports to the standard JSONL
-      await execAsync('bd sync 2>&1 || true', { cwd: workspacePath, encoding: 'utf-8', timeout: 15000 });
+      await execAsync('bd export --output .beads/issues.jsonl 2>&1 || true', { cwd: workspacePath, encoding: 'utf-8', timeout: 15000 });
     }
 
     // Import workspace beads into project-root database
@@ -190,18 +288,17 @@ async function syncWorkspaceBeads(
       return stepOk(step, [`Synced workspace beads to project root for ${issueLower}`]);
     } catch {
       // bd import may not exist — try manual JSONL merge
-      const { readFileSync, appendFileSync } = await import('fs');
       const wsJsonl = join(workspacePath, '.beads', 'issues.jsonl');
       const projJsonl = join(projectPath, '.beads', 'issues.jsonl');
 
       if (existsSync(wsJsonl) && existsSync(projJsonl)) {
-        const wsContent = readFileSync(wsJsonl, 'utf-8');
+        const wsContent = await readFile(wsJsonl, 'utf-8');
         const issuePattern = issueLower.replace('-', '[-_]');
         const relevantLines = wsContent.split('\n').filter(
           line => line.trim() && new RegExp(issuePattern, 'i').test(line)
         );
         if (relevantLines.length > 0) {
-          appendFileSync(projJsonl, '\n' + relevantLines.join('\n'));
+          await appendFile(projJsonl, '\n' + relevantLines.join('\n'));
           return stepOk(step, [`Appended ${relevantLines.length} beads entries for ${issueLower} to project JSONL`]);
         }
       }
@@ -214,9 +311,22 @@ async function syncWorkspaceBeads(
 
 /**
  * Clear beads for this issue from the project-root .beads/issues.jsonl.
- * On wipe, beads should be removed so the user starts fresh.
  */
-async function clearProjectBeads(
+function clearProjectBeads(
+  projectPath: string,
+  issueLower: string,
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => clearProjectBeadsImpl(projectPath, issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:clear-beads', `Failed to clear beads: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function clearProjectBeadsImpl(
   projectPath: string,
   issueLower: string,
 ): Promise<StepResult> {
@@ -228,8 +338,7 @@ async function clearProjectBeads(
   }
 
   try {
-    const { readFileSync, writeFileSync } = await import('fs');
-    const content = readFileSync(projJsonl, 'utf-8');
+    const content = await readFile(projJsonl, 'utf-8');
     const lines = content.split('\n');
     const issueUpper = issueLower.toUpperCase();
     const before = lines.length;
@@ -247,7 +356,7 @@ async function clearProjectBeads(
     });
     const removed = before - filtered.length;
     if (removed > 0) {
-      writeFileSync(projJsonl, filtered.join('\n'));
+      await writeFile(projJsonl, filtered.join('\n'));
       return stepOk(step, [`Removed ${removed} beads entries for ${issueLower} from project JSONL`]);
     }
     return stepSkipped(step, [`No beads entries found for ${issueLower}`]);
@@ -259,7 +368,21 @@ async function clearProjectBeads(
 /**
  * Remove git worktree for the workspace.
  */
-async function removeWorktree(
+function removeWorktree(
+  projectPath: string,
+  workspacePath: string,
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => removeWorktreeImpl(projectPath, workspacePath),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:worktree', `Failed to remove workspace: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function removeWorktreeImpl(
   projectPath: string,
   workspacePath: string,
 ): Promise<StepResult> {
@@ -268,14 +391,25 @@ async function removeWorktree(
     return stepSkipped(step, ['Workspace directory does not exist']);
   }
 
+  // Guard: never delete workspace (and its `.devcontainer/`) while containers
+  // still reference compose paths inside it.
+  const orphanedContainers = await Effect.runPromise(getContainersReferencingWorkspacePath(workspacePath));
+  if (orphanedContainers.length > 0) {
+    return stepFailed(
+      step,
+      `Cannot remove workspace: ${orphanedContainers.length} Docker container(s) still reference compose paths in ${DEVCONTAINER_DIRNAME}/. ` +
+        `Run workspace Docker cleanup first or stop the containers manually.`,
+    );
+  }
+
   try {
     await execAsync(`git worktree remove "${workspacePath}" --force`, { cwd: projectPath });
     return stepOk(step, ['Removed git worktree']);
   } catch {
     // worktree remove failed — try direct removal
     try {
-      rmSync(workspacePath, { recursive: true, force: true });
-      return stepOk(step, ['Removed workspace directory (worktree remove failed, used rmSync)']);
+      await rm(workspacePath, { recursive: true, force: true });
+      return stepOk(step, ['Removed workspace directory after worktree removal failed']);
     } catch (err) {
       return stepFailed(step, `Failed to remove workspace: ${(err as Error).message}`);
     }
@@ -283,21 +417,43 @@ async function removeWorktree(
 }
 
 /**
- * Remove agent state directories (~/.panopticon/agents/agent-<issue>/ and planning-<issue>/).
+ * Remove every agent state directory tied to an issue.
  */
-async function removeAgentState(issueLower: string): Promise<StepResult> {
+function removeAgentState(issueLower: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => removeAgentStateImpl(issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:agent-state', `Failed: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function removeAgentStateImpl(issueLower: string): Promise<StepResult> {
   const step = 'teardown:agent-state';
-  const dirs = [
-    join(AGENTS_DIR, `agent-${issueLower}`),
-    join(AGENTS_DIR, `planning-${issueLower}`),
-  ];
+  const { readdir, rm } = await import('fs/promises');
+
+  let entries: string[];
+  try {
+    entries = await readdir(AGENTS_DIR);
+  } catch {
+    return stepSkipped(step, ['Agents directory not present']);
+  }
+
+  const work = `agent-${issueLower}`;
+  const planner = `planning-${issueLower}`;
+  const specialistPrefix = `agent-${issueLower}-`;
+  const targets = entries.filter(name =>
+    name === work || name === planner || name.startsWith(specialistPrefix),
+  );
 
   let removed = 0;
-  for (const dir of dirs) {
-    if (existsSync(dir)) {
-      rmSync(dir, { recursive: true, force: true });
+  for (const name of targets) {
+    try {
+      await rm(join(AGENTS_DIR, name), { recursive: true, force: true });
       removed++;
-    }
+    } catch { /* non-fatal */ }
   }
 
   if (removed > 0) {
@@ -309,7 +465,21 @@ async function removeAgentState(issueLower: string): Promise<StepResult> {
 /**
  * Delete feature branches (local + remote).
  */
-async function deleteBranches(
+function deleteBranches(
+  projectPath: string,
+  issueLower: string,
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => deleteBranchesImpl(projectPath, issueLower),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:branches', `Failed: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function deleteBranchesImpl(
   projectPath: string,
   issueLower: string,
 ): Promise<StepResult> {
@@ -339,7 +509,18 @@ async function deleteBranches(
 /**
  * Clear shadow state for an issue.
  */
-async function clearShadowState(issueId: string): Promise<StepResult> {
+function clearShadowState(issueId: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => clearShadowStateImpl(issueId),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch(() =>
+      Effect.succeed(stepSkipped('teardown:shadow-state', ['Shadow state cleanup skipped (non-fatal)'])),
+    ),
+  );
+}
+
+async function clearShadowStateImpl(issueId: string): Promise<StepResult> {
   const step = 'teardown:shadow-state';
   try {
     const { removeShadowState } = await import('../shadow-state.js');
@@ -356,31 +537,26 @@ async function clearShadowState(issueId: string): Promise<StepResult> {
 /**
  * Remove legacy .planning/<issue>/ directory from project root.
  */
-async function clearLegacyPlanningDir(
+function clearLegacyPlanningDir(
   projectPath: string,
   issueLower: string,
-): Promise<StepResult> {
-  const step = 'teardown:legacy-planning-dir';
-  const legacyDir = join(projectPath, '.planning', issueLower);
-  if (existsSync(legacyDir)) {
-    rmSync(legacyDir, { recursive: true, force: true });
-    return stepOk(step, [`Deleted legacy planning dir: ${legacyDir}`]);
-  }
-  return stepSkipped(step, ['No legacy planning directory found']);
-}
-
-/**
- * Clear .planning/.planning-complete marker from workspace.
- * Only runs if workspace still exists (before worktree removal).
- */
-async function clearPlanningMarker(workspacePath: string): Promise<StepResult> {
-  const step = 'teardown:planning-marker';
-  const markerPath = join(workspacePath, '.planning', '.planning-complete');
-  if (existsSync(markerPath)) {
-    unlinkSync(markerPath);
-    return stepOk(step, ['Cleared .planning-complete marker']);
-  }
-  return stepSkipped(step, ['No .planning-complete marker found']);
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: async () => {
+      const step = 'teardown:legacy-planning-dir';
+      const legacyDir = join(projectPath, '.planning', issueLower);
+      if (!existsSync(legacyDir)) {
+        return stepSkipped(step, ['No legacy planning directory found']);
+      }
+      await rm(legacyDir, { recursive: true, force: true });
+      return stepOk(step, [`Deleted legacy planning dir: ${legacyDir}`]);
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:legacy-planning-dir', `Failed to delete legacy planning dir: ${(err as Error).message}`)),
+    ),
+  );
 }
 
 /**
@@ -410,128 +586,163 @@ function buildPlaceholders(
 /**
  * Remove Cloudflare tunnel ingress for workspace.
  */
-async function removeTunnelConfig(
+function removeTunnelConfig(
   tunnelConfig: any,
   placeholders: Record<string, string>,
-): Promise<StepResult> {
-  const step = 'teardown:tunnel';
-  try {
-    const { removeTunnelIngress } = await import('../tunnel.js');
-    const result = await removeTunnelIngress(tunnelConfig, placeholders as any);
-    return stepOk(step, result.steps || ['Removed tunnel ingress']);
-  } catch (err) {
-    return stepSkipped(step, [`Tunnel cleanup warning: ${(err as Error).message}`]);
-  }
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: async () => {
+      const { removeTunnelIngress } = await import('../tunnel.js');
+      const result = await Effect.runPromise(removeTunnelIngress(tunnelConfig, placeholders as any));
+      return stepOk('teardown:tunnel', result.steps || ['Removed tunnel ingress']);
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('teardown:tunnel', [`Tunnel cleanup warning: ${(err as Error).message}`])),
+    ),
+  );
 }
 
 /**
  * Remove Hume EVI config for workspace.
  */
-async function removeHumeEviConfig(
+function removeHumeEviConfig(
   humeConfig: any,
   placeholders: Record<string, string>,
-): Promise<StepResult> {
-  const step = 'teardown:hume';
-  try {
-    const { deleteHumeConfig } = await import('../hume.js');
-    const result = await deleteHumeConfig(humeConfig, placeholders as any);
-    return stepOk(step, result.steps || ['Removed Hume EVI config']);
-  } catch (err) {
-    return stepSkipped(step, [`Hume cleanup warning: ${(err as Error).message}`]);
-  }
+): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: async () => {
+      const { deleteHumeConfig } = await import('../hume.js');
+      const result = await Effect.runPromise(deleteHumeConfig(humeConfig, placeholders as any));
+      return stepOk('teardown:hume', result.steps || ['Removed Hume EVI config']);
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('teardown:hume', [`Hume cleanup warning: ${(err as Error).message}`])),
+    ),
+  );
 }
 
 /**
  * Full workspace teardown.
- *
- * Steps (in order):
- *   1. Kill tmux sessions
- *   2. Clear shadow state
- *   3. Clear legacy planning directory
- *   4. Stop TLDR daemon (if workspace exists)
- *   5. Stop Docker containers (if workspace exists)
- *   6. Clear planning marker (if workspace exists, before deletion)
- *   7. Remove tunnel config (if workspace config provided)
- *   8. Remove Hume config (if workspace config provided)
- *   9. Remove git worktree + workspace directory
- *  10. Remove agent state directories
- *  11. (Optional) Delete feature branches
  */
-export async function teardownWorkspace(
+export function teardownWorkspace(
   ctx: LifecycleContext,
   opts: TeardownOptions = {},
-): Promise<StepResult[]> {
-  const issueLower = ctx.issueId.toLowerCase();
-  const projName = opts.projectName || ctx.projectName || (extractPrefix(ctx.issueId)?.toLowerCase() ?? ctx.issueId);
-  const workspacePath = findWorkspacePath(ctx.projectPath, issueLower);
-  const shouldDeleteWorkspace = opts.deleteWorkspace !== false; // default true
-  const results: StepResult[] = [];
+): Effect.Effect<StepResult[]> {
+  return Effect.gen(function* () {
+    const issueLower = ctx.issueId.toLowerCase();
+    const workspacePath = findWorkspacePath(ctx.projectPath, issueLower);
+    const shouldDeleteWorkspace = opts.deleteWorkspace !== false; // default true
+    const results: StepResult[] = [];
 
-  // 1. Kill tmux sessions
-  results.push(await killTmuxSessions(issueLower));
+    // 1. Kill tmux sessions
+    results.push(yield* killTmuxSessions(issueLower));
 
-  // 2. Clear shadow state (always runs)
-  results.push(await clearShadowState(ctx.issueId));
+    // 2. Clear shadow state (always runs)
+    results.push(yield* clearShadowState(ctx.issueId));
 
-  // 3. Clear legacy planning directory (always runs)
-  results.push(await clearLegacyPlanningDir(ctx.projectPath, issueLower));
+    // 3. Clear legacy planning directory (always runs)
+    results.push(yield* clearLegacyPlanningDir(ctx.projectPath, issueLower));
 
-  // 4-9: Workspace-specific cleanup
-  if (workspacePath && existsSync(workspacePath)) {
-    // 4. Stop TLDR daemon (only if deleting workspace)
-    if (shouldDeleteWorkspace) {
-      results.push(await stopTldrDaemon(workspacePath));
-    }
-
-    // 5. Stop Docker containers (only if deleting workspace)
-    if (shouldDeleteWorkspace && !opts.skipDocker) {
-      results.push(await stopDocker(workspacePath, projName, issueLower));
-    }
-
-    // 5b. Kill orphaned host processes (Vite, node) that survive Docker teardown
-    if (shouldDeleteWorkspace) {
-      results.push(await killOrphanedProcesses(workspacePath));
-    }
-
-    // 6. Clear planning marker (before workspace deletion, or when preserving workspace)
-    results.push(await clearPlanningMarker(workspacePath));
-
-    // 6b. Beads lifecycle: sync or clear depending on context (PAN-412)
-    // Normal completion (approve/closeOut): sync beads to project root to preserve history.
-    // Destructive wipe: clear beads so the user starts fresh.
-    if (opts.clearBeads) {
-      results.push(await clearProjectBeads(ctx.projectPath, issueLower));
-    } else if (shouldDeleteWorkspace) {
-      results.push(await syncWorkspaceBeads(ctx.projectPath, workspacePath, issueLower));
-    }
-
-    // 7-8: Project-specific cleanup (tunnel, Hume) — only when deleting workspace and config provided
-    if (shouldDeleteWorkspace && (opts.workspaceConfig?.tunnel || opts.workspaceConfig?.hume)) {
-      const placeholders = buildPlaceholders(ctx, opts, workspacePath);
-
-      if (opts.workspaceConfig.tunnel) {
-        results.push(await removeTunnelConfig(opts.workspaceConfig.tunnel, placeholders));
+    // 4-9: Workspace-specific cleanup
+    if (workspacePath && existsSync(workspacePath)) {
+      // 4. Stop TLDR daemon (only if deleting workspace)
+      if (shouldDeleteWorkspace) {
+        results.push(yield* stopTldrDaemon(workspacePath));
       }
-      if (opts.workspaceConfig.hume) {
-        results.push(await removeHumeEviConfig(opts.workspaceConfig.hume, placeholders));
+
+      // 5. Stop Docker containers (only if deleting workspace)
+      if (shouldDeleteWorkspace && !opts.skipDocker) {
+        results.push(yield* stopDocker(workspacePath, issueLower));
       }
+
+      // 5b. Kill orphaned host processes (Vite, node) that survive Docker teardown
+      if (shouldDeleteWorkspace) {
+        results.push(yield* killOrphanedProcesses(workspacePath));
+      }
+
+      // 6. Beads lifecycle: sync or clear depending on context (PAN-412)
+      if (opts.clearBeads) {
+        results.push(yield* clearProjectBeads(ctx.projectPath, issueLower));
+      } else if (shouldDeleteWorkspace) {
+        results.push(yield* syncWorkspaceBeads(ctx.projectPath, workspacePath, issueLower));
+      }
+
+      // 7-8: Project-specific cleanup (tunnel, Hume)
+      if (shouldDeleteWorkspace && (opts.workspaceConfig?.tunnel || opts.workspaceConfig?.hume)) {
+        const placeholders = buildPlaceholders(ctx, opts, workspacePath);
+
+        if (opts.workspaceConfig.tunnel) {
+          results.push(yield* removeTunnelConfig(opts.workspaceConfig.tunnel, placeholders));
+        }
+        if (opts.workspaceConfig.hume) {
+          results.push(yield* removeHumeEviConfig(opts.workspaceConfig.hume, placeholders));
+        }
+      }
+
+      // 9. Remove worktree + workspace directory (only if deleting workspace).
+      if (shouldDeleteWorkspace) {
+        const allPaths = findAllWorkspacePaths(ctx.projectPath, issueLower);
+        for (const p of allPaths) {
+          results.push(yield* removeWorktree(ctx.projectPath, p));
+        }
+      }
+    } else {
+      results.push(stepSkipped('teardown:workspace', ['No workspace found to clean up']));
     }
 
-    // 9. Remove worktree + workspace directory (only if deleting workspace)
-    if (shouldDeleteWorkspace) {
-      results.push(await removeWorktree(ctx.projectPath, workspacePath));
+    // 10. Remove agent state
+    results.push(yield* removeAgentState(issueLower));
+
+    // 11. Delete branches (only if explicitly requested)
+    if (opts.deleteBranches) {
+      results.push(yield* deleteBranches(ctx.projectPath, issueLower));
     }
-  } else {
-    results.push(stepSkipped('teardown:workspace', ['No workspace found to clean up']));
-  }
 
-  // 10. Remove agent state
-  results.push(await removeAgentState(issueLower));
+    // 12. Prune checkpoint refs for this issue's agents.
+    results.push(yield* pruneCheckpointRefs(ctx.projectPath, issueLower));
 
-  // 11. Delete branches (only if explicitly requested)
-  if (opts.deleteBranches) {
-    results.push(await deleteBranches(ctx.projectPath, issueLower));
-  }
+    // 13. Prune specialist registry entries for this issue.
+    results.push(yield* pruneSpecialistRegistry(ctx.issueId));
 
-  return results;
+    return results;
+  });
+}
+
+function pruneSpecialistRegistry(issueId: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: async () => {
+      const step = 'teardown:specialist-registry';
+      const { pruneSpecialistRegistryEntriesForIssue } = await import('../cloister/specialists.js');
+      const removed = pruneSpecialistRegistryEntriesForIssue(issueId);
+      return removed > 0
+        ? stepOk(step, [`Pruned ${removed} specialist registry entr${removed === 1 ? 'y' : 'ies'} for ${issueId}`])
+        : stepSkipped(step, [`No specialist registry entries for ${issueId}`]);
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('teardown:specialist-registry', [`Specialist registry prune failed (non-fatal): ${(err as Error).message}`])),
+    ),
+  );
+}
+
+function pruneCheckpointRefs(projectPath: string, issueLower: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: async () => {
+      const step = 'teardown:checkpoint-refs';
+      const { pruneCheckpointRefsForAgents } = await import('../checkpoint/checkpoint-manager.js');
+      const agentIds = [`agent-${issueLower}`, `planning-${issueLower}`];
+      const pruned = await Effect.runPromise(pruneCheckpointRefsForAgents(projectPath, agentIds));
+      return stepOk(step, [`Pruned ${pruned} checkpoint ref(s) for ${agentIds.join(', ')}`]);
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:checkpoint-refs', `Checkpoint prune failed: ${(err as Error).message}`)),
+    ),
+  );
 }

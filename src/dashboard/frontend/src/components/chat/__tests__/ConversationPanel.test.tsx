@@ -6,12 +6,23 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ConversationPanel } from '../ConversationPanel';
+import { DialogProvider } from '../../DialogProvider';
+
+// Mock DialogProvider hooks so ConversationPanel can mount without the full provider tree
+vi.mock('../../DialogProvider', () => ({
+  DialogProvider: ({ children }: { children: React.ReactNode }) => children,
+  useConfirm: () => vi.fn().mockResolvedValue(true),
+  useAlert: () => vi.fn().mockResolvedValue(undefined),
+}));
 
 // Mock heavy child components that are not under test
 vi.mock('../../XTerminal', () => ({ XTerminal: () => null }));
 vi.mock('../MessagesTimeline', () => ({ MessagesTimeline: () => null }));
 vi.mock('../ComposerFooter', () => ({ ComposerFooter: () => null }));
 vi.mock('../ModelPicker', () => ({
+  loadStoredHarness: () => 'claude-code',
+  saveStoredHarness: vi.fn(),
+  saveStoredModel: vi.fn(),
   ModelPicker: ({ value, onChange }: { value: string; onChange: (m: string) => void }) => (
     <select
       data-testid="model-picker"
@@ -22,14 +33,15 @@ vi.mock('../ModelPicker', () => ({
 }));
 
 // Mock updateConversationTitle — we only want to assert calls, not hit the network
-vi.mock('../../MissionControl/ConversationList', () => ({
+vi.mock('../../CommandDeck/ConversationList', () => ({
   updateConversationTitle: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../../MissionControl/styles/mission-control.module.css', () => ({
+vi.mock('../../CommandDeck/styles/command-deck.module.css', () => ({
   default: {
     conversationTerminal: 'conversationTerminal',
     conversationTerminalHeader: 'conversationTerminalHeader',
+    conversationHeaderContainer: 'conversationHeaderContainer',
     conversationTerminalTitle: 'conversationTerminalTitle',
     conversationTerminalStatus: 'conversationTerminalStatus',
     conversationTerminalBody: 'conversationTerminalBody',
@@ -44,11 +56,11 @@ vi.mock('../../MissionControl/styles/mission-control.module.css', () => ({
 }));
 
 // Import the mock so we can assert on it
-import { updateConversationTitle } from '../../MissionControl/ConversationList';
+import { updateConversationTitle } from '../../CommandDeck/ConversationList';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const mockConversation = {
+const mockConversation: React.ComponentProps<typeof ConversationPanel>['conversation'] = {
   id: 1,
   name: 'test-conv',
   tmuxSession: 'test-session',
@@ -63,7 +75,11 @@ const mockConversation = {
   model: 'claude-opus-4-6',
 };
 
-function makeClient() {
+function makeClient(messagesData = {
+  messages: [],
+  workLog: [],
+  streaming: false,
+}) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Infinity },
@@ -71,28 +87,27 @@ function makeClient() {
     },
   });
   // Pre-seed messages so the useQuery doesn't attempt a real fetch
-  client.setQueryData(['conversation-messages', 'test-conv'], {
-    messages: [],
-    workLog: [],
-    streaming: false,
-  });
+  client.setQueryData(['conversation-messages', 'test-conv'], messagesData);
   return client;
 }
 
 function renderPanel(
   conversation = mockConversation,
   props: Partial<React.ComponentProps<typeof ConversationPanel>> = {},
+  messagesData?: Parameters<typeof makeClient>[0],
 ) {
-  const client = makeClient();
+  const client = makeClient(messagesData);
   render(
-    <QueryClientProvider client={client}>
-      <ConversationPanel
-        conversation={conversation}
-        viewMode="conversation"
-        onArchived={() => {}}
-        {...props}
-      />
-    </QueryClientProvider>,
+    <DialogProvider>
+      <QueryClientProvider client={client}>
+        <ConversationPanel
+          conversation={conversation}
+          viewMode="conversation"
+          onArchived={() => {}}
+          {...props}
+        />
+      </QueryClientProvider>
+    </DialogProvider>,
   );
   return client;
 }
@@ -108,12 +123,52 @@ describe('ConversationPanel rename flow', () => {
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
+    vi.clearAllMocks();
   });
 
   it('renders the conversation title in the header', () => {
     renderPanel();
     expect(screen.getByText('My Panel Title')).toBeInTheDocument();
+  });
+
+  it('renders context usage in the header', () => {
+    renderPanel({
+      ...mockConversation,
+      contextUsage: {
+        activeBytes: 6_000,
+        estimatedTokens: 1_500,
+        contextWindow: 200_000,
+        percentUsed: 0.75,
+      },
+    });
+    expect(screen.getByTestId('context-usage-indicator')).toHaveTextContent('1.50k');
+  });
+
+  it('prefers the latest messages response context usage', () => {
+    renderPanel(
+      {
+        ...mockConversation,
+        contextUsage: {
+          activeBytes: 6_000,
+          estimatedTokens: 1_500,
+          contextWindow: 200_000,
+          percentUsed: 0.75,
+        },
+      },
+      {},
+      {
+        messages: [],
+        workLog: [],
+        streaming: false,
+        contextUsage: {
+          activeBytes: 132_164,
+          estimatedTokens: 33_041,
+          contextWindow: 200_000,
+          percentUsed: 16.52,
+        },
+      },
+    );
+    expect(screen.getByTestId('context-usage-indicator')).toHaveTextContent('33.04k');
   });
 
   it('shows title input with current value when pencil button is clicked', () => {

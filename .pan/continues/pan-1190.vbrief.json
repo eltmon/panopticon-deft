@@ -1,0 +1,222 @@
+{
+  "version": "1",
+  "issueId": "PAN-1190",
+  "created": "2026-05-19T01:05:49.654Z",
+  "updated": "2026-05-20T23:49:39.047Z",
+  "gitState": {},
+  "decisions": [],
+  "hazards": [],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "feedback": [
+    {
+      "seq": 1,
+      "specialist": "test-agent",
+      "outcome": "failed",
+      "timestamp": "2026-05-20T23:49:39Z",
+      "markdownBody": "TESTS FAILED for PAN-1190:\n\nAutomated gates passed (bun install --frozen-lockfile; npm run typecheck; npm run lint; npm test), but browser UAT did not meet verifying-state acceptance. On https://pan.localhost, live PAN-1190 is still in Review, so the real post-merge verifying path is not observable. A browser-only fixture setting PAN-1190 to status=Verifying/state=verifying_on_main/mergeStatus=merged still rendered PAN-1190 under Ship/Done with COMPLETED/MERGED on Board/Pipeline and no VERIFYING badge; Close Out only appeared as bulk-selection action text, not as the issue verifying close-out action. Unmet criteria: verifying_on_main issue visible on Command Deck/Pipeline/Board with VERIFYING badge and Close Out action while merge action is hidden.\n\n## REQUIRED: Fix ALL test failures, then invoke the /rebase-and-submit skill\n\n1. Read each test failure carefully\n2. Fix the code causing EVERY failure\n3. Run the test suite locally to verify your fixes pass\n4. Commit every change\n5. Invoke the /rebase-and-submit skill for PAN-1190 — this is an atomic task that runs pan done (which handles rebase + push + re-submit internally)\n\nDo NOT stop between steps. Do NOT run git push manually — the skill handles it. Do NOT stop until pan done has completed successfully."
+    }
+  ],
+  "sessionHistory": [
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:05Z] verification-gate → FAILED — seq 1",
+      "timestamp": "2026-05-19T01:05:49.655Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "gpt-5.5",
+      "timestamp": "2026-05-19T01:05:49.913Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:09Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-19T01:09:16.600Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:12Z] verification-gate → FAILED — seq 3",
+      "timestamp": "2026-05-19T01:12:49.503Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:14Z] verification-gate → FAILED — seq 4",
+      "timestamp": "2026-05-19T01:14:37.064Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:29Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T01:29:24.617Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T01:56Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T01:56:36.183Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T02:05Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-19T02:05:31.350Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T02:23Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T02:23:57.389Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T02:43Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-19T02:43:36.625Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T03:02Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T03:02:53.357Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T03:40Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T03:40:11.066Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T04:03Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T04:03:10.609Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T04:33Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T04:33:47.715Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T05:04Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T05:04:28.203Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T05:30Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T05:30:01.156Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T05:47Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T05:47:49.236Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T06:11Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T06:11:27.704Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T06:24Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-19T06:24:16.444Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T06:40Z] verification-gate → FAILED — seq 3",
+      "timestamp": "2026-05-19T06:40:56.728Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T07:12Z] verification-gate → FAILED — seq 4",
+      "timestamp": "2026-05-19T07:12:20.566Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T07:13Z] verification-gate → FAILED — seq 5",
+      "timestamp": "2026-05-19T07:13:48.581Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T07:42Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T07:42:01.927Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T08:09Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T08:09:06.910Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T08:32Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T08:32:58.271Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T08:54Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T08:54:44.527Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T11:27Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T11:27:02.520Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T11:34Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-19T11:34:03.502Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-19T11:55Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-19T11:55:15.848Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.6",
+      "timestamp": "2026-05-20T02:32:21.268Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T07:28Z] verification-gate → FAILED — seq 1",
+      "timestamp": "2026-05-20T07:28:49.645Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.6",
+      "timestamp": "2026-05-20T07:28:49.670Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T07:33Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-05-20T07:33:50.651Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.6",
+      "timestamp": "2026-05-20T07:33:50.668Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T07:38Z] verification-gate → FAILED — seq 3",
+      "timestamp": "2026-05-20T07:38:21.474Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.6",
+      "timestamp": "2026-05-20T07:38:21.493Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T07:39Z] verification-gate → FAILED — seq 4",
+      "timestamp": "2026-05-20T07:39:20.782Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T08:00Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-20T08:00:47.848Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T08:42Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-05-20T08:42:43.226Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-05-20T23:49Z] test-agent → FAILED — seq 1",
+      "timestamp": "2026-05-20T23:49:39.047Z"
+    }
+  ]
+}

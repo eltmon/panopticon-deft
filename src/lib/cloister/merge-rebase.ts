@@ -3,12 +3,19 @@
  *
  * Replaces spawnRebaseAgentForBranch with direct git operations via execAsync.
  * No specialist, no polling, no tmux session — just git commands.
+ *
+ * PAN-1249: Additive Effect variant `rebaseFeatureBranchProgram` exposed for
+ * Effect-typed callers. The Promise-based `rebaseFeatureBranch` retains its
+ * legacy "result-object on success-or-failure" contract used by existing
+ * cloister merge plumbing.
  */
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { existsSync } from 'fs';
 import { join } from 'path';
+import { Effect } from 'effect';
+import { GitError, MergeConflictError } from '../errors.js';
 
 const execAsync = promisify(exec);
 
@@ -18,22 +25,7 @@ export interface RebaseResult {
   conflictFiles?: string[];
   reason?: string;
   newHead?: string;
-}
-
-/**
- * Rebase a feature branch onto a base branch in-process.
- * Returns immediately with a typed result — no specialist, no polling.
- *
- * Steps:
- * 1. Fetch latest base branch
- * 2. Check if rebase is needed (commits behind)
- * 3. Remove .planning/ artifacts (always conflict during rebase)
- * 4. Rebase onto base branch
- * 5. Push with --force-with-lease
- *
- * On conflict: aborts rebase and returns conflict file list.
- */
-export async function rebaseFeatureBranch(
+}async function rebaseFeatureBranchPromise(
   workspacePath: string,
   featureBranch: string,
   baseBranch: string,
@@ -66,26 +58,18 @@ export async function rebaseFeatureBranch(
 
     if (behind === 0) {
       console.log(`${logPrefix} Already up-to-date with origin/${baseBranch}`);
+      // Push any cleanup commit we just made.
+      try {
+        await execAsync(
+          `git push --force-with-lease origin HEAD:${featureBranch}`,
+          execOpts,
+        );
+      } catch { /* up-to-date push is non-fatal */ }
       const { stdout: currentHead } = await execAsync('git rev-parse HEAD', execOpts);
       return { success: true, skipped: true, newHead: currentHead.trim() };
     }
 
     console.log(`${logPrefix} ${behind} commits behind origin/${baseBranch}, rebasing...`);
-
-    // Step 3: Remove .planning/ artifacts before rebase (always cause conflicts)
-    const planningDir = join(workspacePath, '.planning');
-    if (existsSync(planningDir)) {
-      try {
-        await execAsync('git rm -rf .planning/ 2>/dev/null || true', execOpts);
-        await execAsync(
-          'git diff --cached --quiet || git commit -m "chore: remove planning artifacts before rebase"',
-          execOpts,
-        );
-        console.log(`${logPrefix} Removed .planning/ before rebase`);
-      } catch {
-        // Non-fatal — .planning/ might not be tracked
-      }
-    }
 
     // Step 4: Rebase onto base branch
     try {
@@ -137,4 +121,50 @@ export async function rebaseFeatureBranch(
     console.error(`${logPrefix} ${reason}`);
     return { success: false, reason };
   }
+}
+
+/**
+ * Effect-typed variant of {@link rebaseFeatureBranch} (PAN-1249).
+ *
+ * Returns a typed error channel:
+ * - `MergeConflictError` when rebase produced conflicts (which are then aborted)
+ * - `GitError` for any other git failure (fetch / rev-list / push)
+ *
+ * On success resolves to the same `RebaseResult` shape.
+ */
+export function rebaseFeatureBranch(
+  workspacePath: string,
+  featureBranch: string,
+  baseBranch: string,
+  issueId: string,
+): Effect.Effect<RebaseResult, GitError | MergeConflictError> {
+  const wrapped: Effect.Effect<RebaseResult, GitError> = Effect.tryPromise({
+    try: () => rebaseFeatureBranchPromise(workspacePath, featureBranch, baseBranch, issueId),
+    catch: (cause) =>
+      new GitError({
+        command: ['git', 'rebase', baseBranch],
+        stderr: cause instanceof Error ? cause.message : String(cause),
+        exitCode: -1,
+        cause,
+      }),
+  });
+  return Effect.flatMap(wrapped, (result): Effect.Effect<RebaseResult, GitError | MergeConflictError> => {
+    if (result.success) return Effect.succeed(result);
+    if (result.conflictFiles && result.conflictFiles.length > 0) {
+      return Effect.fail(
+        new MergeConflictError({
+          branch: featureBranch,
+          targetBranch: baseBranch,
+          conflictedFiles: result.conflictFiles,
+        }),
+      );
+    }
+    return Effect.fail(
+      new GitError({
+        command: ['git', 'rebase', baseBranch],
+        stderr: result.reason ?? 'rebase failed',
+        exitCode: 1,
+      }),
+    );
+  });
 }

@@ -5,10 +5,10 @@
  * Named after the TARDIS's Cloister Bell - an alarm for catastrophic events.
  */
 
-import type { AgentRuntime, HealthState } from '../runtimes/types.js';
+import type { AgentRuntimeSync, HealthState } from '../runtimes/types.js';
 import type { CloisterConfig } from './config.js';
 import type { AgentHealth, HealthSummary } from './health.js';
-import { loadCloisterConfig } from './config.js';
+import { loadCloisterConfigSync } from './config.js';
 import {
   getAgentHealth,
   getMultipleAgentHealth,
@@ -25,16 +25,18 @@ import { getDatabase, closeDatabase } from '../database/index.js';
 // PAN-378: initializeEnabledSpecialists removed — per-project ephemeral specialists
 // are spawned on-demand, no global initialization needed.
 import { getGlobalRegistry, getRuntimeForAgent } from '../runtimes/index.js';
-import { listRunningAgents, getAgentState, getAgentRuntimeState, saveAgentRuntimeState } from '../agents.js';
+import { listRunningAgentsSync, getAgentStateSync, getAgentState, getAgentRuntimeStateSync, saveAgentRuntimeState } from '../agents.js';
+import type { Role } from '../agents.js';
+import { resolveProjectFromIssueSync } from '../projects.js';
 import { checkAllTriggers, type TriggerDetection } from './triggers.js';
 import { performHandoff, type HandoffResult } from './handoff.js';
-import { logHandoffEvent, createHandoffEvent } from './handoff-logger.js';
+import { logHandoffEventSync, createHandoffEvent } from './handoff-logger.js';
 import {
   checkAgentForViolations,
   sendNudge,
-  resolveViolation,
+  resolveViolationSync,
   hasExceededMaxNudges,
-  clearOldViolations,
+  clearOldViolationsSync,
   type FPPViolation,
 } from './fpp-violations.js';
 import {
@@ -58,15 +60,27 @@ import {
   type DeaconLogEntry,
 } from './deacon.js';
 import { PANOPTICON_HOME } from '../paths.js';
-import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync, renameSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync, renameSync, statSync } from 'fs';
+import { rm } from 'fs/promises';
 import { join } from 'path';
 import { AGENTS_DIR } from '../paths.js';
-import { loadReviewStatuses, setReviewStatus } from '../review-status.js';
-import { sessionExistsAsync } from '../tmux.js';
-import { emitActivityEntry } from '../activity-logger.js';
+import { loadReviewStatuses, setReviewStatusSync } from '../review-status.js';
+import { sessionExists, killSession } from '../tmux.js';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import { Effect } from 'effect';
+
+const execAsync = promisify(exec);
+import { emitActivityEntrySync } from '../activity-logger.js';
+export { spawnFlywheel, pauseFlywheel, resumeFlywheel } from './flywheel.js';
 
 // State file for cross-process communication
 const CLOISTER_STATE_FILE = join(PANOPTICON_HOME, 'cloister.state');
+const LEGACY_SPECIALISTS_DIR = join(PANOPTICON_HOME, 'specialists');
+
+async function cleanupLegacySpecialistsDirectory(): Promise<void> {
+  await rm(LEGACY_SPECIALISTS_DIR, { recursive: true, force: true });
+}
 
 /**
  * Pure helper: from a map of review statuses, return the issue IDs that are
@@ -115,6 +129,273 @@ export function parseSpecialistAgentSession(name: string): {
   }
 
   return null;
+}
+
+export type ReactiveIssueState =
+  | 'todo'
+  | 'open'
+  | 'in_planning'
+  | 'in_progress'
+  | 'in_review'
+  | 'testing'
+  | 'shipping'
+  | 'closed'
+  | 'canceled';
+
+export interface CloisterDomainEventLike {
+  type: string;
+  payload?: unknown;
+}
+
+const ROLE_RUN_STATES: Record<ReactiveIssueState, Role | null> = {
+  todo: null,
+  open: null,
+  in_planning: 'plan',
+  in_progress: 'work',
+  in_review: 'review',
+  testing: 'test',
+  shipping: 'ship',
+  closed: null,
+  canceled: null,
+};
+
+/**
+ * Map issue lifecycle state to the role that should own that state.
+ */
+export function stateToRole(state: string): Role | null {
+  const normalized = state.toLowerCase().replace(/[ -]/g, '_') as ReactiveIssueState;
+  return ROLE_RUN_STATES[normalized] ?? null;
+}
+
+function normalizeIssueId(issueId: string): string {
+  return issueId.trim().toUpperCase();
+}
+
+function roleFromAgentId(agentId: string, issueId: string): Role | null {
+  const base = `agent-${issueId.toLowerCase()}`;
+  if (agentId === base) return 'work';
+  const role = agentId.slice(base.length + 1);
+  return ['plan', 'review', 'test', 'ship'].includes(role) ? role as Role : null;
+}
+
+/**
+ * PAN-1048 performance fix: O(1) direct state lookup instead of scanning
+ * all agent directories. Roles use canonical IDs: agent-<issue-lower> for
+ * work, agent-<issue-lower>-<role> for all others.
+ *
+ * Intentionally does NOT require tmuxActive — spawn routes write state.json
+ * with status:'starting' before the tmux session attaches, so filtering on
+ * tmuxActive would race-spawn a second run.
+ */
+async function activeRoleRunExists(issueId: string, role: Role, workspacePath?: string): Promise<boolean> {
+  const issueLower = issueId.toLowerCase();
+
+  // C1: For 'plan', also check the legacy planning-pan-X session format
+  // alongside the canonical agent-pan-X-plan format. The start-planning route
+  // writes to planning-pan-X while spawnRun uses agent-pan-X-plan.
+  if (role === 'plan') {
+    const legacyId = `planning-${issueLower}`;
+    const legacyState = await Effect.runPromise(getAgentState(legacyId));
+    if (legacyState?.role === 'plan' && legacyState.status !== 'stopped' && legacyState.status !== 'error') {
+      // S1: if stuck at 'starting' with no live tmux session, treat as not-alive
+      // so the next retry can spawn a fresh run without being blocked.
+      if (legacyState.status === 'starting' && !(await Effect.runPromise(sessionExists(legacyId)))) {
+        return false;
+      }
+      return true;
+    }
+  }
+
+  const candidateId = role === 'work'
+    ? `agent-${issueLower}`
+    : `agent-${issueLower}-${role}`;
+
+  const state = await Effect.runPromise(getAgentState(candidateId));
+  if (!state) return false;
+
+  const stateRole = state.role ?? roleFromAgentId(candidateId, issueId);
+
+  // S1: treat a 'starting' state with no live tmux session as not-alive.
+  if (stateRole === role && state.status === 'starting' && !(await Effect.runPromise(sessionExists(candidateId)))) {
+    return false;
+  }
+
+  const aliveByStatus = stateRole === role && state.status !== 'stopped' && state.status !== 'error';
+  if (!aliveByStatus) return false;
+
+  // Zombie detection: an agent that finished its work but never exited keeps
+  // status:'running' forever, which would block every future re-dispatch for
+  // this role (the ship/test stall bug). When we know the workspace and the
+  // run stamped a roleRunHead, compare it against the current workspace HEAD —
+  // a HEAD that has advanced past the marker means this session ran against
+  // stale code and must not be treated as the active run for the new HEAD.
+  if (workspacePath && state.roleRunHead) {
+    try {
+      const { stdout } = await execAsync('git rev-parse --short=8 HEAD', { cwd: workspacePath });
+      const currentHead = stdout.trim();
+      if (currentHead && currentHead !== state.roleRunHead) {
+        console.log(
+          `[cloister] ${issueId}: ${role} session ${candidateId} is stale `
+          + `(ran against ${state.roleRunHead}, HEAD is now ${currentHead}) — not active`,
+        );
+        return false;
+      }
+    } catch { /* non-fatal — fall through to the status-only result */ }
+  }
+
+  return true;
+}
+
+function buildReactiveRolePrompt(issueId: string, state: string, role: Role): string {
+  return `${role.toUpperCase()} TASK for ${issueId}:
+
+The issue lifecycle transitioned to ${state}. Run the ${role} role for this issue.
+
+Required steps:
+1. Work only in the workspace configured for ${issueId}.
+2. Read .pan/continue.json, .pan/spec.vbrief.json, project instructions, and issue context.
+3. Follow the boundaries and success criteria in roles/${role}.md exactly.
+4. Report the role-specific terminal status when done.`;
+}
+
+/**
+ * Resolve the workspace path for an issue from agent state, then fall back
+ * to the canonical `<projectPath>/workspaces/feature-<issueLower>` layout.
+ * Mirrors the resolution used by startup recovery (service.ts:583-609) so
+ * the reactive scheduler dispatches review/test wrappers with the same
+ * workspace contract those wrappers receive on the manual code path.
+ */
+async function resolveWorkspaceForIssue(issueId: string): Promise<string | null> {
+  const issueLower = issueId.toLowerCase();
+  const agentState = await Effect.runPromise(getAgentState(`agent-${issueLower}`));
+  if (agentState?.workspace) return agentState.workspace;
+  const resolved = resolveProjectFromIssueSync(issueId);
+  if (!resolved) return null;
+  return `${resolved.projectPath}/workspaces/feature-${issueLower}`;
+}async function onIssueStateChangePromise(issueId: string, newState: string): Promise<void> {
+  const normalizedIssueId = normalizeIssueId(issueId);
+  const role = stateToRole(newState);
+  if (!role) {
+    console.log(`[cloister] ${normalizedIssueId}: no role for issue state '${newState}'`);
+    return;
+  }
+
+  // Resolve the workspace up front so activeRoleRunExists can probe the
+  // workspace HEAD for stale-session (zombie) detection.
+  const workspace = await resolveWorkspaceForIssue(normalizedIssueId);
+
+  if (await activeRoleRunExists(normalizedIssueId, role, workspace ?? undefined)) {
+    const message = `${normalizedIssueId}: ${role} role already active; skipping lifecycle spawn`;
+    console.log(`[cloister] ${message}`);
+    emitActivityEntrySync({ source: 'cloister', level: 'info', message, issueId: normalizedIssueId });
+    return;
+  }
+
+  // activeRoleRunExists returned false. If a tmux session for this role still
+  // physically exists, it's a zombie (agent finished work but never exited,
+  // and the workspace HEAD has since advanced). Kill it before re-dispatch so
+  // the fresh run gets a clean session name instead of colliding with the
+  // dead one.
+  const issueLower = normalizedIssueId.toLowerCase();
+  const roleSessionId = role === 'work' ? `agent-${issueLower}` : `agent-${issueLower}-${role}`;
+  if (await Effect.runPromise(sessionExists(roleSessionId))) {
+    const message = `${normalizedIssueId}: killing stale ${role} session ${roleSessionId} before re-dispatch`;
+    console.log(`[cloister] ${message}`);
+    emitActivityEntrySync({ source: 'cloister', level: 'info', message, issueId: normalizedIssueId });
+    try {
+      await Effect.runPromise(killSession(roleSessionId));
+    } catch (err) {
+      console.error(`[cloister] failed to kill stale session ${roleSessionId}:`, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  try {
+    if (role === 'review') {
+      if (!workspace) {
+        const failure = `${normalizedIssueId}: cannot dispatch review role — no workspace or project resolved`;
+        console.error(`[cloister] ${failure}`);
+        emitActivityEntrySync({ source: 'cloister', level: 'error', message: failure, issueId: normalizedIssueId });
+        return;
+      }
+      const branch = `feature/${normalizedIssueId.toLowerCase()}`;
+      const { spawnReviewRoleForIssue } = await import('./review-agent.js');
+      const result = await Effect.runPromise(spawnReviewRoleForIssue({ issueId: normalizedIssueId, workspace, branch }));
+      const message = `${normalizedIssueId}: review role dispatched from lifecycle state '${newState}' (${result.message})`;
+      console.log(`[cloister] ${message}`);
+      emitActivityEntrySync({ source: 'cloister', level: result.success ? 'info' : 'error', message, issueId: normalizedIssueId });
+      return;
+    }
+
+    if (role === 'test') {
+      const branch = `feature/${normalizedIssueId.toLowerCase()}`;
+      const { dispatchTestAgentAndNotify } = await import('./test-agent-queue.js');
+      await Effect.runPromise(dispatchTestAgentAndNotify(normalizedIssueId, workspace ?? undefined, branch));
+      const message = `${normalizedIssueId}: test role dispatched from lifecycle state '${newState}'`;
+      console.log(`[cloister] ${message}`);
+      emitActivityEntrySync({ source: 'cloister', level: 'info', message, issueId: normalizedIssueId });
+      return;
+    }
+
+    const { spawnRun } = await import('../agents.js');
+    const run = await spawnRun(normalizedIssueId, role, {
+      prompt: buildReactiveRolePrompt(normalizedIssueId, newState, role),
+    });
+    const message = `${normalizedIssueId}: ${role} role started from lifecycle state '${newState}' as ${run.id}`;
+    console.log(`[cloister] ${message}`);
+    emitActivityEntrySync({ source: 'cloister', level: 'info', message, issueId: normalizedIssueId });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('already running')) {
+      const skipMessage = `${normalizedIssueId}: ${role} role already running; skipping lifecycle spawn`;
+      console.log(`[cloister] ${skipMessage}`);
+      emitActivityEntrySync({ source: 'cloister', level: 'info', message: skipMessage, issueId: normalizedIssueId });
+      return;
+    }
+    console.error(`[cloister] Failed to start ${role} role for ${normalizedIssueId}:`, error);
+    emitActivityEntrySync({ source: 'cloister', level: 'error', message: `${normalizedIssueId}: failed to start ${role} role: ${message}`, issueId: normalizedIssueId });
+  }
+}
+
+function payloadRecord(event: CloisterDomainEventLike): Record<string, unknown> {
+  return event.payload && typeof event.payload === 'object' ? event.payload as Record<string, unknown> : {};
+}
+
+export function issueStateChangeFromDomainEvent(event: CloisterDomainEventLike): { issueId: string; state: string } | null {
+  const payload = payloadRecord(event);
+  const issueId = typeof payload.issueId === 'string' ? payload.issueId : null;
+  if (!issueId) return null;
+
+  switch (event.type) {
+    case 'issue.transitioned':
+      return typeof payload.state === 'string' ? { issueId, state: payload.state } : null;
+    case 'issue.statusChanged':
+      return typeof payload.canonicalStatus === 'string' ? { issueId, state: payload.canonicalStatus } : null;
+    case 'issue.closed':
+      return { issueId, state: 'closed' };
+    case 'agent.completed': {
+      // PAN-1048 review feedback 003: agent.completed is emitted by every
+      // role's lifecycle (work, review, test, ship). Map it to in_review only
+      // when the work role completes — letting other roles land here would
+      // ricochet back into review the moment a review or test role finished.
+      const role = typeof payload.role === 'string' ? payload.role : undefined;
+      if (role === undefined || role === 'work') {
+        return { issueId, state: 'in_review' };
+      }
+      return null;
+    }
+    case 'work.completed':
+      return { issueId, state: 'in_review' };
+    case 'review.approved':
+      return { issueId, state: 'testing' };
+    case 'test.passed':
+      return { issueId, state: 'shipping' };
+    default:
+      return null;
+  }
+}async function handleCloisterDomainEventPromise(event: CloisterDomainEventLike): Promise<void> {
+  const change = issueStateChangeFromDomainEvent(event);
+  if (!change) return;
+  await Effect.runPromise(onIssueStateChange(change.issueId, change.state));
 }
 
 /**
@@ -240,6 +521,7 @@ export class CloisterService {
   private processedCompletions: Map<string, number> = new Map(); // Track completion marker retry counts (Infinity = done)
   private healthCheckCount: number = 0;
   private lastPokeTimestamps: Map<string, number> = new Map(); // agentId → last poke timestamp (ms)
+  private domainEventUnsubscribe: (() => void) | null = null;
 
   // ─── Status cache ────────────────────────────────────────────────────────────
   // getStatus() does sync file I/O + tmux calls for every agent. Cache for 3s
@@ -249,12 +531,17 @@ export class CloisterService {
   private readonly STATUS_CACHE_TTL_MS = 3_000;
 
   constructor(config?: CloisterConfig) {
-    this.config = config || loadCloisterConfig();
+    this.config = config || loadCloisterConfigSync();
   }
 
   private getDashboardApiUrl(): string {
-    if (process.env.DASHBOARD_URL) return process.env.DASHBOARD_URL;
-    return `http://localhost:${process.env.API_PORT || process.env.PORT || '3011'}`;
+    // Cloister always runs in-process with the dashboard, so it must talk to
+    // its own loopback — never to a public DASHBOARD_URL like https://pan.localhost,
+    // which would round-trip through Traefik+TLS and fail validation from inside
+    // Node (PAN-845). Use 127.0.0.1 explicitly to avoid the IPv6-first /etc/hosts
+    // trap (PAN-841): undici-based fetch connects to [::1] and hangs because the
+    // dashboard listens on the IPv4 wildcard.
+    return `http://127.0.0.1:${process.env.API_PORT || process.env.PORT || '3011'}`;
   }
 
   /**
@@ -277,6 +564,13 @@ export class CloisterService {
       console.error('  ✗ Failed to initialize panopticon database:', error);
     }
 
+    try {
+      await cleanupLegacySpecialistsDirectory();
+      console.log('  ✓ Removed legacy ~/.panopticon/specialists directory');
+    } catch (error) {
+      console.error('  ✗ Failed to remove legacy specialists directory:', error);
+    }
+
     // PAN-493: Reset orphaned verificationStatus === 'running' states.
     // If Cloister dies mid-verification, the status is left stuck at 'running' and the
     // pipeline halts indefinitely. On startup, reset any such states to 'pending' so
@@ -286,13 +580,13 @@ export class CloisterService {
       const statuses = loadReviewStatuses();
       for (const [issueId, status] of Object.entries(statuses)) {
         if (status.verificationStatus === 'running') {
-          setReviewStatus(issueId, { verificationStatus: 'pending' });
+          setReviewStatusSync(issueId, { verificationStatus: 'pending' });
           console.log(`  ✓ Reset orphaned verification 'running' → 'pending' for ${issueId}`);
           resetVerificationCount++;
         }
       }
       if (resetVerificationCount > 0) {
-        emitActivityEntry({ source: 'cloister', level: 'warn', message: `Reset ${resetVerificationCount} orphaned verification 'running' → 'pending' on startup` });
+        emitActivityEntrySync({ source: 'cloister', level: 'warn', message: `Reset ${resetVerificationCount} orphaned verification 'running' → 'pending' on startup` });
       }
     } catch (error) {
       console.error('  ✗ Failed to reset orphaned verification states:', error);
@@ -301,8 +595,8 @@ export class CloisterService {
     // PAN-511: Clear stale currentIssue from specialist agents that are not actually running.
     // If Cloister dies while a specialist is between tasks or mid-run, the specialist's
     // runtime.json may retain currentIssue and state='active' even though the process is dead.
-    // wakeSpecialistOrQueue and spawnEphemeralSpecialist check these fields to decide whether
-    // to queue or dispatch — a stale 'active' state permanently blocks new dispatches.
+    // spawnEphemeralSpecialist checks these fields to decide whether
+    // to dispatch — a stale 'active' state permanently blocks new dispatches.
     // On startup, clear currentIssue and reset state from any specialist agent that is:
     //   (a) idle — safe: idle means no active task, currentIssue is leftover
     //   (b) active but tmux session no longer running — state is stale from a crash
@@ -315,7 +609,7 @@ export class CloisterService {
           if (!entry.isDirectory()) continue;
           const parsed = parseSpecialistAgentSession(entry.name);
           if (!parsed) continue;
-          const runtimeState = getAgentRuntimeState(entry.name);
+          const runtimeState = getAgentRuntimeStateSync(entry.name);
           if (!runtimeState?.currentIssue) continue;
 
           if (runtimeState.state === 'idle') {
@@ -327,7 +621,7 @@ export class CloisterService {
             // For issue-scoped specialists, check the exact tmux session instead of the legacy
             // project/type singleton lookup, which cannot represent PAN-754 session identity.
             const stillRunning = parsed.issueId
-              ? await sessionExistsAsync(entry.name)
+              ? await Effect.runPromise(sessionExists(entry.name))
               : await isSpecialistRunning(parsed.specialistType, parsed.projectKey);
             if (!stillRunning) {
               saveAgentRuntimeState(entry.name, {
@@ -342,7 +636,7 @@ export class CloisterService {
         }
       }
       if (clearedSpecialistCount > 0) {
-        emitActivityEntry({ source: 'cloister', level: 'warn', message: `Cleared ${clearedSpecialistCount} stale specialist state(s) on startup` });
+        emitActivityEntrySync({ source: 'cloister', level: 'warn', message: `Cleared ${clearedSpecialistCount} stale specialist state(s) on startup` });
       }
     } catch (error) {
       console.error('  ✗ Failed to clear stale specialist states:', error);
@@ -353,9 +647,8 @@ export class CloisterService {
     // completes, the issue is stuck. On startup, find such issues and re-dispatch directly.
     try {
       const reviewStatuses = loadReviewStatuses();
-      const { resolveProjectFromIssue } = await import('../projects.js');
+      const { resolveProjectFromIssueSync } = await import('../projects.js');
       const { getTmuxSessionName, getAllProjectSpecialistStatuses } = await import('./specialists.js');
-      const { dispatchParallelReview } = await import('./review-agent.js');
 
       // Build set of issue IDs actively being reviewed by a running specialist
       const activeReviewIssues = new Set<string>();
@@ -363,25 +656,29 @@ export class CloisterService {
         const projSpecs = await getAllProjectSpecialistStatuses();
         for (const ps of projSpecs) {
           if (ps.specialistType !== 'review-agent' || !ps.isRunning) continue;
-          const rs = getAgentRuntimeState(ps.tmuxSession);
+          const rs = getAgentRuntimeStateSync(ps.tmuxSession);
           if (rs?.state === 'active' && rs.currentIssue) {
             activeReviewIssues.add(rs.currentIssue.toUpperCase());
           }
         }
         // Also check global review-agent session
         const globalSession = getTmuxSessionName('review-agent');
-        const globalRs = getAgentRuntimeState(globalSession);
+        const globalRs = getAgentRuntimeStateSync(globalSession);
         if (globalRs?.state === 'active' && globalRs.currentIssue) {
           activeReviewIssues.add(globalRs.currentIssue.toUpperCase());
         }
 
-        // Also detect ad-hoc parallel review sessions spawned by dispatchParallelReview.
-        // These never register runtime state, so they're invisible to the checks above.
-        const { listSessionNamesAsync } = await import('../tmux.js');
-        const { getActiveParallelReviewIssues } = await import('./review-agent.js');
-        const allSessions = await listSessionNamesAsync();
-        for (const issueId of getActiveParallelReviewIssues(allSessions)) {
-          activeReviewIssues.add(issueId);
+        // PAN-1048 R5: detect role-primitive review runs (agent-<id>-review).
+        // Replaces the legacy getActiveParallelReviewIssues helper that scanned
+        // tmux for dispatchParallelReview's coordinator session naming pattern.
+        const { listRunningAgents } = await import('../agents.js');
+        const agents = await Effect.runPromise(listRunningAgents());
+        for (const agent of agents) {
+          if (agent.status === 'stopped' || agent.status === 'error') continue;
+          const role = agent.role ?? (agent.id.endsWith('-review') ? 'review' : null);
+          if (role !== 'review') continue;
+          const issueId = (agent.issueId ?? '').trim().toUpperCase();
+          if (issueId) activeReviewIssues.add(issueId);
         }
       } catch {
         // Non-fatal: if we can't check active sessions, re-dispatch all orphaned
@@ -391,34 +688,38 @@ export class CloisterService {
 
       if (orphanedReviewing.length > 0) {
         console.log(`  ⚠ Found ${orphanedReviewing.length} issue(s) with orphaned reviewStatus='reviewing'`);
-        emitActivityEntry({ source: 'cloister', level: 'warn', message: `Found ${orphanedReviewing.length} orphaned reviewStatus='reviewing' issue(s) on startup`, details: orphanedReviewing.join(', ') });
+        emitActivityEntrySync({ source: 'cloister', level: 'warn', message: `Found ${orphanedReviewing.length} orphaned reviewStatus='reviewing' issue(s) on startup`, details: orphanedReviewing.join(', ') });
 
         for (const issueId of orphanedReviewing) {
 
           const agentId = `agent-${issueId.toLowerCase()}`;
-          const agentState = getAgentState(agentId);
+          const agentState = getAgentStateSync(agentId);
           const workspace = agentState?.workspace;
 
           if (!workspace) {
             console.log(`  ⚠ ${issueId}: orphaned reviewing but no workspace found — resetting to pending`);
-            setReviewStatus(issueId, { reviewStatus: 'pending' });
-            emitActivityEntry({ source: 'cloister', level: 'warn', message: `${issueId} orphaned reviewing reset to pending — no workspace found`, issueId });
+            setReviewStatusSync(issueId, { reviewStatus: 'pending' });
+            emitActivityEntrySync({ source: 'cloister', level: 'warn', message: `${issueId} orphaned reviewing reset to pending — no workspace found`, issueId });
             continue;
           }
 
-          const resolved = resolveProjectFromIssue(issueId);
+          const resolved = resolveProjectFromIssueSync(issueId);
           if (!resolved) {
             console.log(`  ⚠ ${issueId}: orphaned reviewing but no project configured — resetting to pending`);
-            setReviewStatus(issueId, { reviewStatus: 'pending' });
-            emitActivityEntry({ source: 'cloister', level: 'warn', message: `${issueId} orphaned reviewing reset to pending — no project configured`, issueId });
+            setReviewStatusSync(issueId, { reviewStatus: 'pending' });
+            emitActivityEntrySync({ source: 'cloister', level: 'warn', message: `${issueId} orphaned reviewing reset to pending — no project configured`, issueId });
             continue;
           }
 
           const branch = `feature/${issueId.toLowerCase()}`;
-          await dispatchParallelReview({ issueId, workspace, branch });
-          // dispatchParallelReview sets reviewStatus='reviewing' internally
+          // PAN-1048 R4: startup recovery now spawns the review role primitive
+          // (loads roles/review.md → Agent tool fans out to convoy reviewers)
+          // instead of the legacy `pan review run` coordinator.
+          const { spawnReviewRoleForIssue } = await import('./review-agent.js');
+          await Effect.runPromise(spawnReviewRoleForIssue({ issueId, workspace, branch }));
+          // spawnReviewRoleForIssue sets reviewStatus='reviewing' internally
           console.log(`  ✓ Re-dispatched recovery review for ${issueId}`);
-          emitActivityEntry({ source: 'cloister', level: 'info', message: `Re-dispatched recovery review for ${issueId}`, issueId });
+          emitActivityEntrySync({ source: 'cloister', level: 'info', message: `Re-dispatched recovery review for ${issueId}`, issueId });
         }
       }
     } catch (error) {
@@ -434,10 +735,10 @@ export class CloisterService {
       console.log('  → Starting deacon health monitor...');
       startDeacon();
       console.log('  ✓ Deacon started');
-      emitActivityEntry({ source: 'cloister', level: 'info', message: 'Deacon health monitor started' });
+      emitActivityEntrySync({ source: 'cloister', level: 'info', message: 'Deacon health monitor started' });
     } catch (error) {
       console.error('  ✗ Failed to start deacon:', error);
-      emitActivityEntry({ source: 'cloister', level: 'error', message: `Failed to start deacon: ${error instanceof Error ? error.message : String(error)}` });
+      emitActivityEntrySync({ source: 'cloister', level: 'error', message: `Failed to start deacon: ${error instanceof Error ? error.message : String(error)}` });
     }
 
     this.running = true;
@@ -445,10 +746,39 @@ export class CloisterService {
     this._statusCache = null;
     writeStateFile(true);
     this.emit({ type: 'started' });
-    emitActivityEntry({ source: 'cloister', level: 'info', message: 'Cloister agent watchdog started' });
+    emitActivityEntrySync({ source: 'cloister', level: 'info', message: 'Cloister agent watchdog started' });
+
+    await this.subscribeToDomainEvents();
 
     // Start monitoring loop
     this.startMonitoringLoop();
+  }
+
+  private async subscribeToDomainEvents(): Promise<void> {
+    if (this.domainEventUnsubscribe) return;
+
+    try {
+      const { initEventStore } = await import('../../dashboard/server/event-store.js');
+      const store = await initEventStore();
+      this.domainEventUnsubscribe = store.subscribe((event) => {
+        void Effect.runPromise(handleCloisterDomainEvent(event)).catch((error) => {
+          console.error('[cloister] Reactive lifecycle event handling failed:', error);
+          emitActivityEntrySync({
+            source: 'cloister',
+            level: 'error',
+            message: `Reactive lifecycle event handling failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        });
+      });
+      console.log('  ✓ Cloister reactive lifecycle scheduler subscribed to domain events');
+    } catch (error) {
+      console.error('  ✗ Failed to subscribe Cloister reactive lifecycle scheduler:', error);
+      emitActivityEntrySync({
+        source: 'cloister',
+        level: 'error',
+        message: `Failed to subscribe reactive lifecycle scheduler: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
   }
 
   /**
@@ -471,6 +801,11 @@ export class CloisterService {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
       this.checkInterval = null;
+    }
+
+    if (this.domainEventUnsubscribe) {
+      this.domainEventUnsubscribe();
+      this.domainEventUnsubscribe = null;
     }
 
     // Stop deacon health monitor
@@ -499,7 +834,7 @@ export class CloisterService {
   emergencyStop(): string[] {
     console.log('🚨 EMERGENCY STOP - Killing all agents');
 
-    const runningAgents = listRunningAgents();
+    const runningAgents = listRunningAgentsSync();
     const killedAgents: string[] = [];
 
     for (const agent of runningAgents) {
@@ -544,7 +879,7 @@ export class CloisterService {
    */
   private async performHealthCheck(): Promise<void> {
     try {
-      const runningAgents = listRunningAgents().filter((a) => a.tmuxActive);
+      const runningAgents = listRunningAgentsSync().filter((a) => a.tmuxActive);
       const agentIds = runningAgents.map((a) => a.id);
       const currentRunningSet = new Set(agentIds);
 
@@ -643,7 +978,7 @@ export class CloisterService {
       // Clean up old resolved violations (daily)
       if (Math.random() < 0.01) {
         // ~1% chance each check = roughly once per day
-        clearOldViolations(24);
+        clearOldViolationsSync(24);
       }
     } catch (error) {
       console.error('Cloister health check failed:', error);
@@ -666,8 +1001,30 @@ export class CloisterService {
         const completedFile = join(AGENTS_DIR, dir.name, 'completed');
         const processedFile = join(AGENTS_DIR, dir.name, 'completed.processed');
 
-        // Skip if no completion marker or already processed on disk
-        if (!existsSync(completedFile) || existsSync(processedFile)) continue;
+        // Skip if no completion marker.
+        if (!existsSync(completedFile)) continue;
+
+        // If a stale `completed.processed` exists from a prior round, it must
+        // not block a NEW completion. `pan done` for a feedback round writes
+        // a fresh `completed` and unlinks `.processed`, but if the unlink
+        // didn't happen (older client, races, manual recovery), fall back to
+        // an mtime comparison: if `completed` is newer than `.processed`,
+        // treat it as a new event and remove the stale processed marker.
+        if (existsSync(processedFile)) {
+          try {
+            const completedMtime = statSync(completedFile).mtimeMs;
+            const processedMtime = statSync(processedFile).mtimeMs;
+            if (completedMtime > processedMtime) {
+              try { unlinkSync(processedFile); } catch {}
+              this.processedCompletions.delete(dir.name);
+              console.log(`🔔 Cloister: Detected re-completion for ${dir.name} (completed newer than .processed) — clearing stale marker`);
+            } else {
+              continue;
+            }
+          } catch {
+            continue;
+          }
+        }
 
         // Skip stale completion markers (older than 24h) — just mark as processed
         try {
@@ -684,17 +1041,23 @@ export class CloisterService {
           continue;
         }
 
-        // Check retry count — give up after 3 failed attempts
+        // Check retry count — give up after 3 failed attempts.
+        // If `.processed` was unlinked (e.g. by a re-run of `pan done` after a
+        // review feedback round), the on-disk state says "fresh completion" —
+        // reset any stale in-memory counter from the previous round so the
+        // trigger fires again.
         const retryCount = this.processedCompletions.get(dir.name) || 0;
-        if (retryCount >= 3) continue;
+        if (retryCount === Infinity) {
+          this.processedCompletions.delete(dir.name);
+        } else if (retryCount >= 3) continue;
 
         // Extract issue ID from agent dir name (e.g. "agent-pan-123" → "PAN-123")
         const issueId = dir.name.replace('agent-', '').toUpperCase();
 
         // Skip if review is already in progress or passed — `pan done` already triggered it.
         // This completion marker scan is only a fallback for when the HTTP call from `pan done` fails.
-        const { getReviewStatus } = await import('../review-status.js');
-        const existingReview = getReviewStatus(issueId);
+        const { getReviewStatusSync } = await import('../review-status.js');
+        const existingReview = getReviewStatusSync(issueId);
         if (existingReview && ['reviewing', 'passed'].includes(existingReview.reviewStatus || '')) {
           console.log(`🔔 Cloister: Completion marker for ${issueId} — review already ${existingReview.reviewStatus}, marking processed`);
           try { renameSync(completedFile, processedFile); } catch {}
@@ -705,30 +1068,31 @@ export class CloisterService {
         console.log(`🔔 Cloister: Found completion marker for ${issueId}, triggering review...${retryCount > 0 ? ` (retry ${retryCount}/3)` : ''}`);
 
         try {
-          // Trigger review via dashboard API (same process, localhost)
-          const http = await import('http');
-          const result = await new Promise<{ success: boolean; error?: string; alreadyReviewed?: boolean; alreadyMerged?: boolean }>((resolve) => {
-            const postData = JSON.stringify({});
-            const req = http.request(
-              `${this.getDashboardApiUrl()}/api/review/${issueId}/trigger`,
-              { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 5000 },
-              (res) => {
-                let data = '';
-                res.on('data', (chunk: string) => data += chunk);
-                res.on('end', () => {
-                  try {
-                    resolve(JSON.parse(data));
-                  } catch {
-                    resolve({ success: false, error: `Invalid response (HTTP ${res.statusCode})` });
-                  }
-                });
+          // Trigger review via dashboard API. Use fetch() so https:// URLs
+          // (e.g. https://pan.localhost via Traefik) work — Node's http.request
+          // rejects https URLs with "Protocol \"https:\" not supported".
+          const result = await (async (): Promise<{ success: boolean; error?: string; alreadyReviewed?: boolean; alreadyMerged?: boolean }> => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5000);
+            try {
+              const res = await fetch(`${this.getDashboardApiUrl()}/api/review/${issueId}/trigger`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+                signal: controller.signal,
+              });
+              clearTimeout(timer);
+              try {
+                return (await res.json()) as { success: boolean; error?: string; alreadyReviewed?: boolean; alreadyMerged?: boolean };
+              } catch {
+                return { success: false, error: `Invalid response (HTTP ${res.status})` };
               }
-            );
-            req.on('error', (e: Error) => resolve({ success: false, error: e.message }));
-            req.on('timeout', () => { req.destroy(); resolve({ success: false, error: 'Timeout (5s)' }); });
-            req.write(postData);
-            req.end();
-          });
+            } catch (e: any) {
+              clearTimeout(timer);
+              if (e?.name === 'AbortError') return { success: false, error: 'Timeout (5s)' };
+              return { success: false, error: e?.message || String(e) };
+            }
+          })();
 
           if (result.success) {
             console.log(`  ✓ Review triggered for ${issueId}`);
@@ -755,7 +1119,15 @@ export class CloisterService {
   }
 
   /**
-   * Poke an agent (send "are you stuck?" message)
+   * Poke an agent (send "are you stuck?" message).
+   *
+   * NOTE: runtime.sendMessage() is async — both ClaudeCodeRuntime and PiRuntime
+   * are declared `async sendMessage(): Promise<void>`. A `throw` inside an
+   * async function before any await still returns a rejected Promise, so the
+   * surrounding try/catch CANNOT catch it. Without explicit `.catch()`, the
+   * rejection becomes an UnhandledPromiseRejection and crashes the dashboard
+   * server. We hit this in production when the deacon health-check polled a
+   * dead agent (PAN-1189 wedge sweep #12-13).
    */
   private pokeAgent(agentId: string): void {
     try {
@@ -768,7 +1140,11 @@ export class CloisterService {
         'Hey, I noticed you haven\'t made progress in a while. Are you stuck? ' +
         'If you need help or clarification, please ask. Otherwise, please continue with your work.';
 
-      runtime.sendMessage(agentId, pokeMessage);
+      // Fire-and-forget: chain .catch() so async rejection cannot bubble out
+      // as an UnhandledPromiseRejection.
+      Promise.resolve(runtime.sendMessage(agentId, pokeMessage)).catch((sendErr) => {
+        console.error(`Failed to send poke to ${agentId}:`, sendErr);
+      });
       this.emit({ type: 'poked_agent', agentId });
 
       console.log(`🔔 Poked ${agentId}`);
@@ -779,6 +1155,10 @@ export class CloisterService {
 
   /**
    * Kill an agent
+   *
+   * runtime.killAgent() is also async in some runtime implementations — apply
+   * the same fire-and-forget guard as pokeAgent so async rejection cannot
+   * crash the dashboard from a deacon health-check timer callback.
    */
   private killAgent(agentId: string): void {
     try {
@@ -787,7 +1167,9 @@ export class CloisterService {
         throw new Error(`No runtime found for agent ${agentId}`);
       }
 
-      runtime.killAgent(agentId);
+      Promise.resolve(runtime.killAgent(agentId)).catch((killErr) => {
+        console.error(`Failed to kill ${agentId}:`, killErr);
+      });
       this.emit({ type: 'killed_agent', agentId });
 
       console.log(`🔔 Killed ${agentId}`);
@@ -807,12 +1189,12 @@ export class CloisterService {
     // Both state.json and runtime.json must be checked — stopAgent writes both,
     // but a race between the CLI kill and this health check poll could see one
     // but not the other if only one file is consulted.
-    const agentState = getAgentState(agentId);
+    const agentState = getAgentStateSync(agentId);
     if (!agentState || agentState.status === 'stopped') {
       console.log(`🔔 Agent ${agentId} was intentionally stopped, skipping restart`);
       return;
     }
-    const runtimeState = getAgentRuntimeState(agentId);
+    const runtimeState = getAgentRuntimeStateSync(agentId);
     if (runtimeState?.state === 'suspended') {
       console.log(`🔔 Agent ${agentId} is suspended, skipping restart`);
       return;
@@ -901,7 +1283,7 @@ export class CloisterService {
     }
 
     // Get agent state to find session ID and workspace
-    const agentState = getAgentState(agentId);
+    const agentState = getAgentStateSync(agentId);
     if (!agentState?.sessionId) {
       throw new Error(`No session ID found for agent ${agentId}`);
     }
@@ -1066,7 +1448,7 @@ export class CloisterService {
    */
   private async checkSpecialistRotations(): Promise<void> {
     // Check merge-agent (the main candidate for rotation)
-    const mergeAgentResult = await checkAndRotateIfNeeded('merge-agent', process.cwd());
+    const mergeAgentResult = await Effect.runPromise(checkAndRotateIfNeeded('merge-agent', process.cwd()));
     if (mergeAgentResult) {
       this.emit({ type: 'session_rotated', specialistName: 'merge-agent', result: mergeAgentResult });
 
@@ -1096,7 +1478,7 @@ export class CloisterService {
       if (previousState === undefined || previousState !== currentState) {
         // Determine source from heartbeat
         const source = health.heartbeat?.source
-          ? this.mapActivitySource(health.heartbeat.source)
+          ? this.mapHeartbeatSource(health.heartbeat.source)
           : 'unknown';
 
         writeHealthEvent({
@@ -1132,21 +1514,21 @@ export class CloisterService {
     for (const health of agentHealths) {
       try {
         // Get agent state
-        const agentState = getAgentState(health.agentId);
+        const agentState = getAgentStateSync(health.agentId);
         if (!agentState) continue;
 
         // Skip if no workspace (can't determine context)
         if (!agentState.workspace) continue;
 
         // Check all triggers
-        const triggers = await checkAllTriggers(
+        const triggers = await Effect.runPromise(checkAllTriggers(
           health.agentId,
           agentState.workspace,
           agentState.issueId,
           agentState.model,
           health,
           this.config
-        );
+        ));
 
         // Execute handoff for first triggered condition
         // (Priority: stuck > planning > test > completion)
@@ -1168,10 +1550,10 @@ export class CloisterService {
           console.log(`🔔 Handoff triggered for ${health.agentId}: ${trigger.reason}`);
 
           // Perform handoff
-          const result = await performHandoff(health.agentId, {
+          const result = await Effect.runPromise(performHandoff(health.agentId, {
             targetModel: trigger.suggestedModel || 'sonnet',
             reason: trigger.reason,
-          });
+          }));
 
           this.emit({ type: 'handoff_completed', agentId: health.agentId, result });
 
@@ -1185,7 +1567,7 @@ export class CloisterService {
               result.success,
               result.error
             );
-            logHandoffEvent(event);
+            logHandoffEventSync(event);
           }
 
           if (result.success) {
@@ -1201,9 +1583,9 @@ export class CloisterService {
   }
 
   /**
-   * Map ActivitySource to database source string
+   * Map heartbeat source to database source string
    */
-  private mapActivitySource(source: string): string {
+  private mapHeartbeatSource(source: string): string {
     switch (source) {
       case 'jsonl':
         return 'jsonl_mtime';
@@ -1231,7 +1613,7 @@ export class CloisterService {
       return this._statusCache;
     }
 
-    const runningAgents = listRunningAgents().filter((a) => a.tmuxActive);
+    const runningAgents = listRunningAgentsSync().filter((a) => a.tmuxActive);
     const agentIds = runningAgents.map((a) => a.id);
 
     const agentHealths: AgentHealth[] = [];
@@ -1276,7 +1658,7 @@ export class CloisterService {
    * Get health for all running agents
    */
   getAllAgentHealth(): AgentHealth[] {
-    const runningAgents = listRunningAgents().filter((a) => a.tmuxActive);
+    const runningAgents = listRunningAgentsSync().filter((a) => a.tmuxActive);
     const agentHealths: AgentHealth[] = [];
 
     for (const agent of runningAgents) {
@@ -1329,7 +1711,7 @@ export class CloisterService {
    * Reload configuration
    */
   reloadConfig(): void {
-    this.config = loadCloisterConfig();
+    this.config = loadCloisterConfigSync();
 
     // Restart monitoring loop with new interval if running
     if (this.running && this.checkInterval) {
@@ -1419,4 +1801,34 @@ export function getCloisterService(): CloisterService {
  */
 export function setCloisterService(service: CloisterService): void {
   globalService = service;
+}
+
+// ─── PAN-1249: additive Effect variants ───────────────────────────────────────
+// service.ts is the top-level Cloister orchestrator (1817 lines, heavy use of
+// closures and direct fs IO). A full Effect rewrite would cascade into half
+// the codebase (review-agent, test-agent-queue, agents.ts) so for the
+// batch-C migration we expose Effect variants only at the two domain-event
+// entry points. The legacy Promise surfaces stay live for existing callers;
+// Effect callers should prefer the *Effect variants. The internal
+// implementations swallow errors (logging via emitActivityEntry instead),
+// so the error channel is `never`.
+
+/**
+ * Effect-typed variant of {@link onIssueStateChange}. Never fails — failures
+ * surface through `emitActivityEntry` inside the legacy implementation.
+ */
+export function onIssueStateChange(
+  issueId: string,
+  newState: string,
+): Effect.Effect<void> {
+  return Effect.promise(() => onIssueStateChangePromise(issueId, newState));
+}
+
+/**
+ * Effect-typed variant of {@link handleCloisterDomainEvent}. Never fails.
+ */
+export function handleCloisterDomainEvent(
+  event: CloisterDomainEventLike,
+): Effect.Effect<void> {
+  return Effect.promise(() => handleCloisterDomainEventPromise(event));
 }

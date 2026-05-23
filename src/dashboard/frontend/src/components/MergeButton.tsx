@@ -7,10 +7,11 @@ interface MergeButtonProps {
   issueId: string;
   reviewStatus?: { readyForMerge?: boolean; mergeStatus?: string };
   variant: 'card' | 'inspector';
+  issueState?: string;
   onClick?: (e: React.MouseEvent) => void;
 }
 
-export function MergeButton({ issueId, reviewStatus, variant, onClick }: MergeButtonProps) {
+export function MergeButton({ issueId, reviewStatus, variant, issueState, onClick }: MergeButtonProps) {
   const showAlert = useAlert();
   const confirm = useConfirm();
   const queryClient = useQueryClient();
@@ -54,7 +55,7 @@ export function MergeButton({ issueId, reviewStatus, variant, onClick }: MergeBu
     : 0;
   const isMergeStuck = mergingElapsed > STUCK_MERGE_MS;
 
-  if (!reviewStatus?.readyForMerge || reviewStatus?.mergeStatus === 'merged') {
+  if (issueState === 'verifying_on_main' || !reviewStatus?.readyForMerge || reviewStatus?.mergeStatus === 'merged') {
     return null;
   }
 
@@ -80,8 +81,8 @@ export function MergeButton({ issueId, reviewStatus, variant, onClick }: MergeBu
         disabled={mergeMutation.isPending || ((reviewStatus?.mergeStatus === 'merging' || reviewStatus?.mergeStatus === 'verifying' || reviewStatus?.mergeStatus === 'queued') && !isMergeStuck)}
         className={`flex items-center gap-1 px-2 py-1 text-xs rounded font-medium ${
           isMergeStuck
-            ? 'bg-warning text-white hover:bg-warning/90'
-            : 'bg-success text-white hover:bg-success/90 disabled:opacity-50'
+            ? 'bg-warning text-warning-foreground hover:bg-warning/90'
+            : 'bg-success text-success-foreground hover:bg-success/90 disabled:opacity-50'
         }`}
         title={isMergeStuck ? 'Merge appears stuck — click to retry' : undefined}
       >

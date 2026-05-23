@@ -9,8 +9,10 @@
 import { existsSync } from 'fs';
 import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
-import { listProjects } from '../projects.js';
+import { Effect } from 'effect';
+import { listProjectsSync } from '../projects.js';
 import { insertCostEvents } from '../database/cost-events-db.js';
+import { FsError } from '../errors.js';
 import type { CostEvent } from './events.js';
 
 const DEFAULT_EVENTS_SUBDIR = '.pan/events';
@@ -26,13 +28,7 @@ export interface SyncResult {
   byProject: Record<string, { imported: number; duplicates: number; files: number }>;
   /** Any errors encountered (non-fatal) */
   errors: string[];
-}
-
-/**
- * Scan all project repos for WAL files and import new events into SQLite.
- * Deduplication is handled by the UNIQUE index on request_id in cost_events.
- */
-export async function syncWalFromAllProjects(): Promise<SyncResult> {
+}async function syncWalFromAllProjectsPromise(): Promise<SyncResult> {
   const result: SyncResult = {
     imported: 0,
     duplicates: 0,
@@ -41,7 +37,7 @@ export async function syncWalFromAllProjects(): Promise<SyncResult> {
     errors: [],
   };
 
-  const projects = listProjects();
+  const projects = listProjectsSync();
 
   for (const { key, config } of projects) {
     const repoPath = config.events_repo ?? config.path;
@@ -84,13 +80,7 @@ export async function syncWalFromAllProjects(): Promise<SyncResult> {
   }
 
   return result;
-}
-
-/**
- * Import WAL files from a specific directory.
- * Used for targeted sync of a single project or directory.
- */
-export async function syncWalFromDir(eventsDir: string): Promise<{ imported: number; duplicates: number; files: number; errors: string[] }> {
+}async function syncWalFromDirPromise(eventsDir: string): Promise<{ imported: number; duplicates: number; files: number; errors: string[] }> {
   const stats = { imported: 0, duplicates: 0, files: 0, errors: [] as string[] };
 
   if (!existsSync(eventsDir)) return stats;
@@ -122,6 +112,28 @@ export async function syncWalFromDir(eventsDir: string): Promise<{ imported: num
 }
 
 // ============== Helpers ==============
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect variant of syncWalFromAllProjects. The underlying impl already
+ * collects per-file errors in `result.errors` rather than throwing, so the
+ * Effect channel only sees catastrophic failures (e.g. listProjects throwing).
+ */
+export const syncWalFromAllProjects = (): Effect.Effect<SyncResult, FsError> =>
+  Effect.tryPromise({
+    try: () => syncWalFromAllProjectsPromise(),
+    catch: (cause) => new FsError({ path: '<all projects>', operation: 'syncWalFromAllProjects', cause }),
+  });
+
+/** Effect variant of syncWalFromDir. */
+export const syncWalFromDir = (
+  eventsDir: string,
+): Effect.Effect<{ imported: number; duplicates: number; files: number; errors: string[] }, FsError> =>
+  Effect.tryPromise({
+    try: () => syncWalFromDirPromise(eventsDir),
+    catch: (cause) => new FsError({ path: eventsDir, operation: 'syncWalFromDir', cause }),
+  });
 
 async function parseWalFile(filePath: string, errors: string[]): Promise<CostEvent[]> {
   let content: string;

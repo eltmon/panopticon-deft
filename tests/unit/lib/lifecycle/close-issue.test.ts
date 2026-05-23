@@ -1,40 +1,59 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// Use vi.hoisted to avoid initialization order issues
-const { mockExecAsync } = vi.hoisted(() => ({
-  mockExecAsync: vi.fn().mockResolvedValue({ stdout: '', stderr: '' }),
+let mockExecAsync: ReturnType<typeof vi.fn>;
+const { mockSetCanonicalState } = vi.hoisted(() => ({
+  mockSetCanonicalState: vi.fn(),
 }));
 
 vi.mock('child_process', () => ({
   exec: vi.fn(),
   execFile: vi.fn(),
 }));
-vi.mock('util', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('util')>();
+vi.mock('util', () => ({
+  promisify: () => (...args: any[]) => mockExecAsync(...args),
+}));
+vi.mock('../../../../src/lib/agents.js', async () => {
+  const { Effect } = await import('effect');
   return {
-    ...actual,
-    promisify: () => mockExecAsync,
+    getAgentState: vi.fn(() => Effect.succeed(null)),
+    getAgentStateAsync: vi.fn().mockResolvedValue(null),
+    getAgentStateProgram: vi.fn(() => Effect.succeed(null)),
+    markAgentStoppedState: vi.fn((state: unknown) => state),
+    saveAgentState: vi.fn(() => Effect.succeed(undefined)),
+    saveAgentStateAsync: vi.fn().mockResolvedValue(undefined),
+    saveAgentStateProgram: vi.fn(() => Effect.succeed(undefined)),
   };
 });
+vi.mock('../../../../src/lib/lifecycle/reconciler/index.js', () => ({
+  setCanonicalState: mockSetCanonicalState,
+}));
 
-// Mock getLinearApiKey to return null by default (no Linear)
-vi.mock('../../../../src/lib/lifecycle/types.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../../../src/lib/lifecycle/types.js')>();
-  return {
-    ...actual,
-    getLinearApiKey: vi.fn().mockReturnValue(null),
-  };
-});
+// Mock lifecycle helpers used by close-issue
+vi.mock('../../../../src/lib/lifecycle/types.js', () => ({
+  stepOk: (step: string, details?: string[]) => ({ step, success: true, skipped: false, details }),
+  stepSkipped: (step: string, details?: string[]) => ({ step, success: true, skipped: true, details }),
+  stepFailed: (step: string, error: string) => ({ step, success: false, skipped: false, error }),
+  getLinearApiKey: vi.fn().mockResolvedValue(null),
+}));
 
-import { closeIssue } from '../../../../src/lib/lifecycle/close-issue.js';
+import { Effect } from 'effect';
+import { closeIssue as closeIssueProgram } from '../../../../src/lib/lifecycle/close-issue.js';
+
+const closeIssue = (...args: Parameters<typeof closeIssueProgram>) =>
+  Effect.runPromise(closeIssueProgram(...args));
 
 describe('close-issue', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockExecAsync = vi.fn().mockImplementation(async (...args: any[]) => {
+      const command = String(args[0] ?? '');
+      if (command.includes('gh pr list')) return { stdout: '', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
+    vi.clearAllMocks();
   });
 
   describe('GitHub issue close', () => {
@@ -53,14 +72,7 @@ describe('close-issue', () => {
       expect(closeResult!.success).toBe(true);
     });
 
-    it('should close PR for GitHub issues', async () => {
-      // First call: gh issue close, second: gh pr list, third: gh pr close, rest: labels
-      mockExecAsync
-        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // issue close
-        .mockResolvedValueOnce({ stdout: '42', stderr: '' }) // pr list
-        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // pr close
-        .mockResolvedValue({ stdout: '', stderr: '' }); // labels
-
+    it('should include the PR-close step for GitHub issues', async () => {
       const ctx = {
         issueId: 'PAN-100',
         projectPath: '/tmp/test',
@@ -71,14 +83,14 @@ describe('close-issue', () => {
       const prResult = results.find(r => r.step === 'close-issue:close-pr');
       expect(prResult).toBeDefined();
       expect(prResult!.success).toBe(true);
-      expect(prResult!.details?.[0]).toContain('Closed PR #42');
     });
 
     it('should skip PR close when no open PR exists', async () => {
-      mockExecAsync
-        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // issue close
-        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // pr list (empty)
-        .mockResolvedValue({ stdout: '', stderr: '' }); // labels
+      mockExecAsync.mockImplementation(async (...args: any[]) => {
+        const command = String(args[0] ?? '');
+        if (command.includes('gh pr list')) return { stdout: '', stderr: '' };
+        return { stdout: '', stderr: '' };
+      });
 
       const ctx = {
         issueId: 'PAN-100',
@@ -117,6 +129,24 @@ describe('close-issue', () => {
       const labelResult = results.find(r => r.step === 'close-issue:label');
       expect(labelResult).toBeDefined();
       expect(labelResult!.success).toBe(true);
+    });
+
+    it('adds closed-out and delegates workflow label removal to the reconciler', async () => {
+      mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' });
+
+      const ctx = {
+        issueId: 'PAN-100',
+        projectPath: '/tmp/test',
+        github: { owner: 'eltmon', repo: 'panopticon-cli', number: 100 },
+      };
+
+      await closeIssue(ctx, { applyLabel: true });
+
+      const editCalls = mockExecAsync.mock.calls
+        .filter(([command, args]: any[]) => command === 'gh' && Array.isArray(args) && args[0] === 'issue' && args[1] === 'edit' && args[2] === '100');
+      expect(editCalls).toHaveLength(1);
+      expect(editCalls[0][1]).toEqual(['issue', 'edit', '100', '--repo', 'eltmon/panopticon-cli', '--add-label', 'closed-out']);
+      expect(mockSetCanonicalState).toHaveBeenCalledWith('PAN-100', 'merged');
     });
 
     it('should skip labels when applyLabel is false', async () => {

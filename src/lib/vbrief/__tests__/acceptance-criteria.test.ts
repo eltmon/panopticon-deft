@@ -3,18 +3,23 @@ import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
-  extractAcceptanceCriteria,
+  extractAcceptanceCriteriaSync,
   extractACFromDocument,
   formatAcceptanceCriteria,
-  checkAllCriteriaCompleted,
+  checkAllCriteriaCompletedSync,
 } from '../acceptance-criteria.js';
 import type { VBriefDocument } from '../types.js';
 
-let TEST_DIR: string;
+let PROJECT_ROOT: string;
+let WORKSPACE_PATH: string;
+const ISSUE_ID = 'PAN-200';
+const SPEC_FILENAME = '2026-01-01-PAN-200-test-plan.vbrief.json';
 
 function makePlanWithAC(items: Array<{
   id: string;
   title: string;
+  status?: string;
+  metadata?: Record<string, unknown>;
   subItems?: Array<{ id: string; title: string; status?: string; kind?: string }>;
 }>): VBriefDocument {
   return {
@@ -22,11 +27,12 @@ function makePlanWithAC(items: Array<{
     plan: {
       id: 'TEST',
       title: 'Test Plan',
-      status: 'approved',
+      status: 'active',
       items: items.map(i => ({
         id: i.id,
         title: i.title,
-        status: 'pending' as const,
+        status: (i.status ?? 'pending') as any,
+        metadata: i.metadata,
         subItems: i.subItems?.map(s => ({
           id: s.id,
           title: s.title,
@@ -39,30 +45,31 @@ function makePlanWithAC(items: Array<{
   };
 }
 
-function writePlan(workspacePath: string, doc: VBriefDocument): void {
-  const planDir = join(workspacePath, '.planning');
-  mkdirSync(planDir, { recursive: true });
-  writeFileSync(join(planDir, 'plan.vbrief.json'), JSON.stringify(doc, null, 2));
+function writePlan(doc: VBriefDocument): void {
+  const specsDir = join(PROJECT_ROOT, '.pan', 'specs');
+  mkdirSync(specsDir, { recursive: true });
+  writeFileSync(join(specsDir, SPEC_FILENAME), JSON.stringify({ ...doc, status: 'active' }, null, 2));
 }
 
 beforeEach(() => {
-  TEST_DIR = join(tmpdir(), `vbrief-ac-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  mkdirSync(TEST_DIR, { recursive: true });
+  PROJECT_ROOT = join(tmpdir(), `vbrief-ac-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  WORKSPACE_PATH = join(PROJECT_ROOT, 'workspaces', `feature-${ISSUE_ID.toLowerCase()}`);
+  mkdirSync(WORKSPACE_PATH, { recursive: true });
 });
 
 afterEach(() => {
-  rmSync(TEST_DIR, { recursive: true, force: true });
+  rmSync(PROJECT_ROOT, { recursive: true, force: true });
 });
 
 describe('extractAcceptanceCriteria', () => {
   it('returns empty array when no plan exists', () => {
-    expect(extractAcceptanceCriteria(TEST_DIR)).toEqual([]);
+    expect(extractAcceptanceCriteriaSync(WORKSPACE_PATH)).toEqual([]);
   });
 
   it('returns empty array when plan has no subItems', () => {
     const doc = makePlanWithAC([{ id: 'item-1', title: 'Task 1' }]);
-    writePlan(TEST_DIR, doc);
-    expect(extractAcceptanceCriteria(TEST_DIR)).toEqual([]);
+    writePlan(doc);
+    expect(extractAcceptanceCriteriaSync(WORKSPACE_PATH)).toEqual([]);
   });
 
   it('extracts AC subItems with parent context', () => {
@@ -74,9 +81,9 @@ describe('extractAcceptanceCriteria', () => {
         { id: 'item-1.ac2', title: 'Tests pass' },
       ],
     }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = extractAcceptanceCriteria(TEST_DIR);
+    const result = extractAcceptanceCriteriaSync(WORKSPACE_PATH);
     expect(result).toHaveLength(2);
     expect(result[0]).toEqual({
       itemId: 'item-1',
@@ -96,11 +103,33 @@ describe('extractAcceptanceCriteria', () => {
         { id: 'item-1.note', title: 'Just a note', kind: 'note' },
       ],
     }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = extractAcceptanceCriteria(TEST_DIR);
+    const result = extractAcceptanceCriteriaSync(WORKSPACE_PATH);
     expect(result).toHaveLength(1);
     expect(result[0].title).toBe('AC item');
+  });
+
+  it('skips acceptance criteria from deferred items', () => {
+    const doc = makePlanWithAC([
+      {
+        id: 'active-item',
+        title: 'Active task',
+        subItems: [{ id: 'active-item.ac1', title: 'Active AC' }],
+      },
+      {
+        id: 'deferred-item',
+        title: 'Deferred task',
+        status: 'deferred',
+        metadata: { deferred: true },
+        subItems: [{ id: 'deferred-item.ac1', title: 'Deferred AC' }],
+      },
+    ]);
+    writePlan(doc);
+
+    const result = extractAcceptanceCriteriaSync(WORKSPACE_PATH);
+    expect(result).toHaveLength(1);
+    expect(result[0].itemId).toBe('active-item');
   });
 
   it('extracts AC from multiple items', () => {
@@ -116,9 +145,9 @@ describe('extractAcceptanceCriteria', () => {
         subItems: [{ id: 'item-2.ac1', title: 'Criterion B' }],
       },
     ]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = extractAcceptanceCriteria(TEST_DIR);
+    const result = extractAcceptanceCriteriaSync(WORKSPACE_PATH);
     expect(result).toHaveLength(2);
     expect(result[0].itemTitle).toBe('First task');
     expect(result[1].itemTitle).toBe('Second task');
@@ -174,7 +203,7 @@ describe('formatAcceptanceCriteria', () => {
 
 describe('checkAllCriteriaCompleted', () => {
   it('returns allCompleted=true when no plan exists (legacy compat)', () => {
-    const result = checkAllCriteriaCompleted(TEST_DIR);
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
     expect(result.allCompleted).toBe(true);
     expect(result.incomplete).toEqual([]);
   });
@@ -188,9 +217,9 @@ describe('checkAllCriteriaCompleted', () => {
         { id: 'item-1.ac2', title: 'Also done', status: 'completed' },
       ],
     }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = checkAllCriteriaCompleted(TEST_DIR);
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
     expect(result.allCompleted).toBe(true);
     expect(result.incomplete).toEqual([]);
   });
@@ -204,9 +233,9 @@ describe('checkAllCriteriaCompleted', () => {
         { id: 'item-1.ac2', title: 'Not done', status: 'pending' },
       ],
     }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = checkAllCriteriaCompleted(TEST_DIR);
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
     expect(result.allCompleted).toBe(false);
     expect(result.incomplete).toHaveLength(1);
     expect(result.incomplete[0].title).toBe('Not done');
@@ -221,17 +250,34 @@ describe('checkAllCriteriaCompleted', () => {
         { id: 'item-1.ac2', title: 'Cancelled', status: 'cancelled' },
       ],
     }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = checkAllCriteriaCompleted(TEST_DIR);
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
     expect(result.allCompleted).toBe(true);
+  });
+
+  it('does not block completion on deferred item acceptance criteria', () => {
+    const doc = makePlanWithAC([{
+      id: 'deferred-item',
+      title: 'Deferred task',
+      status: 'deferred',
+      metadata: { deferred: true },
+      subItems: [
+        { id: 'deferred-item.ac1', title: 'Deferred and not done', status: 'pending' },
+      ],
+    }]);
+    writePlan(doc);
+
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
+    expect(result.allCompleted).toBe(true);
+    expect(result.incomplete).toEqual([]);
   });
 
   it('returns allCompleted=true when items have no AC subItems', () => {
     const doc = makePlanWithAC([{ id: 'item-1', title: 'Task' }]);
-    writePlan(TEST_DIR, doc);
+    writePlan(doc);
 
-    const result = checkAllCriteriaCompleted(TEST_DIR);
+    const result = checkAllCriteriaCompletedSync(WORKSPACE_PATH);
     expect(result.allCompleted).toBe(true);
   });
 });

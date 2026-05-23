@@ -67,6 +67,10 @@ export interface VBriefItem {
     difficulty?: VBriefDifficulty;
     issueLabel?: string;
     phase?: number;
+    /** Files/globs this item touches. Used for file-overlap enforcement during parallel dispatch. */
+    files_scope?: string[];
+    /** True when this item has >1 blocking parent (DAG convergence point). Auto-derived by planner. */
+    requiresSynthesis?: boolean;
     [key: string]: unknown;
   };
   narrative?: {
@@ -98,6 +102,11 @@ export interface VBriefPlan {
   /** ISO 8601 datetime, updated on every write */
   updated?: string;
   tags?: string[];
+  autoDecisions?: Array<{
+    summary: string;
+    rationale?: string;
+    [key: string]: unknown;
+  }>;
   narratives?: {
     Problem?: string;
     Proposal?: string;
@@ -106,9 +115,22 @@ export interface VBriefPlan {
     Alternative?: string;
     [key: string]: string | undefined;
   };
+  /**
+   * Panopticon-specific plan metadata. Free-form per-key storage for
+   * lifecycle bookkeeping (e.g. canonicalFilename for the issue-keyed
+   * filename convention).
+   */
+  metadata?: {
+    /** Issue-keyed filename used in `./vbrief/<lifecycle>/`. Set by plan-finalize. */
+    canonicalFilename?: string;
+    [key: string]: unknown;
+  };
   items: VBriefItem[];
   edges: VBriefEdge[];
 }
+
+export const VBRIEF_INSPECTION_POLICIES = ['auto', 'never', 'fast', 'deep'] as const;
+export type VBriefInspectionPolicy = typeof VBRIEF_INSPECTION_POLICIES[number];
 
 export interface VBriefDocument {
   vBRIEFInfo: {
@@ -121,6 +143,8 @@ export interface VBriefDocument {
     author?: string;
     /** Human-readable description of the plan */
     description?: string;
+    /** Panopticon inspection routing policy. Defaults to auto when omitted. */
+    inspectionPolicy?: VBriefInspectionPolicy;
   };
   plan: VBriefPlan;
 }

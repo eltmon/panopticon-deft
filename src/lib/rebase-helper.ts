@@ -7,8 +7,9 @@
  * submit as a multi-step task that they sometimes drop partway.
  *
  * Conflict handling:
- *   - `.planning/*` files: auto-resolved with `--ours` (local plan state wins
+ *   - `.pan/*` files: auto-resolved with `--ours` (local workspace state wins
  *     since these are workspace-local artifacts, never shared in main).
+ *   - Legacy `.planning/*` files are treated the same during transition.
  *   - Any other conflicts: abort rebase, surface error, agent resolves manually.
  */
 
@@ -16,6 +17,7 @@ import { exec } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { Data, Effect } from 'effect';
 import { MergeSet } from './merge-set.js';
 
 const execAsync = promisify(exec);
@@ -31,12 +33,7 @@ export interface RebaseAllResult {
   success: boolean;
   results: RebaseResult[];
   firstFailure?: RebaseResult;
-}
-
-/**
- * Rebase every repo in the merge set onto its target branch and push.
- */
-export async function rebaseAndPushRepos(
+}async function rebaseAndPushReposPromise(
   workspacePath: string,
   mergeSet: MergeSet
 ): Promise<RebaseAllResult> {
@@ -108,19 +105,35 @@ async function rebaseOneRepo(
 
       if (!resolution.resolved) {
         await execAsync('git rebase --abort', { cwd: repoPath }).catch(() => {});
+
+        // Fallback: try merge instead of rebase for non-planning conflicts.
+        // Rebasing large branches (many commits) across file conflicts is painful;
+        // a single merge commit is acceptable and far safer.
         if (resolution.remainingConflicts.length > 0) {
+          try {
+            await execAsync(`git merge origin/${targetBranch}`, {
+              cwd: repoPath,
+              encoding: 'utf-8',
+              timeout: 120000,
+            });
+            // Merge succeeded — continue to push below.
+            alreadyRebased = false; // mark as needing push
+          } catch (mergeErr: any) {
+            await execAsync('git merge --abort', { cwd: repoPath }).catch(() => {});
+            return {
+              repoKey,
+              outcome: 'conflict',
+              message: `Merge conflicts: ${resolution.remainingConflicts.join(', ')}`,
+              conflictFiles: resolution.remainingConflicts,
+            };
+          }
+        } else {
           return {
             repoKey,
-            outcome: 'conflict',
-            message: `Rebase conflicts in non-planning files: ${resolution.remainingConflicts.join(', ')}`,
-            conflictFiles: resolution.remainingConflicts,
+            outcome: 'error',
+            message: `Rebase failed: ${rebaseErr.message?.trim() || rebaseErr.message}`,
           };
         }
-        return {
-          repoKey,
-          outcome: 'error',
-          message: `Rebase failed: ${rebaseErr.message?.trim() || rebaseErr.message}`,
-        };
       }
     }
   }
@@ -140,9 +153,10 @@ async function rebaseOneRepo(
 }
 
 /**
- * Auto-resolve rebase conflicts if they are limited to `.planning/*` files.
- * Uses `--ours` (local wins) — planning artifacts are workspace-local and
- * should never collide with upstream main in practice.
+ * Auto-resolve rebase conflicts if they are limited to workspace-local
+ * orchestration artifacts in `.pan/*` or legacy `.planning/*`.
+ * Uses `--ours` (local wins) because these files should never collide with
+ * upstream main in practice.
  */
 async function tryResolvePlanningConflicts(
   repoPath: string
@@ -163,7 +177,9 @@ async function tryResolvePlanningConflicts(
       return { resolved: false, remainingConflicts: [] };
     }
 
-    const nonPlanningConflicts = conflictFiles.filter(f => !f.startsWith('.planning/'));
+    const nonPlanningConflicts = conflictFiles.filter(
+      f => !f.startsWith('.pan/') && !f.startsWith('.planning/'),
+    );
     if (nonPlanningConflicts.length > 0) {
       return { resolved: false, remainingConflicts: nonPlanningConflicts };
     }
@@ -185,3 +201,35 @@ async function tryResolvePlanningConflicts(
     return { resolved: false, remainingConflicts: ['(error checking rebase status)'] };
   }
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variant of the rebase helper. The Promise-returning
+// API is preserved for existing callers; new Effect-based callers can compose
+// `rebaseAndPushReposProgram` directly without round-tripping through
+// `Effect.runPromise`.
+
+/** Tagged error for rebase-helper Effect variants. */
+export class RebaseError extends Data.TaggedError('RebaseError')<{
+  readonly workspacePath: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `rebaseAndPushRepos`. Failure shape never throws — the
+ *  result's `success: false` carries the failed-repo details. The Effect
+ *  channel surfaces unexpected exceptions only. */
+export const rebaseAndPushRepos = (
+  workspacePath: string,
+  mergeSet: MergeSet,
+): Effect.Effect<RebaseAllResult, RebaseError> =>
+  Effect.tryPromise({
+    try: () => rebaseAndPushReposPromise(workspacePath, mergeSet),
+    catch: (cause) =>
+      new RebaseError({
+        workspacePath,
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+

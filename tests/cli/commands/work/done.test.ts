@@ -10,6 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Effect } from 'effect';
 import { mkdtempSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -26,31 +27,56 @@ const mockEnsureMergeSetForIssue = vi.fn().mockReturnValue(null);
 const mockRebaseAndPushRepos = vi.fn();
 const mockCreateReviewArtifactsForIssue = vi.fn().mockResolvedValue({ artifacts: [], mergeSet: null });
 const mockSetReviewStatus = vi.fn();
+const mockGetReviewStatus = vi.fn().mockReturnValue(null);
 const mockGetDashboardApiUrl = vi.fn().mockReturnValue('http://localhost:3000');
 const mockGetVBriefACStatus = vi.fn().mockReturnValue(null);
 
+// execFile mock delegates to mockExecFn so tests that only set up exec
+// implementations also cover the bd list calls done-preflight makes via execFile.
+const mockExecFileFn = vi.fn((...args: any[]) => {
+  const lastArg = args[args.length - 1];
+  const callback = typeof lastArg === 'function' ? lastArg : undefined;
+  const file = args[0];
+  const cmdArgs = Array.isArray(args[1]) ? args[1] : [];
+  const cmd = [file, ...cmdArgs].join(' ');
+  if (callback) {
+    return mockExecFn(cmd, {}, callback);
+  }
+  return Promise.resolve({ stdout: '', stderr: '' });
+});
+
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
-  return { ...actual, exec: mockExecFn };
+  return { ...actual, exec: mockExecFn, execFile: mockExecFileFn };
 });
 
 vi.mock('../../../../src/lib/agents.js', () => ({
   getAgentState: mockGetAgentState,
+  getAgentStateSync: mockGetAgentState,
   saveAgentState: mockSaveAgentState,
+  saveAgentStateSync: mockSaveAgentState,
   saveAgentRuntimeState: mockSaveAgentRuntimeState,
+  saveAgentRuntimeStateSync: mockSaveAgentRuntimeState,
 }));
 
 vi.mock('../../../../src/lib/shadow-mode.js', () => ({
-  shouldSkipTrackerUpdate: mockShouldSkipTrackerUpdate,
+  shouldSkipTrackerUpdate: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve(mockShouldSkipTrackerUpdate(...args)),
+    catch: (cause) => cause as any,
+  }),
 }));
 
 vi.mock('../../../../src/lib/shadow-state.js', () => ({
-  updateShadowState: mockUpdateShadowState,
+  updateShadowState: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve(mockUpdateShadowState(...args)),
+    catch: (cause) => cause as any,
+  }),
   markAsSynced: vi.fn(),
 }));
 
 vi.mock('../../../../src/lib/merge-set.js', () => ({
   ensureMergeSetForIssue: mockEnsureMergeSetForIssue,
+  ensureMergeSetForIssueSync: mockEnsureMergeSetForIssue,
 }));
 
 vi.mock('../../../../src/lib/rebase-helper.js', () => ({
@@ -58,25 +84,32 @@ vi.mock('../../../../src/lib/rebase-helper.js', () => ({
 }));
 
 vi.mock('../../../../src/lib/review-artifacts.js', () => ({
-  createReviewArtifactsForIssue: mockCreateReviewArtifactsForIssue,
+  createReviewArtifactsForIssue: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve(mockCreateReviewArtifactsForIssue(...args)),
+    catch: (cause) => cause as any,
+  }),
 }));
 
 vi.mock('../../../../src/lib/review-status.js', () => ({
   setReviewStatus: mockSetReviewStatus,
-  getReviewStatus: vi.fn().mockReturnValue(null),
+  setReviewStatusSync: mockSetReviewStatus,
+  getReviewStatus: mockGetReviewStatus,
+  getReviewStatusSync: mockGetReviewStatus,
 }));
 
 vi.mock('../../../../src/lib/config.js', () => ({
   getDashboardApiUrl: mockGetDashboardApiUrl,
+  getDashboardApiUrlSync: mockGetDashboardApiUrl,
 }));
 
 vi.mock('../../../../src/lib/shadow-utils.js', () => ({
-  getLinearApiKey: vi.fn().mockReturnValue(null),
+  getLinearApiKey: vi.fn().mockReturnValue(Effect.succeed(null)),
 }));
 
 vi.mock('../../../../src/lib/vbrief/beads.js', () => ({
   getVBriefACStatus: mockGetVBriefACStatus,
-  syncBeadStatusToVBrief: vi.fn().mockReturnValue(null),
+  getVBriefACStatusSync: mockGetVBriefACStatus,
+  syncBeadStatusToVBrief: vi.fn().mockReturnValue(Effect.succeed(null)),
 }));
 
 // Suppress ora spinner output in tests
@@ -87,6 +120,12 @@ vi.mock('ora', () => ({
 }));
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  mockGetReviewStatus.mockReset();
+  mockGetReviewStatus.mockReturnValue(null);
+  mockSetReviewStatus.mockClear();
+});
 
 function makeAgentState(workspace: string) {
   return {
@@ -102,28 +141,28 @@ function makeAgentState(workspace: string) {
 
 describe('resolveIssueId normalization', () => {
   it('converts agent-pan-714 to PAN-714', async () => {
-    const { resolveIssueId } = await import('../../../../src/lib/issue-id.js');
-    expect(resolveIssueId('agent-pan-714')).toBe('PAN-714');
+    const { resolveIssueIdSync } = await import('../../../../src/lib/issue-id.js');
+    expect(resolveIssueIdSync('agent-pan-714')).toBe('PAN-714');
   });
 
   it('converts pan-714 (lowercase) to PAN-714', async () => {
-    const { resolveIssueId } = await import('../../../../src/lib/issue-id.js');
-    expect(resolveIssueId('pan-714')).toBe('PAN-714');
+    const { resolveIssueIdSync } = await import('../../../../src/lib/issue-id.js');
+    expect(resolveIssueIdSync('pan-714')).toBe('PAN-714');
   });
 
   it('preserves already-normalized PAN-714', async () => {
-    const { resolveIssueId } = await import('../../../../src/lib/issue-id.js');
-    expect(resolveIssueId('PAN-714')).toBe('PAN-714');
+    const { resolveIssueIdSync } = await import('../../../../src/lib/issue-id.js');
+    expect(resolveIssueIdSync('PAN-714')).toBe('PAN-714');
   });
 
   it('strips agent- prefix case-insensitively', async () => {
-    const { resolveIssueId } = await import('../../../../src/lib/issue-id.js');
-    expect(resolveIssueId('AGENT-MIN-42')).toBe('MIN-42');
+    const { resolveIssueIdSync } = await import('../../../../src/lib/issue-id.js');
+    expect(resolveIssueIdSync('AGENT-MIN-42')).toBe('MIN-42');
   });
 
   it('uppercases the result regardless of input case', async () => {
-    const { resolveIssueId } = await import('../../../../src/lib/issue-id.js');
-    expect(resolveIssueId('min-42')).toBe('MIN-42');
+    const { resolveIssueIdSync } = await import('../../../../src/lib/issue-id.js');
+    expect(resolveIssueIdSync('min-42')).toBe('MIN-42');
   });
 });
 
@@ -169,6 +208,9 @@ describe('doneCommand --force bypass', () => {
   it('does NOT call process.exit(1) from pre-flight when --force is set', async () => {
     // With force, pre-flight is bypassed entirely — bd list is never called
     mockGetAgentState.mockReturnValue(makeAgentState(tempDir));
+    mockExecFn.mockImplementation((_cmd: string, _opts: unknown, cb: Function) => {
+      cb(null, { stdout: '', stderr: '' });
+    });
     mockShouldSkipTrackerUpdate.mockResolvedValue(true);
     mockUpdateShadowState.mockResolvedValue(undefined);
 
@@ -265,6 +307,37 @@ describe('doneCommand dashboard-unreachable graceful path', () => {
     // Should not throw — dashboard unreachable is handled gracefully
     await expect(doneCommand('PAN-714', { force: true })).resolves.not.toThrow();
   });
+
+  it('does not skip review when stored merged status is stale', async () => {
+    mockGetAgentState.mockReturnValue(makeAgentState(tempDir));
+    mockExecFn.mockImplementation((cmd: string, _opts: unknown, cb: Function) => {
+      if (cmd.includes('git merge-base --is-ancestor')) {
+        cb(new Error('not merged'), '', '');
+      } else {
+        cb(null, { stdout: '', stderr: '' });
+      }
+    });
+    mockShouldSkipTrackerUpdate.mockResolvedValue(true);
+    mockUpdateShadowState.mockResolvedValue(undefined);
+    mockGetReviewStatus.mockReturnValue({ mergeStatus: 'merged' });
+    mockCreateReviewArtifactsForIssue.mockResolvedValue({
+      artifacts: [{ skipped: false, url: 'https://example.test/pr/714' }],
+      mergeSet: {
+        workspaceType: 'monorepo',
+        repos: [{ repoKey: 'panopticon-cli', targetBranch: 'main' }],
+      },
+    });
+    mockGetDashboardApiUrl.mockReturnValue('http://localhost:19999');
+
+    const { doneCommand } = await import('../../../../src/cli/commands/done.js');
+    await doneCommand('PAN-714', { force: true });
+
+    expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-714', expect.objectContaining({
+      reviewStatus: 'pending',
+      testStatus: 'pending',
+      mergeStatus: 'pending',
+    }));
+  });
 });
 
 describe('doneCommand preflight failure paths', () => {
@@ -339,12 +412,12 @@ describe('doneCommand preflight failure paths', () => {
     expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
-  it('does NOT exit(1) when only .planning/plan.vbrief.json is dirty (stale from prior run)', async () => {
+  it('does NOT exit(1) when only .pan/spec.vbrief.json is dirty (stale from prior run)', async () => {
     mockGetAgentState.mockReturnValue(makeAgentState(tempDir));
     mockShouldSkipTrackerUpdate.mockResolvedValue(true);
     mockUpdateShadowState.mockResolvedValue(undefined);
 
-    // Simulate stale plan.vbrief.json: dirty before the pre-preflight commit fires,
+    // Simulate stale spec.vbrief.json: dirty before the pre-preflight commit fires,
     // clean afterward (all other git status checks pass).
     let planCommitted = false;
     const capturedCmds: string[] = [];
@@ -353,11 +426,11 @@ describe('doneCommand preflight failure paths', () => {
       if (cmd.includes('bd list')) {
         cb(null, { stdout: '[]', stderr: '' });
       } else if (
-        cmd.includes('git status --porcelain .planning/plan.vbrief.json') &&
+        cmd.includes('git status --porcelain .pan/') &&
         !planCommitted
       ) {
         // First check: stale file from prior run
-        cb(null, { stdout: ' M .planning/plan.vbrief.json\n', stderr: '' });
+        cb(null, { stdout: ' M .pan/spec.vbrief.json\n', stderr: '' });
       } else if (cmd.includes('git commit')) {
         planCommitted = true;
         cb(null, { stdout: '', stderr: '' });
@@ -370,13 +443,13 @@ describe('doneCommand preflight failure paths', () => {
     const { doneCommand } = await import('../../../../src/cli/commands/done.js');
     await doneCommand('PAN-714');
 
-    // Pre-flight must NOT block on the stale plan.vbrief.json
+    // Pre-flight must NOT block on the stale spec.vbrief.json
     expect(exitSpy).not.toHaveBeenCalledWith(1);
     // The stale file must have been committed before preflight ran
     expect(capturedCmds.some((c) => c.includes('git commit'))).toBe(true);
   });
 
-  it('does NOT exit(1) when stale .planning/STATE.md is dirty (other managed planning artifact)', async () => {
+  it('does NOT exit(1) when stale .pan/continue.json is dirty (other managed planning artifact)', async () => {
     mockGetAgentState.mockReturnValue(makeAgentState(tempDir));
     mockShouldSkipTrackerUpdate.mockResolvedValue(true);
     mockUpdateShadowState.mockResolvedValue(undefined);
@@ -388,11 +461,11 @@ describe('doneCommand preflight failure paths', () => {
       if (cmd.includes('bd list')) {
         cb(null, { stdout: '[]', stderr: '' });
       } else if (
-        cmd.includes('git status --porcelain .planning/') &&
+        cmd.includes('git status --porcelain .pan/') &&
         !planningCommitted
       ) {
-        // Stale STATE.md from a prior interrupted run
-        cb(null, { stdout: ' M .planning/STATE.md\n', stderr: '' });
+        // Stale continue.json from a prior interrupted run
+        cb(null, { stdout: ' M .pan/continue.json\n', stderr: '' });
       } else if (cmd.includes('git commit')) {
         planningCommitted = true;
         cb(null, { stdout: '', stderr: '' });

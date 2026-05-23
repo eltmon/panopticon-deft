@@ -19,7 +19,7 @@ services:
       - devnet
       - panopticon
 
-  # Init service: runs npm install + server build once for all workspaces
+  # Init service: runs bun install + server build once for all workspaces
   # Frontend and server depend on this completing successfully
   init:
     build:
@@ -27,16 +27,22 @@ services:
       dockerfile: Dockerfile
     user: node
     working_dir: /workspaces/panopticon
+    environment:
+      - NODE_ENV=development
+      - HUSKY=0
+      - PANOPTICON_SKIP_NATIVE_POSTINSTALL=1
     command: >
       sh -c "
-        echo 'Installing dependencies...' ;
-        bun install ;
+        echo 'Installing dependencies...' &&
+        # PAN-1169: --filter leaves top-level node_modules un-hoisted on this named volume.
+        bun install &&
         echo 'Rebuilding native Node.js addons...' &&
         npm rebuild better-sqlite3 2>&1 &&
         echo 'Building contracts...' &&
         cd packages/contracts && bun run build 2>&1 && cd ../.. &&
         echo 'Building dashboard server...' &&
-        npm run build:dashboard:server &&
+        # PAN-1169: fail init if externalized imports stay unresolved; this grep guard is intentional and must not be removed as noisy build output.
+        npm run build:dashboard:server > /tmp/dashboard-build.log 2>&1; build_status=$$?; cat /tmp/dashboard-build.log; if [ "$$build_status" -ne 0 ]; then exit "$$build_status"; fi; if grep -q 'UNRESOLVED_IMPORT' /tmp/dashboard-build.log; then echo 'ERROR: dashboard build emitted UNRESOLVED_IMPORT warnings — top-level node_modules is incomplete (see PAN-1169).' >&2; exit 1; fi &&
         echo 'Init complete'
       "
     volumes:
@@ -108,13 +114,22 @@ services:
       - bun-store:/root/.bun/install/cache
       # Shadow root node_modules only — Bun hoists all deps here
       - container-node-modules:/workspaces/panopticon/node_modules
-      # Mount required host paths for workspace/agent management
+      # Mount required host paths for workspace/agent management.
+      # NOTE: Do NOT mount ${HOME}/.panopticon into workspace containers — the container's
+      # dashboard server would run its own Deacon patrol against shared host agent state
+      # using a different tmux server, marking every host agent as "orphaned" and racing
+      # auto-resume against the host. (Bug originally observed in PAN-821 loop on
+      # 2026-04-25; recurred in PAN-698 on 2026-05-12 because the template never
+      # inherited the host's fix.) PANOPTICON_DISABLE_DEACON below is belt-and-suspenders
+      # in case someone re-adds the mount.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${HOME}/.panopticon:/home/node/.panopticon
       - {{PROJECTS_DIR}}:{{PROJECTS_DIR}}:ro
     environment:
       - NODE_ENV=development
       - PORT=3011
+      # Single-deacon invariant: see .claude/rules/single-deacon-invariant.md.
+      # The host's `pan up` owns agent lifecycle; container dashboard runs as a read/UI peer only.
+      - PANOPTICON_DISABLE_DEACON=1
       - LINEAR_API_KEY=${LINEAR_API_KEY}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
     networks:

@@ -13,7 +13,7 @@ import {
   INITIAL_READ_MODEL_STATE,
   ReadModelState,
 } from '../../packages/contracts/src/event-reducers.js'
-import type { AgentSnapshot, SpecialistSnapshot, DashboardSnapshot } from '../../packages/contracts/src/index.js'
+import type { AgentSnapshot, DashboardSnapshot } from '../../packages/contracts/src/index.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -36,13 +36,6 @@ const baseAgent: AgentSnapshot = {
   model: 'claude-opus-4-6',
 }
 
-const baseSpecialist: SpecialistSnapshot = {
-  name: 'review-agent',
-  type: 'review-agent',
-  state: 'sleeping',
-  isRunning: false,
-}
-
 // ─── INITIAL_READ_MODEL_STATE ────────────────────────────────────────────────
 
 describe('INITIAL_READ_MODEL_STATE', () => {
@@ -52,12 +45,16 @@ describe('INITIAL_READ_MODEL_STATE', () => {
 
   it('starts with empty collections', () => {
     expect(INITIAL_READ_MODEL_STATE.agentsById).toEqual({})
-    expect(INITIAL_READ_MODEL_STATE.specialistsByName).toEqual({})
     expect(INITIAL_READ_MODEL_STATE.reviewStatusByIssueId).toEqual({})
     expect(INITIAL_READ_MODEL_STATE.agentOutputById).toEqual({})
     expect(INITIAL_READ_MODEL_STATE.issuesRaw).toEqual([])
     expect(INITIAL_READ_MODEL_STATE.recentActivity).toEqual([])
     expect(INITIAL_READ_MODEL_STATE.shadowInferenceByIssueId).toEqual({})
+    expect(INITIAL_READ_MODEL_STATE.observationsByIssueId).toEqual({})
+    expect(INITIAL_READ_MODEL_STATE.statusByIssueId).toEqual({})
+    expect(INITIAL_READ_MODEL_STATE.rollupsByIssueId).toEqual({})
+    expect(INITIAL_READ_MODEL_STATE.resetMarkersByScopeId).toEqual({})
+    expect(INITIAL_READ_MODEL_STATE.healthByIssueId).toEqual({})
     expect(INITIAL_READ_MODEL_STATE.resources).toBeNull()
   })
 })
@@ -70,7 +67,9 @@ describe('syncSnapshot', () => {
   const snapshot: DashboardSnapshot = {
     sequence: 10,
     agents: [baseAgent],
-    specialists: [baseSpecialist],
+    // PAN-1048 — specialists projection retired; snapshot field kept on the
+    // wire for back-compat but the reducer no longer materializes it.
+    specialists: [],
     reviewStatuses: [],
     resources: { cpu: 30, memPercent: 50, memUsed: 1000, memTotal: 2000 },
     timestamp: new Date().toISOString(),
@@ -79,11 +78,6 @@ describe('syncSnapshot', () => {
   it('populates agentsById keyed by agent id', () => {
     const state = syncSnapshot(makeState(), snapshot)
     expect(state.agentsById['agent-1']).toEqual(baseAgent)
-  })
-
-  it('populates specialistsByName keyed by name', () => {
-    const state = syncSnapshot(makeState(), snapshot)
-    expect(state.specialistsByName['review-agent']).toEqual(baseSpecialist)
   })
 
   it('sets sequence from snapshot', () => {
@@ -102,11 +96,64 @@ describe('syncSnapshot', () => {
     expect(state.issuesRaw).toHaveLength(2)
   })
 
+  it('hydrates conversation progress fields from snapshot', () => {
+    const state = syncSnapshot(makeState(), {
+      ...snapshot,
+      scanProgress: {
+        active: true,
+        mode: 'system',
+        dirs: [],
+        dirsProcessed: 1,
+        dirsTotal: 2,
+        sessionsFound: 3,
+        elapsedMs: 4,
+        inserted: 5,
+        updated: 6,
+        skipped: 7,
+        errors: 8,
+        durationMs: 9,
+      },
+      enrichStats: { processed: 1, totalCost: 0.02, failures: 0, durationMs: 10 },
+      enrichProgressBySessionId: {
+        42: { sessionId: 42, level: 2, model: 'claude-sonnet-4-6', cost: 0.01, success: true, timestamp: ts() },
+      },
+      embedProgressBySessionId: {
+        42: { sessionId: 42, model: 'text-embedding-3-small', success: true, timestamp: ts() },
+      },
+    })
+
+    expect(state.scanProgress?.sessionsFound).toBe(3)
+    expect(state.enrichStats?.processed).toBe(1)
+    expect(state.enrichProgressBySessionId[42]?.level).toBe(2)
+    expect(state.embedProgressBySessionId[42]?.success).toBe(true)
+  })
+
   it('preserves existing issuesRaw when snapshot has no issues field', () => {
     const existing = makeState({ issuesRaw: [{ id: 'OLD' }] as unknown[] })
     const state = syncSnapshot(existing, snapshot)
     expect(state.issuesRaw).toHaveLength(1)
     expect((state.issuesRaw[0] as any).id).toBe('OLD')
+  })
+
+  it('hydrates memory state from snapshot', () => {
+    const state = syncSnapshot(makeState(), {
+      ...snapshot,
+      memory: {
+        observationsByIssueId: { 'PAN-1': [] },
+        healthByIssueId: {
+          'PAN-1': {
+            projectId: 'panopticon-cli',
+            issueId: 'PAN-1',
+            status: 'healthy',
+            reason: null,
+            updatedAt: ts(),
+          },
+        },
+      },
+    })
+
+    expect(state.observationsByIssueId['PAN-1']).toEqual([])
+    expect(state.healthByIssueId['PAN-1']?.status).toBe('healthy')
   })
 })
 
@@ -182,6 +229,24 @@ describe('applyEvent — agent.stopped', () => {
     expect(next.agentsById['agent-2']).toEqual(agent2)
     expect(Object.keys(next.agentsById)).toHaveLength(1)
   })
+
+  it('drops stored turn diff summaries for the stopped agent', () => {
+    const state = makeState({
+      agentsById: { 'agent-1': baseAgent },
+      turnDiffSummariesByAgentId: {
+        'agent-1': [{ turnId: 'turn-1', completedAt: ts(), files: [] }],
+        'agent-2': [{ turnId: 'turn-2', completedAt: ts(), files: [] }],
+      },
+    })
+    const next = applyEvent(state, {
+      type: 'agent.stopped',
+      sequence: 4,
+      timestamp: ts(),
+      payload: { agentId: 'agent-1', issueId: 'PAN-1' },
+    })
+    expect(next.turnDiffSummariesByAgentId['agent-1']).toBeUndefined()
+    expect(next.turnDiffSummariesByAgentId['agent-2']).toEqual(state.turnDiffSummariesByAgentId['agent-2'])
+  })
 })
 
 describe('applyEvent — agent.status_changed', () => {
@@ -216,6 +281,48 @@ describe('applyEvent — agent.status_changed', () => {
       payload: { agentId: 'unknown', status: 'stopped' },
     })
     expect(next.sequence).toBe(5)
+  })
+
+  it('drops stored turn diff summaries when the agent enters a terminal status', () => {
+    const state = makeState({
+      agentsById: { 'agent-1': baseAgent },
+      turnDiffSummariesByAgentId: {
+        'agent-1': [{ turnId: 'turn-1', completedAt: ts(), files: [] }],
+      },
+    })
+    const next = applyEvent(state, {
+      type: 'agent.status_changed',
+      sequence: 5,
+      timestamp: ts(),
+      payload: { agentId: 'agent-1', status: 'stopped' },
+    })
+    expect(next.turnDiffSummariesByAgentId['agent-1']).toBeUndefined()
+  })
+})
+
+describe('applyEvent — agent.turn_diff_completed', () => {
+  it('retains only the latest 200 summaries per agent', () => {
+    const existing = Array.from({ length: 200 }, (_, index) => ({
+      turnId: `turn-${index + 1}`,
+      completedAt: `2026-05-08T05:${String(index).padStart(2, '0')}:00.000Z`,
+      files: [{ path: `src/file-${index + 1}.ts`, additions: 1, deletions: 0 }],
+    }))
+    const state = makeState({ turnDiffSummariesByAgentId: { 'agent-1': existing } })
+    const next = applyEvent(state, {
+      type: 'agent.turn_diff_completed',
+      sequence: 6,
+      timestamp: ts(),
+      payload: {
+        agentId: 'agent-1',
+        turnId: 'turn-201',
+        completedAt: '2026-05-08T09:21:00.000Z',
+        files: [{ path: 'src/file-201.ts', additions: 3, deletions: 1 }],
+      },
+    })
+
+    expect(next.turnDiffSummariesByAgentId['agent-1']).toHaveLength(200)
+    expect(next.turnDiffSummariesByAgentId['agent-1']?.[0]?.turnId).toBe('turn-2')
+    expect(next.turnDiffSummariesByAgentId['agent-1']?.at(-1)?.turnId).toBe('turn-201')
   })
 })
 
@@ -258,61 +365,45 @@ describe('applyEvent — agent.output_received', () => {
   })
 })
 
-// ─── applyEvent — specialist events ─────────────────────────────────────────
+// ─── applyEvent — specialist events (sequence-only no-ops post PAN-1048) ────
+// The specialistsByName projection has been retired. Specialist lifecycle is
+// now visible via agent.started / agent.stopped + role-filtered agentsById.
+// Specialist events still flow over the wire so older clients don't crash, but
+// the reducer only advances the sequence number.
 
-describe('applyEvent — specialist.started', () => {
-  it('adds specialist to specialistsByName', () => {
-    const specialist: SpecialistSnapshot = { ...baseSpecialist, state: 'active', isRunning: true }
-    const state = applyEvent(makeState(), {
+describe('applyEvent — specialist.* events (post PAN-1048)', () => {
+  it('only advances sequence for specialist.started', () => {
+    const state = makeState({ sequence: 0 })
+    const next = applyEvent(state, {
       type: 'specialist.started',
       sequence: 10,
       timestamp: ts(),
-      payload: { specialist },
-    })
-    expect(state.specialistsByName['review-agent']).toEqual(specialist)
-  })
-})
-
-describe('applyEvent — specialist.completed', () => {
-  it('sets state to sleeping and isRunning to false', () => {
-    const activeSpec: SpecialistSnapshot = { ...baseSpecialist, state: 'active', isRunning: true, currentIssue: 'PAN-1' }
-    const state = makeState({ specialistsByName: { 'review-agent': activeSpec } })
-    const next = applyEvent(state, {
-      type: 'specialist.completed',
-      sequence: 11,
-      timestamp: ts(),
-      payload: { name: 'review-agent', issueId: 'PAN-1' },
-    })
-    expect(next.specialistsByName['review-agent']!.state).toBe('sleeping')
-    expect(next.specialistsByName['review-agent']!.isRunning).toBe(false)
-    expect(next.specialistsByName['review-agent']!.currentIssue).toBeUndefined()
+      payload: { name: 'review', state: 'active', isRunning: true },
+    } as any)
+    expect(next.sequence).toBe(10)
+    expect(next.agentsById).toBe(state.agentsById)
   })
 
-  it('updates sequence even when specialist not found', () => {
+  it('only advances sequence for specialist.completed', () => {
     const state = makeState({ sequence: 0 })
     const next = applyEvent(state, {
       type: 'specialist.completed',
       sequence: 11,
       timestamp: ts(),
-      payload: { name: 'unknown', issueId: 'PAN-1' },
-    })
+      payload: { name: 'review', issueId: 'PAN-1' },
+    } as any)
     expect(next.sequence).toBe(11)
-    expect(next.specialistsByName).toBe(state.specialistsByName)
   })
-})
 
-describe('applyEvent — specialist.failed', () => {
-  it('sets state to sleeping and isRunning to false', () => {
-    const activeSpec: SpecialistSnapshot = { ...baseSpecialist, state: 'active', isRunning: true }
-    const state = makeState({ specialistsByName: { 'review-agent': activeSpec } })
+  it('only advances sequence for specialist.failed', () => {
+    const state = makeState({ sequence: 0 })
     const next = applyEvent(state, {
       type: 'specialist.failed',
       sequence: 12,
       timestamp: ts(),
-      payload: { name: 'review-agent', issueId: 'PAN-1', reason: 'timeout' },
-    })
-    expect(next.specialistsByName['review-agent']!.state).toBe('sleeping')
-    expect(next.specialistsByName['review-agent']!.isRunning).toBe(false)
+      payload: { name: 'review', issueId: 'PAN-1', error: 'timeout' },
+    } as any)
+    expect(next.sequence).toBe(12)
   })
 })
 
@@ -647,6 +738,25 @@ describe('applyEvent — workspace.deleted', () => {
     expect((next.issuesRaw[0] as any).canonicalStatus).toBe('todo')
     expect((next.issuesRaw[0] as any).state).toBe('todo')
   })
+
+  it('removes stored turn diff summaries for agents in the deleted workspace issue', () => {
+    const agent2: AgentSnapshot = { ...baseAgent, id: 'agent-2', issueId: 'PAN-2' }
+    const state = makeState({
+      agentsById: { 'agent-1': baseAgent, 'agent-2': agent2 },
+      turnDiffSummariesByAgentId: {
+        'agent-1': [{ turnId: 'turn-1', completedAt: ts(), files: [] }],
+        'agent-2': [{ turnId: 'turn-2', completedAt: ts(), files: [] }],
+      },
+    })
+    const next = applyEvent(state, {
+      type: 'workspace.deleted',
+      sequence: 8,
+      timestamp: ts(),
+      payload: { issueId: 'PAN-1' },
+    })
+    expect(next.turnDiffSummariesByAgentId['agent-1']).toBeUndefined()
+    expect(next.turnDiffSummariesByAgentId['agent-2']).toEqual(state.turnDiffSummariesByAgentId['agent-2'])
+  })
 })
 
 describe('applyEvent — workspace.aborted', () => {
@@ -686,5 +796,25 @@ describe('applyEvent — workspace.aborted', () => {
       payload: { issueId: 'PAN-1', sessionName: 'planning-pan-1' },
     })
     expect(next.agentsById).toEqual({})
+  })
+
+  it('removes turn diff summaries for the aborted planning session only', () => {
+    const planningAgent: AgentSnapshot = { ...baseAgent, id: 'planning-pan-1', issueId: 'PAN-1' }
+    const workAgent: AgentSnapshot = { ...baseAgent, id: 'agent-pan-1', issueId: 'PAN-1' }
+    const state = makeState({
+      agentsById: { 'planning-pan-1': planningAgent, 'agent-pan-1': workAgent },
+      turnDiffSummariesByAgentId: {
+        'planning-pan-1': [{ turnId: 'turn-plan', completedAt: ts(), files: [] }],
+        'agent-pan-1': [{ turnId: 'turn-work', completedAt: ts(), files: [] }],
+      },
+    })
+    const next = applyEvent(state, {
+      type: 'workspace.aborted',
+      sequence: 9,
+      timestamp: ts(),
+      payload: { issueId: 'PAN-1', sessionName: 'planning-pan-1' },
+    })
+    expect(next.turnDiffSummariesByAgentId['planning-pan-1']).toBeUndefined()
+    expect(next.turnDiffSummariesByAgentId['agent-pan-1']).toEqual(state.turnDiffSummariesByAgentId['agent-pan-1'])
   })
 })

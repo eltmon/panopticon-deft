@@ -1,0 +1,1397 @@
+import { jsonResponse } from "../http-helpers.js";
+import { buildChildEnvSync } from '../../../lib/child-env.js';
+/**
+ * Command Deck route module — Effect HttpRouter.Layer (PAN-428 B13)
+ *
+ * Implements all /api/command-deck/* endpoints from the Express server:
+ *   GET  /api/command-deck/activity/:issueId
+ *   GET  /api/command-deck/planning/:issueId
+ *   POST /api/command-deck/planning/:issueId/status-review
+ *   POST /api/command-deck/planning/:issueId/upload
+ *   POST /api/command-deck/planning/:issueId/sync-discussions
+ *   POST /api/command-deck/planning/:issueId/init
+ *   GET  /api/command-deck/projects
+ */
+
+import { exec, execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import {
+  access,
+  readFile,
+  readdir,
+  stat,
+  mkdir,
+  writeFile,
+  unlink,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+import { Effect, Layer, Option } from 'effect';
+import { HttpRouter, HttpServerRequest } from 'effect/unstable/http';
+import { EventStoreService } from '../services/domain-services.js';
+import { ReadModelService } from '../read-model.js';
+
+import { getAgentRuntimeState, listRunningAgents } from '../../../lib/agents.js';
+import { detectAwaitingInputForAgent, detectAwaitingInputFromPaneSync, type AwaitingInputDetection } from '../../../lib/agent-input-detection.js';
+import { syncCacheSync, getCostsForIssueSync } from '../../../lib/costs/index.js';
+import { capturePane, listSessionNames } from '../../../lib/tmux.js';
+import { withConcurrencyLimit } from '../../../lib/concurrency.js';
+import type { AgentSnapshot, SessionNodePresence } from '@panctl/contracts';
+import { deriveSessionPresence } from '../services/session-presence.js';
+import { resolveIssueHeadlineCost } from '../services/issue-cost-resolver.js';
+import { getCachedRunningAgents } from '../services/running-agents-cache.js';
+import { findPrdAtStatusSync, type PrdLocation } from '../../../lib/prd-locations.js';
+import { resolveProjectFromIssueSync, listProjectsSync } from '../../../lib/projects.js';
+import { extractPrefixSync, parseIssueIdSync } from '../../../lib/issue-id.js';
+import { loadSettingsApi } from '../../../lib/settings-api.js';
+import { getAgentCommandSync } from '../../../lib/settings.js';
+import { getReviewStatusSync } from '../review-status.js';
+import { getGitHubConfig } from '../services/tracker-config.js';
+import { LinearClient } from '../services/linear-client.js';
+import { IssueDataService } from '../services/issue-data-service.js';
+import { getSharedIssueService } from '../services/issue-service-singleton.js';
+import {
+  getCachedResourceAllocatedIssues,
+  groupResourceAllocatedIssuesByProject,
+  sanitizeResourceAllocatedIssues,
+} from '../services/resource-discovery.js';
+import { httpHandler } from './http-handler.js';
+import { resolveJsonlPath } from './jsonl-resolver.js';
+import { buildReviewerNodes, readSynthesisRounds, type ReviewerRoundMetadata } from './reviewer-tree.js';
+import { PAN_CONTINUE_FILENAME, PAN_DIRNAME } from '../../../lib/pan-dir/types.js';
+import { readWorkspacePlan } from '../../../lib/vbrief/io.js';
+
+const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// ─── Shared IssueDataService (via singleton) ────────────────────────────────
+
+function getIssueDataService(): IssueDataService {
+  return getSharedIssueService();
+}
+
+// ─── Async FS helpers ─────────────────────────────────────────────────────────
+
+/** Returns true if the path exists (any type). */
+async function pathExists(p: string): Promise<boolean> {
+  return access(p).then(() => true, () => false);
+}
+
+/** Read a file or return null if not found. */
+async function readOptional(p: string): Promise<string | null> {
+  return readFile(p, 'utf-8').catch(() => null);
+}
+
+// ─── Local helpers ────────────────────────────────────────────────────────────
+
+/** Cache for resolved project paths to avoid repeated sync FS calls. */
+const projectPathCache = new Map<string, string>();
+const PROJECT_PATH_CACHE_MAX_ENTRIES = 100;
+
+/** TTL cache for closed issues to avoid hammering gh CLI on every poll (~10s).
+ *  Keyed by repo string (owner/repo) so multi-repo setups don't cross-pollute. */
+const closedIssuesCache = new Map<string, { timestamp: number; data: Array<{ number: number; title: string }> }>();
+const CLOSED_ISSUES_TTL_MS = 120_000; // 2 minutes
+
+/** TTL cache for cost data to avoid re-scanning cost events on every 5s poll (PAN-830 review high-4).
+ *  Keyed by upper-cased issueId so concurrent issues don't share stale data. */
+const costCache = new Map<string, { timestamp: number; data: { totalCost: number; costByStage: Record<string, { cost: number; tokens: number }> } }>();
+const COST_CACHE_TTL_MS = 30_000; // 30 seconds
+const stashCountCache = new Map<string, { timestamp: number; count: number }>();
+const STASH_COUNT_CACHE_TTL_MS = 60_000; // 60 seconds
+
+/** Evict expired entries from a TTL cache Map to prevent unbounded growth. */
+function sweepExpired<T extends { timestamp: number }>(cache: Map<string, T>, ttlMs: number): void {
+  const cutoff = Date.now() - ttlMs;
+  for (const [key, entry] of cache) {
+    if (entry.timestamp < cutoff) {
+      cache.delete(key);
+    }
+  }
+}
+
+function setProjectPathCache(issuePrefix: string, path: string): string {
+  if (projectPathCache.has(issuePrefix)) {
+    projectPathCache.delete(issuePrefix);
+  }
+  projectPathCache.set(issuePrefix, path);
+  if (projectPathCache.size > PROJECT_PATH_CACHE_MAX_ENTRIES) {
+    const oldestKey = projectPathCache.keys().next().value;
+    if (oldestKey) {
+      projectPathCache.delete(oldestKey);
+    }
+  }
+  return path;
+}
+
+function getProjectPath(issuePrefix?: string): string {
+  if (!issuePrefix) return join(homedir(), 'Projects');
+
+  const cached = projectPathCache.get(issuePrefix);
+  if (cached) return cached;
+
+  const resolved = resolveProjectFromIssueSync(`${issuePrefix}-1`);
+  if (resolved) {
+    return setProjectPathCache(issuePrefix, resolved.projectPath);
+  }
+
+  const config = getGitHubConfig();
+  if (config) {
+    for (const { owner, repo, prefix } of config.repos) {
+      const repoPrefix = prefix || repo.toUpperCase().replace(/-CLI$/, '').replace(/-/g, '');
+      if (repoPrefix.toUpperCase() === issuePrefix.toUpperCase()) {
+        for (const path of [
+          join(homedir(), 'Projects', repo),
+          join(homedir(), 'Projects', repo.replace(/-cli$/, '')),
+          join(homedir(), 'Projects', owner, repo),
+        ]) {
+          // Sync existsSync is acceptable per CLAUDE.md for fast stat checks
+          if (existsSync(path)) {
+            return setProjectPathCache(issuePrefix, path);
+          }
+        }
+      }
+    }
+  }
+
+  return setProjectPathCache(issuePrefix, join(homedir(), 'Projects'));
+}
+
+/**
+ * Extract reviewer role from tmux session name (PAN-830).
+ * Re-exported from reviewer-tree.ts; supports both the canonical
+ * `specialist-<projectKey>-<issueId>-review-<role>` pattern AND the legacy
+ * `review-<issueId>-<timestamp>-<role>` pattern.
+ */
+export { extractReviewerRole } from './reviewer-tree.js';
+
+// resolveJsonlPath is imported from ./jsonl-resolver (PAN-830).
+
+// Read the request body as unknown JSON
+const readJsonBody = Effect.gen(function* () {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const text = yield* request.text;
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
+  }
+});
+
+// ─── Route: GET /api/command-deck/activity/:issueId ───────────────────────
+
+const getMissionControlActivityRoute = HttpRouter.add(
+  'GET',
+  '/api/command-deck/activity/:issueId',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const readModel = yield* ReadModelService;
+    const issueId = params['issueId'] ?? '';
+    const url = new URL(request.url, 'http://localhost');
+    const includeTranscripts = url.searchParams.get('summary') !== '1';
+    const snapshot = yield* readModel.getSnapshot;
+    const agentSnapshotsById = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
+
+    const result = yield* Effect.tryPromise({
+      try: () => fetchActivityDataWithContext(issueId, { includeTranscripts, agentSnapshotsById }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    return jsonResponse(result);
+  })),
+);
+
+export interface ActivityContext {
+  tmuxSessionNames?: Set<string>;
+  taskFileContents?: Map<string, string>;
+  includeTranscripts?: boolean;
+  agentSnapshotsById?: ReadonlyMap<string, AgentSnapshot>;
+}
+
+function awaitingInputFromProjection(
+  agentId: string,
+  agentSnapshotsById?: ReadonlyMap<string, AgentSnapshot>,
+): AwaitingInputDetection | null | undefined {
+  const agent = agentSnapshotsById?.get(agentId);
+  if (!agent) return undefined;
+  if (agent.hasPendingQuestion !== true) return null;
+  return {
+    reason: (agent.pendingQuestionReason as AwaitingInputDetection['reason'] | undefined) ?? 'other',
+    prompt: agent.pendingQuestionPrompt || 'Agent is waiting for human input',
+  };
+}
+
+export async function fetchActivityData(issueId: string): Promise<unknown> {
+  return fetchActivityDataWithContext(issueId, { includeTranscripts: true });
+}
+
+export async function fetchActivityDataWithContext(
+  issueId: string,
+  context: ActivityContext = {},
+): Promise<unknown> {
+  const issueLower = issueId.toLowerCase();
+  const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+  const includeTranscripts = context.includeTranscripts ?? true;
+
+  // Use shared tmux session names if provided, else fetch once (PAN-821)
+  const tmuxSessionNames = context.tmuxSessionNames ?? new Set<string>();
+  if (!context.tmuxSessionNames) {
+    try {
+      const allSessions = await Effect.runPromise(listSessionNames());
+      for (const s of allSessions) {
+        if (s.trim()) tmuxSessionNames.add(s.trim());
+      }
+    } catch { /* tmux may not be available */ }
+  }
+
+  const sections: Array<{
+    type: string;
+    role?: string;
+    sessionId: string;
+    tmuxSession?: string;
+    model: string;
+    startedAt: string;
+    endedAt?: string;
+    duration: number | null;
+    status: string;
+    transcript?: string;
+    presence: SessionNodePresence;
+    awaitingInput?: boolean;
+    awaitingInputPrompt?: string;
+    awaitingInputReason?: string;
+    hasJsonl?: boolean;
+    roundMetadata?: ReviewerRoundMetadata;
+  }> = [];
+
+  // Shared workspace path for JSONL resolution (PAN-821)
+  const projectPath = getProjectPath(issuePrefix);
+  const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+
+  const agentId = `agent-${issueLower}`;
+  const planningAgentId = `planning-${issueLower}`;
+  const agentsDir = join(homedir(), '.panopticon', 'agents');
+
+  let hasPlanningSection = false;
+
+  for (const checkId of [planningAgentId, agentId]) {
+    const agentDir = join(agentsDir, checkId);
+    if (!await pathExists(agentDir)) continue;
+
+    const stateText = await readOptional(join(agentDir, 'state.json'));
+    if (!stateText) continue;
+
+    try {
+      const state = JSON.parse(stateText) as { model?: string; runtime?: string; startedAt?: string; createdAt?: string; status?: string };
+      const isPlanning = checkId.startsWith('planning-');
+      const sectionType = isPlanning ? 'planning' : 'work';
+      if (isPlanning) hasPlanningSection = true;
+
+      let transcript = '';
+      let transcriptFromPane = false;
+      if (includeTranscripts) {
+        try {
+          transcript = (await Effect.runPromise(capturePane(checkId, 500))).trim();
+          transcriptFromPane = transcript.length > 0;
+        } catch { /* agent may not be running */ }
+
+        if (!isPlanning && !transcript) {
+          const logText = await readOptional(join(agentDir, 'output.log'));
+          if (logText) transcript = logText;
+        }
+
+        if (isPlanning && !transcript) {
+          const projectPath = getProjectPath(issuePrefix);
+          const workspacePanDir = join(projectPath, 'workspaces', `feature-${issueLower}`, PAN_DIRNAME);
+          const continueText = await readOptional(join(workspacePanDir, PAN_CONTINUE_FILENAME));
+          if (continueText) {
+            transcript = `PLANNING COMPLETE\n\n${continueText}`;
+          }
+        }
+      }
+
+      const rtState = await Effect.runPromise(getAgentRuntimeState(checkId));
+      const presence = await deriveSessionPresence(checkId, rtState, tmuxSessionNames);
+      const projectedAwaitingInput = awaitingInputFromProjection(checkId, context.agentSnapshotsById);
+      const awaitingInput = projectedAwaitingInput !== undefined
+        ? projectedAwaitingInput
+        : transcriptFromPane
+          ? detectAwaitingInputFromPaneSync(transcript, { isPlanning })
+          : tmuxSessionNames.has(checkId)
+            ? await Effect.runPromise(detectAwaitingInputForAgent(checkId, { isPlanning }))
+            : null;
+
+      // Resolve JSONL path for conversation rendering (PAN-821)
+      const jsonlPath = await resolveJsonlPath(checkId, workspacePath);
+
+      // Only expose interactive terminal for work/planning sessions (PAN-821 review)
+      const exposeInteractiveTerminal = sectionType === 'work' || sectionType === 'planning';
+
+      sections.push({
+        type: sectionType,
+        sessionId: checkId,
+        model: state.model || 'unknown',
+        startedAt: state.startedAt || state.createdAt || new Date().toISOString(),
+        duration: state.startedAt ? (() => {
+          const ms = Date.now() - new Date(state.startedAt).getTime();
+          return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+        })() : null,
+        status: rtState?.state === 'active' ? 'running'
+          : rtState?.state === 'suspended' ? 'completed'
+          // If runtime state is unavailable but the tmux session IS alive,
+          // the agent is running — don't fall back to stale state.json
+          // which may say "stopped" from a previous lifecycle.
+          : (presence === 'active' || presence === 'idle') ? 'running'
+          : (state.status || 'completed'),
+        transcript: jsonlPath ? undefined : transcript,
+        presence,
+        awaitingInput: awaitingInput !== null,
+        awaitingInputPrompt: awaitingInput?.prompt,
+        awaitingInputReason: awaitingInput?.reason,
+        hasJsonl: !!jsonlPath,
+        tmuxSession: exposeInteractiveTerminal ? checkId : undefined,
+      });
+    } catch { /* skip malformed state */ }
+  }
+
+  // If no planning agent but continue file exists, create synthetic planning section
+  if (!hasPlanningSection) {
+    const continuePath = join(workspacePath, PAN_DIRNAME, PAN_CONTINUE_FILENAME);
+    const continueText = await readOptional(continuePath);
+    if (continueText) {
+      const fileStat = await stat(continuePath).catch(() => null);
+      const sessionId = `planning-${issueLower}-state`;
+      const jsonlPath = await resolveJsonlPath(sessionId, workspacePath);
+      sections.push({
+        type: 'legacy',
+        sessionId,
+        model: 'unknown',
+        startedAt: (fileStat?.birthtime && !Number.isNaN(fileStat.birthtime.getTime()) ? fileStat.birthtime.toISOString() : undefined)
+          || fileStat?.mtime?.toISOString()
+          || new Date().toISOString(),
+        duration: null,
+        status: 'completed',
+        transcript: jsonlPath ? undefined : `PLANNING COMPLETE\n\n${continueText}`,
+        presence: 'ended',
+        hasJsonl: !!jsonlPath,
+      });
+    }
+  }
+
+  // Build specialist sections from review-status history
+  const centralStatus = getReviewStatusSync(issueId.toUpperCase());
+  if (centralStatus?.history && centralStatus.history.length > 0) {
+    const tasksDir = join(homedir(), '.panopticon', 'specialists', 'tasks');
+    const taskFilesByType: Record<string, string[]> = { review: [], test: [], merge: [] };
+
+    // Use shared task file contents if provided, else read once and cache (PAN-821)
+    let taskFileContents = context.taskFileContents;
+    if (!taskFileContents) {
+      taskFileContents = new Map<string, string>();
+      if (await pathExists(tasksDir)) {
+        const filenames = (await readdir(tasksDir).catch(() => [] as string[])).filter(f => f.endsWith('.md'));
+        await Promise.all(filenames.map(async (f) => {
+          const content = await readOptional(join(tasksDir, f));
+          if (content) taskFileContents!.set(f, content);
+        }));
+      }
+    }
+
+    for (const [f, content] of taskFileContents) {
+      if (content.includes(issueId.toUpperCase()) || content.includes(issueId)) {
+        if (f.startsWith('review-agent')) taskFilesByType.review!.push(f);
+        else if (f.startsWith('test-agent')) taskFilesByType.test!.push(f);
+        else if (f.startsWith('merge-agent')) taskFilesByType.merge!.push(f);
+      }
+    }
+    for (const type of Object.keys(taskFilesByType)) {
+      taskFilesByType[type]!.sort();
+    }
+
+    const typeMap: Record<string, string> = { review: 'review', test: 'test', merge: 'merge' };
+    type SpecialistSection = { type: string; startedAt: string; endedAt?: string; status: string; notes?: string };
+    let currentSection: SpecialistSection | null = null;
+    const specialistSections: SpecialistSection[] = [];
+
+    for (const entry of centralStatus.history) {
+      const sectionType = typeMap[entry.type] || entry.type;
+      if (entry.status === 'reviewing' || entry.status === 'testing' || entry.status === 'merging') {
+        currentSection = { type: sectionType, startedAt: entry.timestamp, status: 'running' };
+      } else if (currentSection && currentSection.type === sectionType) {
+        currentSection.endedAt = entry.timestamp;
+        currentSection.status = entry.status === 'passed' ? 'completed' : entry.status === 'failed' ? 'failed' : 'completed';
+        currentSection.notes = (entry as { notes?: string }).notes;
+        specialistSections.push(currentSection);
+        currentSection = null;
+      } else {
+        specialistSections.push({
+          type: sectionType,
+          startedAt: entry.timestamp,
+          status: entry.status === 'passed' ? 'completed' : entry.status === 'failed' ? 'failed' : 'completed',
+          notes: (entry as { notes?: string }).notes,
+        });
+      }
+    }
+    if (currentSection) specialistSections.push(currentSection);
+
+    const taskFileIndex: Record<string, number> = { review: 0, test: 0, merge: 0 };
+
+    // PAN-830: Reviewer panes are canonical (`specialist-<projectKey>-<issueId>-review-<role>`)
+    // and persist across review rounds, so we emit exactly four convoy reviewer
+    // nodes anchored to the *most recent* review section in history.
+    // Earlier review sections are skipped to avoid duplicate role nodes.
+    //
+    // Same for test and merge/ship: each role has one canonical session reused
+    // across rounds, so emit exactly one node anchored to the latest section.
+    // Without this, an issue with N test/merge history entries produced N
+    // same-sessionId nodes — the frontend collapsed them and the agent
+    // effectively vanished from the tree.
+    const lastReviewIndex = specialistSections.reduce(
+      (idx, s, i) => (s.type === 'review' ? i : idx),
+      -1,
+    );
+    const lastTestIndex = specialistSections.reduce(
+      (idx, s, i) => (s.type === 'test' ? i : idx),
+      -1,
+    );
+    const lastMergeIndex = specialistSections.reduce(
+      (idx, s, i) => (s.type === 'merge' ? i : idx),
+      -1,
+    );
+    const resolvedProject = resolveProjectFromIssueSync(issueId);
+    const reviewerProjectKey = resolvedProject?.projectKey ?? issuePrefix.toLowerCase();
+
+    for (let i = 0; i < specialistSections.length; i++) {
+      const ss = specialistSections[i]!;
+      const duration = ss.startedAt && ss.endedAt
+        ? (() => {
+            const ms = new Date(ss.endedAt).getTime() - new Date(ss.startedAt).getTime();
+            return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+          })()
+        : null;
+
+      const transcriptParts: string[] = [];
+      const statusLabel = ss.status === 'completed' ? 'PASSED' : ss.status === 'running' ? 'IN PROGRESS...' : ss.status.toUpperCase();
+      transcriptParts.push(`${ss.type.toUpperCase()} ${statusLabel}`);
+
+      const taskFiles = taskFilesByType[ss.type] || [];
+      const taskIdx = taskFileIndex[ss.type] || 0;
+      if (taskIdx < taskFiles.length) {
+        const taskContent = taskFileContents.get(taskFiles[taskIdx]!);
+        if (taskContent) {
+          const meaningfulLines = taskContent.split('\n').filter(l =>
+            !l.startsWith('```') && !l.startsWith('# EXECUTE') && !l.startsWith('⚠️')
+          );
+          transcriptParts.push(`\n--- Task ---\n${meaningfulLines.slice(0, 5).join('\n')}`);
+        }
+        taskFileIndex[ss.type] = taskIdx + 1;
+      }
+
+      if (ss.status === 'running') {
+        const ageMs = Date.now() - new Date(ss.startedAt).getTime();
+        const STALE_THRESHOLD_MS = 30 * 60 * 1000;
+
+        if (ageMs > STALE_THRESHOLD_MS) {
+          ss.status = 'completed';
+          transcriptParts[0] = `${ss.type.toUpperCase()} TIMED OUT (no result recorded)`;
+        }
+      }
+
+      if (ss.notes) {
+        transcriptParts.push(`\n--- Results ---\n${ss.notes}`);
+      }
+
+      // PAN-830: For review sections, emit the four canonical convoy reviewer
+      // nodes exactly once (anchored to the latest review section in history). Earlier
+      // review sections are absorbed into the round metadata read from
+      // `~/.panopticon/agents/<reviewer-id>/round-N.json`.
+      if (ss.type === 'review') {
+        if (i !== lastReviewIndex) continue;
+        const synthesisRoundMetadata = await readSynthesisRounds(issueId, reviewerProjectKey);
+        // PAN-1048: review orchestrator uses spawnRun naming — agent-<issue>-review
+        const orchestratorSessionName = `agent-${issueLower}-review`;
+        const orchestratorPresence: SessionNodePresence = tmuxSessionNames.has(orchestratorSessionName)
+          ? (ss.status === 'running' ? 'active' : 'idle')
+          : 'ended';
+        const orchestratorJsonlPath = await resolveJsonlPath(orchestratorSessionName, workspacePath);
+        sections.push({
+          type: 'review',
+          sessionId: orchestratorSessionName,
+          model: 'specialist',
+          startedAt: ss.startedAt,
+          endedAt: ss.endedAt,
+          duration: ss.startedAt && ss.endedAt
+            ? (() => {
+                const ms = new Date(ss.endedAt).getTime() - new Date(ss.startedAt).getTime();
+                return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+              })()
+            : null,
+          status: ss.status,
+          presence: orchestratorPresence,
+          roundMetadata: synthesisRoundMetadata,
+          hasJsonl: !!orchestratorJsonlPath,
+          tmuxSession: orchestratorSessionName,
+        });
+        const reviewerNodes = await buildReviewerNodes({
+          issueId,
+          projectKey: reviewerProjectKey,
+          workspacePath,
+          projectPath,
+          tmuxSessionNames,
+          startedAt: ss.startedAt,
+          endedAt: ss.endedAt,
+          status: ss.status,
+        });
+        for (const node of reviewerNodes) sections.push(node);
+        continue;
+      }
+
+      // Normal handling for non-review types — test and merge/ship.
+      // Emit exactly one node per role, anchored to the latest section, the
+      // same way review does. Earlier sections are skipped (their history is
+      // still in the DB and surfaced via status history elsewhere).
+      if (ss.type === 'test' && i !== lastTestIndex) continue;
+      if (ss.type === 'merge' && i !== lastMergeIndex) continue;
+
+      // The pipeline's final stage is the `ship` role, spawned via
+      // spawnRun(issueId, 'ship') as tmux session `agent-<issue>-ship`. The
+      // `merge` history type tracks its status; surface it as a `ship` node
+      // pointed at the real session instead of the legacy `merge-agent` name.
+      // Both the test and ship roles are spawned via spawnRun(issueId, role),
+      // which names the tmux session `agent-<issue>-<role>` — not the legacy
+      // `specialist-<project>-<issue>-<role>-agent` form.
+      const isShipStage = ss.type === 'merge';
+      const nodeType: 'ship' | 'test' = isShipStage ? 'ship' : 'test';
+      const specialistSessionId = isShipStage
+        ? `agent-${issueLower}-ship`
+        : `agent-${issueLower}-test`;
+
+      if (includeTranscripts && ss.status === 'running') {
+        try {
+          const output = (await Effect.runPromise(capturePane(specialistSessionId, 100))).trim();
+          if (output && (output.includes(issueId.toUpperCase()) || output.includes(issueId) || output.includes(issueLower))) {
+            transcriptParts.push(`\n--- Live Output ---\n${output}`);
+          } else if (output) {
+            transcriptParts.push(`\n--- Waiting ---\nSpecialist is processing another issue. Will update when it reaches ${issueId}.`);
+          }
+        } catch { /* specialist may not be running */ }
+      }
+
+      const specialistIsLive = tmuxSessionNames.has(specialistSessionId);
+      const specialistIsZombie = specialistIsLive && (ss.status === 'completed' || ss.status === 'failed');
+      const specialistPresence: SessionNodePresence = specialistIsLive && !specialistIsZombie
+        ? (ss.status === 'running' ? 'active' : 'idle')
+        : specialistIsZombie ? 'idle' : 'ended';
+      const specialistJsonlPath = await resolveJsonlPath(specialistSessionId, workspacePath);
+
+      sections.push({
+        type: nodeType,
+        sessionId: specialistSessionId,
+        model: 'specialist',
+        startedAt: ss.startedAt,
+        duration,
+        status: (specialistIsLive && !specialistIsZombie) ? 'running' : ss.status,
+        transcript: specialistJsonlPath ? undefined : transcriptParts.join('\n'),
+        presence: specialistPresence,
+        hasJsonl: !!specialistJsonlPath,
+      });
+    }
+  }
+
+  sections.sort((a, b) => {
+    if (!a.startedAt) return 1;
+    if (!b.startedAt) return -1;
+    return a.startedAt.localeCompare(b.startedAt);
+  });
+
+  // Cost breakdown — TTL-cached to avoid re-scanning cost events on every 5s poll (PAN-830 review high-4).
+  let costByStage: Record<string, { cost: number; tokens: number }> = {};
+  let totalCost: number | null = null;
+  try {
+    const cacheKey = issueId.toUpperCase();
+    sweepExpired(costCache, COST_CACHE_TTL_MS);
+    const cached = costCache.get(cacheKey);
+    let aggregateCost = 0;
+    if (cached && cached.timestamp > Date.now() - COST_CACHE_TTL_MS) {
+      aggregateCost = cached.data.totalCost;
+      costByStage = cached.data.costByStage;
+    } else {
+      syncCacheSync();
+      const issueData = getCostsForIssueSync(cacheKey);
+      if (issueData) {
+        aggregateCost = issueData.totalCost;
+        costByStage = Object.fromEntries(
+          Object.entries(issueData.stages || {}).map(([stage, stats]) => [stage, { cost: stats.cost, tokens: stats.tokens }])
+        );
+      }
+      sweepExpired(costCache, COST_CACHE_TTL_MS);
+      costCache.set(cacheKey, { timestamp: Date.now(), data: { totalCost: aggregateCost, costByStage } });
+    }
+
+    const agents = includeTranscripts ? await Effect.runPromise(listRunningAgents()) : await getCachedRunningAgents();
+    const resolvedCost = resolveIssueHeadlineCost({
+      issueId,
+      aggregateCost,
+      agents,
+    });
+    totalCost = resolvedCost.resolvedTotalCost;
+
+    return {
+      issueId,
+      sections,
+      costByStage,
+      totalCost,
+      aggregateCost: resolvedCost.aggregateCost,
+      liveCost: resolvedCost.liveCost,
+      resolvedTotalCost: resolvedCost.resolvedTotalCost,
+    };
+  } catch {
+    return { issueId, sections, costByStage, totalCost, aggregateCost: null, liveCost: null, resolvedTotalCost: null };
+  }
+}
+
+// ─── Route: GET /api/command-deck/planning/:issueId ───────────────────────
+
+const getMissionControlPlanningRoute = HttpRouter.add(
+  'GET',
+  '/api/command-deck/planning/:issueId',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const issueId = params['issueId'] ?? '';
+    const url = new URL(request.url, 'http://localhost');
+    const summaryOnly = url.searchParams.get('summary') === '1';
+
+    const result = yield* Effect.tryPromise({
+      try: () => fetchPlanningData(issueId, { summaryOnly }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    return jsonResponse(result);
+  })),
+);
+
+async function fetchPlanningData(
+  issueId: string,
+  options: { summaryOnly?: boolean } = {},
+): Promise<unknown> {
+  const issueLower = issueId.toLowerCase();
+  const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+  const summaryOnly = options.summaryOnly ?? false;
+
+  const projectPath = getProjectPath(issuePrefix);
+  const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+  const planningDir = join(workspacePath, PAN_DIRNAME);
+  const panContinuePath = join(planningDir, PAN_CONTINUE_FILENAME);
+
+  const result: {
+    hasPrd: boolean;
+    hasState: boolean;
+    prd?: string;
+    state?: string;
+    inference?: string;
+    statusReview?: string;
+    statusReviewedAt?: string;
+    transcripts: Array<{ filename: string; content: string; uploadedAt: string }>;
+    discussions: Array<{ filename: string; content: string; syncedAt: string }>;
+    notes: Array<{ filename: string; content: string; uploadedAt: string }>;
+    acceptanceProgress?: { completed: number; total: number; percent: number };
+    stashCount?: number;
+    pipelineMirror?: unknown;
+  } = { hasPrd: false, hasState: false, transcripts: [], discussions: [], notes: [] };
+
+  // Helper: read PRD content from a location, handling both flat and subdir formats.
+  const readPrdContent = async (loc: PrdLocation | null): Promise<string | undefined> => {
+    if (!loc) return undefined;
+    if (loc.format === 'flat' || loc.format === 'pan-draft') {
+      return (await readOptional(loc.path)) ?? undefined;
+    }
+
+    const files = (await readdir(loc.path).catch(() => [] as string[]))
+      .filter((file) => file.endsWith('.md'))
+      .sort((a, b) => {
+        if (a === 'prd.md') return -1;
+        if (b === 'prd.md') return 1;
+        return a.localeCompare(b);
+      });
+    const firstMarkdown = files[0];
+    if (!firstMarkdown) return undefined;
+    return (await readOptional(join(loc.path, firstMarkdown))) ?? undefined;
+  };
+
+  const hasPlanningDir = await pathExists(planningDir);
+  const hasPanContinue = await pathExists(panContinuePath);
+
+  // Acceptance criteria progress from vBRIEF plan (PAN-847)
+  // Pipeline mirror corroboration (PAN-977)
+  try {
+    const doc = await Effect.runPromise(readWorkspacePlan(workspacePath));
+    if (doc) {
+      const items = doc.plan.items;
+      if (items.length > 0) {
+        const completed = items.filter((i) => i.status === 'completed').length;
+        result.acceptanceProgress = {
+          completed,
+          total: items.length,
+          percent: Math.round((completed / items.length) * 100),
+        };
+      }
+      result.pipelineMirror = doc.plan.metadata?.pipeline;
+    }
+  } catch { /* no vBRIEF plan */ }
+
+  if (!hasPlanningDir && !hasPanContinue) {
+    const prd = await readPrdContent(findPrdAtStatusSync(projectPath, issueId, 'active'));
+    if (prd) {
+      result.prd = prd;
+      result.hasPrd = true;
+    }
+    if (summaryOnly) {
+      return {
+        hasPrd: result.hasPrd,
+        hasState: false,
+        hasInference: false,
+        acceptanceProgress: result.acceptanceProgress,
+        stashCount: result.stashCount,
+        statusReviewedAt: result.statusReviewedAt,
+        transcriptCount: 0,
+        discussionCount: 0,
+        noteCount: 0,
+      };
+    }
+    return result;
+  }
+
+  const continueState = await readOptional(panContinuePath);
+  result.state = continueState ?? undefined;
+  result.inference = hasPlanningDir ? (await readOptional(join(planningDir, 'INFERENCE.md')) ?? undefined) : undefined;
+  result.hasState = Boolean(result.state);
+
+  const statusReviewPath = join(planningDir, 'STATUS_REVIEW.md');
+  const statusReview = await readOptional(statusReviewPath);
+  if (statusReview) {
+    result.statusReview = statusReview;
+    const fileStat = await stat(statusReviewPath).catch(() => null);
+    if (fileStat) result.statusReviewedAt = fileStat.mtime.toISOString();
+  }
+
+  if (!result.prd) {
+    for (const status of ['active', 'planned', 'completed'] as const) {
+      const content = await readPrdContent(findPrdAtStatusSync(projectPath, issueId, status));
+      if (content) {
+        result.prd = content;
+        result.hasPrd = true;
+        break;
+      }
+    }
+  }
+
+  if (!result.prd && result.state) result.prd = result.state;
+  result.hasPrd = Boolean(result.prd);
+
+  const listArtifactFiles = async (subdir: string): Promise<Array<{ filename: string; mtime: string }>> => {
+    if (!hasPlanningDir) return [];
+    const dirPath = join(planningDir, subdir);
+    if (!await pathExists(dirPath)) return [];
+    const files = (await readdir(dirPath).catch(() => [] as string[])).filter(
+      (f) => f.endsWith('.md') || f.endsWith('.txt'),
+    );
+    const entries = await Promise.all(files.map(async (filename) => {
+      const filePath = join(dirPath, filename);
+      const fileStat = await stat(filePath).catch(() => null);
+      return {
+        filename,
+        mtime: fileStat?.mtime.toISOString() ?? new Date().toISOString(),
+      };
+    }));
+    return entries.sort((a, b) => new Date(b.mtime).getTime() - new Date(a.mtime).getTime());
+  };
+
+  const readArtifactDir = async (subdir: string, dateField: string): Promise<Array<{ filename: string; content: string; [key: string]: string }>> => {
+    const files = await listArtifactFiles(subdir);
+    const entries = await Promise.all(files.map(async ({ filename, mtime }) => {
+      const filePath = join(planningDir, subdir, filename);
+      const content = await readOptional(filePath);
+      return { filename, content: content ?? '', [dateField]: mtime };
+    }));
+    return entries;
+  };
+
+  if (summaryOnly) {
+    const [transcriptFiles, discussionFiles, noteFiles] = await Promise.all([
+      listArtifactFiles('transcripts'),
+      listArtifactFiles('discussions'),
+      listArtifactFiles('notes'),
+    ]);
+
+    return {
+      hasPrd: result.hasPrd,
+      hasState: result.hasState,
+      hasInference: Boolean(result.inference && result.inference.trim() !== ''),
+      acceptanceProgress: result.acceptanceProgress,
+      pipelineMirror: result.pipelineMirror,
+      stashCount: result.stashCount,
+      statusReviewedAt: result.statusReviewedAt,
+      transcriptCount: transcriptFiles.length,
+      discussionCount: discussionFiles.length,
+      noteCount: noteFiles.length,
+    };
+  }
+
+  result.transcripts = await readArtifactDir('transcripts', 'uploadedAt') as typeof result.transcripts;
+  result.discussions = await readArtifactDir('discussions', 'syncedAt') as typeof result.discussions;
+  result.notes = await readArtifactDir('notes', 'uploadedAt') as typeof result.notes;
+
+  // Stash count for workspace hygiene warning (PAN-847)
+  try {
+    const cacheKey = workspacePath;
+    sweepExpired(stashCountCache, STASH_COUNT_CACHE_TTL_MS);
+    const cached = stashCountCache.get(cacheKey);
+    if (cached && cached.timestamp > Date.now() - STASH_COUNT_CACHE_TTL_MS) {
+      result.stashCount = cached.count;
+    } else {
+      const { stdout: stashList } = await execAsync('git stash list', { cwd: workspacePath, encoding: 'utf-8' });
+      const count = stashList.trim() ? stashList.trim().split('\n').length : 0;
+      stashCountCache.set(cacheKey, { timestamp: Date.now(), count });
+      result.stashCount = count;
+    }
+  } catch { /* not a git repo or git unavailable */ }
+
+  return result;
+}
+
+// ─── Route: POST /api/command-deck/planning/:issueId/status-review ────────
+
+const postMissionControlStatusReviewRoute = HttpRouter.add(
+  'POST',
+  '/api/command-deck/planning/:issueId/status-review',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const issueId = params['issueId'] ?? '';
+    const eventStore = yield* EventStoreService;
+
+    const result = yield* Effect.tryPromise({
+      try: () => generateStatusReview(issueId),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+
+    if (result.type === 'ok') {
+      yield* eventStore.append({ type: 'planning.sync', timestamp: new Date().toISOString(), payload: { issueId, status: 'reviewing' } });
+      return jsonResponse({ success: true, statusReview: result.review, reviewedAt: result.reviewedAt });
+    }
+    return jsonResponse(result.response, { status: result.status });
+  })),
+);
+
+async function generateStatusReview(issueId: string): Promise<
+  | { type: 'ok'; review: string; reviewedAt: string }
+  | { type: 'err'; response: unknown; status: number }
+> {
+  const issueLower = issueId.toLowerCase();
+  const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+
+  const projectPath = getProjectPath(issuePrefix);
+  const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+  const planningDir = join(workspacePath, PAN_DIRNAME);
+  const panContinuePath = join(planningDir, PAN_CONTINUE_FILENAME);
+
+  if (!await pathExists(planningDir) && !await pathExists(panContinuePath)) {
+    return { type: 'err', response: { error: 'No planning state found' }, status: 404 };
+  }
+
+  const state = await readOptional(panContinuePath);
+
+  const readPlanningSubdir = async (subdir: string, limit = 5, maxPerFile = 2000): Promise<string> => {
+    const dirPath = join(planningDir, subdir);
+    if (!await pathExists(dirPath)) return '';
+    const files = (await readdir(dirPath).catch(() => [] as string[])).filter((f) => f.endsWith('.md') || f.endsWith('.txt'));
+    const parts = await Promise.all(files.slice(0, limit).map(async (file) => {
+      const content = await readOptional(join(dirPath, file));
+      return content ? `\n### ${file}\n${content.slice(0, maxPerFile)}\n` : '';
+    }));
+    return parts.join('');
+  };
+
+  const [discussionsContent, transcriptsContent, notesContent] = await Promise.all([
+    readPlanningSubdir('discussions'),
+    readPlanningSubdir('transcripts', 5, 3000),
+    readPlanningSubdir('notes'),
+  ]);
+
+  let issueContext = '';
+  try {
+    const issueDataService = await getIssueDataService();
+    const allIssues = issueDataService.getIssues();
+    const issue = allIssues.find((i: Record<string, unknown>) =>
+      i['identifier'] === issueId || (i['identifier'] as string)?.toLowerCase() === issueId.toLowerCase()
+    ) as Record<string, unknown> | undefined;
+    if (issue) {
+      const assignee = issue['assignee'] as { name?: string } | undefined;
+      const labels = issue['labels'] as string[] | undefined;
+      issueContext = `- **Title**: ${issue['title']}\n- **Status**: ${issue['rawTrackerState'] || issue['status']}\n- **Assignee**: ${assignee?.name || 'Unassigned'}\n- **Source**: ${issue['source']}`;
+      if (labels?.length) issueContext += `\n- **Labels**: ${labels.join(', ')}`;
+      const children = allIssues.filter((i: Record<string, unknown>) => i['parentRef'] === issueId) as Record<string, unknown>[];
+      if (children.length > 0) {
+        const done = children.filter((c) => c['status'] === 'Done').length;
+        const inProgress = children.filter((c) => c['status'] === 'In Progress').length;
+        issueContext += `\n- **Child Stories**: ${children.length} total, ${done} done, ${inProgress} in progress\n\n**Story Breakdown:**\n`;
+        for (const child of children.slice(0, 20)) {
+          issueContext += `  - ${child['identifier']}: ${child['title']} [${child['rawTrackerState'] || child['status']}]\n`;
+        }
+      }
+    }
+  } catch { /* skip if issue data unavailable */ }
+
+  const hasAnyContent = state || discussionsContent || transcriptsContent || notesContent || issueContext;
+  if (!hasAnyContent) {
+    return { type: 'err', response: { error: 'No planning artifacts, discussions, transcripts, or issue data to review against' }, status: 400 };
+  }
+
+  const execSafe = async (cmd: string, opts?: Parameters<typeof execAsync>[1]) => {
+    try {
+      const { stdout } = await execAsync(cmd, { encoding: 'utf-8', timeout: 10000, ...opts });
+      return stdout;
+    } catch { return ''; }
+  };
+
+  const [gitDiff, gitDiffFull, gitLog, filesChanged] = await Promise.all([
+    execSafe(`cd "${workspacePath}" && git diff --stat main 2>/dev/null || git diff --stat HEAD~5 2>/dev/null || echo "No git diff available"`),
+    execSafe(`cd "${workspacePath}" && git diff main 2>/dev/null || git diff HEAD~5 2>/dev/null || echo ""`, { timeout: 15000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf-8' }),
+    execSafe(`cd "${workspacePath}" && git log --oneline -20 2>/dev/null || echo "No git log available"`),
+    execSafe(`cd "${workspacePath}" && git diff --name-only main 2>/dev/null || git diff --name-only HEAD~5 2>/dev/null || echo "No files changed"`),
+  ]);
+
+  const centralReviewStatus = getReviewStatusSync(issueId.toUpperCase());
+  const reviewStatus = centralReviewStatus?.reviewStatus || 'unknown';
+  const testStatus = centralReviewStatus?.testStatus || 'unknown';
+
+  const { createHash } = await import('crypto');
+  const contentHash = createHash('md5')
+    .update([state, discussionsContent, transcriptsContent, notesContent, issueContext, gitDiff, gitDiffFull, gitLog, filesChanged, reviewStatus, testStatus].filter(Boolean).join('|'))
+    .digest('hex');
+
+  await mkdir(planningDir, { recursive: true });
+  const hashPath = join(planningDir, '.status-review-hash');
+  const statusReviewPath = join(planningDir, 'STATUS_REVIEW.md');
+
+  const [savedHash, cachedReview] = await Promise.all([readOptional(hashPath), readOptional(statusReviewPath)]);
+  if (savedHash?.trim() === contentHash && cachedReview) {
+    const fileStat = await stat(statusReviewPath).catch(() => null);
+    console.log(`[status-review] ${issueId}: no changes detected, returning cached review`);
+    return { type: 'ok', review: cachedReview, reviewedAt: fileStat?.mtime.toISOString() ?? new Date().toISOString() };
+  }
+
+  const now = new Date().toISOString();
+  let review: string;
+
+  const analysisPrompt = `You are a senior technical project manager producing an executive-quality status review of a software feature. This review will be read by engineering leadership and executives to understand the current state of this work.
+
+## Issue: ${issueId}
+${issueContext ? `\n${issueContext}\n` : ''}
+## Pipeline Status
+- Review: ${reviewStatus}
+- Tests: ${testStatus}
+
+## Planning Context (continue.vbrief.json)
+${state ? state.slice(0, 4000) : '(No planning state available)'}
+
+## Files Changed
+${filesChanged.slice(0, 2000) || 'No changes detected'}
+
+## Git Diff Summary (stats)
+${gitDiff.slice(0, 3000) || 'No diff available'}
+
+## Actual Code Changes
+${gitDiffFull.slice(0, 15000) || '(No code diff available)'}
+
+## Recent Commits
+${gitLog.slice(0, 2000) || 'No commits yet'}
+
+## Discussions & Comments
+${discussionsContent || '(No discussions synced)'}
+
+## Meeting Transcripts
+${transcriptsContent || '(No transcripts uploaded)'}
+
+## Notes
+${notesContent || '(No notes uploaded)'}
+
+---
+
+**IMPORTANT**: Perform a THOROUGH analysis. Cross-reference the actual code changes against the PRD requirements, discussions, and transcripts. Don't just summarize — evaluate whether the implementation correctly addresses each requirement.
+
+Produce a comprehensive status review in markdown format with these sections:
+
+1. **Summary** (2-3 sentences: overall progress, percentage complete estimate, what's done, what's remaining)
+2. **Requirements Coverage** (cross-reference EACH PRD requirement against the actual code changes — which requirements are fully implemented, partially implemented, or not yet started. Use a table with columns: Requirement | Status | Evidence. If no PRD, infer requirements from discussions/transcripts/issue tracker data)
+3. **Code Quality Assessment** (based on actual code changes: are there any concerns about implementation quality, error handling, test coverage, missing edge cases, security issues?)
+4. **Risk Assessment** (blockers, missing tests, incomplete features, concerns from discussions, timeline risks)
+5. **Key Decisions & Context** (important points from discussions, transcripts, or notes that affect the work — decisions made, open questions, stakeholder feedback)
+6. **Recommendation** (specific next steps, whether it's ready for review/merge, or exactly what needs attention before it can progress)
+
+Be specific: reference actual file names, function names, requirement text, discussion quotes, and transcript highlights. This review should give a reader who hasn't seen the code a clear picture of exactly where things stand.`;
+
+  const apiSettings = loadSettingsApi();
+  const statusModelId = (apiSettings.models?.overrides as Record<string, string>)?.['status-review']
+    || 'claude-sonnet-4-6';
+  const { command: cliCmd, args: cliArgs } = getAgentCommandSync(statusModelId);
+  const modelFlag = cliArgs.length > 0 ? ` ${cliArgs.join(' ')}` : '';
+  const promptFile = join(planningDir, '.status-review-prompt.tmp');
+
+  // Build provider env vars for non-Anthropic models
+  const { getProviderForModelSync, getProviderEnvSync } = await import('../../../lib/providers.js');
+  const { loadConfigSync: loadYamlConfig } = await import('../../../lib/config-yaml.js');
+  let providerEnvStr = '';
+  let providerEnv: Record<string, string> = {};
+  const statusProvider = getProviderForModelSync(statusModelId);
+  if (statusProvider.name !== 'anthropic') {
+    const { config } = loadYamlConfig();
+    const apiKey = config.apiKeys[statusProvider.name as keyof typeof config.apiKeys];
+    if (apiKey) {
+      providerEnv = getProviderEnvSync(statusProvider, apiKey);
+      providerEnvStr = Object.entries(providerEnv).map(([k, v]) => `${k}="${v}"`).join(' ') + ' ';
+    }
+  }
+
+  await writeFile(promptFile, analysisPrompt, 'utf-8');
+  console.log(`[status-review] ${issueId}: generating with ${providerEnvStr}${cliCmd}${modelFlag}`);
+
+  try {
+    const env = buildChildEnvSync(process.env, providerEnv);
+    const promptContent = await readFile(promptFile, 'utf-8');
+    const { stdout: aiReview } = await execAsync(
+      `${cliCmd} -p${modelFlag} --no-session-persistence`,
+      { encoding: 'utf-8', timeout: 120000, maxBuffer: 1024 * 1024, env, input: promptContent } as any
+    );
+    review = `# Status Review - ${issueId}\n\n*AI-Generated: ${now}*\n\n${String(aiReview).trim()}\n\n---\n*Generated by Panopticon Command Deck AI*`;
+  } catch (llmError: unknown) {
+    const msg = llmError instanceof Error ? llmError.message : String(llmError);
+    console.warn(`AI status review failed for ${issueId}, using static template:`, msg);
+    review = `# Status Review - ${issueId}
+
+*Generated: ${now}*
+*Note: AI analysis unavailable (${msg}). Showing raw data.*
+
+## Pipeline Status
+
+| Stage | Status |
+|-------|--------|
+| Work | ${reviewStatus === 'unknown' ? 'In Progress' : 'Complete'} |
+| Review | ${reviewStatus} |
+| Tests | ${testStatus} |
+
+## Files Changed
+\`\`\`
+${filesChanged.slice(0, 2000) || 'No changes detected'}
+\`\`\`
+
+## Recent Commits
+\`\`\`
+${gitLog.slice(0, 2000) || 'No commits yet'}
+\`\`\`
+
+## Discussions
+${discussionsContent || '(No discussions synced)'}
+
+## Transcripts
+${transcriptsContent || '(No transcripts uploaded)'}
+
+## Notes
+${notesContent || '(No notes uploaded)'}
+
+${issueContext ? `## Issue Tracker Data\n${issueContext}\n` : ''}---
+*Review by Panopticon Command Deck (static fallback)*
+`;
+  } finally {
+    await unlink(promptFile).catch(() => { /* ignore */ });
+  }
+
+  await Promise.all([
+    writeFile(statusReviewPath, review, 'utf-8'),
+    writeFile(hashPath, contentHash, 'utf-8'),
+  ]);
+
+  return { type: 'ok', review, reviewedAt: now };
+}
+
+// ─── Route: POST /api/command-deck/planning/:issueId/upload ────────────────
+
+const postMissionControlUploadRoute = HttpRouter.add(
+  'POST',
+  '/api/command-deck/planning/:issueId/upload',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const issueId = params['issueId'] ?? '';
+    const body = yield* readJsonBody;
+
+    const { type, filename, content } = body as { type?: string; filename?: string; content?: string };
+    const issueLower = issueId.toLowerCase();
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+
+    if (!type || !filename || !content) {
+      return jsonResponse({ error: 'type, filename, and content are required' }, { status: 400 });
+    }
+    if (!['transcript', 'note'].includes(type)) {
+      return jsonResponse({ error: 'type must be transcript or note' }, { status: 400 });
+    }
+
+    let safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '-');
+    let processedContent = content;
+
+    if (safeName.endsWith('.vtt')) {
+      const { vttToMarkdown } = yield* Effect.promise(() => import('../utils/vtt-parser.js'));
+      processedContent = vttToMarkdown(content);
+      safeName = safeName.replace(/\.vtt$/, '.md');
+    }
+
+    const ext = safeName.endsWith('.md') || safeName.endsWith('.txt') ? '' : '.md';
+    const projectPath = getProjectPath(issuePrefix);
+    const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+    const subdir = type === 'transcript' ? 'transcripts' : 'notes';
+    const dirPath = join(workspacePath, PAN_DIRNAME, subdir);
+
+    yield* Effect.tryPromise({
+      try: async () => {
+        await mkdir(dirPath, { recursive: true });
+        await writeFile(join(dirPath, safeName + ext), processedContent, 'utf-8');
+      },
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+
+    return jsonResponse({ success: true, path: join(dirPath, safeName + ext) });
+  })),
+);
+
+// ─── Route: POST /api/command-deck/planning/:issueId/sync-discussions ─────
+
+const postMissionControlSyncDiscussionsRoute = HttpRouter.add(
+  'POST',
+  '/api/command-deck/planning/:issueId/sync-discussions',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const issueId = params['issueId'] ?? '';
+    if (!parseIssueIdSync(issueId)) {
+      return jsonResponse({ error: 'Invalid issue id: ' + issueId }, { status: 400 });
+    }
+    const body = yield* readJsonBody;
+    const linear = yield* LinearClient;
+
+    const { tracker } = body as { tracker?: string };
+    const issueLower = issueId.toLowerCase();
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+
+    if (!tracker || !['github', 'linear', 'rally'].includes(tracker)) {
+      return jsonResponse({ error: 'tracker must be github, linear, or rally' }, { status: 400 });
+    }
+
+    const projectPath = getProjectPath(issuePrefix);
+    const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+    const discussionsDir = join(workspacePath, PAN_DIRNAME, 'discussions');
+
+    yield* Effect.tryPromise({
+      try: () => mkdir(discussionsDir, { recursive: true }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+
+    const syncedFiles: string[] = [];
+
+    if (tracker === 'github') {
+      const ghConfig = getGitHubConfig();
+      if (!ghConfig) {
+        return jsonResponse({ error: 'GitHub not configured' }, { status: 400 });
+      }
+
+      yield* Effect.promise(async () => {
+        try {
+          const issueNum = issueId.replace(/^[A-Z]+-/, '');
+          const { stdout } = await execFileAsync(
+            'gh',
+            [
+              'issue', 'view', issueNum,
+              '--repo', `${ghConfig.repos[0]!.owner}/${ghConfig.repos[0]!.repo}`,
+              '--json', 'comments',
+              '--jq', '.comments[] | "## " + .author.login + " (" + .createdAt + ")\n\n" + .body + "\n\n---\n"',
+            ],
+            { encoding: 'utf-8', timeout: 30000 }
+          );
+          if (stdout.trim()) {
+            const filename = `github-${issueId}-comments.md`;
+            await writeFile(join(discussionsDir, filename), `# GitHub Comments for ${issueId}\n\nSynced: ${new Date().toISOString()}\n\n---\n\n` + stdout, 'utf-8');
+            syncedFiles.push(filename);
+          }
+        } catch (err) { console.warn(`Failed to sync GitHub comments for ${issueId}:`, err); }
+
+        try {
+          const { stdout: prList } = await execFileAsync(
+            'gh',
+            [
+              'pr', 'list',
+              '--repo', `${ghConfig.repos[0]!.owner}/${ghConfig.repos[0]!.repo}`,
+              '--head', `feature/${issueLower}`,
+              '--json', 'number,title',
+              '--jq', '.[].number',
+            ],
+            { encoding: 'utf-8', timeout: 15000 }
+          );
+          for (const prNum of prList.trim().split('\n').filter(Boolean)) {
+            try {
+              const { stdout: prComments } = await execFileAsync(
+                'gh',
+                [
+                  'pr', 'view', prNum,
+                  '--repo', `${ghConfig.repos[0]!.owner}/${ghConfig.repos[0]!.repo}`,
+                  '--json', 'comments',
+                  '--jq', '.comments[] | "## " + .author.login + " (" + .createdAt + ")\n\n" + .body + "\n\n---\n"',
+                ],
+                { encoding: 'utf-8', timeout: 15000 }
+              );
+              if (prComments.trim()) {
+                const filename = `pr-${prNum}-discussion.md`;
+                await writeFile(join(discussionsDir, filename), `# PR #${prNum} Discussion\n\nSynced: ${new Date().toISOString()}\n\n---\n\n` + prComments, 'utf-8');
+                syncedFiles.push(filename);
+              }
+            } catch { /* no PR found */ }
+          }
+        } catch { /* no PR list */ }
+      });
+
+    } else if (tracker === 'linear') {
+      try {
+        const issue = yield* linear.getIssue(issueId).pipe(Effect.catchCause(() => Effect.succeed(null)));
+        if (!issue) {
+          return jsonResponse({ error: 'Linear not configured or issue not found' }, { status: 400 });
+        }
+        const comments = yield* linear.getComments(issue.id).pipe(Effect.catchCause(() => Effect.succeed([])));
+        if (comments.length > 0) {
+          const filename = `linear-${issueId}-comments.md`;
+          const commentBody = comments.map((c: { author: string; createdAt: string; body: string }) =>
+            `## ${c.author} (${c.createdAt})\n\n${c.body}\n\n---\n`
+          ).join('\n');
+          yield* Effect.tryPromise({
+            try: () => writeFile(join(discussionsDir, filename), `# Linear Comments for ${issueId}\n\nSynced: ${new Date().toISOString()}\n\n---\n\n` + commentBody, 'utf-8'),
+            catch: (err) => new Error(String(err)),
+          });
+          syncedFiles.push(filename);
+        }
+      } catch (err) { console.warn(`Failed to sync Linear comments for ${issueId}:`, err); }
+
+    } else if (tracker === 'rally') {
+      try {
+        // getIssueDataService is sync — call it directly under JS try/catch
+        // rather than Effect.tryPromise. The old wrapper put any sync throw
+        // onto the FAILURE channel via `catch: () => null`, which `yield*`
+        // then re-raised out of this JS try/catch (Effect failures aren't
+        // JS throws) and into httpHandler's catchCause.
+        let issueDataService: IssueDataService | null;
+        try { issueDataService = getIssueDataService(); }
+        catch { issueDataService = null; }
+        const allIssues = (issueDataService?.getIssues() ?? []) as Record<string, unknown>[];
+        const parentFeature = allIssues.find((i) => i['source'] === 'rally' && i['identifier'] === issueId);
+        const childStories = allIssues.filter((i) => i['source'] === 'rally' && i['parentRef'] === issueId);
+
+        if (childStories.length > 0 || parentFeature) {
+          const filename = `rally-${issueId}-stories.md`;
+          const lines: string[] = [`# Rally Stories for ${issueId}`, '', `Synced: ${new Date().toISOString()}`, ''];
+
+          if (parentFeature) {
+            const pf = parentFeature as { title?: string; rawTrackerState?: string; status?: string; derivedStatus?: string; totalChildCount?: number; completedChildCount?: number; inProgressChildCount?: number };
+            lines.push(`**Feature**: ${pf.title}`, `**Rally State**: ${pf.rawTrackerState || pf.status}`);
+            if (pf.derivedStatus) lines.push(`**Derived Status**: ${pf.derivedStatus}`);
+            lines.push(`**Stories**: ${pf.totalChildCount || childStories.length} total, ${pf.completedChildCount || 0} done, ${pf.inProgressChildCount || 0} active`, '');
+          }
+
+          lines.push('---', '', '## Child Stories', '');
+          for (const story of childStories) {
+            const s = story as { status?: string; identifier?: string; title?: string; rawTrackerState?: string; assignee?: { name?: string } };
+            const statusEmoji = s.status === 'Done' ? '✅' : s.status === 'In Progress' ? '🔄' : s.status === 'In Review' ? '👀' : '⬜';
+            lines.push(`- ${statusEmoji} **${s.identifier}**: ${s.title}`, `  - Status: ${s.rawTrackerState || s.status}`);
+            if (s.assignee?.name) lines.push(`  - Assignee: ${s.assignee.name}`);
+            lines.push('');
+          }
+
+          yield* Effect.tryPromise({
+            try: () => writeFile(join(discussionsDir, filename), lines.join('\n'), 'utf-8'),
+            catch: (err) => new Error(String(err)),
+          });
+          syncedFiles.push(filename);
+        }
+      } catch (err) { console.warn(`Failed to sync Rally stories for ${issueId}:`, err); }
+    }
+
+    return jsonResponse({ synced: syncedFiles.length, files: syncedFiles });
+  })),
+);
+
+// ─── Route: POST /api/command-deck/planning/:issueId/init ─────────────────
+
+const postMissionControlPlanningInitRoute = HttpRouter.add(
+  'POST',
+  '/api/command-deck/planning/:issueId/init',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const issueId = params['issueId'] ?? '';
+    const body = yield* readJsonBody;
+    const eventStore = yield* EventStoreService;
+
+    const { shadow } = body as { shadow?: boolean };
+    const issueLower = issueId.toLowerCase();
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
+
+    const projectPath = getProjectPath(issuePrefix);
+    const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+    const planningDir = join(workspacePath, PAN_DIRNAME);
+
+    yield* Effect.tryPromise({
+      try: async () => {
+        await Promise.all(['transcripts', 'discussions', 'notes'].map(subdir =>
+          mkdir(join(planningDir, subdir), { recursive: true })
+        ));
+
+        if (shadow) {
+          const inferencePath = join(planningDir, 'INFERENCE.md');
+          if (!await pathExists(inferencePath)) {
+            await writeFile(inferencePath, `# Inference Document - ${issueId}\n\n*This document is maintained by the Shadow Engineering Monitoring Agent.*\n\n## Status\n\nAwaiting initial artifact analysis.\n\n## Understanding\n\n(pending)\n\n## Gaps & Risks\n\n(pending)\n`, 'utf-8');
+          }
+        }
+      },
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+
+    const sessionName = `planning-${issueLower}`;
+    yield* eventStore.append({ type: 'planning.started', timestamp: new Date().toISOString(), payload: { issueId, sessionName } });
+    return jsonResponse({ success: true, path: planningDir });
+  })),
+);
+
+// ─── Route: GET /api/command-deck/projects ────────────────────────────────
+
+const getMissionControlProjectsRoute = HttpRouter.add(
+  'GET',
+  '/api/command-deck/projects',
+  httpHandler(Effect.gen(function* () {
+    const result = yield* Effect.tryPromise({
+      try: () => fetchProjectTree(),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    return jsonResponse(result);
+  })),
+);
+
+async function fetchProjectTree(): Promise<unknown[]> {
+  const discovered = await getCachedResourceAllocatedIssues();
+  return groupResourceAllocatedIssuesByProject(sanitizeResourceAllocatedIssues(discovered));
+}
+
+// ─── Compose all routes into a single Layer ───────────────────────────────────
+
+export const commandDeckRouteLayer = Layer.mergeAll(
+  getMissionControlActivityRoute,
+  getMissionControlPlanningRoute,
+  postMissionControlStatusReviewRoute,
+  postMissionControlUploadRoute,
+  postMissionControlSyncDiscussionsRoute,
+  postMissionControlPlanningInitRoute,
+  getMissionControlProjectsRoute,
+);
+
+export default commandDeckRouteLayer;

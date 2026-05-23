@@ -7,7 +7,7 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { Effect, Layer, ServiceMap } from 'effect';
+import { Effect, Layer, Context } from 'effect';
 import {
   AgentAlreadyRunning,
   AgentStartError,
@@ -23,6 +23,7 @@ export interface StartWorkOptions {
   readonly phase?: 'exploration' | 'implementation' | 'testing' | 'documentation' | 'review-response';
   readonly prompt?: string;
   readonly agentType?: 'review-agent' | 'test-agent' | 'merge-agent' | 'work-agent';
+  readonly allowHost?: boolean;
 }
 
 export interface StartPlanningOptions {
@@ -78,7 +79,7 @@ export interface AgentSpawnerShape {
   /**
    * Start a planning agent for an issue.
    *
-   * Creates .planning directory, writes PLANNING_PROMPT.md, sets tmux options
+   * Creates the workspace planning artifacts, writes the planning prompt, and sets tmux options
    * (remain-on-exit on, destroy-unattached off), and spawns the planning session.
    */
   readonly startPlanning: (
@@ -115,7 +116,7 @@ export interface AgentSpawnerShape {
 
 // ─── Service tag ──────────────────────────────────────────────────────────────
 
-export class AgentSpawner extends ServiceMap.Service<AgentSpawner, AgentSpawnerShape>()(
+export class AgentSpawner extends Context.Service<AgentSpawner, AgentSpawnerShape>()(
   'panopticon/dashboard/AgentSpawner',
 ) {}
 
@@ -152,12 +153,12 @@ export const AgentSpawnerLive = Layer.effect(
           }
 
           // Guard: no agent already running
-          const { getAgentStateAsync, spawnAgent, normalizeAgentId } = await import(
+          const { getAgentState, spawnAgent, normalizeAgentId } = await import(
             '../../../lib/agents.js'
           ) as any;
           const normalizedId = normalizeAgentId(issueId);
 
-          const existing = await getAgentStateAsync(normalizedId);
+          const existing = await Effect.runPromise(getAgentState(normalizedId));
           if (existing?.status === 'running') {
             throw new AgentAlreadyRunning({ id: issueId });
           }
@@ -166,9 +167,9 @@ export const AgentSpawnerLive = Layer.effect(
             issueId,
             workspace: workspacePath,
             model: opts.model,
-            phase: opts.phase,
+            role: 'work',
             prompt: opts.prompt,
-            agentType: opts.agentType ?? 'work-agent',
+            allowHost: opts.allowHost,
           });
 
           return {
@@ -200,16 +201,6 @@ export const AgentSpawnerLive = Layer.effect(
           if (!existsSync(workspacePath)) {
             throw new WorkspaceNotFound({ id: issueId });
           }
-
-          // Create .planning directory if it doesn't exist
-          const { promises: fsp } = await import('node:fs');
-          const planningDir = join(workspacePath, '.planning');
-          await fsp.mkdir(planningDir, { recursive: true });
-
-          // Write PLANNING_PROMPT.md
-          const planningPromptPath = join(planningDir, 'PLANNING_PROMPT.md');
-          const { writeFile } = fsp;
-          await writeFile(planningPromptPath, opts.issue.description ?? '', 'utf-8');
 
           // Delegate to spawn-planning-session
           const sessionName = opts.sessionName ?? `planning-${issueId.toLowerCase()}`;
@@ -250,8 +241,8 @@ export const AgentSpawnerLive = Layer.effect(
     kill: (agentId) =>
       Effect.tryPromise({
         try: async () => {
-          const { stopAgentAsync } = await import('../../../lib/agents.js') as any;
-          await stopAgentAsync(agentId);
+          const { stopAgent } = await import('../../../lib/agents.js') as any;
+          await Effect.runPromise(stopAgent(agentId));
         },
         catch: () => undefined,
       }).pipe(Effect.ignore),
@@ -274,23 +265,23 @@ export const AgentSpawnerLive = Layer.effect(
       Effect.tryPromise({
         try: async () => {
           const { deepWipe } = await import('../../../lib/lifecycle/workflows.js');
-          const { resolveProjectFromIssue } = await import('../../../lib/projects.js');
+          const { resolveProjectFromIssueSync } = await import('../../../lib/projects.js');
 
-          const project = resolveProjectFromIssue(issueId);
-          const projectPath = project?.path ?? process.cwd();
+          const project = resolveProjectFromIssueSync(issueId);
+          const projectPath = project?.projectPath ?? process.cwd();
 
-          await deepWipe(
+          await Effect.runPromise(deepWipe(
             {
               issueId,
               projectPath,
-              projectName: project?.name,
+              projectName: project?.projectName,
             },
             {
               deleteWorkspace: opts.deleteWorkspace ?? true,
               deleteBranches: opts.deleteBranches ?? true,
               resetIssue: opts.resetIssue ?? true,
             },
-          );
+          ));
         },
         catch: (err) =>
           new AgentStartError({

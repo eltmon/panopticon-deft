@@ -11,7 +11,7 @@
 import { Duration, Effect, Exit, Layer, ManagedRuntime, Schedule, Scope, Stream } from 'effect'
 import { RpcClient, RpcSerialization } from 'effect/unstable/rpc'
 import * as Socket from 'effect/unstable/socket/Socket'
-import { PanRpcGroup } from '@panopticon/contracts'
+import { PanRpcGroup, WS_METHODS, type FlywheelStatus } from '@panctl/contracts'
 
 // ─── Protocol setup ───────────────────────────────────────────────────────────
 
@@ -22,20 +22,75 @@ export type PanRpcProtocolClient = RpcClientFactory extends Effect.Effect<infer 
   ? C
   : never
 
+function resolveRpcUrl(url?: string): string {
+  if (url) return url
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  // Use VITE_API_URL when available — frontend and API are on different subdomains
+  // (e.g. feature-pan-428.pan.localhost vs api-feature-pan-428.pan.localhost)
+  const apiUrl = import.meta.env.VITE_API_URL
+  if (apiUrl) {
+    const apiHost = new URL(apiUrl).host
+    return `${proto}://${apiHost}/ws/rpc`
+  }
+  return `${proto}://${window.location.host}/ws/rpc`
+}
+
+function dashboardSessionUrl(url?: string): string {
+  const rpcUrl = new URL(resolveRpcUrl(url))
+  rpcUrl.protocol = rpcUrl.protocol === 'wss:' ? 'https:' : 'http:'
+  rpcUrl.pathname = '/api/dashboard/session'
+  rpcUrl.search = ''
+  rpcUrl.hash = ''
+  return rpcUrl.toString()
+}
+
+let dashboardSessionPromise: Promise<void> | null = null
+let dashboardCsrfToken: string | null = null
+
+function consumeDashboardBootstrapToken(): string | null {
+  if (typeof window === 'undefined') return null
+  const hash = window.location.hash.replace(/^#/, '')
+  if (!hash) return null
+  const params = new URLSearchParams(hash)
+  const token = params.get('panopticon_token') ?? params.get('token')
+  if (!token) return null
+  params.delete('panopticon_token')
+  params.delete('token')
+  const nextHash = params.toString()
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ''}`)
+  return token
+}
+
+export function ensureDashboardSession(url?: string): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve()
+  const token = consumeDashboardBootstrapToken()
+  dashboardSessionPromise ??= fetch(dashboardSessionUrl(url), {
+    method: 'POST',
+    credentials: 'include',
+    headers: token ? { 'x-panopticon-internal-token': token } : undefined,
+  }).then(async (response) => {
+    if (response.status === 401) return
+    if (!response.ok) throw new Error(`Dashboard session bootstrap failed: HTTP ${response.status}`)
+    const data = await response.json().catch(() => null) as { csrfToken?: unknown } | null
+    if (typeof data?.csrfToken === 'string') dashboardCsrfToken = data.csrfToken
+  }).catch((err) => {
+    dashboardSessionPromise = null
+    throw err
+  })
+  return dashboardSessionPromise
+}
+
+export async function dashboardMutationJsonHeaders(url?: string): Promise<Record<string, string>> {
+  await ensureDashboardSession(url)
+  if (!dashboardCsrfToken) throw new Error('Dashboard CSRF token unavailable')
+  return {
+    'Content-Type': 'application/json',
+    'x-panopticon-csrf-token': dashboardCsrfToken,
+  }
+}
+
 function createPanRpcProtocolLayer(url?: string) {
-  const resolvedUrl =
-    url ??
-    (() => {
-      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      // Use VITE_API_URL when available — frontend and API are on different subdomains
-      // (e.g. feature-pan-428.pan.localhost vs api-feature-pan-428.pan.localhost)
-      const apiUrl = import.meta.env.VITE_API_URL
-      if (apiUrl) {
-        const apiHost = new URL(apiUrl).host
-        return `${proto}://${apiHost}/ws/rpc`
-      }
-      return `${proto}://${window.location.host}/ws/rpc`
-    })()
+  const resolvedUrl = resolveRpcUrl(url)
 
   const socketLayer = Socket.layerWebSocket(resolvedUrl).pipe(
     Layer.provide(Socket.layerWebSocketConstructorGlobal),
@@ -48,8 +103,11 @@ function createPanRpcProtocolLayer(url?: string) {
 
 // ─── WsTransport ─────────────────────────────────────────────────────────────
 
-interface SubscribeOptions {
+export interface SubscribeOptions {
   readonly retryDelay?: Duration.Input
+  /** Called when the subscription reconnects after a failure. Use this to
+   *  re-bootstrap state (e.g. re-fetch the snapshot from the new server). */
+  readonly onReconnect?: () => void
 }
 
 const DEFAULT_RETRY_DELAY = Duration.millis(250)
@@ -68,8 +126,10 @@ export class WsTransport {
   constructor(url?: string) {
     this.runtime = ManagedRuntime.make(createPanRpcProtocolLayer(url))
     this.clientScope = this.runtime.runSync(Scope.make())
-    this.clientPromise = this.runtime.runPromise(
-      Scope.provide(this.clientScope)(makePanRpcClient),
+    this.clientPromise = ensureDashboardSession(url).then(() =>
+      this.runtime.runPromise(
+        Scope.provide(this.clientScope)(makePanRpcClient),
+      ),
     )
   }
 
@@ -111,44 +171,68 @@ export class WsTransport {
     if (this.disposed) return () => undefined
 
     let active = true
+    let currentCancel: (() => void) | null = null
     const retryDelay = options?.retryDelay ?? DEFAULT_RETRY_DELAY
+    const onReconnect = options?.onReconnect
+    let hasConnectedOnce = false
 
-    const cancel = this.runtime.runCallback(
-      Effect.promise(() => this.clientPromise).pipe(
-        Effect.flatMap((client) =>
-          Stream.runForEach(connect(client), (value) =>
+    const run = () => {
+      if (!active) return
+      const transport = getTransport()
+
+      currentCancel = transport.runtime.runCallback(
+        Effect.promise(() => transport.clientPromise).pipe(
+          Effect.flatMap((client) =>
+            Stream.runForEach(connect(client), (value) =>
+              Effect.sync(() => {
+                if (!active) return
+                // Fire onReconnect the first time we receive data after a
+                // reconnection. This lets EventRouter re-bootstrap its
+                // snapshot from the new server instance.
+                if (hasConnectedOnce && onReconnect) {
+                  hasConnectedOnce = false // reset so it only fires once per reconnect
+                  try { onReconnect() } catch { /* non-fatal */ }
+                }
+                try {
+                  listener(value)
+                } catch {
+                  // Swallow listener errors
+                }
+              }),
+            ),
+          ),
+          Effect.catchDefect((defect: unknown) =>
+            Effect.fail(new Error(formatError(defect))),
+          ),
+          Effect.tapError((err) =>
             Effect.sync(() => {
-              if (!active) return
-              try {
-                listener(value)
-              } catch {
-                // Swallow listener errors
+              if (active) {
+                hasConnectedOnce = true // mark that next successful data = reconnect
+                console.warn('[WsTransport] subscription error, retrying:', formatError(err))
               }
             }),
           ),
+          Effect.retry(Schedule.fixed(retryDelay)),
+          Effect.forever,
         ),
-        Effect.tapError((err) =>
-          Effect.sync(() => {
-            if (active) {
-              console.warn('[WsTransport] subscription error, retrying:', formatError(err))
+        {
+          onExit: (exit) => {
+            if (active && Exit.isFailure(exit)) {
+              hasConnectedOnce = true
+              console.warn('[WsTransport] subscription exited, reconnecting with fresh transport')
+              resetTransport()
+              setTimeout(run, 1000)
             }
-          }),
-        ),
-        Effect.retry(Schedule.fixed(retryDelay)),
-        Effect.forever,
-      ),
-      {
-        onExit: (exit) => {
-          if (active && Exit.isFailure(exit)) {
-            console.warn('[WsTransport] subscription exited unexpectedly')
-          }
+          },
         },
-      },
-    )
+      )
+    }
+
+    run()
 
     return () => {
       active = false
-      cancel()
+      currentCancel?.()
     }
   }
 
@@ -167,4 +251,23 @@ export function getTransport(): WsTransport {
     _transport = new WsTransport()
   }
   return _transport
+}
+
+export function subscribeFlywheelStatus(
+  listener: (status: FlywheelStatus | null) => void,
+  options?: SubscribeOptions,
+): () => void {
+  return getTransport().subscribe(
+    (client) =>
+      (client as PanRpcProtocolClient)[WS_METHODS.subscribeFlywheelStatus]({}) as unknown as Stream.Stream<FlywheelStatus | null, Error>,
+    listener,
+    options,
+  )
+}
+
+export function resetTransport(): void {
+  if (_transport) {
+    _transport.dispose()
+    _transport = null
+  }
 }

@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * Tests for checkFailedMergeRetry — CI failure notification state machine.
  * Tests for checkPostReviewCommits — ciRetryMap.delete on new-commit detection.
@@ -28,56 +29,66 @@ const mockResolveProjectFromIssue = vi.fn();
 const mockGetAgentRuntimeState = vi.fn().mockReturnValue(null);
 
 vi.mock('../../../src/lib/review-status.js', () => ({
+  getReviewStatusSync: vi.fn().mockReturnValue(null),
   setReviewStatus: (...args: unknown[]) => mockSetReviewStatus(...args),
+  setReviewStatusSync: (...args: unknown[]) => mockSetReviewStatus(...args),
   loadReviewStatuses: (...args: unknown[]) => mockLoadReviewStatuses(...args),
+  MAX_AUTO_REQUEUE: 25,
 }));
 
-vi.mock('../../../src/lib/tmux.js', () => ({
-  sessionExists: (...args: unknown[]) => mockSessionExists(...args),
-  sendKeysAsync: (...args: unknown[]) => mockSendKeysAsync(...args),
-  sessionExistsAsync: vi.fn().mockResolvedValue(false),
-  buildTmuxCommandString: vi.fn(),
-  capturePaneAsync: vi.fn(),
-  createSessionAsync: vi.fn(),
-  killSession: vi.fn(),
-  killSessionAsync: vi.fn(),
-  listPaneValues: vi.fn(),
-  listPaneValuesAsync: vi.fn(),
-  listSessionNamesAsync: vi.fn().mockResolvedValue([]),
-}));
+vi.mock('../../../src/lib/tmux.js', async () => {
+  const { Effect } = await import('effect');
+  return {
+    sessionExists: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSessionExists(...args))),
+    sessionExistsSync: (...args: unknown[]) => mockSessionExists(...args),
+    sendKeys: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    sendKeysProgram: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    buildTmuxCommandString: vi.fn(),
+    capturePane: vi.fn(() => Effect.succeed('')),
+    createSession: vi.fn(() => Effect.succeed(undefined)),
+    isPaneDead: vi.fn(() => Effect.succeed(false)),
+    killSession: vi.fn(),
+  killSessionSync: vi.fn(),
+    killSession: vi.fn(() => Effect.succeed(undefined)),
+    listPaneValues: vi.fn(),
+    listPaneValues: vi.fn(() => Effect.succeed([])),
+    listSessionNames: vi.fn(() => Effect.succeed([])),
+  };
+});
 
 vi.mock('../../../src/lib/cloister/feedback-writer.js', () => ({
-  writeFeedbackFile: (...args: unknown[]) => mockWriteFeedbackFile(...args),
+  writeFeedbackFile: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockWriteFeedbackFile(...args))),
 }));
 
-// Stub out heavy transitive dependencies that deacon imports at module level
-// Note: submitToSpecialistQueue, checkSpecialistQueue, getNextSpecialistTask,
-// and completeSpecialistTask were removed from specialists.ts in PAN-722.
+// Stub out heavy transitive dependencies that deacon imports at module level.
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
   getEnabledSpecialists: vi.fn().mockReturnValue([]),
   getTmuxSessionName: vi.fn(),
   isRunning: vi.fn().mockResolvedValue(false),
   initializeSpecialist: vi.fn(),
-  wakeSpecialist: vi.fn(),
-  clearSessionId: vi.fn(),
   spawnEphemeralSpecialist: vi.fn(),
-  wakeSpecialistWithTask: vi.fn(),
   getAllProjectSpecialistStatuses: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: (...args: unknown[]) => mockGetAgentRuntimeState(...args),
+  getAgentRuntimeStateSync: (...args: unknown[]) => mockGetAgentRuntimeState(...args),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
-  listRunningAgents: vi.fn().mockResolvedValue([]),
+  listRunningAgents: vi.fn(() => []),
+  listRunningAgentsSync: vi.fn(() => []),
   getAgentDir: vi.fn().mockReturnValue('/tmp'),
   getAgentState: vi.fn().mockReturnValue(null),
+  getAgentStateSync: vi.fn().mockReturnValue(null),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
 }));
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: (...args: unknown[]) => mockResolveProjectFromIssue(...args),
+  resolveProjectFromIssueSync: (...args: unknown[]) => mockResolveProjectFromIssue(...args),
   findProjectByPath: vi.fn().mockReturnValue(null),
+  findProjectByPathSync: vi.fn().mockReturnValue(null),
 }));
 
 // ── Test constants ──────────────────────────────────────────────────────────
@@ -115,11 +126,19 @@ describe('checkFailedMergeRetry — CI transient retry state machine', () => {
   beforeEach(async () => {
     vi.resetModules();
     mockSetReviewStatus.mockReset();
-    mockLoadReviewStatuses.mockReset().mockReturnValue({});
     mockSessionExists.mockReset().mockReturnValue(false);
     mockSendKeysAsync.mockReset().mockResolvedValue(undefined);
     mockWriteFeedbackFile.mockReset().mockResolvedValue(undefined);
     mockResolveProjectFromIssue.mockReset().mockReturnValue(null);
+    // Default: read the real review-status.json so tests that write to it work
+    mockLoadReviewStatuses.mockReset().mockImplementation(() => {
+      try {
+        const raw = readFileSync(REVIEW_STATUS_FILE, 'utf-8');
+        return JSON.parse(raw);
+      } catch {
+        return {};
+      }
+    });
 
     // Back up existing file
     if (existsSync(REVIEW_STATUS_FILE)) {
@@ -251,9 +270,9 @@ describe('checkFailedMergeRetry — CI transient retry state machine', () => {
     });
 
     try {
-      // loadReviewStatuses returns an issue that has passed review at an OLD commit
+      // Write an issue that has passed review at an OLD commit
       // (different from the current HEAD → triggers the reset path)
-      mockLoadReviewStatuses.mockReturnValue({
+      writeStatusFile({
         [ISSUE_ID]: {
           reviewStatus: 'passed',
           readyForMerge: true,
@@ -282,6 +301,13 @@ describe('checkFailedMergeRetry — CI transient retry state machine', () => {
       );
 
       // On the next patrol: checkFailedMergeRetry should now treat this as a fresh start
+      // Reset mock to read from the file (mockReturnValue above overrode mockImplementation)
+      mockLoadReviewStatuses.mockImplementation(() => {
+        if (existsSync(REVIEW_STATUS_FILE)) {
+          return JSON.parse(readFileSync(REVIEW_STATUS_FILE, 'utf-8'));
+        }
+        return {};
+      });
       // Write a CI-failed status so checkFailedMergeRetry has something to act on
       writeStatusFile({ [ISSUE_ID]: CI_FAILED_STATUS });
       const retryActions = await checkFailedMergeRetry();
@@ -304,14 +330,14 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
   let checkFailedMergeRetry: () => Promise<string[]>;
   let ciRetryMap: Map<string, { count: number; lastAttempt: number }>;
   let tempProjectPath: string;
-
-  const DEAD_END_ISSUE_ID = 'PAN-714-DEAD-END-TEST';
-  const issueLower = DEAD_END_ISSUE_ID.toLowerCase();
+  let deadEndIssueId: string;
+  let issueLower: string;
 
   beforeEach(async () => {
     vi.resetModules();
+    deadEndIssueId = `PAN-714-DEAD-END-TEST-${process.pid}-${Date.now()}`;
+    issueLower = deadEndIssueId.toLowerCase();
     mockSetReviewStatus.mockReset();
-    mockLoadReviewStatuses.mockReset().mockReturnValue({});
     mockSessionExists.mockReset().mockReturnValue(false);
     mockSendKeysAsync.mockReset().mockResolvedValue(undefined);
     mockWriteFeedbackFile.mockReset().mockResolvedValue(undefined);
@@ -321,6 +347,15 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
     mockGetAgentRuntimeState.mockReturnValue({
       state: 'idle',
       lastActivity: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
+    });
+    // Default: read the real review-status.json so tests that write to it work
+    mockLoadReviewStatuses.mockReset().mockImplementation(() => {
+      try {
+        const raw = readFileSync(REVIEW_STATUS_FILE, 'utf-8');
+        return JSON.parse(raw);
+      } catch {
+        return {};
+      }
     });
 
     if (existsSync(REVIEW_STATUS_FILE)) {
@@ -351,7 +386,7 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
     // Create a temp workspace with a stale merge-agent ci-failure feedback file
     tempProjectPath = mkdtempSync(join(tmpdir(), 'pan-dead-end-test-'));
     const feedbackDir = join(
-      tempProjectPath, 'workspaces', `feature-${issueLower}`, '.planning', 'feedback',
+      tempProjectPath, 'workspaces', `feature-${issueLower}`, '.pan', 'feedback',
     );
     mkdirSync(feedbackDir, { recursive: true });
     const staleFeedbackFile = join(feedbackDir, '013-merge-agent-ci-failure.md');
@@ -359,8 +394,8 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
 
     // Write a CI-blocked merge status that is old enough (> 5 min staleness threshold)
     writeStatusFile({
-      [DEAD_END_ISSUE_ID]: {
-        issueId: DEAD_END_ISSUE_ID,
+      [deadEndIssueId]: {
+        issueId: deadEndIssueId,
         reviewStatus: 'passed',
         testStatus: 'passed',
         mergeStatus: 'failed',
@@ -370,7 +405,7 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
       },
     });
 
-    // Agent session exists; capturePaneAsync returns undefined → isAgentActiveInTmux = false (idle)
+    // Agent session exists; captured pane output is blank → isAgentActiveInTmux = false (idle)
     mockSessionExists.mockReturnValue(true);
     // resolveProjectFromIssue returns our temp project so the workspace path resolves
     mockResolveProjectFromIssue.mockReturnValue({ projectPath: tempProjectPath });
@@ -380,7 +415,7 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
     // Merge status must be reset to allow re-entry into the merge flow
     expect(mockSetReviewStatus).toHaveBeenCalledOnce();
     const [calledId, update] = mockSetReviewStatus.mock.calls[0];
-    expect(calledId).toBe(DEAD_END_ISSUE_ID);
+    expect(calledId).toBe(deadEndIssueId);
     expect(update.mergeStatus).toBe('pending');
     expect(update.readyForMerge).toBe(true);
 
@@ -390,19 +425,19 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
     // Action entry must be recorded for audit/logging
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatch(/Dead-end recovery/);
-    expect(actions[0]).toContain(DEAD_END_ISSUE_ID);
+    expect(actions[0]).toContain(deadEndIssueId);
   });
 
   it('resets ciRetryMap on dead-end recovery so next CI failure re-enters at attempt 1/5', async () => {
     // Create a workspace so clearStaleCiFeedback has somewhere to look
     tempProjectPath = mkdtempSync(join(tmpdir(), 'pan-dead-end-ci-reset-'));
     mkdirSync(
-      join(tempProjectPath, 'workspaces', `feature-${issueLower}`, '.planning', 'feedback'),
+      join(tempProjectPath, 'workspaces', `feature-${issueLower}`, '.pan', 'feedback'),
       { recursive: true },
     );
 
     const ciBlockedStatus = {
-      issueId: DEAD_END_ISSUE_ID,
+      issueId: deadEndIssueId,
       reviewStatus: 'passed',
       testStatus: 'passed',
       mergeStatus: 'failed',
@@ -410,28 +445,28 @@ describe('checkDeadEndAgents — dead-end CI recovery path', () => {
       readyForMerge: false,
       updatedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), // 10 min ago
     };
-    writeStatusFile({ [DEAD_END_ISSUE_ID]: ciBlockedStatus });
+    writeStatusFile({ [deadEndIssueId]: ciBlockedStatus });
 
     mockSessionExists.mockReturnValue(true); // idle agent session
     mockResolveProjectFromIssue.mockReturnValue({ projectPath: tempProjectPath });
 
     // Seed ciRetryMap past exhaustion (count=6)
-    ciRetryMap.set(DEAD_END_ISSUE_ID, { count: 6, lastAttempt: Date.now() - 5 * 60_000 });
-    expect(ciRetryMap.has(DEAD_END_ISSUE_ID)).toBe(true);
+    ciRetryMap.set(deadEndIssueId, { count: 6, lastAttempt: Date.now() - 5 * 60_000 });
+    expect(ciRetryMap.has(deadEndIssueId)).toBe(true);
 
     // Dead-end recovery resets merge status and must clear ciRetryMap
     await checkDeadEndAgents();
 
-    expect(ciRetryMap.has(DEAD_END_ISSUE_ID)).toBe(false);
+    expect(ciRetryMap.has(deadEndIssueId)).toBe(false);
 
     // Now simulate the next CI failure for this issue
-    writeStatusFile({ [DEAD_END_ISSUE_ID]: ciBlockedStatus });
+    writeStatusFile({ [deadEndIssueId]: ciBlockedStatus });
     const retryActions = await checkFailedMergeRetry();
 
     // Should re-enter at attempt 1/5, not silently dead-end
     expect(retryActions).toHaveLength(1);
     expect(retryActions[0]).toMatch(/CI failure notification/);
     expect(retryActions[0]).toMatch(/attempt 1\/5/);
-    expect(ciRetryMap.get(DEAD_END_ISSUE_ID)?.count).toBe(1);
+    expect(ciRetryMap.get(deadEndIssueId)?.count).toBe(1);
   });
 });

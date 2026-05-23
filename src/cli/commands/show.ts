@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * pan show <id> — unified observation command
  *
@@ -18,8 +19,9 @@ import { contextCommand } from './context.js';
 import { healthCommand } from './health.js';
 import { getShadowState } from '../../lib/shadow-state.js';
 import { pingAgent } from '../../lib/health.js';
-import { getAgentCV } from '../../lib/cv.js';
-import { getAgentRuntimeState } from '../../lib/agents.js';
+import { getAgentCVSync } from '../../lib/cv.js';
+import { getAgentRuntimeStateSync } from '../../lib/agents.js';
+import { resolveBareNumericIdSync } from '../../lib/issue-id.js';
 
 interface ShowOptions {
   shadow?: boolean;
@@ -46,22 +48,34 @@ function relativeTime(iso: string | null | undefined): string {
 export async function showCommand(id: string, options: ShowOptions = {}): Promise<void> {
   const { shadow, cv, context, health, json } = options;
 
+  // Normalize input: accept bare numbers (1148), prefixed issue IDs (PAN-1148),
+  // and prefixed agent IDs (agent-pan-1148). Bare numbers are resolved by probing
+  // ~/.panopticon/agents/ for a unique state dir, since the CLI doesn't otherwise
+  // know which project a bare number belongs to.
+  const resolved = resolveBareNumericIdSync(id);
+  if (!resolved) {
+    console.error(chalk.red(`Could not resolve issue ID "${id}"`));
+    console.error(chalk.dim(
+      'Pass a fully-qualified ID like "PAN-1148", or ensure the agent state dir exists at ~/.panopticon/agents/agent-<prefix>-<num>/',
+    ));
+    return;
+  }
+  const normalizedId = resolved.toLowerCase();
+  const issueId = resolved;
+  const agentId = `agent-${normalizedId}`;
+
   // Scoped views delegate to the full sub-commands
-  if (shadow) return shadowCommand(id);
-  if (cv) return cvCommand(id, { json });
-  if (context) return contextCommand('state', `agent-${id.toLowerCase()}`, undefined, { json });
-  if (health) return healthCommand('ping', id, { json });
+  if (shadow) return shadowCommand(issueId);
+  if (cv) return cvCommand(issueId, { json });
+  if (context) return contextCommand('state', agentId, undefined, { json });
+  if (health) return healthCommand('ping', issueId, { json });
 
-  // Default: compact combined summary (≤ 25 lines).
-  const issueId = id.toUpperCase();
-  const agentId = `agent-${issueId.toLowerCase()}`;
-
-  const shadowState = await getShadowState(issueId);
-  const healthData = await (async () => {
-    try { return await pingAgent(agentId); } catch { return null; }
-  })();
-  const runtimeState = getAgentRuntimeState(agentId);
-  const cvData = getAgentCV(agentId);
+  const shadowState = await Effect.runPromise(getShadowState(issueId));
+  const healthData = await Effect.runPromise(
+    pingAgent(agentId).pipe(Effect.catch(() => Effect.succeed(null))),
+  );
+  const runtimeState = getAgentRuntimeStateSync(agentId);
+  const cvData = getAgentCVSync(agentId);
 
   if (json) {
     console.log(JSON.stringify({

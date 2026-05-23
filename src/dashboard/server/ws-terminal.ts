@@ -18,14 +18,29 @@
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { WebSocketServer, WebSocket } from 'ws';
+import { Effect } from 'effect';
 import * as pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { activePtyHubs, addClientToHub, broadcastToHub, removeClientFromHub, setClientReady, type PtyHub } from './pty-hub.js';
-import { buildTmuxCommandString, buildTmuxArgs, capturePaneAsync, getWindowDimensionsAsync, listSessionNamesAsync, resizeWindowAsync, sessionExistsAsync } from '../../lib/tmux.js';
+import { buildTmuxArgs, capturePane, getWindowDimensions, listSessionNames, resizeWindow, sessionExists } from '../../lib/tmux.js';
+import { consumeReauthTerminalToken } from './routes/codex-auth.js';
+import { validateOriginHeaders } from './routes/origin-validation.js';
+import { buildChildEnvWithoutTmuxSync } from '../../lib/child-env.js';
+import { isRespawnPending, waitForSessionRespawn } from './services/pending-respawn.js';
+
+// Worst-case respawn window for switch-model / resume / restart-all is
+// dominated by `waitForClaudePrompt`'s 30s ceiling. 35s gives a comfortable
+// margin for the surrounding kill + spawn + tmux-up overhead.
+const RESPAWN_WAIT_MS = 35_000;
 
 type ClientControlMessage =
   | { type: 'attach'; cols: number; rows: number }
   | { type: 'ready' }
   | { type: 'resize'; cols: number; rows: number };
+
+const ATTACH_TIMEOUT_MS = 5000;
+const READY_TIMEOUT_MS = 10_000;
+const PRE_ATTACH_MAX_MESSAGES = 32;
+const PRE_ATTACH_MAX_BYTES = 64 * 1024;
 
 function parseControlMessage(message: string): ClientControlMessage | null {
   if (!message.startsWith('{')) return null;
@@ -47,6 +62,44 @@ function sendControl(ws: WebSocket, payload: unknown): void {
   }
 }
 
+function rejectUpgrade(socket: import('net').Socket, status: number, message: string): void {
+  socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  socket.destroy();
+}
+
+function armReadyTimeout(hub: PtyHub, ws: WebSocket, sessionName: string): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(() => {
+    const state = hub.clientStates.get(ws);
+    if (ws.readyState === WebSocket.OPEN && state && !state.ready) {
+      console.warn(`[ws-terminal] Closing unready terminal client for ${sessionName}`);
+      ws.close(1008, 'terminal-ready-timeout');
+    }
+  }, READY_TIMEOUT_MS);
+  ws.once('close', () => clearTimeout(timer));
+  ws.once('error', () => clearTimeout(timer));
+  return timer;
+}
+
+function markClientReady(hub: PtyHub, ws: WebSocket, readyTimer: ReturnType<typeof setTimeout>): void {
+  clearTimeout(readyTimer);
+  setClientReady(hub, ws);
+}
+
+function authorizeTerminalUpgrade(request: http.IncomingMessage): { ok: true } | { ok: false; status: number; message: string } {
+  // Hotfix for #1166: PAN-457 added an internal-token + session-cookie gate
+  // here that broke every terminal panel when the dashboard is reached via
+  // Traefik (https://pan.localhost) instead of `pan up`'s bootstrapped URL.
+  // Origin validation is sufficient to block cross-origin browser attacks
+  // (a tab on evil.example.com cannot forge Origin: https://pan.localhost),
+  // which is the realistic threat model for a localhost dev tool. Re-add the
+  // gate properly per the acceptance criteria in #1166 before reintroducing.
+  const originCheck = validateOriginHeaders(request.headers, request.method ?? 'GET');
+  if (!originCheck.ok) {
+    return { ok: false, status: 403, message: originCheck.error };
+  }
+  return { ok: true };
+}
+
 // Fresh-attach snapshot cap. 5000 lines with escape sequences was several megabytes
 // on a busy session — the client then had to receive, parse, and write all of that
 // before sending `ready` and letting live data through. 500 lines covers a generous
@@ -59,35 +112,28 @@ const SNAPSHOT_SCROLLBACK_LINES = (() => {
 /**
  * Snapshot for a fresh attach (no existing hub).
  *
- * We used to call `resizeWindowAsync` before `capturePaneAsync`, but tmux's
- * resize is only synchronous from tmux's point of view — the grid dims change
- * instantly, yet the inner program (Claude Code, etc.) only redraws its
- * content asynchronously in response to SIGWINCH. The capture ran between
- * those two events, so the snapshot contained old content laid out for the
- * previous width, painted into a new-width grid. The client then displayed
- * that garbled state until the PTY attach triggered a real redraw — a
- * visible 1–2 s "letters all over the place" glitch on every fresh attach.
+ * Always captures at tmux's current dimensions — never resizes first.
+ * Resizing before capture caused a "letters all over the place" glitch:
+ * tmux's grid changed instantly but the inner program (Claude Code, etc.)
+ * hadn't redrawn yet, so the snapshot contained old content in a new-width
+ * grid.
  *
- * New strategy: only capture if tmux is already at the client's requested
- * dims (the common reopen case — previous client disconnected, dims
- * retained). In that case the content is valid at the requested size and
- * paints cleanly. When the dims don't match, return an empty snapshot at
- * the requested dims: the client resizes its xterm, the PTY attaches at
- * those dims (driving tmux's real resize + the inner program's redraw),
- * and the first visible content is the clean live redraw — no stale
- * mid-resize garbage.
+ * By capturing at the current dims, the snapshot is always consistent with
+ * the rendered content. The client resizes xterm to match the snapshot dims,
+ * paints the content immediately, then the PTY attach drives the resize to
+ * the client's actual dims via the normal resize path.
  */
 async function captureFreshSnapshot(
   sessionName: string,
   requestedCols: number,
   requestedRows: number,
 ): Promise<{ cols: number; rows: number; data: string }> {
-  const dims = await getWindowDimensionsAsync(sessionName);
-  if (!dims || dims.cols !== requestedCols || dims.rows !== requestedRows) {
+  const dims = await Effect.runPromise(getWindowDimensions(sessionName));
+  if (!dims) {
     return { cols: requestedCols, rows: requestedRows, data: '' };
   }
-  const data = await capturePaneAsync(sessionName, SNAPSHOT_SCROLLBACK_LINES, { escapeSequences: true });
-  return { cols: requestedCols, rows: requestedRows, data };
+  const data = await Effect.runPromise(capturePane(sessionName, SNAPSHOT_SCROLLBACK_LINES, { escapeSequences: true }));
+  return { cols: dims.cols, rows: dims.rows, data };
 }
 
 /**
@@ -98,7 +144,7 @@ async function captureFreshSnapshot(
  * naturally covers it. `-S 0` starts capture from the first visible line.
  */
 async function captureViewportSnapshot(sessionName: string): Promise<string> {
-  return capturePaneAsync(sessionName, 0, { escapeSequences: true });
+  return Effect.runPromise(capturePane(sessionName, 0, { escapeSequences: true }));
 }
 
 /**
@@ -132,6 +178,11 @@ export function setupTerminalWebSocket(server: http.Server): void {
     const url = new URL(request.url || '', `http://${request.headers.host}`);
 
     if (url.pathname === '/ws/terminal') {
+      const auth = authorizeTerminalUpgrade(request);
+      if (!auth.ok) {
+        rejectUpgrade(socket, auth.status, auth.message);
+        return;
+      }
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
@@ -147,21 +198,52 @@ export function setupTerminalWebSocket(server: http.Server): void {
       return;
     }
 
+    // Re-auth sessions require a server-issued one-time terminal token to prevent hijacking.
+    if (sessionName.startsWith('reauth-')) {
+      const cookie = req.headers.cookie ?? '';
+      const token = cookie
+        .split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith('pan_codex_reauth='))
+        ?.slice('pan_codex_reauth='.length);
+      let decodedToken = '';
+      try {
+        decodedToken = token ? decodeURIComponent(token) : '';
+      } catch {
+        decodedToken = '';
+      }
+      const [cookieSessionName, terminalToken] = decodedToken.split(':');
+      if (cookieSessionName !== sessionName || !consumeReauthTerminalToken(sessionName, terminalToken)) {
+        ws.close(1008, 'Invalid or missing re-auth token');
+        return;
+      }
+    }
+
     console.log(`[ws-terminal] WebSocket connected for session: ${sessionName}`);
 
     // Buffer messages immediately to avoid losing them during async setup.
     // The client sends resize dimensions immediately on connect, but we have async
     // operations (tmux checks) that take time. Without buffering, messages are lost.
     const earlyMessages: string[] = [];
+    let preAttachBytes = 0;
     let messageHandler: ((data: string) => void) | null = null;
     let resolvePendingAttach: ((attach: Extract<ClientControlMessage, { type: 'attach' }> | null) => void) | null = null;
+
+    const bufferPreAttachMessage = (message: string): boolean => {
+      preAttachBytes += Buffer.byteLength(message);
+      if (earlyMessages.length >= PRE_ATTACH_MAX_MESSAGES || preAttachBytes > PRE_ATTACH_MAX_BYTES) {
+        ws.close(1008, 'attach-handshake-too-large');
+        return false;
+      }
+      earlyMessages.push(message);
+      return true;
+    };
 
     ws.on('message', (data) => {
       const message = data.toString();
       if (messageHandler) {
         messageHandler(message);
-      } else {
-        earlyMessages.push(message);
+      } else if (bufferPreAttachMessage(message)) {
         console.log(`[ws-terminal] Buffered early message for ${sessionName}: ${message.slice(0, 50)}...`);
       }
     });
@@ -176,10 +258,24 @@ export function setupTerminalWebSocket(server: http.Server): void {
     // Check if tmux session exists and set up PTY (async)
     (async () => {
       try {
-        const sessions = await listSessionNamesAsync();
+        const sessions = await Effect.runPromise(listSessionNames());
         if (!sessions.includes(sessionName)) {
-          ws.close(1008, `Session ${sessionName} not found`);
-          return;
+          // The session may legitimately be gone, OR it may be in the
+          // middle of a switch-model / resume / restart-all kill→spawn
+          // cycle. The frontend treats 4404 as fatal (no retry), so
+          // emitting it during a respawn gap leaves the terminal panel
+          // stuck on "Could not reconnect" even after the new session
+          // is up. Wait for the respawn to land before deciding.
+          if (isRespawnPending(sessionName)) {
+            const cameBack = await waitForSessionRespawn(sessionName, RESPAWN_WAIT_MS);
+            if (!cameBack) {
+              ws.close(4404, 'session-not-found');
+              return;
+            }
+          } else {
+            ws.close(4404, 'session-not-found');
+            return;
+          }
         }
       } catch (err) {
         ws.close(1008, `Failed to list tmux sessions: ${err}`);
@@ -187,16 +283,26 @@ export function setupTerminalWebSocket(server: http.Server): void {
       }
 
       let attachMessage: Extract<ClientControlMessage, { type: 'attach' }> | null = null;
+      let attachTimer: ReturnType<typeof setTimeout> | null = null;
       const attachPromise = new Promise<Extract<ClientControlMessage, { type: 'attach' }> | null>((resolve) => {
         resolvePendingAttach = resolve;
+        attachTimer = setTimeout(() => {
+          ws.close(1008, 'attach-handshake-timeout');
+          resolve(null);
+        }, ATTACH_TIMEOUT_MS);
       });
       const remainingMessages: string[] = [];
+      let remainingBytes = 0;
       for (const msg of earlyMessages) {
         const parsed = parseControlMessage(msg);
         if (!attachMessage && parsed?.type === 'attach') {
           attachMessage = parsed;
-        } else {
+        } else if (remainingMessages.length < PRE_ATTACH_MAX_MESSAGES && remainingBytes <= PRE_ATTACH_MAX_BYTES) {
+          remainingBytes += Buffer.byteLength(msg);
           remainingMessages.push(msg);
+        } else {
+          ws.close(1008, 'attach-handshake-too-large');
+          return;
         }
       }
       earlyMessages.length = 0;
@@ -205,7 +311,15 @@ export function setupTerminalWebSocket(server: http.Server): void {
         const parsed = parseControlMessage(message);
         if (!attachMessage && parsed?.type === 'attach') {
           attachMessage = parsed;
+          if (attachTimer) clearTimeout(attachTimer);
           resolvePendingAttach?.(parsed);
+          resolvePendingAttach = null;
+          return;
+        }
+        remainingBytes += Buffer.byteLength(message);
+        if (remainingMessages.length >= PRE_ATTACH_MAX_MESSAGES || remainingBytes > PRE_ATTACH_MAX_BYTES) {
+          ws.close(1008, 'attach-handshake-too-large');
+          resolvePendingAttach?.(null);
           resolvePendingAttach = null;
           return;
         }
@@ -216,6 +330,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
       if (!attachMessage) {
         attachMessage = await attachPromise;
       }
+      if (attachTimer) clearTimeout(attachTimer);
       if (!attachMessage) {
         return;
       }
@@ -255,11 +370,11 @@ export function setupTerminalWebSocket(server: http.Server): void {
           existingHub.cols = requestedCols;
           existingHub.rows = requestedRows;
           try {
-            existingHub.pty.resize(requestedCols, requestedRows);
+            existingHub.pty?.resize(requestedCols, requestedRows);
           } catch {
             // PTY may be mid-teardown; subsequent operations will notice.
           }
-          resizeWindowAsync(sessionName, requestedCols, requestedRows).catch(() => {});
+          Effect.runPromise(resizeWindow(sessionName, requestedCols, requestedRows)).catch(() => {});
           for (const client of existingHub.clients) {
             if (client !== ws) {
               sendControl(client, { type: 'size', cols: requestedCols, rows: requestedRows });
@@ -268,10 +383,11 @@ export function setupTerminalWebSocket(server: http.Server): void {
           sendControl(ws, { type: 'snapshot', cols: requestedCols, rows: requestedRows, data: '' });
         }
 
+        const readyTimer = armReadyTimeout(existingHub, ws, sessionName);
         const handleJoinMessage = (message: string) => {
           const parsed = parseControlMessage(message);
           if (parsed?.type === 'ready') {
-            setClientReady(existingHub, ws);
+            markClientReady(existingHub, ws, readyTimer);
             return;
           }
           if (parsed?.type === 'resize') {
@@ -283,11 +399,11 @@ export function setupTerminalWebSocket(server: http.Server): void {
             existingHub.cols = parsed.cols;
             existingHub.rows = parsed.rows;
             try {
-              existingHub.pty.resize(parsed.cols, parsed.rows);
+              existingHub.pty?.resize(parsed.cols, parsed.rows);
             } catch {
               return;
             }
-            resizeWindowAsync(sessionName, parsed.cols, parsed.rows)
+            Effect.runPromise(resizeWindow(sessionName, parsed.cols, parsed.rows))
               .catch(() => {});
             for (const client of existingHub.clients) {
               sendControl(client, { type: 'size', cols: parsed.cols, rows: parsed.rows });
@@ -298,6 +414,10 @@ export function setupTerminalWebSocket(server: http.Server): void {
             return;
           }
           if (existingHub.inputClient !== ws) return;
+          if (!existingHub.pty) {
+            existingHub.pendingInput.push(message);
+            return;
+          }
           try {
             existingHub.pty.write(message);
           } catch {
@@ -328,53 +448,84 @@ export function setupTerminalWebSocket(server: http.Server): void {
 
       let ptyProcess: pty.IPty | null = null;
       let ptyStarted = false;
-      const pendingInput: string[] = [];
 
       const hub: PtyHub = {
-        pty: null as unknown as pty.IPty,
+        pty: null,
         clients: new Set(),
         cols: requestedCols,
         rows: requestedRows,
+        pendingInput: [],
         inputClient: ws,
         clientStates: new Map(),
       };
 
+      activePtyHubs.set(sessionName, hub);
       addClientToHub(hub, ws, false);
 
       const startLocalPty = async () => {
         if (ptyStarted) return;
         try {
-          const exists = await sessionExistsAsync(sessionName);
+          let exists = await Effect.runPromise(sessionExists(sessionName));
+          // Mirror the upfront 4404 guard: tolerate the kill→spawn gap of
+          // an in-progress respawn rather than emitting fatal 4404 the
+          // client won't retry.
+          if (!exists && isRespawnPending(sessionName)) {
+            exists = await waitForSessionRespawn(sessionName, RESPAWN_WAIT_MS);
+          }
           if (!exists) {
             console.log(`[ws-terminal] Session ${sessionName} does not exist — closing without PTY spawn`);
-            ws.close(1000, 'session-not-found');
+            // Use 4404 (private-use range) so the client can distinguish
+            // "session doesn't exist" from "normal disconnect". The client
+            // should NOT retry on 4404 — the session is gone.
+            activePtyHubs.delete(sessionName);
+            ws.close(4404, 'session-not-found');
             return;
           }
         } catch {
           console.log(`[ws-terminal] Session ${sessionName} does not exist — closing without PTY spawn`);
-          ws.close(1000, 'session-not-found');
+          activePtyHubs.delete(sessionName);
+          ws.close(4404, 'session-not-found');
           return;
         }
 
         ptyStarted = true;
         console.log(`[ws-terminal] Starting local PTY for ${sessionName} at ${hub.cols}x${hub.rows}`);
+        // Strip TMUX/TMUX_PANE from inherited env so `tmux attach-session` doesn't refuse
+        // with "sessions should be nested with care, unset $TMUX to force" when the
+        // dashboard server itself was launched from inside a tmux pane.
         ptyProcess = pty.spawn('tmux', buildTmuxArgs(['attach-session', '-t', sessionName]), {
           name: 'xterm-256color',
           cols: hub.cols,
           rows: hub.rows,
           cwd: homedir(),
-          env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', LANG: 'en_US.UTF-8' } as { [key: string]: string },
+          env: buildChildEnvWithoutTmuxSync(process.env, {
+            TERM: 'xterm-256color',
+            COLORTERM: 'truecolor',
+            LANG: 'en_US.UTF-8',
+          }) as { [key: string]: string },
         });
 
         hub.pty = ptyProcess;
-        activePtyHubs.set(sessionName, hub);
+
+        let ptyChunks = 0;
+        let ptyBytes = 0;
+        const ptyDiagInterval = setInterval(() => {
+          if (ptyChunks === 0) return;
+          const maxBuf = Math.max(...[...hub.clients].map(c => c.bufferedAmount));
+          console.log(`[ws-terminal] PTY ${sessionName}: ${ptyChunks} chunks, ${ptyBytes}B in last 5s, ws-buf=${maxBuf}`);
+          ptyChunks = 0;
+          ptyBytes = 0;
+        }, 5000);
 
         ptyProcess.onData((data) => {
+          ptyChunks++;
+          ptyBytes += data.length;
           broadcastToHub(hub, data);
         });
 
         ptyProcess.onExit(({ exitCode }) => {
           console.log(`[ws-terminal] PTY for ${sessionName} exited with code ${exitCode}`);
+          clearInterval(ptyDiagInterval);
           activePtyHubs.delete(sessionName);
           for (const client of hub.clients) {
             if (client.readyState === WebSocket.OPEN) {
@@ -385,20 +536,28 @@ export function setupTerminalWebSocket(server: http.Server): void {
           hub.clientStates.clear();
         });
 
-        for (const input of pendingInput) {
+        for (const input of hub.pendingInput) {
           ptyProcess.write(input);
         }
-        pendingInput.length = 0;
+        hub.pendingInput.length = 0;
       };
 
-      const snapshot = await captureFreshSnapshot(sessionName, requestedCols, requestedRows);
+      let snapshot: { cols: number; rows: number; data: string };
+      try {
+        snapshot = await captureFreshSnapshot(sessionName, requestedCols, requestedRows);
+      } catch (err) {
+        activePtyHubs.delete(sessionName);
+        ws.close(1008, `Failed to capture terminal snapshot: ${err}`);
+        return;
+      }
       sendControl(ws, { type: 'snapshot', cols: snapshot.cols, rows: snapshot.rows, data: snapshot.data });
+      const readyTimer = armReadyTimeout(hub, ws, sessionName);
+      void startLocalPty();
 
       const handleLocalMessage = (message: string) => {
         const parsed = parseControlMessage(message);
         if (parsed?.type === 'ready') {
-          setClientReady(hub, ws);
-          void startLocalPty();
+          markClientReady(hub, ws, readyTimer);
           return;
         }
         if (parsed?.type === 'resize') {
@@ -411,7 +570,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
           hub.rows = parsed.rows;
           if (ptyProcess) {
             ptyProcess.resize(parsed.cols, parsed.rows);
-            resizeWindowAsync(sessionName, parsed.cols, parsed.rows)
+            Effect.runPromise(resizeWindow(sessionName, parsed.cols, parsed.rows))
               .catch(() => {});
             for (const client of hub.clients) {
               sendControl(client, { type: 'size', cols: parsed.cols, rows: parsed.rows });
@@ -426,7 +585,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
         if (ptyProcess) {
           ptyProcess.write(message);
         } else {
-          pendingInput.push(message);
+          hub.pendingInput.push(message);
         }
       };
 

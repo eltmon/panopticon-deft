@@ -74,7 +74,7 @@ export interface AgentMessage {
 /**
  * Runtime adapter interface
  */
-export interface RuntimeAdapter {
+export interface RuntimeAdapterLegacy {
   readonly type: RuntimeType;
   readonly config: RuntimeConfig;
 
@@ -146,27 +146,68 @@ export interface RuntimeRegistry {
   /**
    * Register a runtime adapter
    */
-  register(adapter: RuntimeAdapter): void;
+  register(adapter: RuntimeAdapterLegacy): void;
 
   /**
    * Get a runtime adapter by type
    */
-  get(type: RuntimeType): RuntimeAdapter | undefined;
+  get(type: RuntimeType): RuntimeAdapterLegacy | undefined;
 
   /**
    * Get all registered runtimes
    */
-  getAll(): RuntimeAdapter[];
+  getAll(): RuntimeAdapterLegacy[];
 
   /**
    * Get all available (installed) runtimes
    */
-  getAvailable(): Promise<RuntimeAdapter[]>;
+  getAvailable(): Promise<RuntimeAdapterLegacy[]>;
 
   /**
    * Sync skills to all registered runtimes
    */
   syncToAll(sourceDir: string, force?: boolean): Promise<Map<RuntimeType, number>>;
+}
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Effect-channel runtime adapter interface. The legacy Promise-based
+// RuntimeAdapterLegacy shape above is preserved for existing dashboard and CLI
+// callers while new consumers compose through the canonical Effect API.
+
+import type { Effect } from 'effect';
+import type {
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  FsError,
+} from '../errors.js';
+
+/** Tagged-error union the Effect runtime methods can fail with. */
+export type RuntimeAdapterError =
+  | ProcessSpawnError
+  | ProcessTimeoutError
+  | FsError;
+
+/**
+ * Runtime adapter whose methods return Effects; failure channels carry tagged
+ * errors for typed `Effect.catchTag` branching.
+ */
+export interface RuntimeAdapter {
+  readonly type: RuntimeType;
+  readonly config: RuntimeConfig;
+
+  isAvailable(): Effect.Effect<boolean>;
+  getVersion(): Effect.Effect<string | null>;
+  initialize(): Effect.Effect<void, FsError>;
+  spawnAgent(id: string, options: AgentSpawnOptions): Effect.Effect<boolean>;
+  sendMessage(id: string, message: AgentMessage): Effect.Effect<boolean>;
+  getAgentStatus(id: string): Effect.Effect<AgentStatus | null>;
+  stopAgent(id: string): Effect.Effect<boolean>;
+  listAgents(): Effect.Effect<AgentStatus[]>;
+  syncSkills(sourceDir: string, force?: boolean): Effect.Effect<number, FsError>;
+  syncCommands?(sourceDir: string, force?: boolean): Effect.Effect<number, FsError>;
+  getSkillsDir(): string;
+  getCommandsDir?(): string;
 }
 
 /**

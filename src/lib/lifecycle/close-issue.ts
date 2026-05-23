@@ -14,17 +14,19 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { Effect } from 'effect';
 import type { IssueTracker } from '../tracker/interface.js';
 import type { LifecycleContext, StepResult } from './types.js';
 import { stepOk, stepSkipped, stepFailed, getLinearApiKey } from './types.js';
-import { extractNumber, extractPrefix } from '../issue-id.js';
+import { extractNumberSync, extractPrefixSync, normalizeIssueIdSync } from '../issue-id.js';
+import { getAgentState, markAgentStoppedState, saveAgentState } from '../agents.js';
 import { setCanonicalState } from './reconciler/index.js';
 
 const execFileAsync = promisify(execFile);
 
 const CLOSED_OUT_LABEL = 'closed-out';
 const CLOSED_OUT_COLOR = '1d4ed8';
-const WORKFLOW_LABELS = ['in-progress', 'in-review', 'needs-close-out'];
+const WORKFLOW_LABELS = ['in-progress', 'in-review', 'needs-close-out', 'verifying-on-main'];
 
 /** Options for close-issue */
 export interface CloseIssueOptions {
@@ -46,73 +48,85 @@ export interface CloseIssueOptions {
  * If a tracker is provided, uses the abstraction layer.
  * Otherwise, falls back to direct gh CLI (GitHub) or Linear SDK calls.
  */
-export async function closeIssue(
+async function markWorkAgentStoppedForIssue(issueId: string): Promise<void> {
+  const agentId = `agent-${normalizeIssueIdSync(issueId)}`;
+  const state = await Effect.runPromise(getAgentState(agentId));
+  if (!state) return;
+  markAgentStoppedState(state);
+  await Effect.runPromise(saveAgentState(state));
+}
+
+export function closeIssue(
   ctx: LifecycleContext,
   opts: CloseIssueOptions = {},
-): Promise<StepResult[]> {
-  const results: StepResult[] = [];
-  const { applyLabel = true, labelOnly = false, comment } = opts;
+): Effect.Effect<StepResult[]> {
+  return Effect.gen(function* () {
+    const results: StepResult[] = [];
+    const { applyLabel = true, labelOnly = false, comment } = opts;
 
-  // Step 1: Transition to closed (unless labelOnly)
-  if (!labelOnly) {
-    const closeResult = opts.tracker
-      ? await closeViaTracker(ctx, opts.tracker, comment)
-      : await closeViaDirect(ctx, comment);
-    results.push(closeResult);
+    // Step 1: Transition to closed (unless labelOnly)
+    if (!labelOnly) {
+      const closeResult = opts.tracker
+        ? yield* closeViaTracker(ctx, opts.tracker, comment)
+        : yield* closeViaDirect(ctx, comment);
+      results.push(closeResult);
 
-    // If close failed, don't bother with labels
-    if (!closeResult.success && !closeResult.skipped) {
-      return results;
+      // If close failed, don't bother with labels
+      if (!closeResult.success && !closeResult.skipped) {
+        return results;
+      }
     }
-  }
 
-  // Step 2: Close any open PR for the feature branch (GitHub only)
-  if (ctx.github) {
-    const prResult = await closeGitHubPr(ctx);
-    results.push(prResult);
-  }
+    // Step 2: Close any open PR for the feature branch (GitHub only)
+    if (ctx.github) {
+      const prResult = yield* closeGitHubPr(ctx);
+      results.push(prResult);
+    }
 
-  // Step 3: Apply closed-out label + remove workflow labels
-  if (applyLabel) {
-    const labelResult = await applyClosedOutLabel(ctx, opts.tracker);
-    results.push(labelResult);
-  }
+    // Step 3: Apply closed-out label + remove workflow labels
+    if (applyLabel) {
+      const labelResult = yield* applyClosedOutLabel(ctx, opts.tracker);
+      results.push(labelResult);
+    }
 
-  return results;
+    return results;
+  });
 }
 
 /**
  * Close via IssueTracker abstraction.
  */
-async function closeViaTracker(
+function closeViaTracker(
   ctx: LifecycleContext,
   tracker: IssueTracker,
   comment?: string,
-): Promise<StepResult> {
+): Effect.Effect<StepResult> {
   const step = 'close-issue:transition';
-  try {
-    await tracker.transitionIssue(ctx.issueId, 'closed');
+  return Effect.gen(function* () {
+    yield* tracker.transitionIssue(ctx.issueId, 'closed');
+    yield* Effect.promise(() => markWorkAgentStoppedForIssue(ctx.issueId));
     if (comment) {
-      try {
-        await tracker.addComment(ctx.issueId, comment);
-      } catch {
-        // Non-fatal — comment is best-effort
-      }
+      // Best-effort comment — swallow errors
+      yield* tracker.addComment(ctx.issueId, comment).pipe(
+        Effect.catch(() => Effect.void),
+      );
     }
     return stepOk(step, [`Closed ${ctx.issueId} via ${tracker.name} tracker`]);
-  } catch (err) {
-    return stepFailed(step, `Failed to close via tracker: ${(err as Error).message}`);
-  }
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed(step, `Failed to close via tracker: ${(err as Error).message ?? String(err)}`)),
+    ),
+  );
 }
 
 /**
  * Close via direct API calls (fallback when no tracker configured).
  * Determines issue type from context and uses appropriate method.
  */
-async function closeViaDirect(
+function closeViaDirect(
   ctx: LifecycleContext,
   comment?: string,
-): Promise<StepResult> {
+): Effect.Effect<StepResult> {
   const step = 'close-issue:transition';
 
   if (ctx.github) {
@@ -125,29 +139,73 @@ async function closeViaDirect(
   }
 
   // Try Linear
-  const linearApiKey = getLinearApiKey();
-  if (linearApiKey) {
-    return closeLinearDirect(ctx, linearApiKey);
-  }
-
-  return stepFailed(step, 'No tracker available and cannot determine issue type');
+  return Effect.gen(function* () {
+    const linearApiKey = yield* Effect.promise(() => getLinearApiKey());
+    if (linearApiKey) {
+      return yield* closeLinearDirect(ctx, linearApiKey);
+    }
+    return stepFailed(step, 'No tracker available and cannot determine issue type');
+  });
 }
 
 /**
  * Close a GitHub issue via gh CLI.
  */
-async function closeGitHubDirect(ctx: LifecycleContext, comment?: string): Promise<StepResult> {
+function closeGitHubDirect(ctx: LifecycleContext, comment?: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => closeGitHubDirectImpl(ctx, comment),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('close-issue:transition', `gh issue close failed: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function closeGitHubDirectImpl(ctx: LifecycleContext, comment?: string): Promise<StepResult> {
   const step = 'close-issue:transition';
   if (!ctx.github) {
     return stepFailed(step, 'GitHub config not provided');
   }
   const { owner, repo, number } = ctx.github;
+
+  // Refuse to close a GitHub issue when its feature branch still has an open,
+  // unmerged PR. PAN-1030 closed the issue while PR #1046 was open with 1152
+  // lines of real changes — the close-out path trusted the operator without
+  // verifying the merge. Fail loudly so the operator notices and either
+  // merges the PR first or tells us why the issue should still close.
+  const branchName = `feature/${ctx.issueId.toLowerCase()}`;
+  try {
+    const { stdout: prRaw } = await execFileAsync(
+      'gh',
+      ['pr', 'list', '--repo', `${owner}/${repo}`, '--head', branchName, '--state', 'open', '--json', 'number,mergedAt,mergeCommit', '--jq', '.[0]'],
+      { encoding: 'utf-8' },
+    );
+    const trimmed = prRaw.trim();
+    if (trimmed) {
+      try {
+        const pr = JSON.parse(trimmed) as { number?: number; mergedAt?: string | null; mergeCommit?: unknown };
+        if (pr.number && !pr.mergedAt && !pr.mergeCommit) {
+          return stepFailed(
+            step,
+            `Refusing to close issue #${number}: open PR #${pr.number} on ${branchName} has not been merged. Merge or close the PR first, or rename the branch if it is unrelated.`,
+          );
+        }
+      } catch {
+        // PR JSON unparseable — continue with the close (don't block on parser error).
+      }
+    }
+  } catch {
+    // gh query failed — don't block close-out on a flaky network call.
+  }
+
   try {
     const args = ['issue', 'close', String(number), '--repo', `${owner}/${repo}`];
     if (comment) {
       args.push('--comment', comment);
     }
     await execFileAsync('gh', args, { encoding: 'utf-8' });
+    await markWorkAgentStoppedForIssue(ctx.issueId);
     return stepOk(step, [`Closed GitHub issue #${number} on ${owner}/${repo}`]);
   } catch (err) {
     return stepFailed(step, `gh issue close failed: ${(err as Error).message}`);
@@ -157,7 +215,18 @@ async function closeGitHubDirect(ctx: LifecycleContext, comment?: string): Promi
 /**
  * Close any open GitHub PR for the feature branch.
  */
-async function closeGitHubPr(ctx: LifecycleContext): Promise<StepResult> {
+function closeGitHubPr(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => closeGitHubPrImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('close-issue:close-pr', [`PR close failed (non-fatal): ${(err as Error).message}`])),
+    ),
+  );
+}
+
+async function closeGitHubPrImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'close-issue:close-pr';
   if (!ctx.github) {
     return stepSkipped(step, ['Not a GitHub issue']);
@@ -167,21 +236,43 @@ async function closeGitHubPr(ctx: LifecycleContext): Promise<StepResult> {
   const branchName = `feature/${issueLower}`;
 
   try {
+    // Pull number + merge status. Closing without checking can land us in the
+    // PAN-1030 state: issue closed + PR left OPEN with real unmerged code,
+    // or worse — close a not-yet-merged PR with a "Merged via Panopticon
+    // lifecycle" comment that lies about what happened.
     const { stdout: prListRaw } = await execFileAsync(
       'gh',
-      ['pr', 'list', '--repo', `${owner}/${repo}`, '--head', branchName, '--state', 'open', '--json', 'number', '--jq', '.[0].number'],
+      ['pr', 'list', '--repo', `${owner}/${repo}`, '--head', branchName, '--state', 'open', '--json', 'number,mergedAt,mergeCommit', '--jq', '.[0]'],
       { encoding: 'utf-8' },
     );
-    const prNumber = prListRaw.trim();
-    if (!prNumber) {
+    const prRaw = prListRaw.trim();
+    if (!prRaw) {
       return stepSkipped(step, ['No open PR found for branch']);
+    }
+    let pr: { number?: number; mergedAt?: string | null; mergeCommit?: unknown };
+    try {
+      pr = JSON.parse(prRaw);
+    } catch {
+      return stepSkipped(step, [`PR JSON parse failed: ${prRaw.slice(0, 80)}`]);
+    }
+    if (!pr.number) {
+      return stepSkipped(step, ['Open PR query returned no number']);
+    }
+    if (!pr.mergedAt && !pr.mergeCommit) {
+      // PR is open but NOT merged — refuse to close. The close-out flow must
+      // not pretend an unmerged PR was merged. Fail loudly so the operator
+      // notices the inconsistency rather than the PR silently disappearing.
+      return stepFailed(
+        step,
+        `Refusing to close PR #${pr.number} on ${owner}/${repo}: PR is not merged. Investigate why close-out fired without a merge.`,
+      );
     }
     await execFileAsync(
       'gh',
-      ['pr', 'close', prNumber, '--repo', `${owner}/${repo}`, '--comment', 'Merged via Panopticon lifecycle'],
+      ['pr', 'close', String(pr.number), '--repo', `${owner}/${repo}`, '--comment', 'Merged via Panopticon lifecycle'],
       { encoding: 'utf-8' },
     );
-    return stepOk(step, [`Closed PR #${prNumber} on ${owner}/${repo}`]);
+    return stepOk(step, [`Closed PR #${pr.number} on ${owner}/${repo}`]);
   } catch (err) {
     return stepSkipped(step, [`PR close failed (non-fatal): ${(err as Error).message}`]);
   }
@@ -198,7 +289,18 @@ const LINEAR_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour (matches Linear'
 /**
  * Close a Linear issue via SDK (find by identifier, transition to Done).
  */
-async function closeLinearDirect(ctx: LifecycleContext, apiKey: string): Promise<StepResult> {
+function closeLinearDirect(ctx: LifecycleContext, apiKey: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => closeLinearDirectImpl(ctx, apiKey),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('close-issue:transition', `Linear close failed: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function closeLinearDirectImpl(ctx: LifecycleContext, apiKey: string): Promise<StepResult> {
   const step = 'close-issue:transition';
 
   // Circuit breaker: if we recently hit a rate limit, fail fast without making API calls
@@ -211,8 +313,8 @@ async function closeLinearDirect(ctx: LifecycleContext, apiKey: string): Promise
     const { LinearClient } = await import('@linear/sdk');
     const client = new LinearClient({ apiKey });
 
-    const issueNumber = extractNumber(ctx.issueId);
-    const issuePrefix = extractPrefix(ctx.issueId);
+    const issueNumber = extractNumberSync(ctx.issueId);
+    const issuePrefix = extractPrefixSync(ctx.issueId);
     if (issueNumber === null || issuePrefix === null) {
       return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
     }
@@ -239,6 +341,7 @@ async function closeLinearDirect(ctx: LifecycleContext, apiKey: string): Promise
       }
     }
 
+    await markWorkAgentStoppedForIssue(ctx.issueId);
     return stepOk(step, [`Moved Linear issue ${ctx.issueId} to Done`]);
   } catch (err) {
     const message = (err as Error).message;
@@ -257,34 +360,43 @@ async function closeLinearDirect(ctx: LifecycleContext, apiKey: string): Promise
 /**
  * Close a Rally issue via RallyTracker.
  */
-async function closeRallyDirect(ctx: LifecycleContext): Promise<StepResult> {
+function closeRallyDirect(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => closeRallyDirectImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('close-issue:transition', `Rally close failed: ${(err as Error).message ?? String(err)}`)),
+    ),
+  );
+}
+
+async function closeRallyDirectImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'close-issue:transition';
   if (!ctx.rally) {
     return stepFailed(step, 'Rally config not provided');
   }
-  try {
-    const { RallyTracker } = await import('../tracker/rally.js');
-    const tracker = new RallyTracker({
-      apiKey: ctx.rally.apiKey,
-      server: ctx.rally.server,
-      workspace: ctx.rally.workspace,
-      project: ctx.rally.project,
-    });
-    await tracker.transitionIssue(ctx.issueId, 'closed');
-    return stepOk(step, [`Closed Rally issue ${ctx.issueId}`]);
-  } catch (err) {
-    return stepFailed(step, `Rally close failed: ${(err as Error).message}`);
-  }
+  const { RallyTracker } = await import('../tracker/rally.js');
+  const tracker = new RallyTracker({
+    apiKey: ctx.rally.apiKey,
+    server: ctx.rally.server,
+    workspace: ctx.rally.workspace,
+    project: ctx.rally.project,
+  });
+  // RallyTracker.transitionIssue returns Effect (migrated in PAN-1249).
+  await Effect.runPromise(tracker.transitionIssue(ctx.issueId, 'closed'));
+  await markWorkAgentStoppedForIssue(ctx.issueId);
+  return stepOk(step, [`Closed Rally issue ${ctx.issueId}`]);
 }
 
 /**
  * Apply 'closed-out' label and remove workflow labels.
  * Uses tracker if available, falls back to direct calls.
  */
-async function applyClosedOutLabel(
+function applyClosedOutLabel(
   ctx: LifecycleContext,
   tracker?: IssueTracker,
-): Promise<StepResult> {
+): Effect.Effect<StepResult> {
   const step = 'close-issue:label';
 
   if (tracker) {
@@ -295,34 +407,47 @@ async function applyClosedOutLabel(
     return applyLabelGitHub(ctx);
   }
 
-  const linearApiKey = getLinearApiKey();
-  if (linearApiKey) {
-    return applyLabelLinear(ctx, linearApiKey);
-  }
-
-  return stepSkipped(step, ['No tracker available for label management']);
+  return Effect.gen(function* () {
+    const linearApiKey = yield* Effect.promise(() => getLinearApiKey());
+    if (linearApiKey) {
+      return yield* applyLabelLinear(ctx, linearApiKey);
+    }
+    return stepSkipped(step, ['No tracker available for label management']);
+  });
 }
 
-async function applyLabelViaTracker(
+function applyLabelViaTracker(
   ctx: LifecycleContext,
   tracker: IssueTracker,
-): Promise<StepResult> {
+): Effect.Effect<StepResult> {
   const step = 'close-issue:label';
-  try {
-    const issue = await tracker.getIssue(ctx.issueId);
-    const newLabels = issue.labels.filter(l => !WORKFLOW_LABELS.includes(l));
+  return Effect.gen(function* () {
+    const issue = yield* tracker.getIssue(ctx.issueId);
+    const newLabels = issue.labels.filter((l: string) => !WORKFLOW_LABELS.includes(l));
     if (!newLabels.includes(CLOSED_OUT_LABEL)) {
       newLabels.push(CLOSED_OUT_LABEL);
     }
-    await tracker.updateIssue(ctx.issueId, { labels: newLabels });
+    yield* tracker.updateIssue(ctx.issueId, { labels: newLabels });
     return stepOk(step, [`Applied '${CLOSED_OUT_LABEL}' label via ${tracker.name} tracker`]);
-  } catch (err) {
-    // Label management is non-fatal
-    return stepSkipped(step, [`Label management failed (non-fatal): ${(err as Error).message}`]);
-  }
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped(step, [`Label management failed (non-fatal): ${(err as Error).message ?? String(err)}`])),
+    ),
+  );
 }
 
-async function applyLabelGitHub(ctx: LifecycleContext): Promise<StepResult> {
+function applyLabelGitHub(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => applyLabelGitHubImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('close-issue:label', [`Label management failed (non-fatal): ${(err as Error).message}`])),
+    ),
+  );
+}
+
+async function applyLabelGitHubImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'close-issue:label';
   if (!ctx.github) return stepSkipped(step);
   const { owner, repo, number } = ctx.github;
@@ -350,14 +475,25 @@ async function applyLabelGitHub(ctx: LifecycleContext): Promise<StepResult> {
   }
 }
 
-async function applyLabelLinear(ctx: LifecycleContext, apiKey: string): Promise<StepResult> {
+function applyLabelLinear(ctx: LifecycleContext, apiKey: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => applyLabelLinearImpl(ctx, apiKey),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('close-issue:label', [`Linear label management failed (non-fatal): ${(err as Error).message}`])),
+    ),
+  );
+}
+
+async function applyLabelLinearImpl(ctx: LifecycleContext, apiKey: string): Promise<StepResult> {
   const step = 'close-issue:label';
   try {
     const { LinearClient } = await import('@linear/sdk');
     const client = new LinearClient({ apiKey });
 
-    const issueNum = extractNumber(ctx.issueId);
-    const teamKey = extractPrefix(ctx.issueId);
+    const issueNum = extractNumberSync(ctx.issueId);
+    const teamKey = extractPrefixSync(ctx.issueId);
     if (issueNum === null || teamKey === null) {
       return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
     }
@@ -399,4 +535,3 @@ async function applyLabelLinear(ctx: LifecycleContext, apiKey: string): Promise<
     return stepSkipped(step, [`Linear label management failed (non-fatal): ${(err as Error).message}`]);
   }
 }
-

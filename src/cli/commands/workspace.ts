@@ -1,54 +1,64 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
-import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync, symlinkSync, lstatSync } from 'fs';
-import { join, basename, resolve } from 'path';
-import { createWorktree, removeWorktree, listWorktrees } from '../../lib/worktree.js';
-import { generateClaudeMd, TemplateVariables } from '../../lib/template.js';
-import { mergeSkillsIntoWorkspace, applyProjectTemplateOverlay } from '../../lib/skills-merge.js';
-import { listRunningAgents } from '../../lib/agents.js';
+import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync, symlinkSync, lstatSync, chmodSync, unlinkSync } from 'fs';
+import { join, basename, resolve, dirname } from 'path';
+import { createWorktree, removeWorktree, listWorktrees, type WorktreeInfo } from '../../lib/worktree.js';
+import { Effect } from 'effect';
+import { layer as nodeServicesLayer } from '@effect/platform-node/NodeServices';
+import { PAN_DIRNAME, PAN_CONTINUE_FILENAME, PAN_CONTEXT_FILENAME, PAN_FEEDBACK_DIRNAME, PAN_SESSIONS_FILENAME } from '../../lib/pan-dir/index.js';
+import { generateClaudeMdSync, TemplateVariables } from '../../lib/template.js';
+import { assembleWorkspaceContext, workspaceContextFile } from '../../lib/context-layers/index.js';
+import { mergeSkillsIntoWorkspaceSync, applyProjectTemplateOverlaySync } from '../../lib/skills-merge.js';
+import { listRunningAgentsSync } from '../../lib/agents.js';
 import {
-  resolveProjectFromIssue,
-  hasProjects,
+  resolveProjectFromIssueSync,
+  hasProjectsSync,
   PROJECTS_CONFIG_FILE,
-  findProjectByTeam,
+  findProjectByTeamSync,
   extractTeamPrefix,
-  listProjects,
+  listProjectsSync,
   getIssuePrefix,
-  getProject,
+  getProjectSync,
 } from '../../lib/projects.js';
 import {
   createWorkspace as createWorkspaceFromConfig,
   removeWorkspace as removeWorkspaceFromConfig,
   addReposToWorkspace,
+  copyPanopticonSettingsToWorkspaceSync,
 } from '../../lib/workspace-manager.js';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
-import { loadConfig } from '../../lib/config.js';
+import { loadConfigSync } from '../../lib/config.js';
+import { buildClaudeUserSettingsSync } from '../../lib/claude-permissions.js';
 import { createFlyProviderFromConfig, isRemoteAvailable } from '../../lib/remote/index.js';
 import type { RemoteWorkspaceMetadata } from '../../lib/remote/interface.js';
 import {
-  saveWorkspaceMetadata,
-  loadWorkspaceMetadata,
-  listWorkspaceMetadata,
+  saveWorkspaceMetadataSync,
+  loadWorkspaceMetadataSync,
+  listWorkspaceMetadataSync,
   WORKSPACES_DIR,
 } from '../../lib/remote/workspace-metadata.js';
 
 const execAsync = promisify(exec);
+const REDIRECT_MANAGED_BEADS_VERSION = 1 * 10000 + 0 * 100 + 4;
+
+function encodeBeadsVersion(version: string): number {
+  const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return 0;
+  const [, major, minor, patch] = match.map(Number);
+  return major * 10000 + minor * 100 + patch;
+}
 
 /**
  * Check beads version to determine which approach to use
- * Returns version as a number (e.g., 47.1 for v0.47.1) or 0 if not installed
+ * Returns version as a sortable semver number (e.g., v1.0.4 = 10004) or 0 if not installed
  */
 async function getBeadsVersion(): Promise<number> {
   try {
     const { stdout } = await execAsync('bd --version', { encoding: 'utf-8' });
-    const match = stdout.match(/(\d+)\.(\d+)\.(\d+)/);
-    if (match) {
-      const [, , minor, patch] = match.map(Number);
-      return minor * 100 + patch; // e.g., 47.1 = 4701
-    }
+    return encodeBeadsVersion(stdout);
   } catch {}
   return 0;
 }
@@ -87,8 +97,8 @@ async function initializeWorkspaceBeads(workspacePath: string, issueId: string):
   try {
     const beadsVersion = await getBeadsVersion();
 
-    if (beadsVersion >= 4701) {
-      // v0.47.1+ - Use shared database with issue label for scoping
+    if (beadsVersion >= REDIRECT_MANAGED_BEADS_VERSION) {
+      // v1.0.4+ - Use shared database with issue label for scoping
       // The worktree's .beads/ directory is created from git (only issues.jsonl is committed),
       // so it lacks the redirect file needed to find the main repo's Dolt database.
       // We must create .beads/redirect explicitly — it is gitignored so cannot be inherited.
@@ -101,6 +111,7 @@ async function initializeWorkspaceBeads(workspacePath: string, issueId: string):
         const mainBeadsDir = join(projectRoot, '.beads');
         if (existsSync(mainBeadsDir)) {
           mkdirSync(beadsDir, { recursive: true });
+          chmodSync(beadsDir, 0o700);
           // Write relative path from workspace .beads/ to main .beads/
           writeFileSync(redirectPath, '../../.beads', 'utf-8');
         }
@@ -119,7 +130,7 @@ async function initializeWorkspaceBeads(workspacePath: string, issueId: string):
       const match = stdout.match(/([a-z]+-[a-z0-9]+)/);
       return { success: true, beadId: match?.[1] };
     } else {
-      // Legacy approach for older beads versions (< 0.47.1)
+      // Legacy approach for older beads versions (< 1.0.4)
       // Remove inherited .beads directory and initialize fresh
       const beadsDir = join(workspacePath, '.beads');
       if (existsSync(beadsDir)) {
@@ -129,6 +140,8 @@ async function initializeWorkspaceBeads(workspacePath: string, issueId: string):
       const prefix = 'workspace';
       await execAsync(`bd init --prefix ${prefix}`, { cwd: workspacePath, encoding: 'utf-8' });
       await execAsync('git config beads.role contributor', { cwd: workspacePath }).catch(() => {});
+      // Disable beads' auto-export git-add to prevent "git add failed" warnings in worktrees
+      await execAsync('bd config set export.git-add false', { cwd: workspacePath, encoding: 'utf-8' }).catch(() => {});
 
       const title = `${issueId.toUpperCase()}: Implementation`;
       const { stdout } = await execAsync(
@@ -148,6 +161,11 @@ async function initializeWorkspaceBeads(workspacePath: string, issueId: string):
     return { success: false, error: error.message };
   }
 }
+
+export const __testInternals = {
+  encodeBeadsVersion,
+  REDIRECT_MANAGED_BEADS_VERSION,
+};
 
 export function registerWorkspaceCommands(program: Command): void {
   const workspace = program.command('workspace').description('Workspace management');
@@ -204,11 +222,76 @@ export function registerWorkspaceCommands(program: Command): void {
     .option('--project <path>', 'Explicit project path (overrides registry)')
     .action(destroyCommand);
 
+  // Re-render `<workspace>/.devcontainer/` from the project's compose
+  // template. Idempotent. The single source of truth for how the
+  // devcontainer files look — used by project-specific bootstrap scripts
+  // (e.g. MYN's `infra/new-feature`) instead of duplicating the render in
+  // bash + `sed`. See MIN-848.
+  workspace
+    .command('render-devcontainer <featureName>')
+    .description('Re-render <workspace>/.devcontainer/ from the project compose template')
+    .option('--project <key>', 'Project key in projects.yaml (e.g. mind-your-now)')
+    .option('--workspace <path>', 'Override the inferred workspace path')
+    .option('--json', 'Emit JSON instead of human-readable output')
+    .action(
+      async (
+        featureName: string,
+        opts: { project?: string; workspace?: string; json?: boolean },
+      ) => {
+        const { workspaceRenderDevcontainerCommand } = await import(
+          './workspace-render-devcontainer.js'
+        );
+        await workspaceRenderDevcontainerCommand(featureName, opts);
+      },
+    );
+
+  // The ONLY allowed call site for `git clean -fd` against a workspace.
+  // Refuses to run if stdin is not a TTY. Lists what would be deleted, asks
+  // the user to type the issue ID to confirm, then runs the chokepointed
+  // `runGitClean(..., userInvoked: true)`. See:
+  //   src/lib/safety/dangerous-git-ops.ts
+  //   src/cli/commands/workspace-deep-clean.ts
+  workspace
+    .command('deep-clean <issueId>')
+    .description(
+      'Interactive: git clean -fd against a workspace (preserves protected paths)',
+    )
+    .option('--yes', 'Skip confirmation prompt (still requires a TTY)')
+    .action(async (issueId: string, opts: { yes?: boolean }) => {
+      const { workspaceDeepCleanCommand } = await import('./workspace-deep-clean.js');
+      await workspaceDeepCleanCommand(issueId, opts);
+    });
+
+  workspace
+    .command('rebuild <issueId>')
+    .description('Tear down, re-render, and restart a single workspace Docker stack')
+    .action(async (issueId: string) => {
+      const { workspaceRebuildCommand } = await import('./workspace-rebuild.js');
+      await workspaceRebuildCommand(issueId);
+    });
+
+  workspace
+    .command('reap')
+    .description('List or remove orphaned unhealthy workspace Docker stacks')
+    .option('--days <days>', 'Minimum age in days', '7')
+    .option('--apply', 'Run docker compose down -v --remove-orphans for candidates')
+    .option('--yes', 'Skip confirmation when using --apply')
+    .action(async (opts: { days?: string; apply?: boolean; yes?: boolean }) => {
+      const { workspaceReapCommand } = await import('./workspace-reap.js');
+      await workspaceReapCommand(opts);
+    });
+
   workspace
     .command('update <issueId>')
     .description('Update skills/agents/rules in an existing workspace')
     .option('--force', 'Overwrite user-modified files')
     .action(updateCommand);
+
+  workspace
+    .command('use-config <issueId>')
+    .description('Copy installed Panopticon config into workspace (makes it user settings)')
+    .option('--project <path>', 'Explicit project path (overrides registry)')
+    .action(useConfigCommand);
 
   workspace
     .command('add-repo <workspaceId> <repoNames...>')
@@ -239,7 +322,7 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
     const folderName = `feature-${normalizedId}`;
 
     // Determine if we should create remote or local workspace
-    const config = loadConfig();
+    const config = loadConfigSync();
     const remoteConfig = config.remote;
     let useRemote = false;
 
@@ -270,18 +353,18 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
 
     // Try to find project config from registry
     const teamPrefix = extractTeamPrefix(issueId);
-    const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+    const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
 
     // Priority 1: Use workspace-manager if project has workspace config
     if (projectConfig?.workspace) {
       spinner.text = 'Creating workspace from config...';
 
-      const result = await createWorkspaceFromConfig({
+      const result = await Effect.runPromise(createWorkspaceFromConfig({
         projectConfig,
         featureName: normalizedId,
         startDocker: options.docker,
         dryRun: options.dryRun,
-      });
+      }));
 
       if (options.dryRun) {
         spinner.info('Dry run - no changes made');
@@ -384,12 +467,12 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
     if (options.project) {
       projectRoot = options.project;
     } else {
-      const resolved = resolveProjectFromIssue(issueId, labels);
+      const resolved = resolveProjectFromIssueSync(issueId, labels);
       if (resolved) {
         projectRoot = resolved.projectPath;
         projectName = resolved.projectName;
         spinner.text = `Resolved project: ${projectName} (${projectRoot})`;
-      } else if (hasProjects()) {
+      } else if (hasProjectsSync()) {
         spinner.warn(`No project found for ${issueId} in registry. Using current directory.`);
         spinner.start('Creating workspace...');
         projectRoot = process.cwd();
@@ -426,24 +509,35 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
 
     // Create worktree
     spinner.text = 'Creating git worktree...';
-    createWorktree(projectRoot, workspacePath, branchName);
+    await Effect.runPromise(
+      createWorktree(projectRoot, workspacePath, branchName).pipe(Effect.provide(nodeServicesLayer)),
+    );
 
-    // Remove stale .planning/ directory inherited from main branch.
-    // This contains STATE.md and other planning artifacts from a PREVIOUS issue.
-    // If left in place, the new agent reads it and works on the wrong issue.
-    // SAFETY: resolve() to absolute path and verify it's under a known workspace prefix
-    // to prevent path traversal from ever reaching rmSync.
+    // Clear stale workspace-local runtime state inherited from main.
+    // Keep canonical plan state (.pan/spec.vbrief.json); clear only mutable
+    // per-workspace artifacts that would belong to a previous issue/session.
     const resolvedWorkspace = resolve(workspacePath);
-    const resolvedPlanning = resolve(resolvedWorkspace, '.planning');
+    const resolvedPanDir = resolve(resolvedWorkspace, PAN_DIRNAME);
     const isUnderWorkspacesDir = resolvedWorkspace.match(/\/workspaces\/feature-[a-z0-9-]+$/);
-    if (
-      isUnderWorkspacesDir &&
-      resolvedPlanning === join(resolvedWorkspace, '.planning') &&
-      existsSync(join(resolvedWorkspace, '.git')) &&
-      existsSync(resolvedPlanning)
-    ) {
-      rmSync(resolvedPlanning, { recursive: true, force: true });
-      console.log('  Removed stale .planning/ directory from previous issue');
+    if (isUnderWorkspacesDir && existsSync(join(resolvedWorkspace, '.git'))) {
+      if (resolvedPanDir === join(resolvedWorkspace, PAN_DIRNAME) && existsSync(resolvedPanDir)) {
+        for (const filePath of [
+          join(resolvedPanDir, PAN_CONTINUE_FILENAME),
+          join(resolvedPanDir, PAN_SESSIONS_FILENAME),
+          join(resolvedPanDir, PAN_CONTEXT_FILENAME),
+        ]) {
+          if (existsSync(filePath)) {
+            unlinkSync(filePath);
+          }
+        }
+
+        const feedbackDir = join(resolvedPanDir, PAN_FEEDBACK_DIRNAME);
+        if (existsSync(feedbackDir)) {
+          rmSync(feedbackDir, { recursive: true, force: true });
+        }
+      }
+
+      console.log('  Cleared stale workspace-local .pan runtime state');
     }
 
     // Initialize fresh beads for this workspace (remove inherited beads from main)
@@ -467,14 +561,32 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
       BEAD_ID: workspaceBeadId,
     };
 
-    const claudeMd = generateClaudeMd(projectRoot, variables);
+    const claudeMd = generateClaudeMdSync(projectRoot, variables);
     writeFileSync(join(workspacePath, 'CLAUDE.md'), claudeMd);
+
+    // PAN-1201: assemble the workspace context layer. The bundle composes the
+    // parent project's layer with issue metadata; PAN-1052 memory injection
+    // and live status are layered on at spawn time. Non-fatal on failure.
+    try {
+      const wsContext = assembleWorkspaceContext({
+        projectRoot,
+        harness: 'claude-code',
+        issueId: issueId.toUpperCase(),
+        workspacePath,
+        branch: branchName,
+      });
+      const wsContextFile = workspaceContextFile(workspacePath);
+      mkdirSync(dirname(wsContextFile), { recursive: true });
+      writeFileSync(wsContextFile, wsContext);
+    } catch (err) {
+      spinner.warn(`Could not assemble workspace context layer: ${(err as Error).message}`);
+    }
 
     // Merge skills, agents, and rules (unless disabled)
     let skillsResult = { added: [] as string[], updated: [] as string[], skipped: [] as string[], overlayed: [] as string[] };
     if (options.skills !== false) {
       spinner.text = 'Merging skills and agents...';
-      skillsResult = mergeSkillsIntoWorkspace(workspacePath);
+      skillsResult = mergeSkillsIntoWorkspaceSync(workspacePath);
     }
 
     // Start Docker containers if requested
@@ -490,6 +602,18 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
         join(workspacePath, '.devcontainer', 'compose.yml'),
         join(workspacePath, '.devcontainer', 'compose.yaml'),
       ];
+
+      // Self-heal: if the workspace already exists from an earlier run but
+      // `.devcontainer/` was deleted (the original PAN-955 bug), regenerate
+      // it from the project template before looking for a compose file.
+      // Idempotent — no-op when `.devcontainer/` is already present.
+      if (!composeLocations.some(f => existsSync(f))) {
+        const { ensureDevcontainerSync } = await import('../../lib/workspace/ensure-devcontainer.js');
+        const ensure = ensureDevcontainerSync({ workspacePath, issueId });
+        if (ensure.rendered) {
+          spinner.text = 'Regenerated .devcontainer/ from project template';
+        }
+      }
 
       const composeFile = composeLocations.find(f => existsSync(f));
 
@@ -526,7 +650,7 @@ async function createCommand(issueId: string, options: CreateOptions): Promise<v
 
     // Install dependencies using the project's package manager.
     // Each worktree needs its own node_modules so that local workspace packages
-    // (e.g., @panopticon/contracts) resolve to the worktree's code, not the main repo's.
+    // (e.g., @panctl/contracts) resolve to the worktree's code, not the main repo's.
     const pkgManager = projectConfig?.package_manager || (existsSync(join(workspacePath, 'bun.lock')) ? 'bun' : 'npm');
     const installCmd = pkgManager === 'bun' ? 'bun install' : `${pkgManager} install`;
     spinner.text = `Installing dependencies (${pkgManager})...`;
@@ -606,27 +730,29 @@ interface ListOptions {
 }
 
 async function listCommand(options: ListOptions): Promise<void> {
-  const projects = listProjects();
+  const projects = listProjectsSync();
 
   // If we have registered projects and --all is specified, list across all projects
   if (projects.length > 0 && options.all) {
     const allWorkspaces: Array<{
       projectName: string;
       projectPath: string;
-      workspaces: ReturnType<typeof listWorktrees>;
+      workspaces: WorktreeInfo[];
     }> = [];
 
     for (const { key, config } of projects) {
       // For polyrepo projects, list worktrees from each sub-repo
       const isPolyrepo = config.workspace?.type === 'polyrepo' && config.workspace?.repos;
-      const workspaces: ReturnType<typeof listWorktrees> = [];
+      const workspaces: WorktreeInfo[] = [];
 
       if (isPolyrepo && config.workspace?.repos) {
         // Polyrepo: scan each configured repo for worktrees
         for (const repo of config.workspace.repos) {
           const repoPath = join(config.path, repo.path);
           if (!existsSync(join(repoPath, '.git'))) continue;
-          const repoWorktrees = listWorktrees(repoPath);
+          const repoWorktrees = await Effect.runPromise(
+            listWorktrees(repoPath).pipe(Effect.provide(nodeServicesLayer)),
+          );
           for (const wt of repoWorktrees) {
             if (wt.path.includes('/workspaces/') || wt.path.includes('\\workspaces\\')) {
               // Deduplicate: polyrepo workspaces share a parent dir (e.g., feature-min-697/fe, feature-min-697/api)
@@ -645,7 +771,9 @@ async function listCommand(options: ListOptions): Promise<void> {
       } else {
         // Monorepo: scan project root
         if (!existsSync(join(config.path, '.git'))) continue;
-        const worktrees = listWorktrees(config.path);
+        const worktrees = await Effect.runPromise(
+          listWorktrees(config.path).pipe(Effect.provide(nodeServicesLayer)),
+        );
         for (const wt of worktrees) {
           if (wt.path.includes('/workspaces/') || wt.path.includes('\\workspaces\\')) {
             workspaces.push(wt);
@@ -697,7 +825,9 @@ async function listCommand(options: ListOptions): Promise<void> {
     process.exit(1);
   }
 
-  const worktrees = listWorktrees(projectRoot);
+  const worktrees = await Effect.runPromise(
+    listWorktrees(projectRoot).pipe(Effect.provide(nodeServicesLayer)),
+  );
 
   // Filter to workspaces directory only
   const workspaces = worktrees.filter((w) =>
@@ -735,7 +865,7 @@ interface DestroyOptions {
   project?: string;
 }
 
-async function destroyCommand(issueId: string, options: DestroyOptions): Promise<void> {
+export async function destroyCommand(issueId: string, options: DestroyOptions): Promise<void> {
   const spinner = ora('Destroying workspace...').start();
 
   try {
@@ -743,7 +873,7 @@ async function destroyCommand(issueId: string, options: DestroyOptions): Promise
     const folderName = `feature-${normalizedId}`;
 
     // Check if this is a remote workspace
-    const metadata = loadWorkspaceMetadata(normalizedId);
+    const metadata = loadWorkspaceMetadataSync(normalizedId);
     if (metadata && metadata.location === 'remote') {
       await destroyRemoteWorkspace(issueId, normalizedId, metadata, spinner, options);
       return;
@@ -751,16 +881,16 @@ async function destroyCommand(issueId: string, options: DestroyOptions): Promise
 
     // Try to find project config from registry
     const teamPrefix = extractTeamPrefix(issueId);
-    const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+    const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
 
     // Priority 1: Use workspace-manager if project has workspace config
     if (projectConfig?.workspace) {
       spinner.text = 'Removing workspace...';
 
-      const result = await removeWorkspaceFromConfig({
+      const result = await Effect.runPromise(removeWorkspaceFromConfig({
         projectConfig,
         featureName: normalizedId,
-      });
+      }));
 
       if (result.success) {
         spinner.succeed('Workspace destroyed!');
@@ -808,7 +938,7 @@ async function destroyCommand(issueId: string, options: DestroyOptions): Promise
     if (options.project) {
       projectRoot = options.project;
     } else {
-      const resolved = resolveProjectFromIssue(issueId);
+      const resolved = resolveProjectFromIssueSync(issueId);
       if (resolved) {
         projectRoot = resolved.projectPath;
       } else {
@@ -831,7 +961,9 @@ async function destroyCommand(issueId: string, options: DestroyOptions): Promise
     const finalWorkspacePath = join(projectRoot, 'workspaces', folderName);
 
     spinner.text = 'Removing git worktree...';
-    removeWorktree(projectRoot, finalWorkspacePath);
+    await Effect.runPromise(
+      removeWorktree(projectRoot, finalWorkspacePath).pipe(Effect.provide(nodeServicesLayer)),
+    );
 
     spinner.succeed(`Workspace destroyed: ${folderName}`);
   } catch (error: any) {
@@ -857,7 +989,7 @@ async function createRemoteWorkspace(
   spinner: Ora,
   options: CreateOptions
 ): Promise<void> {
-  const config = loadConfig();
+  const config = loadConfigSync();
   const remoteConfig = config.remote;
 
   if (!remoteConfig?.enabled) {
@@ -880,7 +1012,7 @@ async function createRemoteWorkspace(
 
   // Determine project context first (needed for VM naming)
   const teamPrefix = extractTeamPrefix(issueId);
-  const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+  const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
   const projectRoot = projectConfig?.path || process.cwd();
 
   // Determine project identifier for VM name
@@ -920,7 +1052,7 @@ async function createRemoteWorkspace(
   try {
     // Step 1: Create VM
     spinner.text = 'Creating VM (this may take 1-2 minutes)...';
-    const vmInfo = await fly.createVm(vmName);
+    const vmInfo = await Effect.runPromise(fly.createVm(vmName));
 
     // Get git remote URL
     let repoUrl = '';
@@ -935,7 +1067,7 @@ async function createRemoteWorkspace(
       console.log('');
       console.log(chalk.dim('Make sure you are in a git repository with a remote origin.'));
       // Clean up VM
-      await fly.deleteVm(vmName);
+      await Effect.runPromise(fly.deleteVm(vmName));
       process.exit(1);
     }
 
@@ -948,9 +1080,9 @@ async function createRemoteWorkspace(
     const gitHost = isGitHub ? 'github.com' : isGitLab ? 'gitlab.com' : null;
 
     // Add SSH host keys to known_hosts for the detected host
-    await fly.ssh(vmName, 'mkdir -p ~/.ssh && chmod 700 ~/.ssh');
+    await Effect.runPromise(fly.ssh(vmName, 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'));
     if (gitHost) {
-      await fly.ssh(vmName, `ssh-keyscan -t ed25519,rsa ${gitHost} >> ~/.ssh/known_hosts 2>/dev/null`);
+      await Effect.runPromise(fly.ssh(vmName, `ssh-keyscan -t ed25519,rsa ${gitHost} >> ~/.ssh/known_hosts 2>/dev/null`));
     }
 
     // Inject SSH key for git access if available
@@ -965,7 +1097,7 @@ async function createRemoteWorkspace(
       const sshKeyBase64 = Buffer.from(readFileSync(sshKeyPath, 'utf-8')).toString('base64');
       // Determine key type from filename for remote VM
       const keyFilename = sshKeyPath.includes('id_rsa') ? 'id_rsa' : 'id_ed25519';
-      await fly.ssh(vmName, `echo '${sshKeyBase64}' | base64 -d > ~/.ssh/${keyFilename} && chmod 600 ~/.ssh/${keyFilename}`);
+      await Effect.runPromise(fly.ssh(vmName, `echo '${sshKeyBase64}' | base64 -d > ~/.ssh/${keyFilename} && chmod 600 ~/.ssh/${keyFilename}`));
     }
 
     // Sync git CLI auth for the detected host
@@ -984,7 +1116,7 @@ async function createRemoteWorkspace(
     if (isPolyrepo) {
       // Polyrepo: Clone each repo separately
       spinner.text = 'Cloning repositories (polyrepo)...';
-      await fly.ssh(vmName, 'mkdir -p ~/workspace');
+      await Effect.runPromise(fly.ssh(vmName, 'mkdir -p ~/workspace'));
 
       for (const repo of projectConfig!.workspace!.repos!) {
         spinner.text = `Cloning ${repo.name}...`;
@@ -1006,7 +1138,7 @@ async function createRemoteWorkspace(
         }
 
         // Clone this repo on the remote VM
-        const cloneResult = await fly.ssh(vmName, `git clone ${repoRemoteUrl} ~/workspace/${repo.name}`);
+        const cloneResult = await Effect.runPromise(fly.ssh(vmName, `git clone ${repoRemoteUrl} ~/workspace/${repo.name}`));
         if (cloneResult.exitCode !== 0) {
           throw new Error(`Failed to clone ${repo.name}: ${cloneResult.stderr}`);
         }
@@ -1014,10 +1146,10 @@ async function createRemoteWorkspace(
         // Create feature branch for this repo
         const repoBranchPrefix = repo.branch_prefix || 'feature/';
         const repoBranchName = `${repoBranchPrefix}${normalizedId}`;
-        const branchResult = await fly.ssh(vmName, `cd ~/workspace/${repo.name} && git checkout -b ${repoBranchName}`);
+        const branchResult = await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace/${repo.name} && git checkout -b ${repoBranchName}`));
         if (branchResult.exitCode !== 0) {
           // Branch might already exist remotely
-          await fly.ssh(vmName, `cd ~/workspace/${repo.name} && git checkout ${repoBranchName} || git checkout -b ${repoBranchName}`);
+          await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace/${repo.name} && git checkout ${repoBranchName} || git checkout -b ${repoBranchName}`));
         }
       }
 
@@ -1028,26 +1160,26 @@ async function createRemoteWorkspace(
       // Remote VMs use SSH keys, not interactive HTTPS credentials
       const sshRepoUrl = convertToSshUrl(repoUrl);
 
-      const cloneResult = await fly.ssh(vmName, `git clone ${sshRepoUrl} ~/workspace`);
+      const cloneResult = await Effect.runPromise(fly.ssh(vmName, `git clone ${sshRepoUrl} ~/workspace`));
       if (cloneResult.exitCode !== 0) {
         throw new Error(`Failed to clone: ${cloneResult.stderr}`);
       }
 
       // Step 4: Create feature branch
       spinner.text = 'Creating feature branch...';
-      const branchResult = await fly.ssh(vmName, `cd ~/workspace && git checkout -b ${branchName}`);
+      const branchResult = await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace && git checkout -b ${branchName}`));
       if (branchResult.exitCode !== 0) {
         // Branch might already exist remotely
-        await fly.ssh(vmName, `cd ~/workspace && git checkout ${branchName} || git checkout -b ${branchName}`);
+        await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace && git checkout ${branchName} || git checkout -b ${branchName}`));
       }
     }
 
     // Step 4.5: Create /workspace symlink for consistent paths
-    await fly.ssh(vmName, `sudo ln -sf ~/workspace /workspace 2>/dev/null || true`);
+    await Effect.runPromise(fly.ssh(vmName, `sudo ln -sf ~/workspace /workspace 2>/dev/null || true`));
 
     // Step 4.6: Configure Claude Code - copy credentials and skip onboarding
     spinner.text = 'Configuring Claude Code...';
-    await fly.ssh(vmName, `mkdir -p ~/.claude`);
+    await Effect.runPromise(fly.ssh(vmName, `mkdir -p ~/.claude`));
 
     // Copy credentials from macOS Keychain to remote
     try {
@@ -1057,7 +1189,7 @@ async function createRemoteWorkspace(
       );
       if (credentials && credentials.trim()) {
         const credsBase64 = Buffer.from(credentials.trim()).toString('base64');
-        await fly.ssh(vmName, `echo '${credsBase64}' | base64 -d > ~/.claude/.credentials.json`);
+        await Effect.runPromise(fly.ssh(vmName, `echo '${credsBase64}' | base64 -d > ~/.claude/.credentials.json`));
       }
     } catch {
       spinner.warn('Could not copy Claude credentials - you may need to login on the VM');
@@ -1079,19 +1211,18 @@ with open(path, "w") as f:
     json.dump(data, f, indent=2)
 `;
     const patchBase64 = Buffer.from(onboardingPatch).toString('base64');
-    await fly.ssh(vmName, `echo '${patchBase64}' | base64 -d | python3`);
+    await Effect.runPromise(fly.ssh(vmName, `echo '${patchBase64}' | base64 -d | python3`));
 
-    // Set theme preference and bypass permissions in settings.json
-    const claudeSettings = JSON.stringify({
-      theme: 'dark',
-      permissions: {
-        defaultMode: 'bypassPermissions',
-      },
-    });
+    // Write ~/.claude/settings.json on the remote VM honoring the user's
+    // Panopticon permission mode. defaultMode here is what `claude` uses when
+    // an invocation omits --permission-mode; hardcoding 'bypassPermissions'
+    // would silently escalate any unflagged claude invocation on the VM
+    // (interactive shells, future helper scripts) even when the user chose Auto.
+    const claudeSettings = JSON.stringify(buildClaudeUserSettingsSync());
     const settingsBase64 = Buffer.from(claudeSettings).toString('base64');
-    await fly.ssh(vmName, `echo '${settingsBase64}' | base64 -d > ~/.claude/settings.json`);
+    await Effect.runPromise(fly.ssh(vmName, `echo '${settingsBase64}' | base64 -d > ~/.claude/settings.json`));
 
-    // Configure Claude Code for autonomous operation (bypass permissions + skip onboarding)
+    // Configure Claude Code for autonomous operation (onboarding-complete + permission mode per user setting)
     await fly.configureClaudeCode(vmName);
 
     // Step 4.7: Copy essential skills to remote VM
@@ -1118,7 +1249,7 @@ with open(path, "w") as f:
       location: 'remote',
     };
 
-    saveWorkspaceMetadata(metadata);
+    saveWorkspaceMetadataSync(metadata);
 
     spinner.succeed('Remote workspace created!');
 
@@ -1140,7 +1271,7 @@ with open(path, "w") as f:
     spinner.fail(`Failed to create remote workspace: ${error.message}`);
     // Try to clean up
     try {
-      await fly.deleteVm(vmName);
+      await Effect.runPromise(fly.deleteVm(vmName));
     } catch {
       // Ignore cleanup errors
     }
@@ -1164,7 +1295,7 @@ async function migrateCommand(issueId: string, options: MigrateOptions): Promise
   }
 
   const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const metadata = loadWorkspaceMetadata(normalizedId);
+  const metadata = loadWorkspaceMetadataSync(normalizedId);
 
   if (options.to === 'remote') {
     if (metadata?.location === 'remote') {
@@ -1172,13 +1303,13 @@ async function migrateCommand(issueId: string, options: MigrateOptions): Promise
       return;
     }
 
-    // Sync beads before migrating
-    spinner.text = 'Syncing beads...';
+    // Persist beads before migrating
+    spinner.text = 'Persisting beads...';
     try {
-      await execAsync('bd sync', { encoding: 'utf-8' });
+      await execAsync('bd dolt commit -m "Sync beads before migration"', { encoding: 'utf-8' });
       await execAsync('git add .beads/ && git commit -m "Sync beads before migration" && git push', { encoding: 'utf-8' });
     } catch {
-      // Non-fatal - beads sync might not be needed
+      // Non-fatal - beads persistence might not be needed
     }
 
     // Create remote workspace
@@ -1210,7 +1341,7 @@ async function syncAuthCommand(issueId: string): Promise<void> {
   const spinner = ora('Syncing credentials...').start();
 
   const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const metadata = loadWorkspaceMetadata(normalizedId);
+  const metadata = loadWorkspaceMetadataSync(normalizedId);
 
   if (!metadata || metadata.location !== 'remote') {
     spinner.fail(`No remote workspace found for ${issueId}`);
@@ -1219,7 +1350,7 @@ async function syncAuthCommand(issueId: string): Promise<void> {
   }
 
   try {
-    const fly = createFlyProviderFromConfig(loadConfig().remote);
+    const fly = createFlyProviderFromConfig(loadConfigSync().remote);
 
     // Sync all credentials (Claude, GitHub, etc.)
     const synced = await fly.syncAllCredentials(metadata.vmName);
@@ -1259,7 +1390,7 @@ async function syncAuthCommand(issueId: string): Promise<void> {
  */
 async function sshCommand(issueId: string): Promise<void> {
   const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const metadata = loadWorkspaceMetadata(normalizedId);
+  const metadata = loadWorkspaceMetadataSync(normalizedId);
 
   if (!metadata || metadata.location !== 'remote') {
     console.error(chalk.red(`No remote workspace found for ${issueId}`));
@@ -1287,7 +1418,7 @@ async function startCommand(issueId: string): Promise<void> {
   const spinner = ora('Starting workspace...').start();
 
   const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const metadata = loadWorkspaceMetadata(normalizedId);
+  const metadata = loadWorkspaceMetadataSync(normalizedId);
 
   if (!metadata || metadata.location !== 'remote') {
     spinner.fail(`No remote workspace found for ${issueId}`);
@@ -1295,8 +1426,8 @@ async function startCommand(issueId: string): Promise<void> {
   }
 
   try {
-    const fly = createFlyProviderFromConfig(loadConfig().remote);
-    await fly.startVm(metadata.vmName);
+    const fly = createFlyProviderFromConfig(loadConfigSync().remote);
+    await Effect.runPromise(fly.startVm(metadata.vmName));
 
     spinner.succeed(`Workspace ${issueId} started`);
 
@@ -1320,7 +1451,7 @@ async function stopCommand(issueId: string): Promise<void> {
   const spinner = ora('Stopping workspace...').start();
 
   const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const metadata = loadWorkspaceMetadata(normalizedId);
+  const metadata = loadWorkspaceMetadataSync(normalizedId);
 
   if (!metadata || metadata.location !== 'remote') {
     spinner.fail(`No remote workspace found for ${issueId}`);
@@ -1328,11 +1459,11 @@ async function stopCommand(issueId: string): Promise<void> {
   }
 
   try {
-    const fly = createFlyProviderFromConfig(loadConfig().remote);
+    const fly = createFlyProviderFromConfig(loadConfigSync().remote);
 
     // Stop VM
     spinner.text = 'Hibernating VM...';
-    await fly.stopVm(metadata.vmName);
+    await Effect.runPromise(fly.stopVm(metadata.vmName));
 
     spinner.succeed(`Workspace ${issueId} stopped (hibernated)`);
     console.log(chalk.dim('  Start again with: pan workspace start ' + issueId));
@@ -1353,7 +1484,7 @@ async function destroyRemoteWorkspace(
   spinner: Ora,
   options: DestroyOptions
 ): Promise<void> {
-  const fly = createFlyProviderFromConfig(loadConfig().remote);
+  const fly = createFlyProviderFromConfig(loadConfigSync().remote);
 
   try {
     // Step 1: Kill any running agent
@@ -1364,7 +1495,7 @@ async function destroyRemoteWorkspace(
 
     // Step 2: Delete VM
     spinner.text = 'Deleting VM...';
-    await fly.deleteVm(metadata.vmName);
+    await Effect.runPromise(fly.deleteVm(metadata.vmName));
 
     // Step 3: Remove workspace metadata file
     const metadataFile = join(WORKSPACES_DIR, `${normalizedId}.yaml`);
@@ -1385,6 +1516,65 @@ async function destroyRemoteWorkspace(
   }
 }
 
+interface UseConfigOptions {
+  project?: string;
+}
+
+async function useConfigCommand(issueId: string, options: UseConfigOptions): Promise<void> {
+  const spinner = ora('Copying Panopticon config to workspace...').start();
+
+  try {
+    const normalizedId = issueId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const folderName = `feature-${normalizedId}`;
+
+    // Resolve workspace path
+    let workspacePath: string;
+
+    if (options.project) {
+      const workspacesDir = join(options.project, 'workspaces');
+      workspacePath = join(workspacesDir, folderName);
+    } else {
+      const teamPrefix = extractTeamPrefix(issueId);
+      const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
+
+      if (projectConfig) {
+        const workspacesDir = join(projectConfig.path, projectConfig.workspace?.workspaces_dir || 'workspaces');
+        workspacePath = join(workspacesDir, folderName);
+      } else {
+        workspacePath = join(process.cwd(), 'workspaces', folderName);
+      }
+    }
+
+    if (!existsSync(workspacePath)) {
+      spinner.fail(`Workspace not found: ${workspacePath}`);
+      process.exit(1);
+    }
+
+    spinner.text = 'Copying config...';
+    const result = copyPanopticonSettingsToWorkspaceSync(workspacePath);
+
+    if (result.errors.length > 0) {
+      spinner.warn('Config copied with errors');
+      for (const error of result.errors) {
+        console.log(chalk.yellow(`  ⚠ ${error}`));
+      }
+    } else {
+      spinner.succeed('Panopticon config copied to workspace');
+    }
+
+    if (result.copied.length > 0) {
+      console.log(chalk.dim('  Copied:'));
+      for (const file of result.copied) {
+        console.log(chalk.dim(`    • ${file}`));
+      }
+    }
+
+  } catch (error: any) {
+    spinner.fail(`Failed to copy config: ${error.message}`);
+    process.exit(1);
+  }
+}
+
 interface UpdateOptions {
   force?: boolean;
 }
@@ -1398,7 +1588,7 @@ async function updateCommand(issueId: string, options: UpdateOptions): Promise<v
 
     // Resolve project and workspace path
     const teamPrefix = extractTeamPrefix(issueId);
-    const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+    const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
 
     if (!projectConfig) {
       spinner.fail(`No project found for issue ${issueId}`);
@@ -1415,7 +1605,7 @@ async function updateCommand(issueId: string, options: UpdateOptions): Promise<v
     }
 
     // Check if an agent is running in this workspace
-    const runningAgents = listRunningAgents();
+    const runningAgents = listRunningAgentsSync();
     const agentInWorkspace = runningAgents.find(
       a => a.workspace === workspacePath && a.tmuxActive && a.status === 'running'
     );
@@ -1432,13 +1622,13 @@ async function updateCommand(issueId: string, options: UpdateOptions): Promise<v
 
     // Merge skills, agents, and rules
     spinner.text = 'Merging skills and agents...';
-    const result = mergeSkillsIntoWorkspace(workspacePath);
+    const result = mergeSkillsIntoWorkspaceSync(workspacePath);
 
     // Apply project template overlay if configured
     if (workspaceConfig?.agent?.template_dir && (workspaceConfig.agent.copy_dirs || workspaceConfig.agent.symlinks)) {
       spinner.text = 'Applying project template overlay...';
       const templateDir = join(projectConfig.path, workspaceConfig.agent.template_dir);
-      const overlayed = applyProjectTemplateOverlay(workspacePath, templateDir);
+      const overlayed = applyProjectTemplateOverlaySync(workspacePath, templateDir);
       result.overlayed = overlayed;
     }
 
@@ -1495,14 +1685,14 @@ async function addRepoCommand(workspaceId: string, repoNames: string[], options:
     const folderName = `feature-${normalizedId}`;
 
     // Resolve project
-    let projectConfig: ReturnType<typeof findProjectByTeam> = null;
+    let projectConfig: ReturnType<typeof findProjectByTeamSync> = null;
     if (options.project) {
-      projectConfig = getProject(options.project);
+      projectConfig = getProjectSync(options.project);
     }
 
     if (!projectConfig) {
       // Try to find project from workspace path
-      const allProjects = listProjects();
+      const allProjects = listProjectsSync();
       for (const { config: p } of allProjects) {
         if (p.workspace?.workspaces_dir) {
           const workspacesDir = join(p.path, p.workspace.workspaces_dir);
@@ -1563,12 +1753,12 @@ async function addRepoCommand(workspaceId: string, repoNames: string[], options:
     }
 
     // Add repos to workspace
-    const result = await addReposToWorkspace({
+    const result = await Effect.runPromise(addReposToWorkspace({
       projectConfig,
       featureName: normalizedId,
       repoNames: targetRepoNames,
       dryRun: options.dryRun,
-    });
+    }));
 
     if (!result.success) {
       spinner.fail(`Failed to add repos: ${result.errors.join(', ')}`);

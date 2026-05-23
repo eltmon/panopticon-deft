@@ -17,6 +17,7 @@
  * - Official provider pricing pages
  */
 
+import { Effect } from 'effect';
 import { ModelId } from './settings.js';
 import type { SubscriptionPlan } from './subscription-types.js';
 
@@ -33,16 +34,25 @@ import type { SubscriptionPlan } from './subscription-types.js';
 export const MODEL_DEPRECATIONS: Record<string, ModelId> = {
   'claude-opus-4-5': 'claude-opus-4-7',
   'claude-sonnet-4-5': 'claude-sonnet-4-6',
-  // OpenAI retired models (Feb 2026)
-  'gpt-5.2-codex': 'gpt-5.4',
-  'o3-deep-research': 'o3',
-  // NOTE: gpt-5.4 family is Panopticon's abstraction over real OpenAI models.
-  // Do NOT treat gpt-4o/gpt-4o-mini as deprecated — they are the actual API names.
+  // OpenAI retired/superseded models — addendum 2026-05-23 trim to the
+  // Codex CLI catalog (gpt-5.5, 5.4, 5.4-mini, 5.3-codex, 5.3-codex-spark,
+  // 5.2). Pro tiers and the o-series reasoning models are out.
+  'gpt-5.2-codex': 'gpt-5.3-codex',     // superseded by gpt-5.3-codex (April 2026)
+  'gpt-5.5-mini': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.5-nano': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.4-nano': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.5-pro': 'gpt-5.5',             // dropped 2026-05-23 — flagship absorbs Pro role
+  'gpt-5.4-pro': 'gpt-5.4',             // dropped 2026-05-23 — drop the -pro tier
+  'o3': 'gpt-5.4',                      // dropped 2026-05-23 — reasoning -> balanced flagship
+  'o3-deep-research': 'gpt-5.4',        // dropped 2026-05-23 — was already aliased to o3
+  'o4-mini': 'gpt-5.4-mini',            // dropped 2026-05-23 — compact reasoning -> mini
+  'gpt-4o': 'gpt-5.4',                  // dropped 2026-05-23 — legacy flagship -> current balanced
+  'gpt-4o-mini': 'gpt-5.4-mini',        // dropped 2026-05-23 — legacy economy -> mini
   // Google deprecated models
   'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
-  'gemini-3-flash-preview': 'gemini-3-flash',
+  'gemini-3-flash': 'gemini-3-flash-preview',
   'gemini-2.5-pro': 'gemini-3.1-pro-preview',
-  'gemini-2.5-flash': 'gemini-3-flash',
+  'gemini-2.5-flash': 'gemini-3-flash-preview',
   // Kimi deprecated
   'kimi-k2': 'kimi-k2.5',
   // Z.AI deprecated
@@ -59,7 +69,7 @@ export const MODEL_DEPRECATIONS: Record<string, ModelId> = {
  * @param modelId - Model ID to resolve (may be deprecated)
  * @returns Current model ID
  */
-export function resolveModelId(modelId: string): ModelId {
+export function resolveModelIdSync(modelId: string): ModelId {
   return (MODEL_DEPRECATIONS[modelId] as ModelId) || (modelId as ModelId);
 }
 
@@ -82,11 +92,13 @@ export type SkillDimension =
 /**
  * Capability profile for a single model
  */
+type CapabilityModelId = ModelId;
+
 export interface ModelCapability {
   /** Model identifier */
   model: ModelId;
   /** Provider for this model */
-  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai';
+  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai' | 'mimo' | 'nous' | 'dashscope';
   /** Display name */
   displayName: string;
   /** Cost per 1M tokens (average of input/output) in USD */
@@ -111,7 +123,7 @@ export interface ModelCapability {
  *
  * These are baseline scores - run Kimi 2.5 research to refine.
  */
-export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
+export const MODEL_CAPABILITIES: Record<CapabilityModelId, ModelCapability> = {
   // ═══════════════════════════════════════════════════════════════════════════
   // ANTHROPIC MODELS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -276,28 +288,6 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     notes: 'Fast and efficient. 400K context. Available in ChatGPT Free/Plus tiers.',
   },
 
-  'gpt-5.4-nano': {
-    model: 'gpt-5.4-nano',
-    provider: 'openai',
-    displayName: 'GPT-5.4 Nano',
-    costPer1MTokens: 0.7, // $0.20 in / $1.25 out
-    contextWindow: 128000,
-    skills: {
-      'code-generation': 70,
-      'code-review': 65,
-      debugging: 62,
-      planning: 58,
-      documentation: 68,
-      testing: 62,
-      security: 52,
-      performance: 58,
-      synthesis: 60,
-      speed: 96, // Fastest OpenAI model
-      'context-length': 75,
-    },
-    notes: 'API-only. Best for classification, extraction, ranking, sub-agents.',
-  },
-
   'o3': {
     model: 'o3',
     provider: 'openai',
@@ -390,51 +380,6 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     notes: 'OpenAI flagship (April 2026). Successor to GPT-5.4 with improved reasoning and coding. 1.05M context, 128K max output.',
   },
 
-  'gpt-5.5-mini': {
-    model: 'gpt-5.5-mini',
-    provider: 'openai',
-    displayName: 'GPT-5.5 Mini',
-    costPer1MTokens: 1.25, // ~$0.50 in / $2.00 out
-    contextWindow: 400000,
-    minTier: 'free', // Available in ChatGPT Free tier
-    skills: {
-      'code-generation': 85,
-      'code-review': 81,
-      debugging: 79,
-      planning: 76,
-      documentation: 83,
-      testing: 79,
-      security: 72,
-      performance: 76,
-      synthesis: 79,
-      speed: 92, // 2x faster than predecessor
-      'context-length': 90, // 400K context
-    },
-    notes: 'Fast and efficient mid-tier model. 400K context. Available in ChatGPT Free/Plus tiers.',
-  },
-
-  'gpt-5.5-nano': {
-    model: 'gpt-5.5-nano',
-    provider: 'openai',
-    displayName: 'GPT-5.5 Nano',
-    costPer1MTokens: 0.875, // $0.25 in / $1.50 out
-    contextWindow: 128000,
-    skills: {
-      'code-generation': 73,
-      'code-review': 68,
-      debugging: 65,
-      planning: 61,
-      documentation: 71,
-      testing: 65,
-      security: 56,
-      performance: 61,
-      synthesis: 64,
-      speed: 97, // Fastest OpenAI model
-      'context-length': 75,
-    },
-    notes: 'API-only. Best for classification, extraction, ranking, sub-agents.',
-  },
-
   'gpt-5.5-pro': {
     model: 'gpt-5.5-pro',
     provider: 'openai',
@@ -458,8 +403,78 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     notes: 'Most advanced OpenAI model. Enhanced reasoning and agentic capabilities over GPT-5.5. Pro subscribers only.',
   },
 
-  // Retired OpenAI model IDs — replaced by newer versions, kept for backward compat
-  'gpt-5.2-codex': { model: 'gpt-5.2-codex', provider: 'openai', displayName: 'GPT-5.2 Codex (deprecated)', costPer1MTokens: 20.0, contextWindow: 128000, skills: { 'code-generation': 92, 'code-review': 90, debugging: 88, planning: 85, documentation: 85, testing: 85, security: 80, performance: 82, synthesis: 88, speed: 50, 'context-length': 75 } },
+  'gpt-5.3-codex': {
+    model: 'gpt-5.3-codex',
+    provider: 'openai',
+    displayName: 'GPT-5.3 Codex',
+    costPer1MTokens: 7.875, // $1.75 in / $14.00 out
+    contextWindow: 400000,
+    skills: {
+      'code-generation': 96,
+      'code-review': 95,
+      debugging: 94,
+      planning: 90,
+      documentation: 88,
+      testing: 90,
+      security: 86,
+      performance: 88,
+      synthesis: 92,
+      speed: 75,
+      'context-length': 90,
+    },
+    notes: 'Industry-leading agentic coding model (2026). Available via Codex CLI/IDE/cloud and the Responses API.',
+  },
+
+  'gpt-5.2': {
+    model: 'gpt-5.2',
+    provider: 'openai',
+    displayName: 'GPT-5.2',
+    costPer1MTokens: 5.625, // $1.25 in / $10 out (estimate)
+    contextWindow: 200000,
+    skills: {
+      'code-generation': 88,
+      'code-review': 86,
+      debugging: 84,
+      planning: 82,
+      documentation: 84,
+      testing: 82,
+      security: 78,
+      performance: 80,
+      synthesis: 84,
+      speed: 70,
+      'context-length': 85,
+    },
+    notes: 'Previous-generation general-purpose model (Oct 2025). Positioned by OpenAI for long-running agent workloads — strong candidate for orchestrator/flywheel roles.',
+  },
+
+  'gpt-5.3-codex-spark': {
+    model: 'gpt-5.3-codex-spark',
+    provider: 'openai',
+    displayName: 'GPT-5.3 Codex Spark',
+    // Headline rate card matches the Codex family ($1.75 in / $14 out) when
+    // the model is reachable, but Spark is a ChatGPT-Pro-only research
+    // preview as of 2026-05-23 — no raw API access. Panopticon routes via
+    // Codex CLI subscription auth through CLIProxy, so it is reachable
+    // when the operator has a Pro account.
+    costPer1MTokens: 7.875,
+    contextWindow: 128000, // 128K per OpenAI excerpt + multiple secondary sources
+    skills: {
+      'code-generation': 92,
+      'code-review': 86,
+      debugging: 84,
+      planning: 78,
+      documentation: 82,
+      testing: 88,
+      security: 76,
+      performance: 82,
+      synthesis: 84,
+      speed: 98, // "1000+ tok/sec" per OpenAI launch material
+      'context-length': 72, // 128K — smaller than the Codex base 400K
+    },
+    notes: 'Ultra-fast coding research preview (Feb 2026). Text-only, 128K context, ChatGPT-Pro-only. Candidate for work.inspect / high-volume code scans when a Pro account is available.',
+  },
+
+  // Retired OpenAI model IDs — kept for backward compat
   'o3-deep-research': { model: 'o3-deep-research', provider: 'openai', displayName: 'O3 Deep Research (deprecated)', costPer1MTokens: 5.0, contextWindow: 200000, skills: { 'code-generation': 88, 'code-review': 95, debugging: 98, planning: 95, documentation: 88, testing: 88, security: 92, performance: 92, synthesis: 95, speed: 25, 'context-length': 95 } },
   // Active OpenAI API names — NOT deprecated. Kept in MODEL_CAPABILITIES for backward compat
   // with saved configs. These are real OpenAI model IDs that still work via the OpenAI API.
@@ -492,10 +507,10 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     notes: 'Google flagship (March 2026). Replaces Gemini 3 Pro (shut down). Strong agentic and coding capabilities.',
   },
 
-  'gemini-3-flash': {
-    model: 'gemini-3-flash',
+  'gemini-3-flash-preview': {
+    model: 'gemini-3-flash-preview',
     provider: 'google',
-    displayName: 'Gemini 3 Flash',
+    displayName: 'Gemini 3 Flash Preview',
     costPer1MTokens: 0.4, // ~$0.15 in / $0.60 out
     contextWindow: 1000000,
     skills: {
@@ -538,7 +553,6 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
 
   // Legacy Google IDs — deprecated aliases kept for backward compat with saved configs
   'gemini-3-pro-preview': { model: 'gemini-3-pro-preview', provider: 'google', displayName: 'Gemini 3 Pro (deprecated)', costPer1MTokens: 7.0, contextWindow: 1000000, skills: { 'code-generation': 93, 'code-review': 90, debugging: 88, planning: 88, documentation: 90, testing: 88, security: 82, performance: 88, synthesis: 92, speed: 75, 'context-length': 100 } },
-  'gemini-3-flash-preview': { model: 'gemini-3-flash-preview', provider: 'google', displayName: 'Gemini 3 Flash (deprecated)', costPer1MTokens: 0.4, contextWindow: 1000000, skills: { 'code-generation': 80, 'code-review': 75, debugging: 72, planning: 68, documentation: 76, testing: 72, security: 60, performance: 70, synthesis: 75, speed: 96, 'context-length': 100 } },
   'gemini-2.5-pro': { model: 'gemini-2.5-pro', provider: 'google', displayName: 'Gemini 2.5 Pro (deprecated)', costPer1MTokens: 7.0, contextWindow: 1000000, skills: { 'code-generation': 90, 'code-review': 88, debugging: 86, planning: 86, documentation: 88, testing: 86, security: 80, performance: 86, synthesis: 90, speed: 70, 'context-length': 100 } },
   'gemini-2.5-flash': { model: 'gemini-2.5-flash', provider: 'google', displayName: 'Gemini 2.5 Flash (deprecated)', costPer1MTokens: 0.4, contextWindow: 1000000, skills: { 'code-generation': 78, 'code-review': 74, debugging: 70, planning: 66, documentation: 74, testing: 70, security: 58, performance: 68, synthesis: 74, speed: 94, 'context-length': 100 } },
 
@@ -729,20 +743,194 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     },
     notes: 'Fast and affordable GLM model for quick iterations. 200K context.',
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // XIAOMI MIMO MODELS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  'mimo-v2.5-pro': {
+    model: 'mimo-v2.5-pro',
+    provider: 'mimo',
+    displayName: 'MiMo V2.5 Pro',
+    costPer1MTokens: 2.0,
+    contextWindow: 1048576,
+    skills: {
+      'code-generation': 88,
+      'code-review': 86,
+      debugging: 86,
+      planning: 84,
+      documentation: 84,
+      testing: 84,
+      security: 80,
+      performance: 82,
+      synthesis: 88,
+      speed: 78,
+      'context-length': 100,
+    },
+    notes: 'Xiaomi MiMo flagship reasoning model. Enhanced agent efficiency, 1M context window.',
+  },
+
+  'mimo-v2.5': {
+    model: 'mimo-v2.5',
+    provider: 'mimo',
+    displayName: 'MiMo V2.5',
+    costPer1MTokens: 1.0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 82,
+      'code-review': 80,
+      debugging: 80,
+      planning: 78,
+      documentation: 78,
+      testing: 78,
+      security: 74,
+      performance: 76,
+      synthesis: 82,
+      speed: 85,
+      'context-length': 96,
+    },
+    notes: 'Xiaomi MiMo multimodal model. 262K context, strong agentic and coding capabilities.',
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NOUS PORTAL MODELS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  'qwen/qwen3.6-plus': {
+    model: 'qwen/qwen3.6-plus',
+    provider: 'nous',
+    displayName: 'Qwen 3.6 Plus (Nous Portal)',
+    costPer1MTokens: 0,
+    contextWindow: 1048576,
+    skills: {
+      'code-generation': 94,
+      'code-review': 92,
+      debugging: 92,
+      planning: 92,
+      documentation: 90,
+      testing: 90,
+      security: 88,
+      performance: 88,
+      synthesis: 92,
+      speed: 74,
+      'context-length': 100,
+    },
+    notes: 'Qwen 3.6 Plus via Nous Portal. Free for a limited time; 1M-token context according to public launch material.',
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DASHSCOPE (ALIBABA) MODELS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  'qwen3-max': {
+    model: 'qwen3-max',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Max (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 95,
+      'code-review': 93,
+      debugging: 93,
+      planning: 94,
+      documentation: 91,
+      testing: 91,
+      security: 89,
+      performance: 89,
+      synthesis: 94,
+      speed: 72,
+      'context-length': 98,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3-coder-plus': {
+    model: 'qwen3-coder-plus',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Coder Plus (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 96,
+      'code-review': 94,
+      debugging: 94,
+      planning: 91,
+      documentation: 90,
+      testing: 92,
+      security: 89,
+      performance: 90,
+      synthesis: 92,
+      speed: 74,
+      'context-length': 98,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3-plus': {
+    model: 'qwen3-plus',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Plus (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 131072,
+    skills: {
+      'code-generation': 88,
+      'code-review': 86,
+      debugging: 86,
+      planning: 84,
+      documentation: 84,
+      testing: 84,
+      security: 80,
+      performance: 82,
+      synthesis: 88,
+      speed: 82,
+      'context-length': 96,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3.7-max': {
+    model: 'qwen3.7-max',
+    provider: 'dashscope',
+    displayName: 'Qwen3.7 Max (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 96,
+      'code-review': 94,
+      debugging: 94,
+      planning: 95,
+      documentation: 92,
+      testing: 92,
+      security: 90,
+      performance: 90,
+      synthesis: 95,
+      speed: 70,
+      'context-length': 98,
+    },
+    notes: 'Canonical DashScope ID verified from Qwen Cloud docs on 2026-05-22. Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
 };
 
 /**
  * Get capability profile for a model
  */
-export function getModelCapability(model: ModelId): ModelCapability {
-  return MODEL_CAPABILITIES[model];
+export function getModelCapabilitySync(model: ModelId): ModelCapability {
+  const capability = MODEL_CAPABILITIES[model as CapabilityModelId];
+  if (!capability) {
+    throw new Error(`No capability profile registered for model: ${model}`);
+  }
+  return capability;
+}
+
+export function hasModelCapabilitySync(model: ModelId | string): boolean {
+  return model in MODEL_CAPABILITIES;
 }
 
 /**
  * Get all models sorted by a specific skill (descending)
  */
-export function getModelsBySkill(skill: SkillDimension): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).sort(
+export function getModelsBySkillSync(skill: SkillDimension): ModelId[] {
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).sort(
     (a, b) => MODEL_CAPABILITIES[b].skills[skill] - MODEL_CAPABILITIES[a].skills[skill]
   );
 }
@@ -750,10 +938,10 @@ export function getModelsBySkill(skill: SkillDimension): ModelId[] {
 /**
  * Get all models for a provider
  */
-export function getModelsForProvider(
+export function getModelsForProviderSync(
   provider: ModelCapability['provider']
 ): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).filter(
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).filter(
     (model) => MODEL_CAPABILITIES[model].provider === provider
   );
 }
@@ -761,8 +949,8 @@ export function getModelsForProvider(
 /**
  * Get cheapest models (sorted by cost ascending)
  */
-export function getCheapestModels(): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).sort(
+export function getCheapestModelsSync(): ModelId[] {
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).sort(
     (a, b) => MODEL_CAPABILITIES[a].costPer1MTokens - MODEL_CAPABILITIES[b].costPer1MTokens
   );
 }
@@ -771,15 +959,15 @@ export function getCheapestModels(): ModelId[] {
  * Calculate cost efficiency score for a skill
  * Higher = better value (skill score / cost)
  */
-export function getValueScore(model: ModelId, skill: SkillDimension): number {
-  const cap = MODEL_CAPABILITIES[model];
+export function getValueScoreSync(model: ModelId, skill: SkillDimension): number {
+  const cap = getModelCapabilitySync(model);
   return cap.skills[skill] / Math.log10(cap.costPer1MTokens + 1);
 }
 
 /**
  * Get all skill dimensions
  */
-export function getAllSkillDimensions(): SkillDimension[] {
+export function getAllSkillDimensionsSync(): SkillDimension[] {
   return [
     'code-generation',
     'code-review',
@@ -794,3 +982,39 @@ export function getAllSkillDimensions(): SkillDimension[] {
     'context-length',
   ];
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// All capability queries are pure lookups — additive Effect.sync wrappers.
+
+/** Resolve a (possibly-deprecated) model id to its canonical id. Pure. */
+export const resolveModelId = (modelId: string): Effect.Effect<ModelId> =>
+  Effect.sync(() => resolveModelIdSync(modelId));
+
+/** Look up a model's capability matrix. Pure. */
+export const getModelCapability = (
+  model: ModelId,
+): Effect.Effect<ModelCapability> => Effect.sync(() => getModelCapabilitySync(model));
+
+/** List models ranked best-first for a given skill. Pure. */
+export const getModelsBySkill = (
+  skill: SkillDimension,
+): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsBySkillSync(skill));
+
+/** List models for a specific provider. Pure. */
+export const getModelsForProvider = (
+  provider: ModelCapability['provider'],
+): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsForProviderSync(provider));
+
+/** List the cheapest models ranked best-first. Pure. */
+export const getCheapestModels = (): Effect.Effect<ModelId[]> =>
+  Effect.sync(() => getCheapestModelsSync());
+
+/** Compute the cost-adjusted value score for a model + skill. Pure. */
+export const getValueScore = (
+  model: ModelId,
+  skill: SkillDimension,
+): Effect.Effect<number> => Effect.sync(() => getValueScoreSync(model, skill));
+
+/** Enumerate all known skill dimensions. Pure. */
+export const getAllSkillDimensions = (): Effect.Effect<SkillDimension[]> =>
+  Effect.sync(() => getAllSkillDimensionsSync());

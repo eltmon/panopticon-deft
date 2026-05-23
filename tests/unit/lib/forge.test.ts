@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -35,7 +36,7 @@ vi.mock('../../../src/lib/github-app.js', () => ({
   parsePullRequestRef: parsePullRequestRefMock,
 }));
 
-import { getForgeAdapter } from '../../../src/lib/forge.js';
+import { getForgeAdapter, GITHUB_MERGE_TIMEOUT_MS } from '../../../src/lib/forge.js';
 
 describe('forge adapters', () => {
   beforeEach(() => {
@@ -118,7 +119,7 @@ describe('forge adapters', () => {
     vi.useFakeTimers();
     isGitHubAppConfiguredMock.mockReturnValue(true);
     getPullRequestStateMock
-      .mockResolvedValueOnce({
+      .mockReturnValueOnce(Effect.succeed({
         owner: 'org',
         repo: 'repo',
         number: 42,
@@ -131,8 +132,8 @@ describe('forge adapters', () => {
         baseBranch: 'main',
         checksPending: true,
         checksFailed: false,
-      })
-      .mockResolvedValueOnce({
+      }))
+      .mockReturnValueOnce(Effect.succeed({
         owner: 'org',
         repo: 'repo',
         number: 42,
@@ -145,8 +146,8 @@ describe('forge adapters', () => {
         baseBranch: 'main',
         checksPending: false,
         checksFailed: false,
-      });
-    mergePullRequestWithAppMock.mockResolvedValue({ merged: true });
+      }));
+    mergePullRequestWithAppMock.mockReturnValue(Effect.succeed({ merged: true }));
 
     const mergePromise = getForgeAdapter('github').mergeReviewArtifact({
       forge: 'github',
@@ -164,7 +165,7 @@ describe('forge adapters', () => {
 
   it('treats already merged GitHub PRs as success', async () => {
     isGitHubAppConfiguredMock.mockReturnValue(true);
-    getPullRequestStateMock.mockResolvedValue({
+    getPullRequestStateMock.mockReturnValue(Effect.succeed({
       owner: 'org',
       repo: 'repo',
       number: 42,
@@ -177,7 +178,7 @@ describe('forge adapters', () => {
       baseBranch: 'main',
       checksPending: false,
       checksFailed: false,
-    });
+    }));
 
     await expect(
       getForgeAdapter('github').mergeReviewArtifact({
@@ -189,5 +190,9 @@ describe('forge adapters', () => {
     ).resolves.toBeUndefined();
 
     expect(mergePullRequestWithAppMock).not.toHaveBeenCalled();
+  });
+
+  it('has a GitHub merge timeout of at least 15 minutes', () => {
+    expect(GITHUB_MERGE_TIMEOUT_MS).toBe(15 * 60 * 1000);
   });
 });

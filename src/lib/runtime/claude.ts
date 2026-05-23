@@ -7,8 +7,10 @@
 import { existsSync, mkdirSync, readdirSync, symlinkSync, unlinkSync, lstatSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
+import { Effect } from 'effect';
 import type {
   RuntimeAdapter,
+  RuntimeAdapterLegacy,
   RuntimeConfig,
   RuntimeType,
   AgentSpawnOptions,
@@ -16,10 +18,13 @@ import type {
   AgentMessage,
 } from './interface.js';
 import { CLAUDE_FEATURES } from './interface.js';
+import { FsError } from '../errors.js';
+import { generateLauncherScriptSync } from '../launcher-generator.js';
+import { getClaudePermissionFlagsSync } from '../claude-permissions.js';
 
 const CLAUDE_DIR = join(homedir(), '.claude');
 
-export function createClaudeAdapter(): RuntimeAdapter {
+export function createClaudeAdapterSync(): RuntimeAdapterLegacy {
   const config: RuntimeConfig = {
     type: 'claude',
     name: 'Claude Code',
@@ -39,8 +44,10 @@ export function createClaudeAdapter(): RuntimeAdapter {
       try {
         const { execa } = await import('execa');
         const result = await execa('which', ['claude']);
+        console.log(`[claude-invoke] purpose=runtime-check | model=n/a | source=runtime/claude.ts:isAvailable | command="which claude" | available=${result.exitCode === 0}`);
         return result.exitCode === 0;
       } catch {
+        console.log(`[claude-invoke] purpose=runtime-check | model=n/a | source=runtime/claude.ts:isAvailable | command="which claude" | available=false`);
         return false;
       }
     },
@@ -49,8 +56,11 @@ export function createClaudeAdapter(): RuntimeAdapter {
       try {
         const { execa } = await import('execa');
         const result = await execa('claude', ['--version']);
-        return result.stdout.trim();
+        const version = result.stdout.trim();
+        console.log(`[claude-invoke] purpose=runtime-check | model=n/a | source=runtime/claude.ts:getVersion | command="claude --version" | version="${version}"`);
+        return version;
       } catch {
+        console.log(`[claude-invoke] purpose=runtime-check | model=n/a | source=runtime/claude.ts:getVersion | command="claude --version" | version=null`);
         return null;
       }
     },
@@ -76,8 +86,8 @@ export function createClaudeAdapter(): RuntimeAdapter {
           args.push('--model', options.model);
         }
 
-        // Add permission bypass flags for autonomous agents
-        args.push('--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions');
+        // Add permission flags for autonomous agents (auto by default; bypass via config/--yolo)
+        args.push(...getClaudePermissionFlagsSync());
 
         // Spawn in tmux session using a launcher script (safer for prompts with special chars)
         const sessionName = `agent-${id}`;
@@ -90,12 +100,18 @@ export function createClaudeAdapter(): RuntimeAdapter {
 
         // Create launcher script
         const launcherScript = join(agentDir, 'launcher.sh');
-        const argsStr = args.length > 0 ? ` ${args.join(' ')}` : '';
-        writeFileSync(launcherScript, `#!/bin/bash
-cd "${options.workingDir}"
-prompt=$(cat "${promptFile}")
-exec claude${argsStr} "$prompt"
-`, { mode: 0o755 });
+        writeFileSync(
+          launcherScript,
+          generateLauncherScriptSync({
+            role: 'work',
+            workingDir: options.workingDir,
+            setTerminalEnv: true,
+            promptFile,
+            baseCommand: 'claude',
+            extraArgs: args.length > 0 ? args.join(' ') : undefined,
+          }),
+          { mode: 0o755 },
+        );
 
         await execa('tmux', [
           'new-session',
@@ -289,5 +305,66 @@ exec claude${argsStr} "$prompt"
     getCommandsDir(): string {
       return config.commandsDir || '';
     },
+  };
+}
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel adapter. Wraps the promise-returning methods of the
+// legacy adapter in Effect.promise so callers can compose typed pipelines.
+// Mutation semantics are unchanged.
+
+/**
+ * Build a {@link RuntimeAdapter} backed by the legacy
+ * {@link RuntimeAdapterLegacy}. Methods that swallow errors in the legacy variant
+ * keep that contract; methods that can produce FS errors lift them via
+ * {@link Effect.tryPromise}.
+ */
+export function createClaudeAdapter(): RuntimeAdapter {
+  const adapter = createClaudeAdapterSync();
+  return {
+    type: adapter.type,
+    config: adapter.config,
+    isAvailable: () => Effect.promise(() => adapter.isAvailable()),
+    getVersion: () => Effect.promise(() => adapter.getVersion()),
+    initialize: () =>
+      Effect.tryPromise({
+        try: () => adapter.initialize(),
+        catch: (cause) =>
+          new FsError({
+            path: adapter.config.skillsDir,
+            operation: 'initialize',
+            cause,
+          }),
+      }),
+    spawnAgent: (id, options) =>
+      Effect.promise(() => adapter.spawnAgent(id, options)),
+    sendMessage: (id, message) =>
+      Effect.promise(() => adapter.sendMessage(id, message)),
+    getAgentStatus: (id) => Effect.promise(() => adapter.getAgentStatus(id)),
+    stopAgent: (id) => Effect.promise(() => adapter.stopAgent(id)),
+    listAgents: () => Effect.promise(() => adapter.listAgents()),
+    syncSkills: (sourceDir, force) =>
+      Effect.tryPromise({
+        try: () => adapter.syncSkills(sourceDir, force),
+        catch: (cause) =>
+          new FsError({ path: sourceDir, operation: 'syncSkills', cause }),
+      }),
+    syncCommands: adapter.syncCommands
+      ? (sourceDir, force) =>
+          Effect.tryPromise({
+            try: () => adapter.syncCommands!(sourceDir, force),
+            catch: (cause) =>
+              new FsError({
+                path: sourceDir,
+                operation: 'syncCommands',
+                cause,
+              }),
+          })
+      : undefined,
+    getSkillsDir: () => adapter.getSkillsDir(),
+    getCommandsDir: adapter.getCommandsDir
+      ? () => adapter.getCommandsDir!()
+      : undefined,
   };
 }

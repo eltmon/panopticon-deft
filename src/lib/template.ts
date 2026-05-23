@@ -1,6 +1,8 @@
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { Effect } from 'effect';
 import { CLAUDE_MD_TEMPLATES } from './paths.js';
+import { FsError } from './errors.js';
 
 export interface TemplateVariables {
   FEATURE_FOLDER: string;
@@ -25,7 +27,7 @@ function loadSection(path: string, variables: TemplateVariables): string {
   return result;
 }
 
-export function generateClaudeMd(
+export function generateClaudeMdSync(
   projectPath: string,
   variables: TemplateVariables
 ): string {
@@ -71,3 +73,19 @@ This workspace was created by Panopticon. Use \`bd\` commands to track your work
 
   return sections.join('\n\n---\n\n');
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Generate the workspace CLAUDE.md content. Effect-native. Fails with FsError
+ * if any template section cannot be read.
+ */
+export const generateClaudeMd = (
+  projectPath: string,
+  variables: TemplateVariables,
+): Effect.Effect<string, FsError> =>
+  Effect.try({
+    try: () => generateClaudeMdSync(projectPath, variables),
+    catch: (cause) =>
+      new FsError({ path: projectPath, operation: 'generateClaudeMd', cause }),
+  });

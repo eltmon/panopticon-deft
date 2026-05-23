@@ -4,7 +4,7 @@
  * Wraps the GitHub REST API in an Effect service with typed errors.
  */
 
-import { Effect, Layer, ServiceMap } from 'effect';
+import { Effect, Layer, Context } from 'effect';
 import { getGitHubConfig } from './tracker-config.js';
 import {
   IssueNotFound,
@@ -39,6 +39,8 @@ export interface GitHubComment {
 
 // ─── Service interface ────────────────────────────────────────────────────────
 
+export type GitHubClientError = TrackerApiError | RateLimited | TrackerNotConfigured;
+
 export interface GitHubClientShape {
   /**
    * Get a GitHub issue by owner/repo/number.
@@ -47,7 +49,7 @@ export interface GitHubClientShape {
     owner: string,
     repo: string,
     number: number,
-  ) => Effect.Effect<GitHubIssue, IssueNotFound | TrackerApiError>;
+  ) => Effect.Effect<GitHubIssue, IssueNotFound | GitHubClientError>;
 
   /**
    * Close a GitHub issue.
@@ -56,7 +58,7 @@ export interface GitHubClientShape {
     owner: string,
     repo: string,
     number: number,
-  ) => Effect.Effect<void, TrackerApiError>;
+  ) => Effect.Effect<void, GitHubClientError>;
 
   /**
    * Reopen a GitHub issue.
@@ -65,7 +67,7 @@ export interface GitHubClientShape {
     owner: string,
     repo: string,
     number: number,
-  ) => Effect.Effect<void, TrackerApiError>;
+  ) => Effect.Effect<void, GitHubClientError>;
 
   /**
    * Add a label to an issue. Creates the label in the repo if it does not exist.
@@ -75,7 +77,7 @@ export interface GitHubClientShape {
     repo: string,
     number: number,
     label: string,
-  ) => Effect.Effect<void, TrackerApiError>;
+  ) => Effect.Effect<void, GitHubClientError>;
 
   /**
    * Remove a label from an issue. Non-fatal if label is not present.
@@ -85,7 +87,7 @@ export interface GitHubClientShape {
     repo: string,
     number: number,
     label: string,
-  ) => Effect.Effect<void, TrackerApiError>;
+  ) => Effect.Effect<void, GitHubClientError>;
 
   /**
    * Ensure a label exists in the repo (create if absent).
@@ -96,7 +98,7 @@ export interface GitHubClientShape {
     name: string,
     color?: string,
     description?: string,
-  ) => Effect.Effect<GitHubLabel, TrackerApiError>;
+  ) => Effect.Effect<GitHubLabel, GitHubClientError>;
 
   /**
    * Add a comment to an issue.
@@ -106,7 +108,7 @@ export interface GitHubClientShape {
     repo: string,
     number: number,
     body: string,
-  ) => Effect.Effect<void, TrackerApiError>;
+  ) => Effect.Effect<void, GitHubClientError>;
 
   /**
    * Get comments on an issue.
@@ -116,12 +118,12 @@ export interface GitHubClientShape {
     repo: string,
     number: number,
     perPage?: number,
-  ) => Effect.Effect<ReadonlyArray<GitHubComment>, TrackerApiError>;
+  ) => Effect.Effect<ReadonlyArray<GitHubComment>, GitHubClientError>;
 }
 
 // ─── Service tag ──────────────────────────────────────────────────────────────
 
-export class GitHubClient extends ServiceMap.Service<GitHubClient, GitHubClientShape>()(
+export class GitHubClient extends Context.Service<GitHubClient, GitHubClientShape>()(
   'panopticon/dashboard/GitHubClient',
 ) {}
 
@@ -331,8 +333,15 @@ function makeGitHubClientImpl(token: string): GitHubClientShape {
             createdAt: c.created_at as string,
           })) satisfies GitHubComment[];
         },
-        catch: (err) => {
-          if (err instanceof IssueNotFound || err instanceof RateLimited) return err;
+        catch: (err): GitHubClientError => {
+          if (err instanceof RateLimited) return err;
+          if (err instanceof IssueNotFound) {
+            return new TrackerApiError({
+              tracker: 'github',
+              message: `Issue not found: ${err.id}`,
+              cause: err,
+            });
+          }
           return wrapGitHubError(err);
         },
       }),
@@ -350,26 +359,45 @@ export const GitHubClientLive = Layer.effect(
   }),
 );
 
+let _githubClientImpl: GitHubClientShape | null = null;
+let _githubClientToken: string | null = null;
+
+function getGitHubClient(): GitHubClientShape {
+  const config = getGitHubConfig();
+  if (!config) {
+    const fail = Effect.fail(new TrackerNotConfigured({ tracker: 'github' }));
+    return {
+      getIssue: () => fail,
+      closeIssue: () => fail,
+      reopenIssue: () => fail,
+      addLabel: () => fail,
+      removeLabel: () => fail,
+      ensureLabel: () => fail,
+      addComment: () => fail,
+      getComments: () => fail,
+    };
+  }
+  if (_githubClientToken !== config.token || !_githubClientImpl) {
+    _githubClientToken = config.token;
+    _githubClientImpl = makeGitHubClientImpl(config.token);
+  }
+  return _githubClientImpl;
+}
+
 /**
- * Layer that provides a no-op GitHubClient when GitHub is not configured.
+ * Layer that provides a GitHubClient which dynamically checks configuration on each call.
+ * This avoids caching a no-op client if the config wasn't ready at layer construction time.
  */
 export const GitHubClientOptionalLive = Layer.effect(
   GitHubClient,
-  Effect.gen(function* () {
-    const config = getGitHubConfig();
-    if (!config) {
-      const fail = Effect.fail(new TrackerNotConfigured({ tracker: 'github' }));
-      return {
-        getIssue: () => fail,
-        closeIssue: () => fail,
-        reopenIssue: () => fail,
-        addLabel: () => fail,
-        removeLabel: () => fail,
-        ensureLabel: () => fail,
-        addComment: () => fail,
-        getComments: () => fail,
-      } as GitHubClientShape;
-    }
-    return makeGitHubClientImpl(config.token);
-  }),
+  Effect.succeed({
+    getIssue: (...args) => getGitHubClient().getIssue(...args),
+    closeIssue: (...args) => getGitHubClient().closeIssue(...args),
+    reopenIssue: (...args) => getGitHubClient().reopenIssue(...args),
+    addLabel: (...args) => getGitHubClient().addLabel(...args),
+    removeLabel: (...args) => getGitHubClient().removeLabel(...args),
+    ensureLabel: (...args) => getGitHubClient().ensureLabel(...args),
+    addComment: (...args) => getGitHubClient().addComment(...args),
+    getComments: (...args) => getGitHubClient().getComments(...args),
+  } as GitHubClientShape),
 );

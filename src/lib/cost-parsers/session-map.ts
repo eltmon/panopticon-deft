@@ -6,7 +6,9 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { Effect } from 'effect';
 import { PANOPTICON_HOME } from '../paths.js';
+import { FsError } from '../errors.js';
 
 const SESSION_MAP_FILE = join(PANOPTICON_HOME, 'session-map.json');
 
@@ -54,7 +56,7 @@ const DEFAULT_DATA: SessionMapData = {
 /**
  * Load session map from file
  */
-export function loadSessionMap(): SessionMapData {
+export function loadSessionMapSync(): SessionMapData {
   try {
     if (existsSync(SESSION_MAP_FILE)) {
       const content = readFileSync(SESSION_MAP_FILE, 'utf-8');
@@ -69,7 +71,7 @@ export function loadSessionMap(): SessionMapData {
 /**
  * Save session map to file
  */
-export function saveSessionMap(data: SessionMapData): void {
+export function saveSessionMapSync(data: SessionMapData): void {
   mkdirSync(PANOPTICON_HOME, { recursive: true });
   data.lastUpdated = new Date().toISOString();
   writeFileSync(SESSION_MAP_FILE, JSON.stringify(data, null, 2));
@@ -78,7 +80,7 @@ export function saveSessionMap(data: SessionMapData): void {
 /**
  * Link a session to an issue
  */
-export function linkSessionToIssue(
+export function linkSessionToIssueSync(
   sessionId: string,
   issueId: string,
   options: {
@@ -88,7 +90,7 @@ export function linkSessionToIssue(
     agentId?: string;
   } = {}
 ): SessionRecord {
-  const data = loadSessionMap();
+  const data = loadSessionMapSync();
 
   if (!data.issues[issueId]) {
     data.issues[issueId] = { sessions: [] };
@@ -111,7 +113,7 @@ export function linkSessionToIssue(
   };
 
   data.issues[issueId].sessions.push(record);
-  saveSessionMap(data);
+  saveSessionMapSync(data);
 
   return record;
 }
@@ -119,7 +121,7 @@ export function linkSessionToIssue(
 /**
  * Mark a session as completed
  */
-export function completeSession(
+export function completeSessionSync(
   sessionId: string,
   issueId: string,
   results: {
@@ -127,7 +129,7 @@ export function completeSession(
     tokenCount?: number;
   } = {}
 ): SessionRecord | null {
-  const data = loadSessionMap();
+  const data = loadSessionMapSync();
 
   const issueData = data.issues[issueId];
   if (!issueData) return null;
@@ -142,7 +144,7 @@ export function completeSession(
   // Recalculate totals
   recalculateIssueTotals(data, issueId);
 
-  saveSessionMap(data);
+  saveSessionMapSync(data);
   return session;
 }
 
@@ -166,21 +168,21 @@ function recalculateIssueTotals(data: SessionMapData, issueId: string): void {
 /**
  * Get sessions for an issue
  */
-export function getIssueSessions(issueId: string): SessionRecord[] {
-  const data = loadSessionMap();
+export function getIssueSessionsSync(issueId: string): SessionRecord[] {
+  const data = loadSessionMapSync();
   return data.issues[issueId]?.sessions || [];
 }
 
 /**
  * Get issue cost summary
  */
-export function getIssueCostSummary(issueId: string): {
+export function getIssueCostSummarySync(issueId: string): {
   totalCost: number;
   totalTokens: number;
   sessionCount: number;
   sessions: SessionRecord[];
 } | null {
-  const data = loadSessionMap();
+  const data = loadSessionMapSync();
   const issueData = data.issues[issueId];
 
   if (!issueData) {
@@ -198,13 +200,13 @@ export function getIssueCostSummary(issueId: string): {
 /**
  * Get all issues with costs
  */
-export function getAllIssuesWithCosts(): Array<{
+export function getAllIssuesWithCostsSync(): Array<{
   issueId: string;
   totalCost: number;
   totalTokens: number;
   sessionCount: number;
 }> {
-  const data = loadSessionMap();
+  const data = loadSessionMapSync();
 
   return Object.entries(data.issues).map(([issueId, issueData]) => ({
     issueId,
@@ -217,8 +219,8 @@ export function getAllIssuesWithCosts(): Array<{
 /**
  * Get session by ID (searches all issues)
  */
-export function findSessionById(sessionId: string): { issueId: string; session: SessionRecord } | null {
-  const data = loadSessionMap();
+export function findSessionByIdSync(sessionId: string): { issueId: string; session: SessionRecord } | null {
+  const data = loadSessionMapSync();
 
   for (const [issueId, issueData] of Object.entries(data.issues)) {
     const session = issueData.sessions.find(s => s.id === sessionId);
@@ -233,7 +235,7 @@ export function findSessionById(sessionId: string): { issueId: string; session: 
 /**
  * Update session cost from JSONL parsing
  */
-export function updateSessionFromJSONL(
+export function updateSessionFromJSONLSync(
   sessionId: string,
   issueId: string,
   usage: {
@@ -242,7 +244,7 @@ export function updateSessionFromJSONL(
     model?: string;
   }
 ): SessionRecord | null {
-  const data = loadSessionMap();
+  const data = loadSessionMapSync();
 
   const issueData = data.issues[issueId];
   if (!issueData) return null;
@@ -257,7 +259,95 @@ export function updateSessionFromJSONL(
   }
 
   recalculateIssueTotals(data, issueId);
-  saveSessionMap(data);
+  saveSessionMapSync(data);
 
   return session;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Effect variant of loadSessionMap. */
+export const loadSessionMap = (): Effect.Effect<SessionMapData, FsError> =>
+  Effect.try({
+    try: () => loadSessionMapSync(),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'loadSessionMap', cause }),
+  });
+
+/** Effect variant of saveSessionMap. */
+export const saveSessionMap = (
+  data: SessionMapData,
+): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => saveSessionMapSync(data),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'saveSessionMap', cause }),
+  });
+
+/** Effect variant of linkSessionToIssue. */
+export const linkSessionToIssue = (
+  sessionId: string,
+  issueId: string,
+  options: Parameters<typeof linkSessionToIssueSync>[2] = {},
+): Effect.Effect<SessionRecord, FsError> =>
+  Effect.try({
+    try: () => linkSessionToIssueSync(sessionId, issueId, options),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'linkSessionToIssue', cause }),
+  });
+
+/** Effect variant of completeSession. */
+export const completeSession = (
+  sessionId: string,
+  issueId: string,
+  usage?: Parameters<typeof completeSessionSync>[2],
+): Effect.Effect<SessionRecord | null, FsError> =>
+  Effect.try({
+    try: () => completeSessionSync(sessionId, issueId, usage),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'completeSession', cause }),
+  });
+
+/** Effect variant of getIssueSessions. */
+export const getIssueSessions = (
+  issueId: string,
+): Effect.Effect<SessionRecord[], FsError> =>
+  Effect.try({
+    try: () => getIssueSessionsSync(issueId),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'getIssueSessions', cause }),
+  });
+
+/** Effect variant of getIssueCostSummary. */
+export const getIssueCostSummary = (
+  issueId: string,
+): Effect.Effect<ReturnType<typeof getIssueCostSummarySync>, FsError> =>
+  Effect.try({
+    try: () => getIssueCostSummarySync(issueId),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'getIssueCostSummary', cause }),
+  });
+
+/** Effect variant of getAllIssuesWithCosts. */
+export const getAllIssuesWithCosts = (): Effect.Effect<
+  ReturnType<typeof getAllIssuesWithCostsSync>,
+  FsError
+> =>
+  Effect.try({
+    try: () => getAllIssuesWithCostsSync(),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'getAllIssuesWithCosts', cause }),
+  });
+
+/** Effect variant of findSessionById. */
+export const findSessionById = (
+  sessionId: string,
+): Effect.Effect<{ issueId: string; session: SessionRecord } | null, FsError> =>
+  Effect.try({
+    try: () => findSessionByIdSync(sessionId),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'findSessionById', cause }),
+  });
+
+/** Effect variant of updateSessionFromJSONL. */
+export const updateSessionFromJSONL = (
+  sessionId: string,
+  issueId: string,
+  usage: Parameters<typeof updateSessionFromJSONLSync>[2],
+): Effect.Effect<SessionRecord | null, FsError> =>
+  Effect.try({
+    try: () => updateSessionFromJSONLSync(sessionId, issueId, usage),
+    catch: (cause) => new FsError({ path: SESSION_MAP_FILE, operation: 'updateSessionFromJSONL', cause }),
+  });

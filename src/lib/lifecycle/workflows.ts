@@ -7,11 +7,12 @@
  * deepWipe() — Destructive: teardown(deleteBranches) + delete agent state + reset issue
  */
 
-import { existsSync, readFileSync } from 'fs';
-import { copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { copyFile, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { Effect } from 'effect';
 import { PANOPTICON_HOME } from '../paths.js';
 import type {
   LifecycleContext,
@@ -27,9 +28,15 @@ import { closeIssue, type CloseIssueOptions } from './close-issue.js';
 import { teardownWorkspace } from './teardown-workspace.js';
 import { compactBeads } from './compact-beads.js';
 import { setCanonicalState } from './reconciler/index.js';
-import { extractNumber, extractPrefix } from '../issue-id.js';
+import { loadCloisterConfig } from '../cloister/config.js';
+import { extractNumberSync, extractPrefixSync } from '../issue-id.js';
 
 const execAsync = promisify(exec);
+
+function trackerName(ctx: LifecycleContext, fallback: string): string {
+  const name = ctx.tracker?.name ?? fallback;
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
 
 /**
  * Build a WorkflowResult from collected steps.
@@ -49,95 +56,87 @@ function buildResult(
   };
 }
 
+function hasBlockingFailure(steps: StepResult[]): boolean {
+  return steps.some(s => !s.success && !s.skipped);
+}
+
 /**
  * approve() — Post-merge lifecycle.
- *
- * 1. Archive planning artifacts (PRD move + .planning/ preservation)
- * 2. Close issue on tracker
- * 3. Teardown workspace
- * 4. Compact beads
- * 5. Clear review status
- *
- * Note: The actual merge step is NOT included here — the merge-agent
- * handles merge validation. This workflow runs AFTER merge completes.
  */
-export async function approve(
+export function approve(
   ctx: LifecycleContext,
   opts: ApproveOptions & CloseIssueOptions & ArchiveOptions = {},
-): Promise<WorkflowResult> {
-  const start = Date.now();
-  const allSteps: StepResult[] = [];
+): Effect.Effect<WorkflowResult> {
+  return Effect.gen(function* () {
+    const start = Date.now();
+    const allSteps: StepResult[] = [];
 
-  // 1. Archive planning
-  const archiveSteps = await archivePlanning(ctx, opts);
-  allSteps.push(...archiveSteps);
+    // 1. Archive planning
+    const archiveSteps = yield* archivePlanning(ctx, opts);
+    allSteps.push(...archiveSteps);
 
-  // If archive failed, stop — don't destroy unarchived artifacts
-  const archiveFailed = archiveSteps.some(s => !s.success && !s.skipped);
-  if (archiveFailed) {
-    allSteps.push(stepFailed('approve:abort', 'Stopped — archiving failed, workspace preserved'));
+    // If archive failed, stop — don't destroy unarchived artifacts
+    const archiveFailed = archiveSteps.some(s => !s.success && !s.skipped);
+    if (archiveFailed) {
+      allSteps.push(stepFailed('approve:abort', 'Stopped — archiving failed, workspace preserved'));
+      return buildResult('approve', ctx.issueId, allSteps, start);
+    }
+
+    // 2. Close issue
+    const closeSteps = yield* closeIssue(ctx, {
+      tracker: opts.tracker,
+      comment: 'Merged to main via Panopticon lifecycle',
+      applyLabel: true,
+    });
+    allSteps.push(...closeSteps);
+
+    // 3. Teardown workspace (delete branches — merge is complete)
+    const teardownSteps = yield* teardownWorkspace(ctx, { deleteBranches: true });
+    allSteps.push(...teardownSteps);
+
+    // 4. Compact beads (non-blocking — failure doesn't affect workflow success)
+    if (!opts.skipBeadsCompaction) {
+      const beadsResult = yield* compactBeads(ctx);
+      allSteps.push(beadsResult);
+    }
+
+    // 5. Clear review status
+    const clearResult = yield* clearReviewStatusStep(ctx.issueId);
+    allSteps.push(clearResult);
+
     return buildResult('approve', ctx.issueId, allSteps, start);
-  }
-
-  // 2. Close issue
-  const closeSteps = await closeIssue(ctx, {
-    tracker: opts.tracker,
-    comment: 'Merged to main via Panopticon lifecycle',
-    applyLabel: true,
   });
-  allSteps.push(...closeSteps);
-
-  // 3. Teardown workspace
-  const teardownSteps = await teardownWorkspace(ctx);
-  allSteps.push(...teardownSteps);
-
-  // 4. Compact beads (non-blocking — failure doesn't affect workflow success)
-  if (!opts.skipBeadsCompaction) {
-    const beadsResult = await compactBeads(ctx);
-    allSteps.push(beadsResult);
-  }
-
-  // 5. Clear review status
-  const clearResult = await clearReviewStatusStep(ctx.issueId);
-  allSteps.push(clearResult);
-
-  return buildResult('approve', ctx.issueId, allSteps, start);
 }
 
 /**
  * close() — Simple issue close with teardown.
- *
- * Used when an issue is being closed without merge (canceled, won't-do, etc.)
- * Does NOT archive workspace artifacts.
- *
- * 1. Close issue on tracker
- * 2. Teardown workspace
- * 3. Clear review status
  */
-export async function close(
+export function close(
   ctx: LifecycleContext,
   opts: CloseIssueOptions = {},
-): Promise<WorkflowResult> {
-  const start = Date.now();
-  const allSteps: StepResult[] = [];
+): Effect.Effect<WorkflowResult> {
+  return Effect.gen(function* () {
+    const start = Date.now();
+    const allSteps: StepResult[] = [];
 
-  // 1. Close issue
-  const closeSteps = await closeIssue(ctx, {
-    tracker: opts.tracker,
-    reason: opts.reason,
-    applyLabel: false,
+    // 1. Close issue
+    const closeSteps = yield* closeIssue(ctx, {
+      tracker: opts.tracker,
+      reason: opts.reason,
+      applyLabel: false,
+    });
+    allSteps.push(...closeSteps);
+
+    // 2. Teardown workspace
+    const teardownSteps = yield* teardownWorkspace(ctx);
+    allSteps.push(...teardownSteps);
+
+    // 3. Clear review status
+    const clearResult = yield* clearReviewStatusStep(ctx.issueId);
+    allSteps.push(clearResult);
+
+    return buildResult('close', ctx.issueId, allSteps, start);
   });
-  allSteps.push(...closeSteps);
-
-  // 2. Teardown workspace
-  const teardownSteps = await teardownWorkspace(ctx);
-  allSteps.push(...teardownSteps);
-
-  // 3. Clear review status
-  const clearResult = await clearReviewStatusStep(ctx.issueId);
-  allSteps.push(clearResult);
-
-  return buildResult('close', ctx.issueId, allSteps, start);
 }
 
 /**
@@ -148,138 +147,163 @@ export async function close(
  *
  * 1. Verify branch merged (hard fail if not — must pass before any cleanup)
  * 2. Move PRD + archive workspace artifacts (hard fail if archiving fails)
- * 3. Clean up workspace (tmux, TLDR, Docker, worktree)
- * 4. Clean up agent state
- * 5. Close issue on tracker
- * 6. Apply closed-out label
- * 7. Clear review status
+ * 3. Mark vBRIEF completed
+ * 4. Clean up workspace (tmux, TLDR, Docker, worktree)
+ * 5. Clean up agent state
+ * 6. Close issue on tracker
+ * 7. Apply closed-out label
+ * 8. Clear review status
  */
-export async function closeOut(
+export function closeOut(
   ctx: LifecycleContext,
   opts: CloseIssueOptions & ArchiveOptions = {},
-): Promise<WorkflowResult> {
-  const start = Date.now();
-  const allSteps: StepResult[] = [];
+): Effect.Effect<WorkflowResult> {
+  return Effect.gen(function* () {
+    const start = Date.now();
+    const allSteps: StepResult[] = [];
 
-  // 1. Verify branch merged (hard fail — must pass before we archive or clean up)
-  const mergeVerify = await verifyBranchMerged(ctx);
-  allSteps.push(mergeVerify);
-  if (!mergeVerify.success && !mergeVerify.skipped) {
+    // 1. Verify branch merged (hard fail — must pass before we archive or clean up)
+    const mergeVerify = yield* verifyBranchMerged(ctx);
+    allSteps.push(mergeVerify);
+    if (!mergeVerify.success && !mergeVerify.skipped) {
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
+    // 2. Move PRD + archive workspace artifacts
+    const archiveSteps = yield* archivePlanning(ctx, opts);
+    allSteps.push(...archiveSteps);
+
+    // Hard fail on archive failure — don't destroy unarchived artifacts
+    const archiveFailed = archiveSteps.some(s => !s.success && !s.skipped);
+    if (archiveFailed) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — archiving failed, workspace preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
+    // 3. Mark the vBRIEF completed on main before teardown removes local state.
+    const vbriefStep = yield* Effect.promise(() => completeVBriefStep(ctx));
+    allSteps.push(vbriefStep);
+    if (!vbriefStep.success && !vbriefStep.skipped) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — vBRIEF completion failed, workspace preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
+    // 4+5. Teardown workspace + agent state
+    const closeOutConfig = (yield* Effect.promise(() => Effect.runPromise(loadCloisterConfig()))).close_out;
+    const teardownSteps = yield* teardownWorkspace(ctx, {
+      deleteWorkspace: closeOutConfig?.remove_workspace ?? false,
+      deleteBranches: closeOutConfig?.delete_feature_branch ?? false,
+    });
+    allSteps.push(...teardownSteps);
+    if (hasBlockingFailure(teardownSteps)) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — teardown failed, tracker issue and review status preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
+    // 6+7. Close issue + apply label
+    const closeSteps = yield* closeIssue(ctx, {
+      tracker: opts.tracker,
+      comment: ctx.auto ? 'Closed via automatic close-out ceremony' : 'Closed via close-out ceremony',
+      applyLabel: true,
+    });
+    allSteps.push(...closeSteps);
+    if (hasBlockingFailure(closeSteps)) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — issue close failed, review status preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
+    // 8. Clear review status
+    const clearResult = yield* clearReviewStatusStep(ctx.issueId);
+    allSteps.push(clearResult);
+
+    yield* Effect.promise(() => resetPostMergeStateForIssue(ctx.issueId));
+
     return buildResult('close-out', ctx.issueId, allSteps, start);
-  }
-
-  // 2. Move PRD + archive workspace artifacts
-  const archiveSteps = await archivePlanning(ctx, opts);
-  allSteps.push(...archiveSteps);
-
-  // Hard fail on archive failure — don't destroy unarchived artifacts
-  const archiveFailed = archiveSteps.some(s => !s.success && !s.skipped);
-  if (archiveFailed) {
-    allSteps.push(stepFailed('close-out:abort', 'Stopped — archiving failed, workspace preserved'));
-    return buildResult('close-out', ctx.issueId, allSteps, start);
-  }
-
-  // 4+5. Teardown workspace + agent state
-  const teardownSteps = await teardownWorkspace(ctx);
-  allSteps.push(...teardownSteps);
-
-  // 6+7. Close issue + apply label
-  const closeSteps = await closeIssue(ctx, {
-    tracker: opts.tracker,
-    comment: 'Closed via close-out ceremony',
-    applyLabel: true,
   });
-  allSteps.push(...closeSteps);
-
-  // 8. Clear review status
-  const clearResult = await clearReviewStatusStep(ctx.issueId);
-  allSteps.push(clearResult);
-
-  return buildResult('close-out', ctx.issueId, allSteps, start);
 }
 
 /**
  * deepWipe() — Destructive cleanup for abandoned workspaces.
- *
- * 1. Teardown workspace (with branch deletion)
- * 2. (Optional) Reset issue to backlog/open
- * 3. Clear review status
  */
-async function destructiveResetWorkflow(
+function destructiveResetWorkflow(
   workflow: 'deep-wipe' | 'reset' | 'cancel',
   ctx: LifecycleContext,
-  opts: DeepWipeOptions = {},
-  resetStep: (ctx: LifecycleContext) => Promise<StepResult>,
+  opts: DeepWipeOptions,
+  resetStep: (ctx: LifecycleContext) => Effect.Effect<StepResult>,
   progressLabel: string,
   progressSuccessDetail: string,
-): Promise<WorkflowResult> {
-  const start = Date.now();
-  const allSteps: StepResult[] = [];
-  const { deleteWorkspace = true, deleteBranches = true, resetIssue = true, onProgress } = opts;
+): Effect.Effect<WorkflowResult> {
+  return Effect.gen(function* () {
+    const start = Date.now();
+    const allSteps: StepResult[] = [];
+    const { deleteWorkspace = true, deleteBranches = true, resetIssue = true, onProgress } = opts;
+    const resetContext = opts.tracker ? { ...ctx, tracker: opts.tracker } : ctx;
 
-  const TOTAL_STEPS = 3 + (resetIssue ? 1 : 0);
-  let stepNum = 0;
+    const TOTAL_STEPS = 3 + (resetIssue ? 1 : 0);
+    let stepNum = 0;
 
-  const progress = (label: string, detail: string, status: 'active' | 'complete' | 'error' = 'active') => {
-    onProgress?.({ step: stepNum, total: TOTAL_STEPS, label, detail, status });
-  };
+    const progress = (label: string, detail: string, status: 'active' | 'complete' | 'error' = 'active') => {
+      onProgress?.({ step: stepNum, total: TOTAL_STEPS, label, detail, status });
+    };
 
-  stepNum = 1;
+    stepNum = 1;
 
-  // Preserve PRD before workspace teardown so it survives reset/cancel.
-  // complete-planning copies STATE.md and plan.vbrief.json to docs/prds/active/
-  // but does not copy prd.md. Ensure it is preserved here.
-  const issueLower = ctx.issueId.toLowerCase();
-  const workspacePath = findWorkspacePath(ctx.projectPath, issueLower);
-  if (workspacePath && existsSync(workspacePath)) {
-    const prdPath = join(workspacePath, '.planning', 'prd.md');
-    if (existsSync(prdPath)) {
-      try {
-        const activeDir = join(ctx.projectPath, 'docs', 'prds', 'active', issueLower);
-        const { mkdir } = await import('fs/promises');
-        await mkdir(activeDir, { recursive: true });
-        await copyFile(prdPath, join(activeDir, 'prd.md'));
-      } catch { /* non-fatal — PRD preservation is best-effort */ }
+    // Preserve PRD before workspace teardown so it survives reset/cancel.
+    const issueLower = ctx.issueId.toLowerCase();
+    const workspacePath = findWorkspacePath(ctx.projectPath, issueLower);
+    if (workspacePath && existsSync(workspacePath)) {
+      const prdPath = join(workspacePath, '.pan', 'prd.md');
+      if (existsSync(prdPath)) {
+        yield* Effect.tryPromise({
+          try: async () => {
+            const activeDir = join(ctx.projectPath, 'docs', 'prds', 'active', issueLower);
+            const { mkdir } = await import('fs/promises');
+            await mkdir(activeDir, { recursive: true });
+            await copyFile(prdPath, join(activeDir, 'prd.md'));
+          },
+          catch: () => null,
+        }).pipe(Effect.catch(() => Effect.void));
+      }
     }
-  }
 
-  progress('Tearing down workspace', 'Killing agents, stopping services, removing files');
-  const teardownSteps = await teardownWorkspace(ctx, {
-    deleteWorkspace,
-    deleteBranches,
-    clearBeads: true,
-    workspaceConfig: opts.workspaceConfig,
-    projectName: opts.projectName,
+    progress('Tearing down workspace', 'Killing agents, stopping services, removing files');
+    const teardownSteps = yield* teardownWorkspace(ctx, {
+      deleteWorkspace,
+      deleteBranches,
+      clearBeads: true,
+      workspaceConfig: opts.workspaceConfig,
+      projectName: opts.projectName,
+    });
+    allSteps.push(...teardownSteps);
+    const teardownFailed = teardownSteps.some(s => !s.success && !s.skipped);
+    progress('Tearing down workspace', teardownFailed ? 'Some steps failed' : 'Workspace torn down', teardownFailed ? 'error' : 'complete');
+
+    stepNum = 2;
+    progress('Deleting git branches', `feature/${ctx.issueId.toLowerCase()}`);
+    progress('Deleting git branches', deleteBranches ? 'Branches removed' : 'Skipped', 'complete');
+
+    if (resetIssue) {
+      stepNum = 3;
+      progress(progressLabel, `${ctx.issueId}`);
+      const resetResult = yield* resetStep(resetContext);
+      allSteps.push(resetResult);
+      progress(progressLabel, resetResult.success ? progressSuccessDetail : (resetResult.error || 'Failed'), resetResult.success ? 'complete' : 'error');
+    }
+
+    stepNum = resetIssue ? 4 : 3;
+    progress('Clearing review status', 'Removing specialist state');
+    const clearResult = yield* clearReviewStatusStep(ctx.issueId);
+    allSteps.push(clearResult);
+    progress('Clearing review status', 'Review status cleared', 'complete');
+
+    return buildResult(workflow, ctx.issueId, allSteps, start);
   });
-  allSteps.push(...teardownSteps);
-  const teardownFailed = teardownSteps.some(s => !s.success && !s.skipped);
-  progress('Tearing down workspace', teardownFailed ? 'Some steps failed' : 'Workspace torn down', teardownFailed ? 'error' : 'complete');
-
-  stepNum = 2;
-  progress('Deleting git branches', `feature/${ctx.issueId.toLowerCase()}`);
-  progress('Deleting git branches', deleteBranches ? 'Branches removed' : 'Skipped', 'complete');
-
-  if (resetIssue) {
-    stepNum = 3;
-    progress(progressLabel, `${ctx.issueId}`);
-    const resetResult = await resetStep(ctx);
-    allSteps.push(resetResult);
-    progress(progressLabel, resetResult.success ? progressSuccessDetail : (resetResult.error || 'Failed'), resetResult.success ? 'complete' : 'error');
-  }
-
-  stepNum = resetIssue ? 4 : 3;
-  progress('Clearing review status', 'Removing specialist state');
-  const clearResult = await clearReviewStatusStep(ctx.issueId);
-  allSteps.push(clearResult);
-  progress('Clearing review status', 'Review status cleared', 'complete');
-
-  return buildResult(workflow, ctx.issueId, allSteps, start);
 }
 
-export async function deepWipe(
+export function deepWipe(
   ctx: LifecycleContext,
   opts: DeepWipeOptions = {},
-): Promise<WorkflowResult> {
+): Effect.Effect<WorkflowResult> {
   return destructiveResetWorkflow(
     'deep-wipe',
     ctx,
@@ -290,10 +314,10 @@ export async function deepWipe(
   );
 }
 
-export async function resetToTodo(
+export function resetToTodo(
   ctx: LifecycleContext,
   opts: DeepWipeOptions = {},
-): Promise<WorkflowResult> {
+): Effect.Effect<WorkflowResult> {
   return destructiveResetWorkflow(
     'reset',
     ctx,
@@ -304,10 +328,10 @@ export async function resetToTodo(
   );
 }
 
-export async function cancelIssueWorkflow(
+export function cancelIssueWorkflow(
   ctx: LifecycleContext,
   opts: DeepWipeOptions = {},
-): Promise<WorkflowResult> {
+): Effect.Effect<WorkflowResult> {
   return destructiveResetWorkflow(
     'cancel',
     ctx,
@@ -320,10 +344,48 @@ export async function cancelIssueWorkflow(
 
 // --- Internal helpers ---
 
+async function completeVBriefStep(ctx: LifecycleContext): Promise<StepResult> {
+  const step = 'close-out:vbrief-completed';
+  try {
+    const { transitionVBriefOnMain } = await import('../vbrief/lifecycle-io.js');
+    const result = await Effect.runPromise(transitionVBriefOnMain(
+      ctx.projectPath,
+      ctx.issueId,
+      'completed',
+      'completed',
+      `scope: complete ${ctx.issueId.toUpperCase()} vBRIEF`,
+    ));
+    const details = [
+      result.moved ? 'Updated vBRIEF lifecycle to completed' : 'vBRIEF lifecycle already completed',
+      result.statusUpdated ? 'Updated plan.status to completed' : 'plan.status already completed',
+    ];
+    if (result.committed) details.push('Committed vBRIEF completion on main');
+    return stepOk(step, details);
+  } catch (err) {
+    const cause = (err as { cause?: unknown }).cause ?? err;
+    const message = cause instanceof Error ? cause.message : String(cause);
+    if (message.includes('No vBRIEF found')) {
+      return stepSkipped(step, [`No vBRIEF found for ${ctx.issueId}`]);
+    }
+    return stepFailed(step, `vBRIEF completion failed: ${message}`);
+  }
+}
+
 /**
  * Verify feature branch is merged into main.
  */
-async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
+function verifyBranchMerged(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => verifyBranchMergedImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('close-out:verify-merged', `Could not verify merge: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function verifyBranchMergedImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'close-out:verify-merged';
   const issueLower = ctx.issueId.toLowerCase();
   const branchName = `feature/${issueLower}`;
@@ -350,7 +412,6 @@ async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
 
     if (branchExists.trim()) {
       // Use merge-base --is-ancestor: checks if the branch tip is reachable from main
-      // Note: does NOT detect squash merges — code-diff fallback handles those
       try {
         await execAsync(
           `git merge-base --is-ancestor ${branchName} main`,
@@ -359,8 +420,6 @@ async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
         return stepOk(step, ['All commits merged to main']);
       } catch {
         // --is-ancestor fails for squash merges where the branch still exists.
-        // Check if the code diff (excluding planning artifacts) is empty — if so,
-        // the code was squash-merged and only planning files remain on the branch.
         try {
           const { stdout: codeDiff } = await execAsync(
             `git diff main...${branchName} -- ':!.planning' ':!docs/prds' ':!.panopticon/prompts' 2>/dev/null || true`,
@@ -378,6 +437,21 @@ async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
           { cwd: ctx.projectPath, encoding: 'utf-8' },
         );
         const count = unmerged.trim() ? unmerged.trim().split('\n').length : 0;
+
+        if (ctx.github) {
+          try {
+            const { stdout: issueState } = await execAsync(
+              `gh issue view ${ctx.github.number} --repo ${ctx.github.owner}/${ctx.github.repo} --json state --jq '.state'`,
+              { cwd: ctx.projectPath, encoding: 'utf-8' },
+            );
+            if (issueState.trim().toUpperCase() === 'CLOSED') {
+              return stepSkipped(step, [`Issue already closed on GitHub; ${count} unmerged commit(s) remain on ${branchName}`]);
+            }
+          } catch {
+            // gh check failed — fall through to hard fail
+          }
+        }
+
         return stepFailed(step, `${count} unmerged commit(s) on ${branchName}. Merge before closing out.`);
       }
     }
@@ -415,6 +489,21 @@ async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
           { cwd: ctx.projectPath, encoding: 'utf-8' },
         );
         const count = remoteUnmerged.trim() ? remoteUnmerged.trim().split('\n').length : 0;
+
+        if (ctx.github) {
+          try {
+            const { stdout: issueState } = await execAsync(
+              `gh issue view ${ctx.github.number} --repo ${ctx.github.owner}/${ctx.github.repo} --json state --jq '.state'`,
+              { cwd: ctx.projectPath, encoding: 'utf-8' },
+            );
+            if (issueState.trim().toUpperCase() === 'CLOSED') {
+              return stepSkipped(step, [`Issue already closed on GitHub; ${count} unmerged commit(s) remain on remote ${branchName}`]);
+            }
+          } catch {
+            // gh check failed — fall through to hard fail
+          }
+        }
+
         return stepFailed(step, `${count} unmerged commit(s) on remote ${branchName}.`);
       }
     }
@@ -429,7 +518,18 @@ async function verifyBranchMerged(ctx: LifecycleContext): Promise<StepResult> {
 /**
  * Reset issue back to open/backlog state (for destructive reset).
  */
-async function resetIssueToTodo(ctx: LifecycleContext): Promise<StepResult> {
+function resetIssueToTodo(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => resetIssueToTodoImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('reset:reset-issue', `Failed to reset issue: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function resetIssueToTodoImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'reset:reset-issue';
   try {
     if (ctx.github) {
@@ -445,12 +545,12 @@ async function resetIssueToTodo(ctx: LifecycleContext): Promise<StepResult> {
     }
 
     // Linear: reopen to Todo
-    const linearApiKey = getLinearApiKey();
+    const linearApiKey = await getLinearApiKey();
     if (linearApiKey) {
       const { LinearClient } = await import('@linear/sdk');
       const client = new LinearClient({ apiKey: linearApiKey });
-      const issueNum = extractNumber(ctx.issueId);
-      const teamKey = extractPrefix(ctx.issueId);
+      const issueNum = extractNumberSync(ctx.issueId);
+      const teamKey = extractPrefixSync(ctx.issueId);
       if (issueNum === null || teamKey === null) {
         return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
       }
@@ -473,7 +573,7 @@ async function resetIssueToTodo(ctx: LifecycleContext): Promise<StepResult> {
           }
         }
       }
-      return stepOk(step, [`Reset Linear issue ${ctx.issueId} to Todo`]);
+      return stepOk(step, [`Reset ${trackerName(ctx, 'linear')} issue ${ctx.issueId} to Todo`]);
     }
 
     return stepSkipped(step, ['No tracker available to reset issue']);
@@ -485,7 +585,28 @@ async function resetIssueToTodo(ctx: LifecycleContext): Promise<StepResult> {
 /**
  * Clear review status for an issue.
  */
-async function clearReviewStatusStep(issueId: string): Promise<StepResult> {
+async function resetPostMergeStateForIssue(issueId: string): Promise<void> {
+  try {
+    const { resetPostMergeState } = await import('../cloister/merge-agent.js');
+    resetPostMergeState(issueId);
+    resetPostMergeState(issueId.toUpperCase());
+  } catch {
+    return;
+  }
+}
+
+function clearReviewStatusStep(issueId: string): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => clearReviewStatusStepImpl(issueId),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepSkipped('clear-review-status', [`Failed to clear review status (non-fatal): ${(err as Error).message}`])),
+    ),
+  );
+}
+
+async function clearReviewStatusStepImpl(issueId: string): Promise<StepResult> {
   const step = 'clear-review-status';
   try {
     const { clearReviewStatus } = await import('../review-status.js');
@@ -496,12 +617,11 @@ async function clearReviewStatusStep(issueId: string): Promise<StepResult> {
     try {
       const statusFile = join(PANOPTICON_HOME, 'review-status.json');
       if (existsSync(statusFile)) {
-        const data = JSON.parse(readFileSync(statusFile, 'utf-8'));
+        const data = JSON.parse(await readFile(statusFile, 'utf-8'));
         const upperKey = issueId.toUpperCase();
         if (data[upperKey]) {
           delete data[upperKey];
-          const { writeFileSync } = await import('fs');
-          writeFileSync(statusFile, JSON.stringify(data, null, 2));
+          await writeFile(statusFile, JSON.stringify(data, null, 2));
         }
       }
       return stepOk(step, ['Review status cleared (direct)']);
@@ -511,7 +631,23 @@ async function clearReviewStatusStep(issueId: string): Promise<StepResult> {
   }
 }
 
-async function resetIssueToCanceled(ctx: LifecycleContext): Promise<StepResult> {
+export const __testInternals = {
+  completeVBriefStep,
+  verifyBranchMerged,
+};
+
+function resetIssueToCanceled(ctx: LifecycleContext): Effect.Effect<StepResult> {
+  return Effect.tryPromise({
+    try: () => resetIssueToCanceledImpl(ctx),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('cancel:reset-issue', `Failed to cancel issue: ${(err as Error).message}`)),
+    ),
+  );
+}
+
+async function resetIssueToCanceledImpl(ctx: LifecycleContext): Promise<StepResult> {
   const step = 'cancel:reset-issue';
   try {
     if (ctx.github) {
@@ -521,12 +657,12 @@ async function resetIssueToCanceled(ctx: LifecycleContext): Promise<StepResult> 
       return stepOk(step, [`Marked GitHub issue #${number} as canceled/wontfix (reconciler enqueued)`]);
     }
 
-    const linearApiKey = getLinearApiKey();
+    const linearApiKey = await getLinearApiKey();
     if (linearApiKey) {
       const { LinearClient } = await import('@linear/sdk');
       const client = new LinearClient({ apiKey: linearApiKey });
-      const issueNum = extractNumber(ctx.issueId);
-      const teamKey = extractPrefix(ctx.issueId);
+      const issueNum = extractNumberSync(ctx.issueId);
+      const teamKey = extractPrefixSync(ctx.issueId);
       if (issueNum === null || teamKey === null) {
         return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
       }
@@ -549,7 +685,7 @@ async function resetIssueToCanceled(ctx: LifecycleContext): Promise<StepResult> 
           }
         }
       }
-      return stepOk(step, [`Reset Linear issue ${ctx.issueId} to Canceled`]);
+      return stepOk(step, [`Reset ${trackerName(ctx, 'linear')} issue ${ctx.issueId} to Canceled`]);
     }
 
     return stepSkipped(step, ['No tracker available to cancel issue']);
@@ -557,4 +693,3 @@ async function resetIssueToCanceled(ctx: LifecycleContext): Promise<StepResult> 
     return stepFailed(step, `Failed to cancel issue: ${(err as Error).message}`);
   }
 }
-

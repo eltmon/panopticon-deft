@@ -10,8 +10,9 @@
  */
 
 import { useState, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { Terminal, XCircle, Loader2, X, Info, AlertTriangle, CheckCircle2, Volume2 } from 'lucide-react';
+import { useMutation, useQuery } from '@tanstack/react-query';
+import { Terminal, XCircle, Loader2, X, Info, AlertTriangle, CheckCircle2, Volume2, Play } from 'lucide-react';
+import { toast } from 'sonner';
 import { useDashboardStore } from '../lib/store';
 
 export interface ActivityEntry {
@@ -64,6 +65,20 @@ async function fetchGitActivity(): Promise<ActivityEntry[]> {
   return res.json() as Promise<ActivityEntry[]>;
 }
 
+async function replayTtsUtterance(text: string): Promise<void> {
+  const res = await fetch('/api/tts/speak', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  const body = await res.json().catch(() => undefined) as { spoken?: unknown; result?: unknown; error?: unknown } | undefined;
+  const error = typeof body?.error === 'string' ? body.error : undefined;
+  const result = typeof body?.result === 'string' ? body.result : undefined;
+
+  if (!res.ok) throw new Error(error || result || 'TTS daemon unavailable');
+  if (body?.spoken !== true) throw new Error(error || (result ? `TTS did not speak (${result})` : 'TTS daemon unavailable'));
+}
+
 function LevelIcon({ level }: { level: ActivityEntry['level'] }) {
   switch (level) {
     case 'success':
@@ -87,12 +102,13 @@ function levelBadgeClass(level: ActivityEntry['level']): string {
 }
 
 const SOURCE_COLORS: Record<string, string> = {
-  'merge-agent':       'bg-purple-500/20 text-purple-400',
-  'cloister':         'bg-blue-500/20 text-blue-400',
-  'review-specialist':'bg-green-500/20 text-green-400',
-  'test-specialist':   'bg-orange-500/20 text-orange-400',
-  'dashboard':        'bg-gray-500/20 text-gray-400',
-  'deploy-script':    'bg-cyan-500/20 text-cyan-400',
+  plan:        'bg-indigo-500/20 text-indigo-400',
+  work:        'bg-blue-500/20 text-blue-400',
+  review:     'bg-green-500/20 text-green-400',
+  test:       'bg-orange-500/20 text-orange-400',
+  ship:       'bg-purple-500/20 text-purple-400',
+  cloister:   'bg-blue-500/20 text-blue-400',
+  dashboard:  'bg-gray-500/20 text-gray-400',
 };
 
 function SourceBadge({ source }: { source: string }) {
@@ -124,7 +140,7 @@ function formatTimestamp(iso: string): string {
 
 type LevelFilter = 'all' | ActivityEntry['level'];
 type SourceFilter = 'all' | string;
-type CategoryFilter = 'all' | 'git' | 'specialist' | 'sync';
+type CategoryFilter = 'all' | 'git' | 'role' | 'sync';
 
 interface FilterState {
   level: LevelFilter;
@@ -139,7 +155,7 @@ export function inferCategory(entry: ActivityEntry): string {
   if (entry.category) return entry.category;
   const src = entry.source ?? '';
   if (src === 'git') return 'git';
-  if (src.includes('specialist') || src.includes('merge-agent') || src.includes('review') || src.includes('test')) return 'specialist';
+  if (src === 'plan' || src === 'work' || src === 'review' || src === 'test' || src === 'ship') return 'role';
   if (src.includes('sync') || src.includes('pull')) return 'sync';
   return 'other';
 }
@@ -165,7 +181,7 @@ export function applyPinWarnings(matched: ActivityEntry[], pinWarnings: boolean)
 
 function ActivityItem({ activity }: { activity: ActivityEntry }) {
   return (
-    <div className="p-3 hover:bg-surface/50 transition-colors">
+    <div className="p-3 hover:bg-card/50 transition-colors">
       {/* Header row */}
       <div className="flex items-start gap-2 mb-1">
         <LevelIcon level={activity.level} />
@@ -174,42 +190,42 @@ function ActivityItem({ activity }: { activity: ActivityEntry }) {
             <SourceBadge source={activity.source} />
             <span className={levelBadgeClass(activity.level)}>{activity.level}</span>
             {inferCategory(activity) !== 'other' && (
-              <span className="text-xs text-content-muted bg-surface/60 px-1 py-0.5 rounded font-mono">
+              <span className="text-xs text-muted-foreground bg-card/60 px-1 py-0.5 rounded font-mono">
                 {inferCategory(activity)}
               </span>
             )}
             {activity.issueId && (
-              <span className="text-xs font-mono text-content-muted bg-surface px-1.5 py-0.5 rounded">
+              <span className="text-xs font-mono text-muted-foreground bg-card px-1.5 py-0.5 rounded">
                 {activity.issueId}
               </span>
             )}
           </div>
         </div>
-        <span className="text-xs text-content-muted shrink-0 tabular-nums" title={activity.timestamp}>
+        <span className="text-xs text-muted-foreground shrink-0 tabular-nums" title={activity.timestamp}>
           {formatTimestamp(activity.timestamp)}
         </span>
       </div>
 
       {/* Message */}
-      <p className="text-sm text-content font-medium leading-snug mb-1">
+      <p className="text-sm text-foreground font-medium leading-snug mb-1">
         {activity.message}
       </p>
 
       {/* Details (collapsible) */}
       {activity.details && (
-        <details className="mt-1">
-          <summary className="text-xs text-content-muted cursor-pointer hover:text-content">
+        <details className="mt-1 group">
+          <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground select-none">
             Details
           </summary>
-          <pre className="mt-1 bg-surface rounded p-2 text-xs text-content-body font-mono overflow-x-auto whitespace-pre-wrap">
-            {activity.details}
+          <pre className="mt-1 bg-card rounded p-2 text-xs text-foreground font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto">
+            {activity.details.replace(/\x1b\[[0-9;]*m/g, '')}
           </pre>
         </details>
       )}
 
       {/* Triggering event (detailed stream only) */}
       {activity.triggeringEvent && (
-        <p className="text-xs text-content-muted mt-1 font-mono">
+        <p className="text-xs text-muted-foreground mt-1 font-mono">
           event: {activity.triggeringEvent}
         </p>
       )}
@@ -218,21 +234,26 @@ function ActivityItem({ activity }: { activity: ActivityEntry }) {
 }
 
 function TtsItem({ entry }: { entry: TtsEntry }) {
+  const replayMutation = useMutation({
+    mutationFn: replayTtsUtterance,
+    onError: (error: Error) => toast.error(`Failed to replay TTS: ${error.message}`),
+  });
+
   return (
-    <div className="p-3 hover:bg-surface/50 transition-colors">
+    <div className="p-3 hover:bg-card/50 transition-colors">
       <div className="flex items-start gap-2">
         <Volume2 className="w-4 h-4 text-primary shrink-0 mt-0.5" />
         <div className="flex-1 min-w-0">
-          <p className="text-sm text-content font-medium leading-snug">
+          <p className="text-sm text-foreground font-medium leading-snug">
             {entry.utterance}
           </p>
           <div className="flex items-center gap-2 mt-1">
             {entry.issueId && (
-              <span className="text-xs font-mono text-content-muted bg-surface px-1.5 py-0.5 rounded">
+              <span className="text-xs font-mono text-muted-foreground bg-card px-1.5 py-0.5 rounded">
                 {entry.issueId}
               </span>
             )}
-            <span className="text-xs text-content-muted tabular-nums" title={entry.timestamp}>
+            <span className="text-xs text-muted-foreground tabular-nums" title={entry.timestamp}>
               {formatTimestamp(entry.timestamp)}
             </span>
             {entry.priority !== undefined && entry.priority !== null && (
@@ -246,6 +267,17 @@ function TtsItem({ entry }: { entry: TtsEntry }) {
             )}
           </div>
         </div>
+        <button
+          type="button"
+          onClick={() => replayMutation.mutate(entry.utterance)}
+          disabled={replayMutation.isPending}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-popover hover:text-foreground disabled:opacity-50"
+          aria-label={`Replay TTS utterance: ${entry.utterance}`}
+          title="Replay TTS utterance"
+          data-testid={`tts-activity-replay-${entry.id}`}
+        >
+          {replayMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+        </button>
       </div>
     </div>
   );
@@ -360,14 +392,14 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
   const displayCount = activeStream === 'tts' ? ttsActivities.length : filtered.length;
 
   return (
-    <div className="flex flex-col h-full bg-surface-raised border-l border-divider">
+    <div className="flex flex-col h-full bg-card border-l border-border">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-divider flex items-center justify-between shrink-0">
+      <div className="px-4 py-3 border-b border-border flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
           <Terminal className="w-5 h-5 text-primary" />
-          <h2 className="font-medium text-content">Activity Log</h2>
+          <h2 className="font-medium text-foreground">Activity Log</h2>
           {totalCount > 0 && (
-            <span className="text-xs text-content-muted bg-surface px-1.5 py-0.5 rounded-full">
+            <span className="text-xs text-muted-foreground bg-card px-1.5 py-0.5 rounded-full">
               {displayCount !== totalCount ? `${displayCount}/${totalCount}` : totalCount}
             </span>
           )}
@@ -376,20 +408,20 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
           {activeStream !== 'tts' && (
             <button
               onClick={() => setShowFilters(!showFilters)}
-              className={`text-xs px-2 py-1 rounded ${showFilters ? 'bg-primary/20 text-primary' : 'text-content-muted hover:text-content'} transition-colors`}
+              className={`text-xs px-2 py-1 rounded ${showFilters ? 'bg-primary/20 text-primary' : 'text-muted-foreground hover:text-foreground'} transition-colors`}
               title="Toggle filters"
             >
               Filter
             </button>
           )}
-          <button onClick={onClose} className="text-content-subtle hover:text-content p-1 ml-1">
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground p-1 ml-1">
             <X className="w-4 h-4" />
           </button>
         </div>
       </div>
 
       {/* Stream tabs */}
-      <div className="flex border-b border-divider shrink-0">
+      <div className="flex border-b border-border shrink-0">
         {(['normal', 'detailed', 'tts'] as ActivityStream[]).map((stream) => (
           <button
             key={stream}
@@ -397,7 +429,7 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
             className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
               activeStream === stream
                 ? 'bg-primary/10 text-primary border-b-2 border-primary'
-                : 'text-content-muted hover:text-content hover:bg-surface/50'
+                : 'text-muted-foreground hover:text-foreground hover:bg-card/50'
             }`}
           >
             {stream === 'normal' ? 'Normal'
@@ -409,11 +441,11 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
 
       {/* Filter bar */}
       {showFilters && activeStream !== 'tts' && (
-        <div className="px-4 py-2 border-b border-divider flex flex-wrap gap-2 shrink-0 bg-surface-raised/80">
+        <div className="px-4 py-2 border-b border-border flex flex-wrap gap-2 shrink-0 bg-card/80">
           <select
             value={filters.level}
             onChange={(e) => setFilters((f) => ({ ...f, level: e.target.value as LevelFilter }))}
-            className="text-xs bg-surface border border-divider rounded px-2 py-1 text-content"
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground"
           >
             <option value="all">All levels</option>
             <option value="info">Info</option>
@@ -425,18 +457,18 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
           <select
             value={filters.category}
             onChange={(e) => setFilters((f) => ({ ...f, category: e.target.value as CategoryFilter }))}
-            className="text-xs bg-surface border border-divider rounded px-2 py-1 text-content"
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground"
           >
             <option value="all">All types</option>
             <option value="git">Git</option>
-            <option value="specialist">Specialist</option>
+            <option value="role">Roles</option>
             <option value="sync">Sync</option>
           </select>
 
           <select
             value={filters.source}
             onChange={(e) => setFilters((f) => ({ ...f, source: e.target.value as SourceFilter }))}
-            className="text-xs bg-surface border border-divider rounded px-2 py-1 text-content"
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground"
           >
             <option value="all">All sources</option>
             {sources.map((s) => (
@@ -449,10 +481,10 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
             placeholder="Search…"
             value={filters.search}
             onChange={(e) => setFilters((f) => ({ ...f, search: e.target.value }))}
-            className="text-xs bg-surface border border-divider rounded px-2 py-1 text-content flex-1 min-w-24 placeholder:text-content-muted"
+            className="text-xs bg-card border border-border rounded px-2 py-1 text-foreground flex-1 min-w-24 placeholder:text-muted-foreground"
           />
 
-          <label className="flex items-center gap-1.5 text-xs text-content-muted cursor-pointer select-none">
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
             <input
               type="checkbox"
               checked={filters.pinWarnings}
@@ -465,7 +497,7 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
           {(filters.level !== 'all' || filters.source !== 'all' || filters.category !== 'all' || filters.search) && (
             <button
               onClick={() => setFilters({ level: 'all', source: 'all', category: 'all', search: '', pinWarnings: filters.pinWarnings })}
-              className="text-xs text-content-muted hover:text-content underline"
+              className="text-xs text-muted-foreground hover:text-foreground underline"
             >
               Clear
             </button>
@@ -476,12 +508,12 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
-          <div className="flex items-center justify-center h-32 text-content-subtle">
+          <div className="flex items-center justify-center h-32 text-muted-foreground">
             <Loader2 className="w-6 h-6 animate-spin" />
           </div>
         ) : activeStream === 'tts' ? (
           ttsActivities.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-32 text-content-muted">
+            <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
               <Volume2 className="w-8 h-8 mb-2 opacity-50" />
               <p className="text-sm">No TTS utterances yet</p>
               <p className="text-xs mt-1">Major milestones will be spoken aloud</p>
@@ -494,7 +526,7 @@ export function ActivityPanel({ onClose }: ActivityPanelProps) {
             </div>
           )
         ) : filtered.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-32 text-content-muted">
+          <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
             <Terminal className="w-8 h-8 mb-2 opacity-50" />
             <p className="text-sm">{currentActivities.length === 0 ? 'No activity yet' : 'No matches for filters'}</p>
             {currentActivities.length === 0 && (

@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Effect } from 'effect';
 import * as fs from 'fs';
 
 // Mock fs before importing the module under test
@@ -20,6 +21,7 @@ vi.mock('fs', async (importOriginal) => {
 // Mock config and tracker modules
 vi.mock('../../../src/lib/config.js', () => ({
   loadConfig: vi.fn(),
+  loadConfigSync: vi.fn(),
 }));
 
 vi.mock('../../../src/lib/tracker/factory.js', () => ({
@@ -27,13 +29,13 @@ vi.mock('../../../src/lib/tracker/factory.js', () => ({
 }));
 
 import { getTrackerContext } from '../../../src/lib/cloister/work-agent-prompt.js';
-import { loadConfig } from '../../../src/lib/config.js';
+import { loadConfigSync } from '../../../src/lib/config.js';
 import { createTrackerFromConfig } from '../../../src/lib/tracker/factory.js';
 import { NotImplementedError } from '../../../src/lib/tracker/interface.js';
 
 const mockExistsSync = vi.mocked(fs.existsSync);
 const mockStatSync = vi.mocked(fs.statSync);
-const mockLoadConfig = vi.mocked(loadConfig);
+const mockLoadConfig = vi.mocked(loadConfigSync);
 const mockCreateTrackerFromConfig = vi.mocked(createTrackerFromConfig);
 
 const STATE_MTIME = new Date('2025-01-10T00:00:00Z');
@@ -41,11 +43,13 @@ const OLD_COMMENT_DATE = '2025-01-09T12:00:00Z';  // before STATE.md
 const NEW_COMMENT_DATE = '2025-01-11T08:00:00Z';  // after STATE.md
 
 function makeTracker(overrides: Partial<{
-  getIssue: () => Promise<any>;
-  getComments: () => Promise<any[]>;
+  getIssue: () => any;
+  getComments: () => any;
 }> = {}) {
+  // Production work-agent-prompt calls tracker via Effect.runPromise(tracker.getIssue/getComments)
+  // so mocks must return Effects. mockReturnValue (not mockResolvedValue) yields the value as-is.
   return {
-    getIssue: vi.fn().mockResolvedValue({
+    getIssue: vi.fn().mockReturnValue(Effect.succeed({
       id: 'PAN-253',
       ref: 'PAN-253',
       title: 'Test issue',
@@ -57,8 +61,8 @@ function makeTracker(overrides: Partial<{
       description: '',
       createdAt: OLD_COMMENT_DATE,
       updatedAt: NEW_COMMENT_DATE,
-    }),
-    getComments: vi.fn().mockResolvedValue([]),
+    })),
+    getComments: vi.fn().mockReturnValue(Effect.succeed([])),
     ...overrides,
   };
 }
@@ -119,7 +123,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig();
       const tracker = makeTracker({
-        getComments: vi.fn().mockResolvedValue([
+        getComments: vi.fn().mockReturnValue(Effect.succeed([
           {
             id: '1',
             issueId: 'PAN-253',
@@ -128,7 +132,7 @@ describe('getTrackerContext', () => {
             createdAt: NEW_COMMENT_DATE,
             updatedAt: NEW_COMMENT_DATE,
           },
-        ]),
+        ])),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -142,7 +146,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig();
       const tracker = makeTracker({
-        getComments: vi.fn().mockResolvedValue([
+        getComments: vi.fn().mockReturnValue(Effect.succeed([
           {
             id: '1',
             issueId: 'PAN-253',
@@ -151,7 +155,7 @@ describe('getTrackerContext', () => {
             createdAt: OLD_COMMENT_DATE,
             updatedAt: OLD_COMMENT_DATE,
           },
-        ]),
+        ])),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -165,7 +169,7 @@ describe('getTrackerContext', () => {
       setupConfig();
       const longBody = 'x'.repeat(1000);
       const tracker = makeTracker({
-        getComments: vi.fn().mockResolvedValue([
+        getComments: vi.fn().mockReturnValue(Effect.succeed([
           {
             id: '1',
             issueId: 'PAN-253',
@@ -174,7 +178,7 @@ describe('getTrackerContext', () => {
             createdAt: NEW_COMMENT_DATE,
             updatedAt: NEW_COMMENT_DATE,
           },
-        ]),
+        ])),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -188,7 +192,7 @@ describe('getTrackerContext', () => {
       setupConfig();
       // Issue is closed so not reopened
       const tracker = makeTracker({
-        getIssue: vi.fn().mockResolvedValue({
+        getIssue: vi.fn().mockReturnValue(Effect.succeed({
           id: 'PAN-253',
           ref: 'PAN-253',
           title: 'Test issue',
@@ -199,8 +203,8 @@ describe('getTrackerContext', () => {
           description: '',
           createdAt: OLD_COMMENT_DATE,
           updatedAt: OLD_COMMENT_DATE,
-        }),
-        getComments: vi.fn().mockResolvedValue([
+        })),
+        getComments: vi.fn().mockReturnValue(Effect.succeed([
           {
             id: '1',
             issueId: 'PAN-253',
@@ -209,7 +213,7 @@ describe('getTrackerContext', () => {
             createdAt: OLD_COMMENT_DATE,
             updatedAt: OLD_COMMENT_DATE,
           },
-        ]),
+        ])),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -234,7 +238,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig();
       const tracker = makeTracker({
-        getIssue: vi.fn().mockResolvedValue({
+        getIssue: vi.fn().mockReturnValue(Effect.succeed({
           id: 'PAN-253',
           ref: 'PAN-253',
           title: 'Test issue',
@@ -246,7 +250,7 @@ describe('getTrackerContext', () => {
           description: '',
           createdAt: OLD_COMMENT_DATE,
           updatedAt: NEW_COMMENT_DATE,
-        }),
+        })),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -258,7 +262,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig();
       const tracker = makeTracker({
-        getIssue: vi.fn().mockResolvedValue({
+        getIssue: vi.fn().mockReturnValue(Effect.succeed({
           id: 'PAN-253',
           ref: 'PAN-253',
           title: 'Test issue',
@@ -269,7 +273,7 @@ describe('getTrackerContext', () => {
           description: '',
           createdAt: OLD_COMMENT_DATE,
           updatedAt: OLD_COMMENT_DATE,
-        }),
+        })),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -283,9 +287,9 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig('gitlab');
       const tracker = makeTracker({
-        getComments: vi.fn().mockRejectedValue(
+        getComments: vi.fn().mockReturnValue(Effect.fail(
           new NotImplementedError('GitLab tracker is not yet implemented')
-        ),
+        )),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -301,7 +305,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig();
       const tracker = makeTracker({
-        getIssue: vi.fn().mockRejectedValue(new Error('Authentication failed')),
+        getIssue: vi.fn().mockReturnValue(Effect.fail(new Error('Authentication failed'))),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -314,7 +318,7 @@ describe('getTrackerContext', () => {
       setupStateMtime();
       setupConfig('github');
       const tracker = makeTracker({
-        getIssue: vi.fn().mockRejectedValue(new Error('Issue not found: PAN-253')),
+        getIssue: vi.fn().mockReturnValue(Effect.fail(new Error('Issue not found: PAN-253'))),
       });
       mockCreateTrackerFromConfig.mockReturnValue(tracker as any);
 
@@ -329,7 +333,7 @@ describe('getTrackerContext', () => {
       } as any);
 
       const linearTracker = makeTracker({
-        getIssue: vi.fn().mockRejectedValue(new Error('not found in linear')),
+        getIssue: vi.fn().mockReturnValue(Effect.fail(new Error('not found in linear'))),
       });
       const githubTracker = makeTracker(); // succeeds
 

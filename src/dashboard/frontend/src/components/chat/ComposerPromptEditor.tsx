@@ -24,7 +24,7 @@ import {
   KEY_ENTER_COMMAND,
   COMMAND_PRIORITY_HIGH,
 } from 'lexical';
-import styles from '../MissionControl/styles/mission-control.module.css';
+import styles from '../CommandDeck/styles/command-deck.module.css';
 
 // ─── Draft persistence ────────────────────────────────────────────────────────
 
@@ -96,6 +96,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   // ─── Core System ─────────────────────────────────────────────────────────────
   { id: 'pan-up', label: 'pan up', description: 'Start dashboard and Traefik', insert: 'pan up', category: 'Core' },
   { id: 'pan-down', label: 'pan down', description: 'Stop dashboard and Traefik', insert: 'pan down', category: 'Core' },
+  { id: 'pan-reload', label: 'pan reload', description: 'Rebuild then restart the dashboard if build succeeds', insert: 'pan reload', category: 'Core' },
+  { id: 'pan-restart', label: 'pan restart', description: 'Restart dashboard (use --full for entire stack)', insert: 'pan restart', category: 'Core' },
   { id: 'pan-status', label: 'pan status', description: 'Show running agents', insert: 'pan status', category: 'Core' },
   { id: 'pan-init', label: 'pan init', description: 'Initialize Panopticon', insert: 'pan init', category: 'Core' },
   { id: 'pan-sync', label: 'pan sync', description: 'Sync skills/agents/rules to devroot', insert: 'pan sync', category: 'Core' },
@@ -114,7 +116,6 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { id: 'pan-recover', label: 'pan recover', description: 'Recover a crashed agent', insert: 'pan recover ', category: 'Lifecycle' },
   { id: 'pan-sync-main', label: 'pan sync-main', description: 'Sync latest main into feature branch', insert: 'pan sync-main ', category: 'Lifecycle' },
   { id: 'pan-done', label: 'pan done', description: 'Mark agent work complete', insert: 'pan done ', category: 'Lifecycle' },
-  { id: 'pan-approve', label: 'pan approve', description: 'Approve agent work and merge', insert: 'pan approve ', category: 'Lifecycle' },
   { id: 'pan-reopen', label: 'pan reopen', description: 'Reopen a completed issue', insert: 'pan reopen ', category: 'Lifecycle' },
   { id: 'pan-wipe', label: 'pan wipe', description: 'Deep wipe: completely reset all state', insert: 'pan wipe ', category: 'Lifecycle' },
   { id: 'pan-close', label: 'pan close', description: 'Close out a completed issue', insert: 'pan close ', category: 'Lifecycle' },
@@ -214,6 +215,8 @@ function ComposerPlugin({
 }: InnerPluginProps) {
   const [editor] = useLexicalComposerContext();
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestTextRef = useRef(loadDraft(conversationName));
+  const unmountingRef = useRef(false);
 
   // Register Enter key handler.
   // NOTE: We do NOT check `disabled` here — the submit handler owns that check.
@@ -254,10 +257,22 @@ function ComposerPlugin({
     return () => root.removeEventListener('keydown', handleKeyDown);
   }, [editor, onSlashKey]);
 
+  // Flush draft to localStorage on unmount so tab switches don't lose text
+  useEffect(() => {
+    unmountingRef.current = false;
+    return () => {
+      unmountingRef.current = true;
+      if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+      saveDraft(conversationName, latestTextRef.current);
+    };
+  }, [conversationName]);
+
   // Debounced draft persistence
   const handleChange = useCallback(() => {
+    if (unmountingRef.current) return;
     editor.read(() => {
       const text = $getRoot().getTextContent();
+      latestTextRef.current = text;
       onTextChange(text);
 
       if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
@@ -298,6 +313,8 @@ export interface ComposerPromptEditorProps {
   editorRef?: React.RefObject<LexicalEditor | null>;
   /** Callback whenever text content changes */
   onChange?: (text: string) => void;
+  /** Paste handler registered on the editor root element */
+  onPaste?: (event: React.ClipboardEvent<HTMLDivElement>) => void;
 }
 
 // ─── Slash Menu ───────────────────────────────────────────────────────────────
@@ -433,6 +450,7 @@ export function ComposerPromptEditor({
   onCommandKeyDown,
   editorRef,
   onChange,
+  onPaste,
 }: ComposerPromptEditorProps) {
   const draft = loadDraft(conversationName);
 
@@ -474,7 +492,6 @@ export function ComposerPromptEditor({
     if (slashIdx < 0) return null;
 
     const afterSlash = text.slice(slashIdx + 1);
-    if (/\s/.test(afterSlash)) return null;
 
     return {
       slashIdx,
@@ -585,12 +602,13 @@ export function ComposerPromptEditor({
 
   return (
     <div style={{ position: 'relative' }}>
-      <LexicalComposer initialConfig={initialConfig}>
+      <LexicalComposer key={conversationName} initialConfig={initialConfig}>
         <div className={`${styles.composerEditor} ${disabled ? styles.composerEditorDisabled : ''}`}>
           <PlainTextPlugin
             contentEditable={
               <ContentEditable
                 className={styles.composerEditable}
+                onPaste={onPaste}
                 aria-placeholder={placeholder}
                 placeholder={() =>
                   !text ? (

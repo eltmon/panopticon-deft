@@ -21,18 +21,18 @@
  *   `fs.promises.readFile` for the one-time runtime.json migration fallback.
  */
 
-import { Effect, Layer, ServiceMap, Stream, SubscriptionRef } from 'effect';
+import { Effect, Layer, Context, Stream, SubscriptionRef } from 'effect';
 import {
   applyEvent as applyReducerEvent,
   INITIAL_READ_MODEL_STATE,
-} from '@panopticon/contracts';
+} from '@panctl/contracts';
 import type {
   AgentRuntimeSnapshot,
   DomainEvent,
-} from '@panopticon/contracts';
+} from '@panctl/contracts';
 import { initEventStore, getSharedDb } from '../event-store.js';
 import type { StoredEvent } from '../event-store.js';
-import { setAgentRuntimeMirror, getRuntimeSnapshotSync as getMirrorSnapshot, markAgentStateServiceInProcess } from '../../../lib/agent-runtime-mirror.js';
+import { setAgentRuntimeMirror, getRuntimeSnapshot as getMirrorSnapshot, markAgentStateServiceInProcess } from '../../../lib/agent-runtime-mirror.js';
 
 // ─── Event filtering ──────────────────────────────────────────────────────────
 
@@ -82,7 +82,7 @@ export interface AgentStateServiceShape {
   ) => Effect.Effect<void>;
 }
 
-export class AgentStateService extends ServiceMap.Service<
+export class AgentStateService extends Context.Service<
   AgentStateService,
   AgentStateServiceShape
 >()('panopticon/dashboard/AgentStateService') {}
@@ -90,7 +90,7 @@ export class AgentStateService extends ServiceMap.Service<
 // ─── Live implementation ──────────────────────────────────────────────────────
 
 // Re-export the cross-process-safe mirror accessor.
-export const getRuntimeSnapshotSync = getMirrorSnapshot;
+export const getRuntimeSnapshot = getMirrorSnapshot;
 
 export const AgentStateServiceLive = Layer.effect(
   AgentStateService,
@@ -98,7 +98,7 @@ export const AgentStateServiceLive = Layer.effect(
     // Flag lib-side adapters to prefer the in-process mirror over HTTP.
     // Without this, agent-enrichment / ReadModel bootstrap would fetch() our
     // own HTTP server before it finished listening — a circular deadlock.
-    markAgentStateServiceInProcess();
+    yield* markAgentStateServiceInProcess();
     const store = yield* Effect.promise(() => initEventStore());
     const ref = yield* SubscriptionRef.make<Record<string, AgentRuntimeSnapshot>>({});
 
@@ -147,7 +147,7 @@ export const AgentStateServiceLive = Layer.effect(
         if (snap.updatedAtSequence > maxCachedSequence) maxCachedSequence = snap.updatedAtSequence;
       }
       yield* SubscriptionRef.set(ref, initial);
-      setAgentRuntimeMirror(initial);
+      yield* setAgentRuntimeMirror(initial);
       console.log(
         `[AgentStateService] Bootstrapped ${Object.keys(initial).length} runtime snapshot(s) from projection_cache (seq=${maxCachedSequence})`,
       );
@@ -185,7 +185,7 @@ export const AgentStateServiceLive = Layer.effect(
       get: (id) =>
         SubscriptionRef.get(ref).pipe(Effect.map((m) => m[id])),
       getAll: SubscriptionRef.get(ref),
-      changes: ref.changes,
+      changes: SubscriptionRef.changes(ref),
       emit: (event) =>
         Effect.promise(() =>
           store.appendAsync(event as Omit<DomainEvent, 'sequence'>),
@@ -228,7 +228,7 @@ function applyEventToRef(
       }
     }
 
-    setAgentRuntimeMirror(next);
+    Effect.runSync(setAgentRuntimeMirror(next));
     return next;
   });
 }

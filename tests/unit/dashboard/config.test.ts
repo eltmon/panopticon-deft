@@ -13,6 +13,7 @@ import { ServerConfig, ServerConfigLayer, ServerConfigError } from '../../../src
 // so env var presence/absence is fully controlled by the test.
 vi.mock('../../../src/lib/env-loader.js', () => ({
   loadPanopticonEnv: () => ({ loaded: [], skipped: [] }),
+  loadPanopticonEnvSync: () => ({ loaded: [], skipped: [] }),
 }));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -33,7 +34,16 @@ function restoreEnv(snapshot: EnvSnapshot) {
   }
 }
 
-const ENV_KEYS = ['API_PORT', 'PORT', 'HOST', 'LINEAR_API_KEY', 'ANTHROPIC_API_KEY', 'DASHBOARD_URL', 'PANOPTICON_HOME'];
+const ENV_KEYS = [
+  'API_PORT',
+  'PORT',
+  'HOST',
+  'LINEAR_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'DASHBOARD_URL',
+  'PANOPTICON_HOME',
+  'PANOPTICON_WORKSPACE_DASHBOARD_ALLOW_PRIMARY',
+];
 
 let envSnapshot: EnvSnapshot;
 
@@ -41,6 +51,7 @@ beforeEach(() => {
   envSnapshot = captureEnv(ENV_KEYS);
   // Clear all relevant env vars so each test starts from a clean baseline
   for (const k of ENV_KEYS) delete process.env[k];
+  process.env['PANOPTICON_WORKSPACE_DASHBOARD_ALLOW_PRIMARY'] = '1';
 });
 
 afterEach(() => {
@@ -91,12 +102,12 @@ describe('ServerConfig', () => {
   });
 
   describe('host', () => {
-    it('defaults to 0.0.0.0', async () => {
+    it('defaults to 0.0.0.0 so panopticon-traefik (docker) can reach the host process', async () => {
       const cfg = await getConfig();
       expect(cfg.host).toBe('0.0.0.0');
     });
 
-    it('reads HOST env var', async () => {
+    it('reads HOST env var (lockdown to loopback)', async () => {
       process.env['HOST'] = '127.0.0.1';
       const cfg = await getConfig();
       expect(cfg.host).toBe('127.0.0.1');

@@ -4,12 +4,16 @@
  * Maps Linear team prefixes and labels to project paths for workspace creation.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
+import { mkdir, readFile, stat, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { Effect } from 'effect';
+import { ConfigError, ConfigParseError, FsError } from './errors.js';
 import { PANOPTICON_HOME } from './paths.js';
-import { extractPrefix, parseIssueId } from './issue-id.js';
+import { extractPrefixSync, parseIssueIdSync } from './issue-id.js';
 import type { QualityGateConfig, RepoConfig } from './workspace-config.js';
+import type { AutoResumeConfig } from './cloister/auto-resume-config.js';
 
 export const PROJECTS_CONFIG_FILE = join(PANOPTICON_HOME, 'projects.yaml');
 
@@ -114,12 +118,19 @@ export interface ProjectConfig {
   rally_project?: string;
   /** Specialist agent configuration */
   specialists?: SpecialistConfig;
+  /** Per-project auto-resume failure tracking and backoff overrides */
+  autoResume?: Partial<AutoResumeConfig>;
   /** Quality gates run by merge-agent before pushing (lint, typecheck, prod build, etc.) */
   quality_gates?: Record<string, QualityGateConfig>;
   /** Package manager for dependency installation in workspaces (bun, npm, pnpm) */
   package_manager?: 'bun' | 'npm' | 'pnpm';
-  /** Local workspace packages that need building before quality gates (e.g., @panopticon/contracts) */
+  /** Local workspace packages that need building before quality gates (e.g., @panctl/contracts) */
   workspace_packages?: Array<{ path: string; build_command: string }>;
+  /**
+   * Directory name for vBRIEF lifecycle directories (proposed/active/completed/cancelled).
+   * Defaults to "vbrief". Relative to the project root.
+   */
+  vbrief_dir?: string;
   /**
    * Path to the repo where per-project cost WAL files live.
    * Defaults to `path` (the project repo itself).
@@ -155,18 +166,27 @@ export interface ResolvedProject {
   linearTeam?: string;
 }
 
-/**
- * Load projects configuration from ~/.panopticon/projects.yaml
- */
-export function loadProjectsConfig(): ProjectsConfig {
+// Mtime-based cache: re-parse projects.yaml only when the file changes on disk.
+// Without this cache, every call to resolveProjectFromIssue (enrichment service,
+// deacon patrol, status updates — dozens of times per minute) re-read and re-parsed
+// the YAML, consuming ~50% of the server's non-idle CPU and causing 1.5-second
+// event loop stalls.
+let _projectsCache: { mtime: number; config: ProjectsConfig } | null = null;
+
+export function loadProjectsConfigSync(): ProjectsConfig {
   if (!existsSync(PROJECTS_CONFIG_FILE)) {
     return { projects: {} };
   }
 
   try {
+    const mtime = statSync(PROJECTS_CONFIG_FILE).mtimeMs;
+    if (_projectsCache && _projectsCache.mtime === mtime) {
+      return _projectsCache.config;
+    }
     const content = readFileSync(PROJECTS_CONFIG_FILE, 'utf-8');
-    const config = parseYaml(content) as ProjectsConfig;
-    return config || { projects: {} };
+    const config = (parseYaml(content) as ProjectsConfig) || { projects: {} };
+    _projectsCache = { mtime, config };
+    return config;
   } catch (error: any) {
     console.error(`Failed to parse projects.yaml: ${error.message}`);
     return { projects: {} };
@@ -176,7 +196,7 @@ export function loadProjectsConfig(): ProjectsConfig {
 /**
  * Save projects configuration
  */
-export function saveProjectsConfig(config: ProjectsConfig): void {
+export function saveProjectsConfigSync(config: ProjectsConfig): void {
   const dir = PANOPTICON_HOME;
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -184,13 +204,14 @@ export function saveProjectsConfig(config: ProjectsConfig): void {
 
   const yaml = stringifyYaml(config, { indent: 2 });
   writeFileSync(PROJECTS_CONFIG_FILE, yaml, 'utf-8');
+  _projectsCache = null;
 }
 
 /**
  * Get a list of all registered projects
  */
-export function listProjects(): Array<{ key: string; config: ProjectConfig }> {
-  const config = loadProjectsConfig();
+export function listProjectsSync(): Array<{ key: string; config: ProjectConfig }> {
+  const config = loadProjectsConfigSync();
   return Object.entries(config.projects).map(([key, projectConfig]) => ({
     key,
     config: projectConfig,
@@ -200,20 +221,20 @@ export function listProjects(): Array<{ key: string; config: ProjectConfig }> {
 /**
  * Add or update a project in the registry
  */
-export function registerProject(key: string, projectConfig: ProjectConfig): void {
-  const config = loadProjectsConfig();
+export function registerProjectSync(key: string, projectConfig: ProjectConfig): void {
+  const config = loadProjectsConfigSync();
   config.projects[key] = projectConfig;
-  saveProjectsConfig(config);
+  saveProjectsConfigSync(config);
 }
 
 /**
  * Remove a project from the registry
  */
-export function unregisterProject(key: string): boolean {
-  const config = loadProjectsConfig();
+export function unregisterProjectSync(key: string): boolean {
+  const config = loadProjectsConfigSync();
   if (config.projects[key]) {
     delete config.projects[key];
-    saveProjectsConfig(config);
+    saveProjectsConfigSync(config);
     return true;
   }
   return false;
@@ -225,14 +246,14 @@ export function unregisterProject(key: string): boolean {
  * @deprecated Use extractPrefix from issue-id.ts for unified parsing
  */
 export function extractTeamPrefix(issueId: string): string | null {
-  return extractPrefix(issueId);
+  return extractPrefixSync(issueId);
 }
 
 /**
  * Find project by Linear team prefix
  */
-export function findProjectByTeam(teamPrefix: string): ProjectConfig | null {
-  const config = loadProjectsConfig();
+export function findProjectByTeamSync(teamPrefix: string): ProjectConfig | null {
+  const config = loadProjectsConfigSync();
 
   for (const [, projectConfig] of Object.entries(config.projects)) {
     if (getIssuePrefix(projectConfig)?.toUpperCase() === teamPrefix.toUpperCase()) {
@@ -248,8 +269,8 @@ export function findProjectByTeam(teamPrefix: string): ProjectConfig | null {
  * Matches any project whose root path is an ancestor of the given path.
  * Used to resolve the tracker (GitHub/GitLab) from a workspace directory.
  */
-export function findProjectByPath(workspacePath: string): ProjectConfig | null {
-  const config = loadProjectsConfig();
+export function findProjectByPathSync(workspacePath: string): ProjectConfig | null {
+  const config = loadProjectsConfigSync();
   const normalizedTarget = resolve(workspacePath);
 
   for (const [, projectConfig] of Object.entries(config.projects)) {
@@ -307,16 +328,16 @@ export function resolveProjectPath(project: ProjectConfig, labels: string[] = []
  * @param labels - Optional array of label names
  * @returns Resolved project info or null if not found
  */
-export function resolveProjectFromIssue(
+export function resolveProjectFromIssueSync(
   issueId: string,
   labels: string[] = []
 ): ResolvedProject | null {
-  const parsed = parseIssueId(issueId);
+  const parsed = parseIssueIdSync(issueId);
   if (!parsed) {
     return null;
   }
 
-  const config = loadProjectsConfig();
+  const config = loadProjectsConfigSync();
 
   for (const [key, projectConfig] of Object.entries(config.projects)) {
     // Check single issue_prefix (existing behavior)
@@ -363,16 +384,16 @@ export function resolveProjectFromIssue(
 /**
  * Get a project by key
  */
-export function getProject(key: string): ProjectConfig | null {
-  const config = loadProjectsConfig();
+export function getProjectSync(key: string): ProjectConfig | null {
+  const config = loadProjectsConfigSync();
   return config.projects[key] || null;
 }
 
 /**
  * Check if projects.yaml exists and has any projects
  */
-export function hasProjects(): boolean {
-  const config = loadProjectsConfig();
+export function hasProjectsSync(): boolean {
+  const config = loadProjectsConfigSync();
   return Object.keys(config.projects).length > 0;
 }
 
@@ -392,7 +413,7 @@ export function createDefaultProjectsConfig(): ProjectsConfig {
 /**
  * Initialize projects.yaml with example configuration
  */
-export function initializeProjectsConfig(): void {
+export function initializeProjectsConfigSync(): void {
   if (existsSync(PROJECTS_CONFIG_FILE)) {
     console.log(`Projects config already exists at ${PROJECTS_CONFIG_FILE}`);
     return;
@@ -462,7 +483,7 @@ const DEFAULT_SPECIALIST_CONFIG: Required<SpecialistConfig> = {
  * @returns Specialist config with defaults applied
  */
 export function getSpecialistConfig(projectKey: string): Required<SpecialistConfig> {
-  const project = getProject(projectKey);
+  const project = getProjectSync(projectKey);
 
   if (!project || !project.specialists) {
     return DEFAULT_SPECIALIST_CONFIG;
@@ -495,7 +516,7 @@ export function getSpecialistRetention(projectKey: string): { max_days: number; 
  * Returns array of { key, config } for projects with Rally project OIDs.
  */
 export function findProjectsByRallyProject(): Array<{ key: string; config: ProjectConfig }> {
-  const config = loadProjectsConfig();
+  const config = loadProjectsConfigSync();
   return Object.entries(config.projects)
     .filter(([, projectConfig]) => !!projectConfig.rally_project)
     .map(([key, projectConfig]) => ({ key, config: projectConfig }));
@@ -515,3 +536,176 @@ export function getSpecialistPromptOverride(
   const config = getSpecialistConfig(projectKey);
   return (config.prompts as Record<string, string | undefined>)[specialistType] || null;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect variant of {@link loadProjectsConfigSync}.
+ *
+ * Reuses the mtime-cache from the sync implementation but reads the YAML
+ * asynchronously when a cache miss occurs. Parse failures surface as
+ * `ConfigParseError` instead of being swallowed.
+ */
+export const loadProjectsConfig = (): Effect.Effect<ProjectsConfig, ConfigParseError | FsError> =>
+  Effect.gen(function* () {
+    const exists = yield* Effect.sync(() => existsSync(PROJECTS_CONFIG_FILE));
+    if (!exists) return { projects: {} } as ProjectsConfig;
+
+    const mtime = yield* Effect.tryPromise({
+      try: async () => (await stat(PROJECTS_CONFIG_FILE)).mtimeMs,
+      catch: (cause) =>
+        new FsError({ path: PROJECTS_CONFIG_FILE, operation: 'stat', cause }),
+    });
+    if (_projectsCache && _projectsCache.mtime === mtime) {
+      return _projectsCache.config;
+    }
+    const content = yield* Effect.tryPromise({
+      try: () => readFile(PROJECTS_CONFIG_FILE, 'utf-8'),
+      catch: (cause) =>
+        new FsError({ path: PROJECTS_CONFIG_FILE, operation: 'readFile', cause }),
+    });
+    const config = yield* Effect.try({
+      try: () => (parseYaml(content) as ProjectsConfig) || { projects: {} },
+      catch: (cause) =>
+        new ConfigParseError({
+          path: PROJECTS_CONFIG_FILE,
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    });
+    _projectsCache = { mtime, config };
+    return config;
+  });
+
+/** Effect variant of {@link saveProjectsConfigSync}. */
+export const saveProjectsConfig = (config: ProjectsConfig): Effect.Effect<void, FsError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const dir = PANOPTICON_HOME;
+      if (!existsSync(dir)) {
+        await mkdir(dir, { recursive: true });
+      }
+      const out = stringifyYaml(config, { indent: 2 });
+      await writeFile(PROJECTS_CONFIG_FILE, out, 'utf-8');
+      _projectsCache = null;
+    },
+    catch: (cause) =>
+      new FsError({ path: PROJECTS_CONFIG_FILE, operation: 'saveProjectsConfig', cause }),
+  });
+
+/** Effect variant of {@link listProjectsSync}. */
+export const listProjects = (): Effect.Effect<Array<{ key: string; config: ProjectConfig }>, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.map((config) =>
+      Object.entries(config.projects).map(([key, projectConfig]) => ({ key, config: projectConfig })),
+    ),
+  );
+
+/** Effect variant of {@link registerProjectSync}. */
+export const registerProject = (key: string, projectConfig: ProjectConfig): Effect.Effect<void, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.flatMap((config) => {
+      config.projects[key] = projectConfig;
+      return saveProjectsConfig(config);
+    }),
+  );
+
+/** Effect variant of {@link unregisterProjectSync}. */
+export const unregisterProject = (key: string): Effect.Effect<boolean, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.flatMap((config) => {
+      if (!config.projects[key]) return Effect.succeed(false);
+      delete config.projects[key];
+      return saveProjectsConfig(config).pipe(Effect.as(true));
+    }),
+  );
+
+/** Effect variant of {@link findProjectByTeamSync}. */
+export const findProjectByTeam = (teamPrefix: string): Effect.Effect<ProjectConfig | null, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.map((config) => {
+      for (const [, projectConfig] of Object.entries(config.projects)) {
+        if (getIssuePrefix(projectConfig)?.toUpperCase() === teamPrefix.toUpperCase()) {
+          return projectConfig;
+        }
+      }
+      return null;
+    }),
+  );
+
+/** Effect variant of {@link findProjectByPathSync}. */
+export const findProjectByPath = (workspacePath: string): Effect.Effect<ProjectConfig | null, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.map((config) => {
+      const normalizedTarget = resolve(workspacePath);
+      for (const [, projectConfig] of Object.entries(config.projects)) {
+        const normalizedProject = resolve(projectConfig.path);
+        if (
+          normalizedTarget === normalizedProject ||
+          normalizedTarget.startsWith(normalizedProject + '/')
+        ) {
+          return projectConfig;
+        }
+      }
+      return null;
+    }),
+  );
+
+/** Effect variant of {@link resolveProjectFromIssueSync}. */
+export const resolveProjectFromIssue = (
+  issueId: string,
+  labels: string[] = [],
+): Effect.Effect<ResolvedProject | null, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(
+    Effect.map((config) => {
+      const parsed = parseIssueIdSync(issueId);
+      if (!parsed) return null;
+      for (const [key, projectConfig] of Object.entries(config.projects)) {
+        const singlePrefix = getIssuePrefix(projectConfig);
+        if (singlePrefix?.toUpperCase() === parsed.prefix) {
+          return {
+            projectKey: key,
+            projectName: projectConfig.name,
+            projectPath: resolveProjectPath(projectConfig, labels),
+            linearTeam: singlePrefix,
+          } satisfies ResolvedProject;
+        }
+        if (projectConfig.issue_prefixes?.some((p) => p.toUpperCase() === parsed.prefix)) {
+          return {
+            projectKey: key,
+            projectName: projectConfig.name,
+            projectPath: resolveProjectPath(projectConfig, labels),
+            linearTeam: projectConfig.issue_prefixes?.find((p) => p.toUpperCase() === parsed.prefix),
+          } satisfies ResolvedProject;
+        }
+        if (!singlePrefix && !projectConfig.issue_prefixes) {
+          const derivedPrefix = key.toUpperCase().replace(/-/g, '');
+          if (derivedPrefix === parsed.prefix) {
+            return {
+              projectKey: key,
+              projectName: projectConfig.name,
+              projectPath: resolveProjectPath(projectConfig, labels),
+              linearTeam: undefined,
+            } satisfies ResolvedProject;
+          }
+        }
+      }
+      return null;
+    }),
+  );
+
+/** Effect variant of {@link getProjectSync}. */
+export const getProject = (key: string): Effect.Effect<ProjectConfig | null, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(Effect.map((config) => config.projects[key] || null));
+
+/** Effect variant of {@link hasProjectsSync}. */
+export const hasProjects = (): Effect.Effect<boolean, ConfigParseError | FsError> =>
+  loadProjectsConfig().pipe(Effect.map((config) => Object.keys(config.projects).length > 0));
+
+/** Effect variant of {@link initializeProjectsConfigSync}. */
+export const initializeProjectsConfig = (): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => initializeProjectsConfigSync(),
+    catch: (cause) => new FsError({ path: PROJECTS_CONFIG_FILE, operation: 'initializeProjectsConfig', cause }),
+  });
+

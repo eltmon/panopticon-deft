@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -26,6 +26,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageJsonPath = join(__dirname, '..', '..', 'package.json');
 const desktopPackageJsonPath = join(__dirname, '..', '..', 'apps', 'desktop', 'package.json');
+const contractsPackageJsonPath = join(__dirname, '..', '..', 'packages', 'contracts', 'package.json');
 
 export function registerReleaseCommands(program: Command): void {
   const release = program
@@ -72,6 +73,14 @@ function readDesktopPackageJson(): PackageJson {
 
 function writeDesktopPackageJson(pkg: PackageJson): void {
   writeFileSync(desktopPackageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+
+function readContractsPackageJson(): PackageJson {
+  return JSON.parse(readFileSync(contractsPackageJsonPath, 'utf-8')) as PackageJson;
+}
+
+function writeContractsPackageJson(pkg: PackageJson): void {
+  writeFileSync(contractsPackageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`);
 }
 
 function getCurrentVersion(): string {
@@ -135,8 +144,8 @@ function buildReleaseNotesMarkdown(params: {
   const { channel, version, from, to, entries } = params;
   const range = from ? `${from}...${to}` : to;
   const installCommand = channel === 'stable'
-    ? 'npm install -g panopticon-cli'
-    : `npm install -g panopticon-cli@${channel}`;
+    ? 'npm install -g @panctl/cli'
+    : `npm install -g @panctl/cli@${channel}`;
 
   const bullets = entries.length > 0
     ? entries.map((entry) => `- ${entry}`).join('\n')
@@ -250,6 +259,32 @@ function runPreflight(repoRoot: string): PreflightResult[] {
     detail: clean ? 'clean' : 'dirty',
   });
 
+  // The CI guardrail refuses to advance main when legacy planning paths are
+  // still tracked. Mirror that here so we catch leaks BEFORE tagging, not
+  // after the release workflow fails.
+  //
+  // PAN-967 retired the `.planning/` directory in favour of `vbrief/`
+  // (proposed, active, completed, cancelled). Only `.planning/` is legacy;
+  // `vbrief/` is the current lifecycle and is tracked intentionally — listing
+  // it here used to false-flag every release with "233 file(s) tracked".
+  const trackedLegacyPlanning = (() => {
+    try {
+      return execFileSync('git', ['ls-files', '--', '.planning/'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      }).trim();
+    } catch {
+      return '';
+    }
+  })();
+  results.push({
+    name: 'No legacy planning tracked',
+    ok: trackedLegacyPlanning === '',
+    detail: trackedLegacyPlanning === ''
+      ? 'clean'
+      : `${trackedLegacyPlanning.split('\n').length} file(s) tracked — strip before tagging`,
+  });
+
   try {
     runStreaming('npm run build', repoRoot);
     results.push({
@@ -357,6 +392,10 @@ async function releaseCreateCommand(channel: ReleaseChannel, version?: string): 
   desktopPkg.version = resolvedVersion;
   writeDesktopPackageJson(desktopPkg);
 
+  const contractsPkg = readContractsPackageJson();
+  contractsPkg.version = resolvedVersion;
+  writeContractsPackageJson(contractsPkg);
+
   const entries = getCommitSubjects(repoRoot, previousTag ? `${previousTag}..HEAD` : 'HEAD');
   const releaseNotes = buildReleaseNotesMarkdown({
     channel,
@@ -370,8 +409,26 @@ async function releaseCreateCommand(channel: ReleaseChannel, version?: string): 
 
   run('bun install', repoRoot);
 
-  run('git add package.json apps/desktop/package.json bun.lock', repoRoot);
-  run(`git commit -m "chore: release ${resolvedVersion}"`, repoRoot);
+  run(
+    `git add package.json apps/desktop/package.json packages/contracts/package.json bun.lock ${releaseNotesPath}`,
+    repoRoot
+  );
+  // Idempotent: when retagging the same version after a CI failure, the package
+  // bumps and release notes are already on HEAD. Skip the commit if nothing
+  // staged. Tagging is still meaningful because the tag may have been deleted.
+  const hasStagedChanges = (() => {
+    try {
+      execSync('git diff --cached --quiet', { cwd: repoRoot });
+      return false;
+    } catch {
+      return true;
+    }
+  })();
+  if (hasStagedChanges) {
+    run(`git commit -m "chore: release ${resolvedVersion}"`, repoRoot);
+  } else {
+    console.log(chalk.dim('No version-bump changes to commit — tagging current HEAD.'));
+  }
   run(`git tag -a ${tagName} -m "Release ${resolvedVersion}"`, repoRoot);
 
   console.log(chalk.green('\n✓ Release commit and tag created'));

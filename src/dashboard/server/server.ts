@@ -27,7 +27,10 @@ import { IssueLifecycleLive } from './services/issue-lifecycle.js';
 import { AgentSpawnerLive } from './services/agent-spawner.js';
 import { WorkspaceServiceLive } from './services/workspace-service.js';
 import { OpenRouterServiceLive } from './services/openrouter-service.js';
+import { PanOpenLive } from './services/open.js';
 import { setupTerminalWebSocket } from './ws-terminal.js';
+import { setupVoiceWebSocket } from './ws-voice.js';
+import { setupAutoPresoWebSocket } from './ws-autopreso.js';
 import { websocketRpcRouteLayer } from './ws-rpc.js'
 import { issuesRouteLayer } from './routes/issues.js'
 import { agentsRouteLayer } from './routes/agents.js'
@@ -36,18 +39,32 @@ import { specialistsRouteLayer } from './routes/specialists.js'
 import { costsRouteLayer } from './routes/costs.js'
 import { cloisterRouteLayer } from './routes/cloister.js'
 import { resourcesRouteLayer } from './routes/resources.js'
-import { commandDeckRouteLayer } from './routes/mission-control.js'
+import { commandDeckRouteLayer } from './routes/command-deck.js'
 import { remoteRouteLayer } from './routes/remote.js'
 import { settingsRouteLayer } from './routes/settings.js'
+import { voiceRouteLayer } from './routes/voice.js';
+import { autopresoRouteLayer } from './routes/autopreso.js';
 import { metricsRouteLayer } from './routes/metrics.js'
 import { miscRouteLayer } from './routes/misc.js';
+import { paletteRouteLayer } from './routes/palette.js';
 import { conversationsRouteLayer } from './routes/conversations.js';
 import { eventsRouteLayer } from './routes/events.js';
 import { showRouteLayer } from './routes/show.js';
+import { projectsRouteLayer } from './routes/projects.js';
 import { adminRouteLayer } from './routes/admin.js';
 import { prereqsRouteLayer } from './routes/prereqs.js';
 import { cliproxyRouteLayer } from './routes/cliproxy.js';
-import { emitActivityEntry, emitActivityTts } from '../../lib/activity-logger.js';
+import { ttsRouteLayer } from './routes/tts.js';
+import { webhooksRouteLayer } from './routes/webhooks.js';
+import { hooksRouteLayer } from './routes/hooks.js';
+import { diffsRouteLayer } from './routes/diffs.js';
+import { codexAuthRouteLayer } from './routes/codex-auth.js';
+import { swarmRouteLayer } from './routes/swarm.js';
+import { discoveredSessionsRouteLayer } from './routes/discovered-sessions.js';
+import { flywheelRouteLayer } from './routes/flywheel.js';
+import { dashboardCsrfToken, dashboardSessionCookieHeader, rejectUnauthorizedDashboardRequest, rejectUnauthorizedDashboardSessionMintRequest } from './routes/dashboard-auth.js';
+import { validateOrigin } from './routes/origin-validation.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../lib/activity-logger.js';
 
 // ─── Dual-runtime layers ──────────────────────────────────────────────────────
 
@@ -65,6 +82,8 @@ const HttpServerLive = Layer.unwrap(
     ]);
     const nodeServer = NodeHttp.createServer();
     setupTerminalWebSocket(nodeServer);
+    setupVoiceWebSocket(nodeServer);
+    setupAutoPresoWebSocket(nodeServer);
     return NodeHttpServer.layer(() => nodeServer, {
       host: config.host,
       port: config.port,
@@ -86,6 +105,86 @@ const healthRouteLayer = HttpRouter.add(
   'GET',
   '/api/health',
   jsonResponse({ status: 'ok' }),
+);
+
+function requestHeader(request: HttpServerRequest.HttpServerRequest, name: string): string | undefined {
+  const value = (request.headers as Record<string, string | string[] | undefined>)[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function allowDashboardSessionCors(
+  response: HttpServerResponse.HttpServerResponse,
+  request: HttpServerRequest.HttpServerRequest,
+): HttpServerResponse.HttpServerResponse {
+  const origin = requestHeader(request, 'origin');
+  if (!origin) return response;
+  return HttpServerResponse.setHeader(
+    HttpServerResponse.setHeader(
+      HttpServerResponse.setHeader(
+        HttpServerResponse.setHeader(response, 'Access-Control-Allow-Origin', origin),
+        'Access-Control-Allow-Credentials',
+        'true',
+      ),
+      'Access-Control-Allow-Headers',
+      'x-panopticon-internal-token, x-panopticon-csrf-token, authorization, content-type',
+    ),
+    'Vary',
+    'Origin',
+  );
+}
+
+function isHttpsRequest(request: HttpServerRequest.HttpServerRequest): boolean {
+  const forwardedProto = requestHeader(request, 'x-forwarded-proto');
+  if (forwardedProto?.split(',')[0]?.trim().toLowerCase() === 'https') return true;
+  return HttpServerRequest.toURL(request).pipe(Option.match({
+    onNone: () => false,
+    onSome: (url) => url.protocol === 'https:',
+  }));
+}
+
+const dashboardSessionPreflightRouteLayer = HttpRouter.add(
+  'OPTIONS',
+  '/api/dashboard/session',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    return allowDashboardSessionCors(
+      HttpServerResponse.setHeader(jsonResponse({ ok: true }), 'Access-Control-Allow-Methods', 'POST, OPTIONS'),
+      request,
+    );
+  }),
+);
+
+const dashboardSessionRouteLayer = HttpRouter.add(
+  'POST',
+  '/api/dashboard/session',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const mintAuthError = rejectUnauthorizedDashboardSessionMintRequest(request);
+    const sessionAuthError = rejectUnauthorizedDashboardRequest(request);
+    if (mintAuthError && sessionAuthError) return mintAuthError;
+
+    let response = jsonResponse({ ok: true, csrfToken: dashboardCsrfToken() });
+    if (!mintAuthError) {
+      response = HttpServerResponse.setHeader(
+        response,
+        'Set-Cookie',
+        dashboardSessionCookieHeader({ secure: isHttpsRequest(request) }),
+      );
+    }
+
+    return allowDashboardSessionCors(
+      HttpServerResponse.setHeader(response, 'Cache-Control', 'no-store'),
+      request,
+    );
+  }),
 );
 
 // ─── Static file route ────────────────────────────────────────────────────────
@@ -157,18 +256,31 @@ const staticRouteLayer = HttpRouter.add(
       if (!indexInfo || indexInfo.type !== 'File') {
         return HttpServerResponse.text('Not Found', { status: 404 });
       }
+      // index.html must never be cached: it references hashed JS bundles that
+      // change on every build. If the browser caches an old index.html, it will
+      // load stale JS bundles and the user sees outdated UI.
       return yield* HttpServerResponse.file(indexPath).pipe(
+        Effect.map((res) => HttpServerResponse.setHeader(res, 'Cache-Control', 'no-cache, no-store, must-revalidate')),
         Effect.catch(() =>
           Effect.succeed(HttpServerResponse.text('Internal Server Error', { status: 500 })),
         ),
       );
     }
 
-    return yield* HttpServerResponse.file(filePath).pipe(
+    const res = yield* HttpServerResponse.file(filePath).pipe(
       Effect.catch(() =>
         Effect.succeed(HttpServerResponse.text('Internal Server Error', { status: 500 })),
       ),
     );
+
+    // index.html must never be cached: it references hashed JS bundles that
+    // change on every build. If the browser caches an old index.html, it will
+    // load stale JS bundles and the user sees outdated UI.
+    if (filePath.endsWith('index.html')) {
+      return HttpServerResponse.setHeader(res, 'Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+
+    return res;
   }),
 );
 
@@ -176,6 +288,8 @@ const staticRouteLayer = HttpRouter.add(
 
 export const makeRoutesLayer = Layer.mergeAll(
   healthRouteLayer,
+  dashboardSessionPreflightRouteLayer,
+  dashboardSessionRouteLayer,
   websocketRpcRouteLayer,
   issuesRouteLayer,
   agentsRouteLayer,
@@ -187,14 +301,26 @@ export const makeRoutesLayer = Layer.mergeAll(
   commandDeckRouteLayer,
   remoteRouteLayer,
   settingsRouteLayer,
+  voiceRouteLayer,
+  autopresoRouteLayer,
   metricsRouteLayer,
   miscRouteLayer,
+  paletteRouteLayer,
   conversationsRouteLayer,
   eventsRouteLayer,
   showRouteLayer,
+  projectsRouteLayer,
   adminRouteLayer,
   prereqsRouteLayer,
   cliproxyRouteLayer,
+  ttsRouteLayer,
+  webhooksRouteLayer,
+  hooksRouteLayer,
+  diffsRouteLayer,
+  codexAuthRouteLayer,
+  swarmRouteLayer,
+  discoveredSessionsRouteLayer,
+  flywheelRouteLayer,
   staticRouteLayer,
 );
 
@@ -226,6 +352,7 @@ const DomainServicesLive = Layer.mergeAll(
   AgentSpawnerLive,
   WorkspaceServiceLive,
   OpenRouterServiceLive,
+  PanOpenLive,
 );
 
 // ─── Full server layer ────────────────────────────────────────────────────────
@@ -240,12 +367,17 @@ export const makeServerLayer = Layer.unwrap(
         yield* Effect.sync(() => {
           console.log(`[panopticon] Dashboard listening on http://${config.host}:${config.port}`);
           const mode = process.env['PANOPTICON_MODE'] === 'production' ? 'production mode' : 'development mode';
-          emitActivityEntry({
+          emitActivityEntrySync({
             source: 'dashboard',
             level: 'success',
             message: `Dashboard started in ${mode}`,
           });
-          emitActivityTts({ utterance: `Dashboard started in ${mode}`, priority: 2 });
+          emitActivityTtsSync({
+            utterance: `Dashboard started in ${mode}`,
+            priority: 2,
+            source: 'dashboard',
+            eventType: 'dashboard.started',
+          });
         });
       }),
     );

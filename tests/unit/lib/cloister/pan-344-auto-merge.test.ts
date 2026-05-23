@@ -83,26 +83,36 @@ vi.mock('../../../../src/lib/cloister/specialists.js', () => ({
   getTmuxSessionName: vi.fn(),
   isRunning: vi.fn(),
   initializeSpecialist: vi.fn(),
-  wakeSpecialist: vi.fn(),
-  clearSessionId: vi.fn(),
-  wakeSpecialistWithTask: vi.fn(),
   getAllProjectSpecialistStatuses: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: vi.fn(),
+  getAgentRuntimeStateSync: vi.fn(),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
   listRunningAgents: vi.fn().mockReturnValue([]),
+  listRunningAgentsSync: vi.fn().mockReturnValue([]),
   getAgentDir: vi.fn(),
   getAgentState: vi.fn(),
+  getAgentStateSync: vi.fn(),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
 }));
 
 vi.mock('../../../../src/lib/tmux.js', () => ({
   sessionExists: vi.fn().mockReturnValue(false),
+  sessionExistsSync: vi.fn().mockReturnValue(false),
   sendKeysAsync: vi.fn(),
 }));
+
+vi.mock('../../../../src/lib/review-status.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/lib/review-status.js')>();
+  return {
+    ...actual,
+    loadReviewStatuses: vi.fn(() => _statusData),
+  };
+});
 
 // Import after mocks are in place
 import { checkReadyForMergeStuck, setMergeReadyNotifier } from '../../../../src/lib/cloister/deacon.js';

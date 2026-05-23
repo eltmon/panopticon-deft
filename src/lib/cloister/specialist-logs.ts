@@ -10,6 +10,7 @@
 
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join, basename } from 'path';
+import { Data, Effect } from 'effect';
 import { getPanopticonHome } from '../paths.js';
 
 /** Get specialists directory (lazy to support test env overrides) */
@@ -87,7 +88,7 @@ function ensureRunsDirectory(projectKey: string, specialistType: string): void {
  * @param contextSeed - Optional context digest that was provided to the specialist
  * @returns Run ID and file path
  */
-export function createRunLog(
+export function createRunLogSync(
   projectKey: string,
   specialistType: string,
   issueId: string,
@@ -125,7 +126,7 @@ ${contextSeed ? contextSeed : '[No context digest available]'}
  * @param runId - Run identifier
  * @param content - Content to append
  */
-export function appendToRunLog(
+export function appendToRunLogSync(
   projectKey: string,
   specialistType: string,
   runId: string,
@@ -148,7 +149,7 @@ export function appendToRunLog(
  * @param runId - Run identifier
  * @param result - Run result
  */
-export function finalizeRunLog(
+export function finalizeRunLogSync(
   projectKey: string,
   specialistType: string,
   runId: string,
@@ -197,7 +198,7 @@ Finished: ${finishedAt.toISOString()}
  * @param runId - Run identifier
  * @returns Log content or null if not found
  */
-export function getRunLog(
+export function getRunLogSync(
   projectKey: string,
   specialistType: string,
   runId: string
@@ -264,7 +265,7 @@ export function parseLogMetadata(logContent: string): Partial<RunLogMetadata> {
  * @param options - Listing options
  * @returns Array of run log entries, sorted by most recent first
  */
-export function listRunLogs(
+export function listRunLogsSync(
   projectKey: string,
   specialistType: string,
   options: {
@@ -342,7 +343,7 @@ export function getRecentRunLogs(
   specialistType: string,
   count: number
 ): RunLogEntry[] {
-  return listRunLogs(projectKey, specialistType, { limit: count });
+  return listRunLogsSync(projectKey, specialistType, { limit: count });
 }
 
 /**
@@ -357,7 +358,7 @@ export function getRecentRunLogs(
  * @param retention - Retention policy
  * @returns Number of logs deleted
  */
-export function cleanupOldLogs(
+export function cleanupOldLogsSync(
   projectKey: string,
   specialistType: string,
   retention: { maxDays: number; maxRuns: number }
@@ -371,7 +372,7 @@ export function cleanupOldLogs(
   const now = new Date();
   const cutoffDate = new Date(now.getTime() - maxDays * 24 * 60 * 60 * 1000);
 
-  const allLogs = listRunLogs(projectKey, specialistType);
+  const allLogs = listRunLogsSync(projectKey, specialistType);
 
   if (allLogs.length === 0) {
     return 0;
@@ -421,7 +422,7 @@ export function isRunLogActive(
   specialistType: string,
   runId: string
 ): boolean {
-  const content = getRunLog(projectKey, specialistType, runId);
+  const content = getRunLogSync(projectKey, specialistType, runId);
 
   if (!content) {
     return false;
@@ -501,7 +502,7 @@ export function checkLogSizeLimit(
  *
  * @returns Summary of cleanup results
  */
-export function cleanupAllLogs(): {
+export function cleanupAllLogsSync(): {
   totalDeleted: number;
   byProject: Record<string, Record<string, number>>;
 } {
@@ -525,7 +526,7 @@ export function cleanupAllLogs(): {
     const specialistTypes = ['review-agent', 'test-agent', 'merge-agent'];
 
     for (const specialistType of specialistTypes) {
-      const deleted = cleanupOldLogs(projectKey, specialistType, retention);
+      const deleted = cleanupOldLogsSync(projectKey, specialistType, retention);
 
       if (deleted > 0) {
         results.byProject[projectKey][specialistType] = deleted;
@@ -538,3 +539,112 @@ export function cleanupAllLogs(): {
 
   return results;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect wrappers around the existing sync APIs. The underlying file
+// I/O is sync (CLI-callable); these variants lift thrown exceptions into a
+// typed error channel so callers can compose specialist-log operations with
+// other Effect-native code. Migrate callers individually.
+
+/** Tagged error for specialist-log Effect variants. */
+export class SpecialistLogError extends Data.TaggedError('SpecialistLogError')<{
+  readonly projectKey: string;
+  readonly specialistType: string;
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+const liftLogError = (
+  projectKey: string,
+  specialistType: string,
+  operation: string,
+  cause: unknown,
+): SpecialistLogError =>
+  new SpecialistLogError({
+    projectKey,
+    specialistType,
+    operation,
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+  });
+
+/** Effect variant of `createRunLog`. */
+export const createRunLog = (
+  projectKey: string,
+  specialistType: string,
+  issueId: string,
+  contextSeed?: string,
+): Effect.Effect<{ runId: string; filePath: string }, SpecialistLogError> =>
+  Effect.try({
+    try: () => createRunLogSync(projectKey, specialistType, issueId, contextSeed),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'createRunLog', cause),
+  });
+
+/** Effect variant of `appendToRunLog`. */
+export const appendToRunLog = (
+  projectKey: string,
+  specialistType: string,
+  runId: string,
+  content: string,
+): Effect.Effect<void, SpecialistLogError> =>
+  Effect.try({
+    try: () => appendToRunLogSync(projectKey, specialistType, runId, content),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'appendToRunLog', cause),
+  });
+
+/** Effect variant of `finalizeRunLog`. */
+export const finalizeRunLog = (
+  projectKey: string,
+  specialistType: string,
+  runId: string,
+  result: { status: 'passed' | 'failed' | 'blocked' | 'incomplete'; notes?: string },
+): Effect.Effect<void, SpecialistLogError> =>
+  Effect.try({
+    try: () => finalizeRunLogSync(projectKey, specialistType, runId, result),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'finalizeRunLog', cause),
+  });
+
+/** Effect variant of `getRunLog`. */
+export const getRunLog = (
+  projectKey: string,
+  specialistType: string,
+  runId: string,
+): Effect.Effect<string | null, SpecialistLogError> =>
+  Effect.try({
+    try: () => getRunLogSync(projectKey, specialistType, runId),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'getRunLog', cause),
+  });
+
+/** Effect variant of `listRunLogs`. */
+export const listRunLogs = (
+  projectKey: string,
+  specialistType: string,
+  options: { limit?: number; offset?: number } = {},
+): Effect.Effect<RunLogEntry[], SpecialistLogError> =>
+  Effect.try({
+    try: () => listRunLogsSync(projectKey, specialistType, options),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'listRunLogs', cause),
+  });
+
+/** Effect variant of `cleanupOldLogs`. */
+export const cleanupOldLogs = (
+  projectKey: string,
+  specialistType: string,
+  retention: { maxDays: number; maxRuns: number },
+): Effect.Effect<number, SpecialistLogError> =>
+  Effect.try({
+    try: () => cleanupOldLogsSync(projectKey, specialistType, retention),
+    catch: (cause) => liftLogError(projectKey, specialistType, 'cleanupOldLogs', cause),
+  });
+
+/** Effect variant of `cleanupAllLogs`. */
+export const cleanupAllLogs = (): Effect.Effect<
+  { totalDeleted: number; byProject: Record<string, Record<string, number>> },
+  SpecialistLogError
+> =>
+  Effect.try({
+    try: () => cleanupAllLogsSync(),
+    catch: (cause) => liftLogError('*', '*', 'cleanupAllLogs', cause),
+  });

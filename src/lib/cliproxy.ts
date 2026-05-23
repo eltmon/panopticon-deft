@@ -22,21 +22,31 @@ import {
   writeFileSync,
   statSync,
 } from 'fs';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { spawn, execSync, exec } from 'child_process';
 import { promisify } from 'util';
 import net from 'net';
+import { Effect, Data } from 'effect';
 import { PANOPTICON_HOME, BIN_DIR } from './paths.js';
+import { FsError, ProcessSpawnError } from './errors.js';
 
 const execAsync = promisify(exec);
+
+/** A cliproxy sidecar lifecycle operation (install/start/stop/probe) failed. */
+export class CliproxyError extends Data.TaggedError('CliproxyError')<{
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
 export const CLIPROXY_HOST = '127.0.0.1';
 export const CLIPROXY_PORT = 8317;
 export const CLIPROXY_AUTH_TOKEN = 'panopticon-local-cliproxy-key';
 export const CLIPROXY_BASE_URL = `http://${CLIPROXY_HOST}:${CLIPROXY_PORT}`;
 
-const CLIPROXY_RELEASE_VERSION = 'v6.9.24';
+const CLIPROXY_RELEASE_VERSION = 'v6.10.9';
 
 export function getCliproxyDir(): string {
   return join(PANOPTICON_HOME, 'cliproxy');
@@ -70,10 +80,22 @@ function getCliproxyCodexCredPath(): string {
   return join(getCliproxyAuthDir(), 'codex-primary.json');
 }
 
+function getCliproxyGeminiCredPath(): string {
+  return join(getCliproxyAuthDir(), 'gemini-primary.json');
+}
+
 function ensureDirs(): void {
   for (const dir of [PANOPTICON_HOME, BIN_DIR, getCliproxyDir(), getCliproxyAuthDir()]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
+}
+
+async function ensureDirsAsync(): Promise<void> {
+  await Promise.all(
+    [PANOPTICON_HOME, BIN_DIR, getCliproxyDir(), getCliproxyAuthDir()].map((dir) =>
+      mkdir(dir, { recursive: true }),
+    ),
+  );
 }
 
 interface CodexAuthFile {
@@ -99,7 +121,13 @@ interface CliproxyCodexCredentials {
   disabled: boolean;
 }
 
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
+interface CliproxyGeminiCredentials {
+  api_key: string;
+  type: 'gemini';
+  disabled: boolean;
+}
+
+export function decodeJwtPayload(token: string): Record<string, unknown> | null {
   const parts = token.split('.');
   if (parts.length < 2) return null;
   try {
@@ -118,7 +146,7 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
  * was written (including "already up-to-date" writes), false if the source
  * was missing or malformed.
  */
-export function bridgeCodexAuthToCliproxy(): boolean {
+export function bridgeCodexAuthToCliproxySync(): boolean {
   const codexPath = getCodexAuthPath();
   if (!existsSync(codexPath)) return false;
 
@@ -175,21 +203,181 @@ export function bridgeCodexAuthToCliproxy(): boolean {
   return true;
 }
 
-function ensureConfigFile(): void {
-  ensureDirs();
-  const configPath = getCliproxyConfigPath();
+/** Async variant of bridgeCodexAuthToCliproxy — safe for the event loop. */
+async function bridgeCodexAuthToCliproxyTask(): Promise<boolean> {
+  const codexPath = getCodexAuthPath();
+  if (!existsSync(codexPath)) return false;
+
+  let raw: string;
+  try {
+    raw = await readFile(codexPath, 'utf8');
+  } catch {
+    return false;
+  }
+
+  let parsed: CodexAuthFile;
+  try {
+    parsed = JSON.parse(raw) as CodexAuthFile;
+  } catch {
+    return false;
+  }
+
+  const accessToken = typeof parsed.tokens?.access_token === 'string' ? parsed.tokens.access_token : null;
+  const idToken = typeof parsed.tokens?.id_token === 'string' ? parsed.tokens.id_token : null;
+  const refreshToken = typeof parsed.tokens?.refresh_token === 'string' ? parsed.tokens.refresh_token : null;
+  const accountId = typeof parsed.tokens?.account_id === 'string' ? parsed.tokens.account_id : null;
+  const lastRefresh = typeof parsed.last_refresh === 'string' ? parsed.last_refresh : new Date().toISOString();
+
+  if (!accessToken || !idToken || !refreshToken || !accountId) return false;
+
+  const idClaims = decodeJwtPayload(idToken) ?? {};
+  const email = typeof idClaims.email === 'string' ? idClaims.email : '';
+  const accessClaims = decodeJwtPayload(accessToken) ?? {};
+  const expSec = typeof accessClaims.exp === 'number'
+    ? accessClaims.exp
+    : (typeof idClaims.exp === 'number' ? idClaims.exp : Math.floor(Date.now() / 1000) + 3600);
+  const expiredIso = new Date(expSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  const creds: CliproxyCodexCredentials = {
+    access_token: accessToken,
+    id_token: idToken,
+    refresh_token: refreshToken,
+    account_id: accountId,
+    last_refresh: lastRefresh,
+    email,
+    type: 'codex',
+    expired: expiredIso,
+    disabled: false,
+  };
+
+  await ensureDirsAsync();
+  const target = getCliproxyCodexCredPath();
+
+  const serialized = JSON.stringify(creds, null, 2) + '\n';
+  if (existsSync(target)) {
+    try {
+      const existing = await readFile(target, 'utf8');
+      if (existing === serialized) return true;
+    } catch {
+      // fall through and overwrite
+    }
+  }
+
+  try {
+    await writeFile(target, serialized, { mode: 0o600 });
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function parseBridgedGeminiApiKey(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<CliproxyGeminiCredentials>;
+    return typeof parsed.api_key === 'string' && parsed.api_key.trim().length > 0
+      ? parsed.api_key.trim()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readBridgedGeminiApiKey(): string | null {
+  const target = getCliproxyGeminiCredPath();
+  if (!existsSync(target)) return null;
+
+  try {
+    return parseBridgedGeminiApiKey(readFileSync(target, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function readBridgedGeminiApiKeyAsync(): Promise<string | null> {
+  try {
+    return parseBridgedGeminiApiKey(await readFile(getCliproxyGeminiCredPath(), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function serializeYamlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+/**
+ * Persist a Google Generative Language API key for CLIProxyAPI's Gemini backend.
+ *
+ * CLIProxyAPI v6.10.x accepts Gemini API keys through the `gemini-api-key`
+ * config section. We also keep a small credential marker in auth-dir so future
+ * config rewrites can preserve the bridged key without re-reading Panopticon
+ * settings. This path is used by getProviderEnvForModel(), which is reachable
+ * from dashboard HTTP routes, so all credential/config persistence is async.
+ */
+async function bridgeGeminiAuthToCliproxyTask(apiKey: string): Promise<boolean> {
+  const normalized = apiKey.trim();
+  if (!normalized) return false;
+
+  try {
+    await ensureDirsAsync();
+  } catch {
+    return false;
+  }
+
+  const creds: CliproxyGeminiCredentials = {
+    api_key: normalized,
+    type: 'gemini',
+    disabled: false,
+  };
+  const serialized = JSON.stringify(creds, null, 2) + '\n';
+  const target = getCliproxyGeminiCredPath();
+
+  try {
+    let existing: string | null = null;
+    try {
+      existing = await readFile(target, 'utf8');
+    } catch {
+      existing = null;
+    }
+
+    if (existing !== serialized) {
+      await writeFile(target, serialized, { mode: 0o600 });
+    }
+    await ensureConfigFileAsync(normalized);
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+function buildCliproxyConfig(geminiApiKey: string | null): string {
   const authDir = getCliproxyAuthDir();
 
   // Config is rewritten every time so upgrades can evolve the format safely.
-  const config = [
+  const lines = [
     `host: "${CLIPROXY_HOST}"`,
     `port: ${CLIPROXY_PORT}`,
     `auth-dir: "${authDir}"`,
     `api-keys:`,
     `  - "${CLIPROXY_AUTH_TOKEN}"`,
-    `debug: false`,
-    '',
-  ].join('\n');
+  ];
+
+  if (geminiApiKey) {
+    lines.push(
+      `gemini-api-key:`,
+      `  - api-key: ${serializeYamlString(geminiApiKey)}`,
+    );
+  }
+
+  lines.push(`debug: false`, '');
+  return lines.join('\n');
+}
+
+function ensureConfigFile(geminiApiKey: string | null = readBridgedGeminiApiKey()): void {
+  ensureDirs();
+  const configPath = getCliproxyConfigPath();
+  const config = buildCliproxyConfig(geminiApiKey);
 
   if (existsSync(configPath)) {
     try {
@@ -199,6 +387,25 @@ function ensureConfigFile(): void {
     }
   }
   writeFileSync(configPath, config);
+}
+
+async function ensureConfigFileAsync(geminiApiKey?: string | null): Promise<void> {
+  await ensureDirsAsync();
+  const configPath = getCliproxyConfigPath();
+  const effectiveGeminiApiKey = geminiApiKey === undefined
+    ? await readBridgedGeminiApiKeyAsync()
+    : geminiApiKey;
+  const config = buildCliproxyConfig(effectiveGeminiApiKey);
+
+  let existing: string | null = null;
+  try {
+    existing = await readFile(configPath, 'utf8');
+  } catch {
+    existing = null;
+  }
+
+  if (existing === config) return;
+  await writeFile(configPath, config);
 }
 
 function detectPlatformAsset(): { archive: string; } | null {
@@ -234,7 +441,7 @@ export function isCliproxyInstalled(): boolean {
  * Uses curl + tar because that's already a hard dep of pan install. Throws
  * with a clear message on unsupported platforms.
  */
-export function installCliproxy(force = false): void {
+export function installCliproxySync(force = false): void {
   ensureDirs();
   if (!force && isCliproxyInstalled()) return;
 
@@ -268,6 +475,42 @@ export function installCliproxy(force = false): void {
   } catch { /* non-fatal */ }
 }
 
+/**
+ * Async variant of installCliproxy — safe for the event loop.
+ * Uses execAsync instead of execSync so it won't block the dashboard server.
+ */
+async function installCliproxyTask(force = false): Promise<void> {
+  ensureDirs();
+  if (!force && isCliproxyInstalled()) return;
+
+  const asset = detectPlatformAsset();
+  if (!asset) {
+    throw new Error(
+      `CLIProxyAPI does not publish a prebuilt binary for ${process.platform}/${process.arch}. `
+      + `GPT subscription routing is currently supported on linux and darwin (amd64/arm64) only.`,
+    );
+  }
+
+  const url = `https://github.com/router-for-me/CLIProxyAPI/releases/download/${CLIPROXY_RELEASE_VERSION}/${asset.archive}`;
+  const tmpDir = join(getCliproxyDir(), 'tmp');
+  if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
+  const archivePath = join(tmpDir, asset.archive);
+
+  await execAsync(`curl -sSL -o "${archivePath}" "${url}"`, { timeout: 60_000 });
+  await execAsync(`tar -xzf "${archivePath}" -C "${tmpDir}"`, { timeout: 10_000 });
+
+  const extracted = join(tmpDir, 'cli-proxy-api');
+  if (!existsSync(extracted)) {
+    throw new Error(`cliproxy archive did not contain expected cli-proxy-api binary`);
+  }
+
+  const target = getCliproxyBinary();
+  await execAsync(`install -m 0755 "${extracted}" "${target}"`, { timeout: 10_000 });
+  try {
+    await execAsync(`rm -rf "${tmpDir}"`, { timeout: 10_000 });
+  } catch { /* non-fatal */ }
+}
+
 export function readPidFile(): number | null {
   const pidPath = getCliproxyPidPath();
   if (!existsSync(pidPath)) return null;
@@ -288,13 +531,19 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-export function isCliproxyRunning(): boolean {
+export function isCliproxyRunningSync(): boolean {
   const pid = readPidFile();
   if (pid && isProcessAlive(pid)) return true;
   // Fallback: something may be listening on the port without our pidfile.
+  // Use bash /dev/tcp instead of lsof — busybox lsof on Alpine ignores -t/-i
+  // and returns all processes, making this check both incorrect and dangerous.
   try {
-    const out = execSync(`lsof -ti:${CLIPROXY_PORT} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-    return out.length > 0;
+    execSync(`bash -c 'echo >/dev/tcp/127.0.0.1/${CLIPROXY_PORT}'`, {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 1000,
+    });
+    return true;
   } catch {
     return false;
   }
@@ -305,17 +554,17 @@ export function isCliproxyRunning(): boolean {
  * instance is already running. Ensures config + auth-dir + codex bridge are
  * up-to-date before spawning.
  */
-export function startCliproxy(): void {
+export function startCliproxySync(): void {
   ensureDirs();
   ensureConfigFile();
   // Best-effort bridge; if the user hasn't logged into Codex yet, cliproxy
   // will still start but subscription auth won't be available until they do.
-  try { bridgeCodexAuthToCliproxy(); } catch { /* non-fatal */ }
+  try { bridgeCodexAuthToCliproxySync(); } catch { /* non-fatal */ }
 
-  if (isCliproxyRunning()) return;
+  if (isCliproxyRunningSync()) return;
 
   if (!isCliproxyInstalled()) {
-    installCliproxy();
+    installCliproxySync();
   }
 
   const bin = getCliproxyBinary();
@@ -340,14 +589,16 @@ export function startCliproxy(): void {
   child.unref();
 }
 
-export function stopCliproxy(): void {
+export function stopCliproxySync(): void {
   const pid = readPidFile();
   if (pid && isProcessAlive(pid)) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
   }
   // Also clear anything else bound to the port (stale / manually-started instances).
+  // Use fuser instead of lsof | xargs kill — busybox lsof on Alpine ignores -t/-i
+  // and lists ALL processes, which xargs then tries to kill (including PID 1).
   try {
-    execSync(`lsof -ti:${CLIPROXY_PORT} 2>/dev/null | xargs -r kill 2>/dev/null || true`, { stdio: 'pipe' });
+    execSync(`fuser -k -TERM ${CLIPROXY_PORT}/tcp 2>/dev/null || true`, { stdio: 'pipe' });
   } catch {
     /* ignore */
   }
@@ -374,7 +625,7 @@ export function getCliproxyClientEnv(): Record<string, string> {
 // ─── Async lifecycle (safe for dashboard server — no execSync) ─────────────────
 
 /** Check whether the cliproxy TCP port is accepting connections. */
-export async function checkCliproxyPortAsync(): Promise<boolean> {
+async function checkCliproxyPortTask(): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.connect(CLIPROXY_PORT, CLIPROXY_HOST);
     socket.on('connect', () => {
@@ -390,21 +641,24 @@ export async function checkCliproxyPortAsync(): Promise<boolean> {
 }
 
 /** Async variant of isCliproxyRunning — safe for the event loop. */
-export async function isCliproxyRunningAsync(): Promise<boolean> {
+async function isCliproxyRunningTask(): Promise<boolean> {
   const pid = readPidFile();
   if (pid && isProcessAlive(pid)) return true;
-  return checkCliproxyPortAsync();
+  return checkCliproxyPortTask();
 }
 
 /** Async variant of stopCliproxy — safe for the event loop. */
-export async function stopCliproxyAsync(): Promise<void> {
+async function stopCliproxyTask(): Promise<void> {
   const pid = readPidFile();
   if (pid && isProcessAlive(pid)) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
     await new Promise((r) => setTimeout(r, 500));
   }
+  // Fallback: kill any process still holding the port.
+  // Use fuser instead of lsof | xargs kill — busybox lsof on Alpine ignores -t/-i
+  // and lists ALL processes, which xargs then tries to kill (including PID 1).
   try {
-    await execAsync(`lsof -ti:${CLIPROXY_PORT} 2>/dev/null | xargs -r kill 2>/dev/null || true`);
+    await execAsync(`fuser -k -TERM ${CLIPROXY_PORT}/tcp 2>/dev/null || true`);
   } catch { /* ignore */ }
   try {
     if (existsSync(getCliproxyPidPath())) {
@@ -415,18 +669,16 @@ export async function stopCliproxyAsync(): Promise<void> {
 }
 
 /** Async variant of startCliproxy — safe for the event loop.
- *  Throws if cliproxy is not installed (does not perform blocking install). */
-export async function startCliproxyAsync(): Promise<void> {
+ *  Auto-installs cliproxy if missing (non-blocking download). */
+async function startCliproxyTask(): Promise<void> {
   ensureDirs();
   ensureConfigFile();
-  try { bridgeCodexAuthToCliproxy(); } catch { /* non-fatal */ }
+  try { bridgeCodexAuthToCliproxySync(); } catch { /* non-fatal */ }
 
-  if (await isCliproxyRunningAsync()) return;
+  if (await isCliproxyRunningTask()) return;
 
   if (!isCliproxyInstalled()) {
-    throw new Error(
-      'CLIProxy is not installed. Run `pan up` from the CLI to install it.',
-    );
+    await installCliproxyTask();
   }
 
   const bin = getCliproxyBinary();
@@ -451,8 +703,98 @@ export async function startCliproxyAsync(): Promise<void> {
 }
 
 /** Restart cliproxy asynchronously. Safe for the event loop. */
-export async function restartCliproxyAsync(): Promise<void> {
-  await stopCliproxyAsync();
+async function restartCliproxyTask(): Promise<void> {
+  await stopCliproxyTask();
   await new Promise((r) => setTimeout(r, 500));
-  await startCliproxyAsync();
+  await startCliproxyTask();
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+const cliproxyCatch = (operation: string) => (cause: unknown) =>
+  new CliproxyError({
+    operation,
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+  });
+
+/**
+ * Effect-native bridgeCodexAuthToCliproxy — copies ChatGPT subscription
+ * credentials into cliproxy's auth dir. Fails with FsError if a copy or
+ * mkdir throws.
+ */
+export const bridgeCodexAuthToCliproxy = (): Effect.Effect<boolean, FsError> =>
+  Effect.tryPromise({
+    try: () => bridgeCodexAuthToCliproxyTask(),
+    catch: (cause) =>
+      new FsError({
+        path: getCliproxyAuthDir(),
+        operation: 'bridgeCodexAuthToCliproxy',
+        cause,
+      }),
+  });
+
+/**
+ * Effect-native bridgeGeminiAuthToCliproxy — writes the supplied API key
+ * to cliproxy's gemini credential file. Fails with FsError on write failure.
+ */
+export const bridgeGeminiAuthToCliproxy = (
+  apiKey: string,
+): Effect.Effect<boolean, FsError> =>
+  Effect.tryPromise({
+    try: () => bridgeGeminiAuthToCliproxyTask(apiKey),
+    catch: (cause) =>
+      new FsError({
+        path: getCliproxyAuthDir(),
+        operation: 'bridgeGeminiAuthToCliproxy',
+        cause,
+      }),
+  });
+
+/**
+ * Effect-native installCliproxy — downloads + unpacks the cliproxy binary
+ * from GitHub releases. Fails with CliproxyError on network or extraction
+ * failure.
+ */
+export const installCliproxy = (
+  force = false,
+): Effect.Effect<void, CliproxyError> =>
+  Effect.tryPromise({
+    try: () => installCliproxyTask(force),
+    catch: cliproxyCatch('installCliproxy'),
+  });
+
+/** Effect-native isCliproxyRunningTask — port + pidfile probe, never fails. */
+export const isCliproxyRunning = (): Effect.Effect<boolean, never> =>
+  Effect.promise(() => isCliproxyRunningTask());
+
+/** Effect-native checkCliproxyPort — TCP probe of the local port, never fails. */
+export const checkCliproxyPort = (): Effect.Effect<boolean, never> =>
+  Effect.promise(() => checkCliproxyPortTask());
+
+/** Effect-native startCliproxy — spawns the sidecar. Fails with ProcessSpawnError. */
+export const startCliproxy = (): Effect.Effect<void, ProcessSpawnError> =>
+  Effect.tryPromise({
+    try: () => startCliproxyTask(),
+    catch: (cause) =>
+      new ProcessSpawnError({
+        command: getCliproxyBinary(),
+        args: ['-config', getCliproxyConfigPath()],
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect-native stopCliproxy — best-effort SIGTERM via pidfile. */
+export const stopCliproxy = (): Effect.Effect<void, CliproxyError> =>
+  Effect.tryPromise({
+    try: () => stopCliproxyTask(),
+    catch: cliproxyCatch('stopCliproxy'),
+  });
+
+/** Effect-native restartCliproxy — stop + 500ms wait + start. */
+export const restartCliproxy = (): Effect.Effect<void, ProcessSpawnError | CliproxyError> =>
+  Effect.tryPromise({
+    try: () => restartCliproxyTask(),
+    catch: cliproxyCatch('restartCliproxy'),
+  });

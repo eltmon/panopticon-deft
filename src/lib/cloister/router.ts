@@ -8,7 +8,7 @@
 import type { ComplexityLevel, BeadsTask, WorkspaceMetadata, ComplexityDetectionResult } from './complexity.js';
 import type { CloisterConfig, ModelSelectionConfig } from './config.js';
 import { detectComplexity, complexityToModel } from './complexity.js';
-import { loadCloisterConfig } from './config.js';
+import { loadCloisterConfigSync } from './config.js';
 
 /**
  * Model routing result
@@ -28,7 +28,7 @@ export class ModelRouter {
   private config: CloisterConfig;
 
   constructor(config?: CloisterConfig) {
-    this.config = config || loadCloisterConfig();
+    this.config = config || loadCloisterConfigSync();
   }
 
   /**
@@ -87,6 +87,21 @@ export class ModelRouter {
   }
 
   /**
+   * Get the configured harness for a specialist (PAN-636).
+   *
+   * Mirrors getSpecialistModel: normalizes dash-form names ('merge-agent')
+   * to underscore-form ('merge_agent'), reads
+   * model_selection.specialist_harnesses, and falls back to 'claude-code'
+   * for unknown specialists or absent overrides.
+   */
+  getSpecialistHarness(specialistName: string): 'claude-code' | 'pi' {
+    const harnesses = this.config.model_selection?.specialist_harnesses;
+    if (!harnesses) return 'claude-code';
+    const normalizedName = specialistName.replace(/-/g, '_') as keyof typeof harnesses;
+    return harnesses[normalizedName] ?? 'claude-code';
+  }
+
+  /**
    * Get the default model for general tasks
    *
    * @returns Default model name
@@ -116,7 +131,7 @@ export class ModelRouter {
    * Useful when configuration is updated at runtime.
    */
   reloadConfig(): void {
-    this.config = loadCloisterConfig();
+    this.config = loadCloisterConfigSync();
   }
 }
 
@@ -163,6 +178,14 @@ export function routeTask(task: BeadsTask, workspace?: WorkspaceMetadata): Model
  */
 export function getSpecialistModel(specialistName: string): 'opus' | 'sonnet' | 'haiku' {
   return getGlobalRouter().getSpecialistModel(specialistName);
+}
+
+/**
+ * Convenience function to get the configured specialist harness via the
+ * global router (PAN-636).
+ */
+export function getSpecialistHarness(specialistName: string): 'claude-code' | 'pi' {
+  return getGlobalRouter().getSpecialistHarness(specialistName);
 }
 
 /**

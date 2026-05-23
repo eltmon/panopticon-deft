@@ -8,6 +8,8 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { Effect } from 'effect';
+import { FsError } from './errors.js';
 
 /**
  * Path to the Panopticon environment file
@@ -46,7 +48,7 @@ function parseEnvFile(content: string): Record<string, string> {
  *
  * @returns Object with loaded variables and any errors
  */
-export function loadPanopticonEnv(): {
+export function loadPanopticonEnvSync(): {
   loaded: string[];
   skipped: string[];
   error?: string;
@@ -88,12 +90,14 @@ export function getApiKeysFromEnv(): {
   google?: string;
   kimi?: string;
   openrouter?: string;
+  nous?: string;
 } {
   return {
     openai: process.env.OPENAI_API_KEY,
     google: process.env.GOOGLE_API_KEY,
-    kimi: process.env.KIMI_API_KEY,
+    kimi: process.env.KIMI_CODING_API_KEY || process.env.KIMI_API_KEY,
     openrouter: process.env.OPENROUTER_API_KEY,
+    nous: process.env.NOUS_API_KEY,
   };
 }
 
@@ -120,3 +124,21 @@ export function hasEnvFile(): boolean {
 export function getEnvFilePath(): string {
   return ENV_FILE_PATH;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Effect-native version of loadPanopticonEnv. Mutates process.env as a side
+ * effect (like the original). Fails with FsError if the env file is present
+ * but unreadable; missing file is reported via the loaded/skipped/error
+ * payload, not via the typed error channel.
+ */
+export const loadPanopticonEnv = (): Effect.Effect<
+  { loaded: string[]; skipped: string[]; error?: string },
+  FsError
+> =>
+  Effect.try({
+    try: () => loadPanopticonEnvSync(),
+    catch: (cause) =>
+      new FsError({ path: ENV_FILE_PATH, operation: 'loadPanopticonEnv', cause }),
+  });

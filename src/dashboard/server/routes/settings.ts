@@ -27,9 +27,16 @@ import {
 } from '../../../lib/settings-api.js';
 import { getClaudeAuthStatus } from '../../../lib/claude-auth.js';
 import { getOpenAIAuthStatus } from '../../../lib/openai-auth.js';
-import { PROVIDERS } from '../../../lib/providers.js';
+import { getProviderForModelSync, PROVIDERS } from '../../../lib/providers.js';
 import { OpenRouterService } from '../services/openrouter-service.js';
 import { httpHandler } from './http-handler.js';
+import { getProviderAuthMode, getProviderEnvForModel } from '../../../lib/agents.js';
+import { canUseHarnessSync } from '../../../lib/harness-policy.js';
+import {
+  detectProviderEnvConflicts,
+} from '../../../lib/claude-settings-overlay.js';
+import { refreshTtsRuntimeConfig } from '../services/tts-runtime-config.js';
+import { syncTtsPlaybackWithConfig } from '../services/tts-playback.js';
 
 // ─── Local helpers ────────────────────────────────────────────────────────────
 
@@ -45,19 +52,18 @@ const readJsonBody = Effect.gen(function* () {
 });
 
 /** Model ID to API model ID mapping */
-const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
-  // OpenAI models — gpt-5.x family maps to real API model names
-  'gpt-5.5-pro': { apiModel: 'gpt-4o' },
-  'gpt-5.5': { apiModel: 'gpt-4o' },
-  'gpt-5.5-mini': { apiModel: 'gpt-4o-mini' },
-  'gpt-5.5-nano': { apiModel: 'gpt-4o-mini' },
-  'gpt-5.4-pro': { apiModel: 'gpt-4o' },
-  'gpt-5.4': { apiModel: 'gpt-4o' },
-  'gpt-5.4-mini': { apiModel: 'gpt-4o-mini' },
-  'gpt-5.4-nano': { apiModel: 'gpt-4o-mini' },
+export const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
+  // OpenAI models — gpt-5.x are real OpenAI model IDs (identity map).
+  // Codex sign-in routes through CLIProxy; API key routes direct.
+  'gpt-5.5-pro': { apiModel: 'gpt-5.5-pro' },
+  'gpt-5.5': { apiModel: 'gpt-5.5' },
+  'gpt-5.4-pro': { apiModel: 'gpt-5.4-pro' },
+  'gpt-5.4': { apiModel: 'gpt-5.4' },
+  'gpt-5.4-mini': { apiModel: 'gpt-5.4-mini' },
+  'gpt-5.3-codex': { apiModel: 'gpt-5.3-codex' },
+  'gpt-5.2': { apiModel: 'gpt-5.2' },
   'o3': { apiModel: 'o3' },
   'o4-mini': { apiModel: 'o4-mini' },
-  'gpt-5.2-codex': { apiModel: 'gpt-4o' },
   'o3-deep-research': { apiModel: 'gpt-4o' },
   'gpt-4o': { apiModel: 'gpt-4o' },
   'gpt-4o-mini': { apiModel: 'gpt-4o-mini' },
@@ -80,6 +86,16 @@ const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
   'glm-5.1': { apiModel: 'glm-5.1' },
   'glm-4.7': { apiModel: 'glm-4.7' },
   'glm-4.7-flash': { apiModel: 'glm-4.7-flash' },
+  // MiMo models
+  'mimo-v2.5-pro': { apiModel: 'mimo-v2.5-pro' },
+  'mimo-v2.5': { apiModel: 'mimo-v2.5' },
+  // Nous Portal models
+  'qwen/qwen3.6-plus': { apiModel: 'qwen/qwen3.6-plus' },
+  // Alibaba DashScope models
+  'qwen3-max': { apiModel: 'qwen3-max' },
+  'qwen3-coder-plus': { apiModel: 'qwen3-coder-plus' },
+  'qwen3-plus': { apiModel: 'qwen3-plus' },
+  'qwen3.7-max': { apiModel: 'qwen3.7-max' },
 };
 
 // ─── Route: GET /api/settings ─────────────────────────────────────────────────
@@ -132,7 +148,7 @@ const getClaudeAuthRoute = HttpRouter.add(
   'GET',
   '/api/settings/claude-auth',
   httpHandler(Effect.gen(function* () {
-    const status = yield* Effect.promise(() => getClaudeAuthStatus());
+    const status = yield* getClaudeAuthStatus();
     return jsonResponse(status);
   })),
 );
@@ -143,7 +159,7 @@ const getOpenAIAuthRoute = HttpRouter.add(
   'GET',
   '/api/settings/openai-auth',
   httpHandler(Effect.gen(function* () {
-    const status = yield* Effect.promise(() => getOpenAIAuthStatus());
+    const status = yield* getOpenAIAuthStatus();
     return jsonResponse(status);
   })),
 );
@@ -341,6 +357,103 @@ const postTestApiKeyRoute = HttpRouter.add(
           break;
         }
 
+        case 'mimo': {
+          const apiModel = model ? (MODEL_API_IDS[model]?.apiModel || 'mimo-v2.5-pro') : 'mimo-v2.5-pro';
+          try {
+            const resp = await fetch('https://token-plan-sgp.xiaomimimo.com/anthropic/v1/messages', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: apiModel, messages: [{ role: 'user', content: testPrompt }], max_tokens: 128 }),
+            });
+            latencyMs = Date.now() - startTime;
+            const responseText = await resp.text();
+            if (resp.ok) {
+              try {
+                const data = JSON.parse(responseText) as { content?: Array<{ type?: string; text?: string }> };
+                const textBlock = data.content?.find(b => b.type === 'text');
+                response = textBlock?.text?.trim() || '';
+                success = response.includes(expectedAnswer);
+                if (!success) error = `Model returned: ${response} (expected ${expectedAnswer})`;
+              } catch {
+                error = `MiMo returned non-JSON response: ${responseText.slice(0, 100)}`;
+              }
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 404) {
+              error = `Model not found: ${apiModel}`;
+            } else {
+              error = `HTTP ${resp.status}: ${responseText.slice(0, 100)}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
+        case 'nous': {
+          const apiModel = model ? (MODEL_API_IDS[model]?.apiModel || 'qwen/qwen3.6-plus') : 'qwen/qwen3.6-plus';
+          try {
+            const resp = await fetch('https://inference-api.nousresearch.com/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: apiModel, messages: [{ role: 'user', content: testPrompt }], max_tokens: 10 }),
+            });
+            latencyMs = Date.now() - startTime;
+            const responseText = await resp.text();
+            if (resp.ok) {
+              try {
+                const data = JSON.parse(responseText) as { choices?: Array<{ message?: { content?: string | null } }> };
+                response = data.choices?.[0]?.message?.content?.trim() || '';
+                success = response.includes(expectedAnswer);
+                if (!success) error = `Model returned: ${response} (expected ${expectedAnswer})`;
+              } catch {
+                error = `Nous Portal returned non-JSON response: ${responseText.slice(0, 100)}`;
+              }
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 404) {
+              error = `Model not found: ${apiModel}`;
+            } else {
+              error = `HTTP ${resp.status}: ${responseText.slice(0, 100)}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
+        case 'dashscope': {
+          const apiModel = model ? (MODEL_API_IDS[model]?.apiModel || 'qwen3-max') : 'qwen3-max';
+          try {
+            const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: apiModel, messages: [{ role: 'user', content: testPrompt }], max_tokens: 10 }),
+            });
+            latencyMs = Date.now() - startTime;
+            const responseText = await resp.text();
+            if (resp.ok) {
+              try {
+                const data = JSON.parse(responseText) as { choices?: Array<{ message?: { content?: string | null } }> };
+                response = data.choices?.[0]?.message?.content?.trim() || '';
+                success = response.includes(expectedAnswer);
+                if (!success) error = `Model returned: ${response} (expected ${expectedAnswer})`;
+              } catch {
+                error = `DashScope returned non-JSON response: ${responseText.slice(0, 100)}`;
+              }
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 404) {
+              error = `Model not found: ${apiModel}`;
+            } else {
+              error = `HTTP ${resp.status}: ${responseText.slice(0, 100)}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
         default:
           error = `Unknown provider: ${provider}`;
       }
@@ -363,7 +476,7 @@ const postValidateApiKeyRoute = HttpRouter.add(
       return jsonResponse({ error: 'Provider and apiKey are required' }, { status: 400 });
     }
 
-    if (!['openai', 'google', 'kimi', 'minimax', 'zai'].includes(provider)) {
+    if (!['openai', 'google', 'kimi', 'minimax', 'zai', 'mimo', 'nous', 'dashscope'].includes(provider)) {
       return jsonResponse({ error: `Unsupported provider: ${provider}` }, { status: 400 });
     }
 
@@ -400,7 +513,8 @@ const postValidateApiKeyRoute = HttpRouter.add(
 
         case 'google': {
           try {
-            const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+            const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview' + ':generateContent';
+            const resp = await fetch(`${endpoint}?key=${apiKey}`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ contents: [{ parts: [{ text: 'test' }] }] }),
@@ -486,6 +600,74 @@ const postValidateApiKeyRoute = HttpRouter.add(
           }
           break;
         }
+
+        case 'mimo': {
+          // MiMo subscription endpoint does not expose /v1/models; validate via a lightweight messages request
+          try {
+            const resp = await fetch('https://token-plan-sgp.xiaomimimo.com/anthropic/v1/messages', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: 'mimo-v2.5-pro', messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1 }),
+            });
+            if (resp.ok) {
+              valid = true;
+              models = ['mimo-v2.5-pro', 'mimo-v2.5'];
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 429) {
+              error = 'Rate limit exceeded';
+            } else {
+              error = `HTTP error: ${resp.status}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
+        case 'nous': {
+          try {
+            const resp = await fetch('https://inference-api.nousresearch.com/v1/models', {
+              headers: { 'Authorization': `Bearer ${apiKey}` },
+            });
+            if (resp.ok) {
+              const data = await resp.json() as { data?: Array<{ id: string }> };
+              valid = true;
+              models = data.data?.map(m => m.id) || ['qwen/qwen3.6-plus'];
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 429) {
+              error = 'Rate limit exceeded';
+            } else {
+              error = `HTTP error: ${resp.status}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
+        case 'dashscope': {
+          try {
+            const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models', {
+              headers: { 'Authorization': `Bearer ${apiKey}` },
+            });
+            if (resp.ok) {
+              const data = await resp.json() as { data?: Array<{ id: string }> };
+              valid = true;
+              models = data.data?.map(m => m.id) || ['qwen3-max', 'qwen3-coder-plus', 'qwen3-plus', 'qwen3.7-max'];
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 429) {
+              error = 'Rate limit exceeded';
+            } else {
+              error = `HTTP error: ${resp.status}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
       }
 
       return jsonResponse({ valid, provider, models: valid ? models : undefined, error: error || undefined });
@@ -508,7 +690,9 @@ const putSettingsRoute = HttpRouter.add(
         if (!validation.valid) {
           return jsonResponse({ error: validation.errors.join('; ') }, { status: 400 });
         }
-        await saveSettingsApi(newSettings);
+        await Effect.runPromise(saveSettingsApi(newSettings));
+        await refreshTtsRuntimeConfig();
+        await syncTtsPlaybackWithConfig();
         return jsonResponse({
           success: true,
           message: 'Settings saved to config.yaml',
@@ -550,7 +734,7 @@ const putOpenRouterFavoritesRoute = HttpRouter.add(
     const modelIds = favorites.filter((f): f is string => typeof f === 'string');
     return yield* Effect.promise(async () => {
       try {
-        await saveOpenRouterFavorites(modelIds);
+        await Effect.runPromise(saveOpenRouterFavorites(modelIds));
         return jsonResponse({ success: true, favorites: modelIds });
       } catch (err) {
         throw new Error(err instanceof Error ? err.message : String(err));
@@ -574,7 +758,7 @@ const putOpenRouterApiKeyRoute = HttpRouter.add(
 
     return yield* Effect.promise(async () => {
       try {
-        const settings = await updateProviderApiKey('openrouter', apiKey?.trim() || undefined);
+        const settings = await Effect.runPromise(updateProviderApiKey('openrouter', apiKey?.trim() || undefined));
         return jsonResponse({
           success: true,
           apiKey: settings.api_keys.openrouter,
@@ -606,6 +790,79 @@ const postOpenRouterTestKeyRoute = HttpRouter.add(
   })),
 );
 
+// ─── Route: GET /api/settings/harness-policy ────────────────────────────────
+
+const SAFE_MODEL_PATTERN = /^[a-zA-Z0-9_.:\/-]+$/;
+const MAX_HARNESS_POLICY_MODELS = 250;
+const MAX_HARNESS_POLICY_MODEL_LENGTH = 200;
+
+const getHarnessPolicyRoute = HttpRouter.add(
+  'GET',
+  '/api/settings/harness-policy',
+  httpHandler(Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    return yield* Effect.promise(async () => {
+      const url = new URL(request.url, 'http://localhost');
+      const models = (url.searchParams.get('models') ?? '')
+        .split(',')
+        .map((model) => model.trim())
+        .filter(Boolean);
+
+      if (
+        models.length === 0
+        || models.length > MAX_HARNESS_POLICY_MODELS
+        || models.some((model) => model.length > MAX_HARNESS_POLICY_MODEL_LENGTH || !SAFE_MODEL_PATTERN.test(model))
+      ) {
+        return jsonResponse({ error: 'Valid models parameter is required' }, { status: 400 });
+      }
+
+      const decisions: Record<string, Record<string, { allowed: boolean; reason?: string }>> = {};
+      const authModeByProvider = new Map<string, Awaited<ReturnType<typeof getProviderAuthMode>>>();
+      for (const model of Array.from(new Set(models))) {
+        const providerName = getProviderForModelSync(model).name;
+        let authMode = authModeByProvider.get(providerName);
+        if (!authModeByProvider.has(providerName)) {
+          authMode = await getProviderAuthMode(model);
+          authModeByProvider.set(providerName, authMode);
+        }
+        decisions[model] = {
+          'claude-code': canUseHarnessSync('claude-code', model, authMode),
+          pi: canUseHarnessSync('pi', model, authMode),
+        };
+      }
+      return jsonResponse({ decisions });
+    });
+  })),
+);
+
+// ─── Route: GET /api/settings/provider-env-conflicts ─────────────────────────
+
+
+const getProviderEnvConflictsRoute = HttpRouter.add(
+  'GET',
+  '/api/settings/provider-env-conflicts',
+  httpHandler(Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    return yield* Effect.promise(async () => {
+      const url = new URL(request.url, 'http://localhost');
+      const model = url.searchParams.get('model');
+      if (!model || !SAFE_MODEL_PATTERN.test(model)) {
+        return jsonResponse({ error: 'Valid model parameter is required' }, { status: 400 });
+      }
+
+      try {
+        const providerEnv = await getProviderEnvForModel(model);
+        const conflicts = await Effect.runPromise(detectProviderEnvConflicts(providerEnv));
+        return jsonResponse({ conflicts });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return jsonResponse({ error: msg }, { status: 500 });
+      }
+    });
+  })),
+);
+
+
 // ─── Compose all routes into a single Layer ───────────────────────────────────
 
 export const settingsRouteLayer = Layer.mergeAll(
@@ -622,6 +879,8 @@ export const settingsRouteLayer = Layer.mergeAll(
   putOpenRouterFavoritesRoute,
   putOpenRouterApiKeyRoute,
   postOpenRouterTestKeyRoute,
+  getHarnessPolicyRoute,
+  getProviderEnvConflictsRoute,
 );
 
 export default settingsRouteLayer;

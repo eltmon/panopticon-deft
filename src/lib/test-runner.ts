@@ -10,7 +10,9 @@ import { join, basename } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
-import { ProjectConfig, TestConfig, TemplatePlaceholders, replacePlaceholders } from './workspace-config.js';
+import { Effect } from 'effect';
+import { ProjectConfig, TestConfig, TemplatePlaceholders, replacePlaceholdersSync } from './workspace-config.js';
+import { ProcessSpawnError } from './errors.js';
 
 const execAsync = promisify(exec);
 
@@ -132,13 +134,13 @@ async function runTestSuite(
 
   if (testConfig.env) {
     for (const [key, value] of Object.entries(testConfig.env)) {
-      env[key] = replacePlaceholders(value, placeholders);
+      env[key] = replacePlaceholdersSync(value, placeholders);
     }
   }
 
   // If running in container, wrap command
   if (testConfig.container && testConfig.container_name) {
-    const containerName = replacePlaceholders(testConfig.container_name, placeholders);
+    const containerName = replacePlaceholdersSync(testConfig.container_name, placeholders);
     command = `docker exec "${containerName}" ${command}`;
   }
 
@@ -252,12 +254,7 @@ export interface RunTestsOptions {
   featureName?: string;
   testNames?: string[];
   notify?: boolean;
-}
-
-/**
- * Run all tests for a project/workspace
- */
-export async function runTests(options: RunTestsOptions): Promise<TestRunResult> {
+}async function runTestsPromise(options: RunTestsOptions): Promise<TestRunResult> {
   const { projectConfig, featureName, testNames, notify = true } = options;
 
   const workspaceConfig = projectConfig.workspace;
@@ -382,3 +379,24 @@ export async function runTests(options: RunTestsOptions): Promise<TestRunResult>
 
   return result;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Run the configured test suites (maven, vitest, jest, playwright, ...) for a
+ * project. Wraps the Promise variant; spawn / wiring failures surface as
+ * ProcessSpawnError, but individual test failures stay inside `TestRunResult`.
+ */
+export const runTests = (
+  options: RunTestsOptions,
+): Effect.Effect<TestRunResult, ProcessSpawnError> =>
+  Effect.tryPromise({
+    try: () => runTestsPromise(options),
+    catch: (cause) =>
+      new ProcessSpawnError({
+        command: 'test-runner',
+        args: [options.featureName ?? ''],
+        message: 'runTests failed',
+        cause,
+      }),
+  });

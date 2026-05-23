@@ -6,10 +6,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Effect } from 'effect';
 
 // Mock projects module
 vi.mock('../projects.js', () => ({
   findProjectByPath: vi.fn(),
+  findProjectByPathSync: vi.fn(),
   getIssuePrefix: vi.fn(),
 }));
 
@@ -22,19 +24,21 @@ vi.mock('../tracker/factory.js', () => ({
 // Mock config
 vi.mock('../config.js', () => ({
   loadConfig: vi.fn(() => ({ trackers: { linear: { apiKey: 'fake-key' } } })),
+  loadConfigSync: vi.fn(() => ({ trackers: { linear: { apiKey: 'fake-key' } } })),
 }));
 
-import { findProjectByPath, getIssuePrefix } from '../projects.js';
+import { findProjectByPathSync, getIssuePrefix } from '../projects.js';
 import { createTracker, createTrackerFromConfig } from '../tracker/factory.js';
 import { transitionIssueToInReview } from '../agents.js';
 
-const mockFindProjectByPath = vi.mocked(findProjectByPath);
+const mockFindProjectByPath = vi.mocked(findProjectByPathSync);
 const mockGetIssuePrefix = vi.mocked(getIssuePrefix);
 const mockCreateTracker = vi.mocked(createTracker);
 const mockCreateTrackerFromConfig = vi.mocked(createTrackerFromConfig);
 
 const mockTracker = {
-  transitionIssue: vi.fn().mockResolvedValue(undefined),
+  // transitionIssue is Effect-returning post-PAN-1249; production calls via Effect.runPromise.
+  transitionIssue: vi.fn().mockReturnValue(Effect.succeed(undefined)),
   getIssue: vi.fn(),
   listIssues: vi.fn(),
   updateIssue: vi.fn(),

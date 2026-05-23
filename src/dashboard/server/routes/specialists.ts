@@ -1,6 +1,7 @@
 import { jsonResponse } from '../http-helpers.js';
 import { httpHandler } from './http-handler.js';
 import { encodeClaudeProjectDir } from '../../../lib/paths.js';
+import { getClaudePermissionFlagsStringSync } from '../../../lib/claude-permissions.js';
 /**
  * Specialists route module — Effect HttpRouter.Layer (PAN-428 B9)
  *
@@ -40,7 +41,7 @@ import { encodeClaudeProjectDir } from '../../../lib/paths.js';
  *   POST   /api/specialists/:project/:type/logs/cleanup
  */
 
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -50,11 +51,11 @@ import { promisify } from 'node:util';
 import { Effect, Layer, Option, Stream } from 'effect';
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/unstable/http';
 
-import { getAgentCommand } from '../../../lib/settings.js';
-import { resolveProjectFromIssue } from '../../../lib/projects.js';
+import { getAgentCommandSync } from '../../../lib/settings.js';
+import { resolveProjectFromIssueSync } from '../../../lib/projects.js';
 import {
-  getReviewStatus,
-  setReviewStatus as setReviewStatusBase,
+  getReviewStatusSync,
+  setReviewStatusSync as setReviewStatusBase,
   loadReviewStatuses,
   type ReviewStatus,
 } from '../../../lib/review-status.js';
@@ -63,21 +64,24 @@ import {
   messageAgent,
   transitionIssueToInProgress,
 } from '../../../lib/agents.js';
-import { calculateCost, getPricing, type TokenUsage } from '../../../lib/cost.js';
+import { calculateCostSync, getPricingSync, type TokenUsage } from '../../../lib/cost.js';
 import { normalizeModelName } from '../../../lib/cost-parsers/jsonl-parser.js';
+import { queryBeadById } from '../../../lib/beads-query.js';
 import { syncBeadStatusToVBrief } from '../../../lib/vbrief/beads.js';
-import { readWorkspacePlan } from '../../../lib/vbrief/io.js';
-import { getUnblockedItems } from '../../../lib/cloister/task-readiness.js';
+import { readWorkspacePlanSync } from '../../../lib/vbrief/io.js';
+import { getUnblockedItemsSync } from '../../../lib/cloister/task-readiness.js';
 import { EventStoreService } from '../services/domain-services.js';
-import { extractPrefix } from '../../../lib/issue-id.js';
-import { createSessionAsync } from '../../../lib/tmux.js';
+import { extractPrefixSync } from '../../../lib/issue-id.js';
+import { killSession } from '../../../lib/tmux.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-type SpecialistType = 'merge-agent' | 'review-agent' | 'test-agent' | 'inspect-agent' | 'uat-agent';
-type ProjectSpecialistType = 'review-agent' | 'test-agent' | 'merge-agent';
+type SpecialistAgentName = 'merge-agent' | 'review-agent' | 'test-agent' | 'inspect-agent' | 'uat-agent';
+type ProjectSpecialistAgentName = 'review-agent' | 'test-agent' | 'merge-agent';
+type SpecialistEventRole = 'review' | 'test' | 'ship';
 
 const VALID_SPECIALIST_NAMES: string[] = [
   'merge-agent',
@@ -87,8 +91,15 @@ const VALID_SPECIALIST_NAMES: string[] = [
   'uat-agent',
 ];
 
-function validateSpecialistType(type: string): type is ProjectSpecialistType {
+function validateSpecialistAgentName(type: string): type is ProjectSpecialistAgentName {
   return type === 'review-agent' || type === 'test-agent' || type === 'merge-agent';
+}
+
+function specialistEventRole(name: string): SpecialistEventRole | undefined {
+  if (name === 'review' || name === 'review-agent') return 'review';
+  if (name === 'test' || name === 'test-agent') return 'test';
+  if (name === 'merge' || name === 'merge-agent') return 'ship';
+  return undefined;
 }
 
 // Read the request body as unknown JSON
@@ -116,7 +127,7 @@ function firePostMergeLifecycle(issueId: string): void {
     return;
   }
 
-  const issuePrefix = extractPrefix(issueId) ?? issueId.split('-')[0];
+  const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
   const projectPath = getProjectPathForIssue(issuePrefix);
 
   _postMergeInFlight.add(issueId);
@@ -135,7 +146,7 @@ function firePostMergeLifecycle(issueId: string): void {
 
 function getProjectPathForIssue(issuePrefix: string): string {
   const issueId = `${issuePrefix}-1`;
-  const resolved = resolveProjectFromIssue(issueId);
+  const resolved = resolveProjectFromIssueSync(issueId);
   if (resolved) return resolved.projectPath;
   return join(homedir(), 'Projects');
 }
@@ -170,11 +181,10 @@ const postSpecialistsResetAllRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const {
       getAllSpecialists,
-      clearSessionId,
       isRunning,
       getTmuxSessionName,
     } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const { clearHook } = yield* Effect.promise(() => import('../../../lib/hooks.js'));
+    const { clearHookSync } = yield* Effect.promise(() => import('../../../lib/hooks.js'));
 
     const specialists = getAllSpecialists();
     const results: { name: string; killed: boolean; sessionCleared: boolean; queueCleared: boolean }[] = [];
@@ -183,17 +193,17 @@ const postSpecialistsResetAllRoute = HttpRouter.add(
       const name = specialist.name;
       let killed = false;
 
-      if (isRunning(name)) {
+      if (yield* Effect.promise(() => isRunning(name))) {
         const tmuxSession = getTmuxSessionName(name);
-        const killResult = yield* Effect.promise(() =>
-          killSessionAsync(tmuxSession).then(() => true).catch(() => false),
+        const killResult = yield* killSession(tmuxSession).pipe(
+          Effect.as(true),
+          Effect.catch(() => Effect.succeed(false)),
         );
         killed = killResult;
       }
 
-      const sessionCleared = clearSessionId(name);
-      clearHook(name);
-      results.push({ name, killed, sessionCleared, queueCleared: true });
+      clearHookSync(name);
+      results.push({ name, killed, sessionCleared: false, queueCleared: true });
     }
 
     // Reset any "reviewing" statuses to "pending" — use per-issue atomic updates
@@ -238,7 +248,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
     };
 
     // Validate specialist type
-    const validSpecialists = ['review', 'test', 'merge', 'inspect', 'uat'];
+    const validSpecialists = ['review', 'test', 'merge', 'inspect', 'uat', 'ship'];
     if (!validSpecialists.includes(specialist)) {
       return jsonResponse(
         { error: `Invalid specialist: ${specialist}. Valid: ${validSpecialists.join(', ')}` },
@@ -262,19 +272,17 @@ const postSpecialistsDoneRoute = HttpRouter.add(
     const normalizedIssueId = issueId.toUpperCase();
     console.log(`[specialists/done] ${specialist} signaling ${status} for ${normalizedIssueId}`);
 
-    // Resolve any pending specialist completion Promises (PAN-632: event-driven completion).
+    // Resolve any pending specialist completion waiters (PAN-632: event-driven completion).
     // This replaces polling loops in spawnMergeAgentForBranches / syncMainIntoWorkspace.
     if (specialist === 'merge') {
-      yield* Effect.promise(async () => {
-        const { reportSpecialistCompletion } = await import('../../../lib/cloister/specialist-completion.js');
-        const resolved = reportSpecialistCompletion(normalizedIssueId, {
-          status: status as 'passed' | 'failed',
-          notes,
-        });
-        if (resolved) {
-          console.log(`[specialists/done] Resolved pending completion waiter for ${normalizedIssueId}`);
-        }
+      const { reportSpecialistCompletion } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-completion.js'));
+      const resolved = yield* reportSpecialistCompletion(normalizedIssueId, {
+        status: status as 'passed' | 'failed',
+        notes,
       });
+      if (resolved) {
+        console.log(`[specialists/done] Resolved pending completion waiter for ${normalizedIssueId}`);
+      }
     }
 
     // GUARD: If this issue is in a server-managed merge (polyrepo), the server handles
@@ -301,7 +309,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
         break;
 
       case 'test':
-        update.testStatus = status;
+        update.testStatus = status as typeof update.testStatus;
         if (notes) update.testNotes = notes;
         break;
 
@@ -310,13 +318,19 @@ const postSpecialistsDoneRoute = HttpRouter.add(
         break;
 
       case 'inspect':
-        update.inspectStatus = status;
+        update.inspectStatus = status as typeof update.inspectStatus;
         if (notes) update.inspectNotes = notes;
         break;
 
       case 'uat':
-        update.uatStatus = status;
+        update.uatStatus = status as typeof update.uatStatus;
         if (notes) update.uatNotes = notes;
+        if (status === 'passed') {
+          update.readyForMerge = true;
+        }
+        break;
+
+      case 'ship':
         if (status === 'passed') {
           update.readyForMerge = true;
         }
@@ -332,23 +346,32 @@ const postSpecialistsDoneRoute = HttpRouter.add(
       try {
         const { getTmuxSessionName, updateRunMetadata, makeSpecialistRegistryKey } =
           await import('../../../lib/cloister/specialists.js');
-        const project = resolveProjectFromIssue(normalizedIssueId);
+        const project = resolveProjectFromIssueSync(normalizedIssueId);
         const projectKey = project?.projectKey;
         const tmuxSession = projectKey
-          ? getTmuxSessionName(`${specialist}-agent` as SpecialistType, projectKey, normalizedIssueId)
-          : getTmuxSessionName(`${specialist}-agent` as SpecialistType);
+          ? getTmuxSessionName(`${specialist}-agent` as SpecialistAgentName, projectKey, normalizedIssueId)
+          : getTmuxSessionName(`${specialist}-agent` as SpecialistAgentName);
         saveAgentRuntimeState(tmuxSession, {
           state: 'idle',
           lastActivity: new Date().toISOString(),
         });
         console.log(`[specialists/done] Set ${tmuxSession} to idle`);
 
+        // PAN-846: Kill the specialist tmux session so it doesn't leak RAM.
+        // The session has completed its work; next dispatch spawns fresh.
+        try {
+          await Effect.runPromise(killSession(tmuxSession));
+          console.log(`[specialists/done] Killed specialist session ${tmuxSession}`);
+        } catch (err) {
+          console.log(`[specialists/done] Session ${tmuxSession} already gone or failed to kill: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
         // Clear write-scope lock so the next specialist can claim the workspace
         if (projectKey) {
           const registryKey = makeSpecialistRegistryKey(`${specialist}-agent`, normalizedIssueId);
           updateRunMetadata(projectKey, registryKey, {
             currentRun: null,
-            writeScope: null,
+            writeScope: undefined,
             workspace: null,
             currentActivity: null,
           });
@@ -357,12 +380,12 @@ const postSpecialistsDoneRoute = HttpRouter.add(
 
         // Update specialist handoff log so success-rate metrics reflect actual outcome
         const { updateSpecialistHandoffStatus } = await import('../../../lib/cloister/specialist-handoff-logger.js');
-        const updated = await updateSpecialistHandoffStatus(
+        const updated = await Effect.runPromise(updateSpecialistHandoffStatus(
           normalizedIssueId,
           `${specialist}-agent`,
           status === 'passed' ? 'completed' : 'failed',
           status === 'passed' ? 'success' : 'failure',
-        );
+        ));
         if (updated) {
           console.log(`[specialists/done] Updated handoff log: ${specialist}-agent ${normalizedIssueId} → ${status}`);
         }
@@ -376,7 +399,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
     if (specialist === 'review' && status === 'passed') {
       yield* Effect.promise(async () => {
         try {
-          const project = resolveProjectFromIssue(normalizedIssueId);
+          const project = resolveProjectFromIssueSync(normalizedIssueId);
           if (project) {
             const workspacePath = join(
               project.projectPath,
@@ -385,7 +408,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
             );
             if (existsSync(workspacePath)) {
               const { getWorkspaceGitInfo } = await import('../../../lib/git-utils.js');
-              const { HEAD } = await getWorkspaceGitInfo(workspacePath);
+              const { HEAD } = await Effect.runPromise(getWorkspaceGitInfo(workspacePath));
               setReviewStatusBase(normalizedIssueId, { reviewedAtCommit: HEAD });
               console.log(`[specialists/done] Snapshotted reviewedAtCommit=${HEAD.substring(0, 8)} for ${normalizedIssueId}`);
             }
@@ -405,7 +428,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
           const beadMatch = notes?.match(/[Bb]ead\s+(\S+)/);
           const beadId = beadMatch?.[1] || 'unknown';
           // Resolve project to get workspace path
-          const project = resolveProjectFromIssue(normalizedIssueId);
+          const project = resolveProjectFromIssueSync(normalizedIssueId);
           if (project) {
             const workspacePath = join(
               project.projectPath,
@@ -413,21 +436,22 @@ const postSpecialistsDoneRoute = HttpRouter.add(
               `feature-${normalizedIssueId.toLowerCase()}`,
             );
             if (existsSync(workspacePath)) {
-              onInspectComplete(project.projectKey, normalizedIssueId, beadId, 'passed', workspacePath);
+              (await Effect.runPromise(onInspectComplete(project.projectKey, normalizedIssueId, beadId, 'passed', workspacePath)));
 
               // Sync bead completion to vBRIEF plan
               try {
-                const updatedItemId = syncBeadStatusToVBrief(beadId, workspacePath, 'completed');
+                const beadData = await Effect.runPromise(queryBeadById(workspacePath, beadId));
+                const updatedItemId = await Effect.runPromise(syncBeadStatusToVBrief(beadId, workspacePath, 'completed', beadData?.title));
                 if (updatedItemId) {
                   // Check which tasks are now unblocked and wake the work agent
                   try {
-                    const unblockedItems = getUnblockedItems(workspacePath, updatedItemId);
+                    const unblockedItems = getUnblockedItemsSync(workspacePath, updatedItemId);
                     if (unblockedItems.length > 0) {
                       console.log(
                         `[auto-wake] ${normalizedIssueId}: items unblocked after "${updatedItemId}": ${unblockedItems.join(', ')}`,
                       );
                       const workAgentId = `agent-${normalizedIssueId.toLowerCase()}`;
-                      const doc = readWorkspacePlan(workspacePath);
+                      const doc = readWorkspacePlanSync(workspacePath);
                       const unblockedTitles = unblockedItems
                         .map((id) => {
                           const it = doc?.plan.items.find((i) => i.id === id);
@@ -459,26 +483,35 @@ const postSpecialistsDoneRoute = HttpRouter.add(
       });
     }
 
-    // When test specialist reports success, mark as ready for merge.
-    // The post-rebase verification in triggerMerge() is the real quality gate —
-    // don't block readyForMerge based on a potentially stale verification status.
+    // When test specialist reports success, emit test.passed so reactive Cloister
+    // dispatches the ship role (which sets readyForMerge: true).  PAN-1048 invariant:
+    // ONLY the ship role sets readyForMerge: true — no direct assignment here.
     if (specialist === 'test' && status === 'passed') {
-      try {
-        const project = resolveProjectFromIssue(normalizedIssueId);
-        if (project) {
-          const workspacePath = join(
-            project.projectPath,
-            'workspaces',
-            `feature-${normalizedIssueId.toLowerCase()}`,
-          );
-          if (existsSync(workspacePath)) {
-            setReviewStatusBase(normalizedIssueId, { readyForMerge: true });
-            console.log(`[specialists/done] ${normalizedIssueId} marked ready for merge after tests passed`);
+      yield* Effect.promise(async () => {
+        try {
+          const project = resolveProjectFromIssueSync(normalizedIssueId);
+          if (project) {
+            const workspacePath = join(
+              project.projectPath,
+              'workspaces',
+              `feature-${normalizedIssueId.toLowerCase()}`,
+            );
+            if (existsSync(workspacePath)) {
+              setReviewStatusBase(normalizedIssueId, { testStatus: 'passed' });
+              const { initEventStore } = await import('../event-store.js');
+              const store = await initEventStore();
+              await store.appendAsync({
+                type: 'test.passed',
+                timestamp: new Date().toISOString(),
+                payload: { issueId: normalizedIssueId },
+              } as any);
+              console.log(`[specialists/done] ${normalizedIssueId} emitted test.passed; ship role dispatched`);
+            }
           }
+        } catch (err) {
+          console.error(`[specialists/done] Error emitting test.passed for ${normalizedIssueId}:`, err);
         }
-      } catch (err) {
-        console.error(`[specialists/done] Error marking ready for merge:`, err);
-      }
+      });
     }
 
     // When merge specialist reports success, run post-merge lifecycle ONCE.
@@ -495,7 +528,7 @@ const postSpecialistsDoneRoute = HttpRouter.add(
     // (inspect failures don't change Linear status — they're mid-implementation gates).
     if (status === 'failed' && specialist !== 'inspect') {
       try {
-        const project = resolveProjectFromIssue(normalizedIssueId);
+        const project = resolveProjectFromIssueSync(normalizedIssueId);
         if (project) {
           const workspacePath = join(
             project.projectPath,
@@ -533,7 +566,11 @@ const postSpecialistsDoneRoute = HttpRouter.add(
             if (prMatch) {
               const [, owner, repo, prNumber] = prMatch;
               const commentBody = `## Merge Failed\n\n${notes || 'Merge could not be completed.'}\n\nThe issue has been moved back to In Progress. The work agent needs to resolve conflicts and resubmit.`;
-              await execAsync(`gh api repos/${owner}/${repo}/issues/${prNumber}/comments -f body=${JSON.stringify(commentBody)}`, { encoding: 'utf-8' });
+              await execFileAsync(
+                'gh',
+                ['api', `repos/${owner}/${repo}/issues/${prNumber}/comments`, '--field', `body=${commentBody}`],
+                { encoding: 'utf-8' },
+              );
               console.log(`[specialists/done] Posted merge failure comment on ${prUrl}`);
             }
           }
@@ -547,10 +584,10 @@ const postSpecialistsDoneRoute = HttpRouter.add(
         yield* Effect.promise(async () => {
           try {
             const workAgentId = `agent-${normalizedIssueId.toLowerCase()}`;
-            const { sessionExistsAsync } = await import('../../../lib/tmux.js');
-            const { messageAgent, spawnAgent, getAgentState } = await import('../../../lib/agents.js');
+            const { sessionExists } = await import('../../../lib/tmux.js');
+            const { messageAgent, spawnAgent, getAgentStateSync } = await import('../../../lib/agents.js');
 
-            if (await sessionExistsAsync(workAgentId)) {
+            if (await Effect.runPromise(sessionExists(workAgentId))) {
               // Agent is running — send rebase instructions directly
               const rebaseMsg = `MERGE CONFLICT: The merge-agent could not rebase your branch onto main due to conflicts. Please fix this now:\n\n1. git fetch origin main\n2. git rebase origin/main\n3. Resolve any conflicts (git add <file> && git rebase --continue)\n4. git push --force-with-lease\n5. Resubmit: curl -s -X POST http://localhost:3011/api/review/${normalizedIssueId}/request -H "Content-Type: application/json" -d "{}"\n\nConflict details: ${notes}`;
               await messageAgent(workAgentId, rebaseMsg);
@@ -566,38 +603,49 @@ const postSpecialistsDoneRoute = HttpRouter.add(
       }
     }
 
-    // When review fails or is blocked, send feedback to work agent so it can fix the issues
-    if (specialist === 'review' && (status === 'failed' || status === 'blocked') && notes) {
+    if (specialist === 'review' && (status === 'failed' || status === 'blocked')) {
       yield* Effect.promise(async () => {
         try {
-          const workAgentId = `agent-${normalizedIssueId.toLowerCase()}`;
-          const { sessionExistsAsync } = await import('../../../lib/tmux.js');
-          const { messageAgent } = await import('../../../lib/agents.js');
-
-          if (await sessionExistsAsync(workAgentId)) {
-            const reviewMsg = `REVIEW FEEDBACK: The review specialist found issues that must be fixed:\n\n${notes}\n\nPlease address all issues, push your changes, then re-request review with: pan review request ${normalizedIssueId} -m "Fixed review issues"`;
-            await messageAgent(workAgentId, reviewMsg);
-            console.log(`[specialists/done] Sent review feedback to ${workAgentId}`);
-          }
+          const project = resolveProjectFromIssueSync(normalizedIssueId);
+          const workspacePath = project
+            ? join(project.projectPath, 'workspaces', `feature-${normalizedIssueId.toLowerCase()}`)
+            : undefined;
+          const { deliverReviewVerdictFeedback } = await import(
+            '../../../lib/cloister/review-verdict-feedback.js'
+          );
+          const result = await Effect.runPromise(deliverReviewVerdictFeedback({
+            issueId: normalizedIssueId,
+            verdict: status === 'failed' ? 'failed' : 'blocked',
+            notes,
+            workspacePath,
+            prUrl: updatedStatus.prUrl,
+          }));
+          console.log(
+            `[specialists/done] Delivered review verdict feedback for ${normalizedIssueId}` +
+              ` (feedback=${result.feedbackPath ?? 'none'}, synthesis=${result.synthesisPath ?? 'none'}, prComment=${result.prCommentPosted})`,
+          );
         } catch (err: any) {
-          console.warn(`[specialists/done] Failed to send review feedback: ${err.message}`);
+          console.warn(`[specialists/done] Failed to deliver review verdict feedback: ${err.message}`);
         }
       });
     }
 
-    // Emit domain event for specialist completion/failure
-    if (status === 'passed') {
-      yield* eventStore.append({
-        type: 'specialist.completed',
-        timestamp: new Date().toISOString(),
-        payload: { name: `${specialist}-agent`, issueId: normalizedIssueId },
-      });
-    } else {
-      yield* eventStore.append({
-        type: 'specialist.failed',
-        timestamp: new Date().toISOString(),
-        payload: { name: `${specialist}-agent`, issueId: normalizedIssueId, error: notes || `${specialist} failed` },
-      });
+    // Emit domain event for role-backed specialist completion/failure.
+    const eventRole = specialistEventRole(specialist);
+    if (eventRole) {
+      if (status === 'passed') {
+        yield* eventStore.append({
+          type: 'specialist.completed',
+          timestamp: new Date().toISOString(),
+          payload: { name: eventRole, issueId: normalizedIssueId },
+        });
+      } else {
+        yield* eventStore.append({
+          type: 'specialist.failed',
+          timestamp: new Date().toISOString(),
+          payload: { name: eventRole, issueId: normalizedIssueId, error: notes || `${specialist} failed` },
+        });
+      }
     }
 
     return jsonResponse({
@@ -618,8 +666,8 @@ const postSpecialistsLogsCleanupAllRoute = HttpRouter.add(
   'POST',
   '/api/specialists/logs/cleanup-all',
   httpHandler(Effect.gen(function* () {
-    const { cleanupAllLogs } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
-    const results = cleanupAllLogs();
+    const { cleanupAllLogsSync } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
+    const results = cleanupAllLogsSync();
 
     return jsonResponse({
       success: true,
@@ -652,79 +700,10 @@ const postSpecialistWakeRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const name = params['name'] as string;
-    const body = yield* readJsonBody;
-    const { sessionId } = body as { sessionId?: string };
-    const eventStore = yield* EventStoreService;
-
-    const {
-      getTmuxSessionName,
-      getSessionId,
-      recordWake,
-      isRunning,
-    } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-
-    if (yield* Effect.promise(() => isRunning(name as SpecialistType))) {
-      return jsonResponse(
-        { error: `Specialist ${name} is already running` },
-        { status: 400 },
-      );
-    }
-
-    const existingSessionId = getSessionId(name as SpecialistType);
-    const tmuxSession = getTmuxSessionName(name as SpecialistType);
-
-    if (!existingSessionId && !sessionId) {
-      return jsonResponse(
-        {
-          error: 'No session ID found. Specialist must be initialized first or provide sessionId in request.',
-        },
-        { status: 400 },
-      );
-    }
-
-    const useSessionId = sessionId || existingSessionId;
-
-    // Get specialist model from work-type router (config.yaml)
-    let specModel = 'claude-sonnet-4-6';
-    try {
-      const { getModelId } = yield* Effect.promise(() => import('../../../lib/work-type-router.js'));
-      const workTypeId = `specialist-${name}` as any;
-      specModel = getModelId(workTypeId);
-    } catch { /* fall back to default */ }
-    const specCmd = getAgentCommand(specModel);
-    const specCmdWithArgs =
-      specCmd.args.length > 0
-        ? `${specCmd.command} ${specCmd.args.join(' ')} --dangerously-skip-permissions --permission-mode bypassPermissions`
-        : `${specCmd.command} --dangerously-skip-permissions --permission-mode bypassPermissions`;
-
-    const cwd = homedir();
-    yield* Effect.promise(() => createSessionAsync(
-      tmuxSession,
-      cwd,
-      `${specCmdWithArgs} --resume ${useSessionId}`,
-    ));
-
-    recordWake(name as SpecialistType, useSessionId!);
-
-    yield* eventStore.append({
-      type: 'specialist.started',
-      timestamp: new Date().toISOString(),
-      payload: {
-        specialist: {
-          name: name as SpecialistType,
-          state: 'active',
-          isRunning: true,
-          lastWake: new Date().toISOString(),
-        },
-      },
-    });
-
-    return jsonResponse({
-      success: true,
-      message: `Specialist ${name} woken up`,
-      tmuxSession,
-      sessionId: useSessionId,
-    });
+    return jsonResponse(
+      { error: `Legacy specialist wake is no longer supported for ${name}; role runs spawn agents directly.` },
+      { status: 410 },
+    );
   })),
 );
 
@@ -736,37 +715,10 @@ const postSpecialistResetRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const name = params['name'] as string;
-    const body = yield* readJsonBody;
-    const { reinitialize = false } = body as { reinitialize?: boolean };
-
-    const {
-      clearSessionId,
-      isRunning,
-      getTmuxSessionName,
-    } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-
-    if (yield* Effect.promise(() => isRunning(name as SpecialistType))) {
-      const tmuxSession = getTmuxSessionName(name as SpecialistType);
-      return jsonResponse(
-        {
-          error: `Specialist ${name} is currently running. Stop it first (tmux kill-session -t ${tmuxSession})`,
-        },
-        { status: 400 },
-      );
-    }
-
-    const wasDeleted = clearSessionId(name as SpecialistType);
-
-    if (reinitialize) {
-      // TODO: Add initialization logic if needed
-      // For now, just clearing is sufficient
-    }
-
-    return jsonResponse({
-      success: true,
-      message: `Specialist ${name} reset`,
-      sessionCleared: wasDeleted,
-    });
+    return jsonResponse(
+      { error: `Legacy specialist session reset is no longer supported for ${name}; role agents are managed through the normal agent lifecycle.` },
+      { status: 410 },
+    );
   })),
 );
 
@@ -778,20 +730,10 @@ const postSpecialistInitRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const name = params['name'] as string;
-
-    const { initializeSpecialist } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const result = yield* Effect.promise(() => initializeSpecialist(name as SpecialistType));
-
-    if (!result.success) {
-      return jsonResponse({ error: result.message }, { status: 400 });
-    }
-
-    return jsonResponse({
-      success: true,
-      message: result.message,
-      tmuxSession: result.tmuxSession,
-      note: 'Session ID will be available after Claude responds. Use "claude config get sessionId" in the tmux session to get it, then update via /reset with reinitialize.',
-    });
+    return jsonResponse(
+      { error: `Legacy specialist initialization is no longer supported for ${name}; role flows spawn agents on demand.` },
+      { status: 410 },
+    );
   })),
 );
 
@@ -845,7 +787,7 @@ const postSpecialistReportStatusRoute = HttpRouter.add(
     // When specialist reports completion (passed/blocked/failed), set state to idle
     if (['passed', 'blocked', 'failed'].includes(status)) {
       const { getTmuxSessionName } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-      const tmuxSession = getTmuxSessionName(name as SpecialistType);
+      const tmuxSession = getTmuxSessionName(name as SpecialistAgentName);
       saveAgentRuntimeState(tmuxSession, {
         state: 'idle',
         lastActivity: new Date().toISOString(),
@@ -853,17 +795,18 @@ const postSpecialistReportStatusRoute = HttpRouter.add(
     }
 
     // Emit domain event based on status
-    if (status === 'passed') {
+    const eventRole = specialistEventRole(name);
+    if (eventRole && status === 'passed') {
       yield* eventStore.append({
         type: 'specialist.completed',
         timestamp: new Date().toISOString(),
-        payload: { name: name as SpecialistType, issueId },
+        payload: { name: eventRole, issueId },
       });
-    } else if (status === 'failed' || status === 'blocked') {
+    } else if (eventRole && (status === 'failed' || status === 'blocked')) {
       yield* eventStore.append({
         type: 'specialist.failed',
         timestamp: new Date().toISOString(),
-        payload: { name: name as SpecialistType, issueId, error: notes || `${name} reported ${status}` },
+        payload: { name: eventRole, issueId, error: notes || `${name} reported ${status}` },
       });
     }
 
@@ -877,85 +820,7 @@ const getSpecialistCostRoute = HttpRouter.add(
   'GET',
   '/api/specialists/:name/cost',
   httpHandler(Effect.gen(function* () {
-    const params = yield* HttpRouter.params;
-    const name = params['name'] as string;
-
-    const { getSessionId } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const sessionId = getSessionId(name as SpecialistType);
-
-    if (!sessionId) {
-      return jsonResponse({ cost: 0, inputTokens: 0, outputTokens: 0 });
-    }
-
-    // Find the JSONL session file
-    const homeDir = process.env.HOME || homedir();
-    const claudeProjectsDir = join(homeDir, '.claude', 'projects');
-
-    const projectDirName = encodeClaudeProjectDir(homeDir);
-    const projectDir = join(claudeProjectsDir, projectDirName);
-    const sessionsIndexPath = join(projectDir, 'sessions-index.json');
-
-    let cost = 0;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let cacheReadTokens = 0;
-    let cacheWriteTokens = 0;
-    let detectedModel = '';
-
-    if (existsSync(sessionsIndexPath)) {
-      const indexContent = JSON.parse(yield* Effect.promise(() => readFile(sessionsIndexPath, 'utf-8')));
-      const sessionEntry = indexContent.entries?.find(
-        (e: { sessionId: string }) => e.sessionId === sessionId,
-      );
-
-      if (sessionEntry?.fullPath && existsSync(sessionEntry.fullPath)) {
-        const jsonlContent = yield* Effect.promise(() => readFile(sessionEntry.fullPath, 'utf-8'));
-        const lines = jsonlContent.split('\n').filter((l: string) => l.trim());
-
-        for (const line of lines) {
-          try {
-            const entry = JSON.parse(line);
-            const usage = entry.message?.usage || entry.usage;
-            const model = entry.message?.model || entry.model;
-
-            if (usage) {
-              inputTokens += usage.input_tokens || 0;
-              outputTokens += usage.output_tokens || 0;
-              cacheReadTokens += usage.cache_read_input_tokens || 0;
-              cacheWriteTokens += usage.cache_creation_input_tokens || 0;
-            }
-            if (model && !detectedModel) {
-              detectedModel = model;
-            }
-          } catch {
-            // Skip malformed lines
-          }
-        }
-      }
-    }
-
-    if (inputTokens > 0 || outputTokens > 0) {
-      const modelInfo = normalizeModelName(detectedModel || 'claude-sonnet-4');
-      const pricing = getPricing(modelInfo.provider, modelInfo.model);
-      if (pricing) {
-        const usage: TokenUsage = {
-          inputTokens,
-          outputTokens,
-          cacheReadTokens,
-          cacheWriteTokens,
-        };
-        cost = calculateCost(usage, pricing);
-      }
-    }
-
-    return jsonResponse({
-      cost,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheWriteTokens,
-      model: detectedModel,
-    });
+    return jsonResponse({ cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, model: '' });
   })),
 );
 
@@ -989,10 +854,9 @@ const postSpecialistAutoCompleteRoute = HttpRouter.add(
 
     const {
       getTmuxSessionName,
-      spawnEphemeralSpecialist,
     } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
 
-    const tmuxSession = getTmuxSessionName(name as SpecialistType);
+    const tmuxSession = getTmuxSessionName(name as SpecialistAgentName);
 
     // Set specialist to idle and clear currentIssue
     saveAgentRuntimeState(tmuxSession, {
@@ -1002,7 +866,7 @@ const postSpecialistAutoCompleteRoute = HttpRouter.add(
     });
 
     // Update review/test status based on specialist type
-    const existingStatus = getReviewStatus(issueId);
+    const existingStatus = getReviewStatusSync(issueId);
 
     if (name === 'review-agent') {
       const alreadyReported =
@@ -1019,53 +883,8 @@ const postSpecialistAutoCompleteRoute = HttpRouter.add(
         });
       }
 
-      // If passed (by either method), dispatch test-agent immediately
-      const effectiveReviewStatus = alreadyReported
-        ? existingStatus!.reviewStatus
-        : status === 'passed'
-        ? 'passed'
-        : 'blocked';
-      if (effectiveReviewStatus === 'passed') {
-        // Get workspace info from work agent state
-        const workAgentId = `agent-${issueId.toLowerCase()}`;
-        const workStateFile = join(
-          homedir(),
-          '.panopticon',
-          'agents',
-          workAgentId,
-          'state.json',
-        );
-        let workspace: string | undefined;
-        let branch: string | undefined;
-
-        if (existsSync(workStateFile)) {
-          try {
-            const workState = JSON.parse(yield* Effect.promise(() => readFile(workStateFile, 'utf-8')));
-            workspace = workState.workspace;
-            branch = workState.branch || `feature/${issueId.toLowerCase()}`;
-          } catch {}
-        }
-
-        const resolved = resolveProjectFromIssue(issueId);
-        if (resolved) {
-          const result = yield* Effect.promise(() => spawnEphemeralSpecialist(resolved.projectKey, 'test-agent', {
-            issueId,
-            workspace,
-            branch,
-          }));
-          if (result.success) {
-            setReviewStatusBase(issueId, { testStatus: 'testing' });
-            console.log(`[specialists] Dispatched test-agent for ${issueId} after review passed`);
-          } else {
-            setReviewStatusBase(issueId, {
-              testStatus: 'dispatch_failed',
-              testNotes: `Test specialist dispatch failed: ${result.message || result.error}. Deacon will retry.`,
-            });
-            console.log(`[specialists] Test-agent dispatch failed for ${issueId}: ${result.message || result.error}`);
-          }
-        } else {
-          console.warn(`[specialists] Cannot dispatch test-agent for ${issueId}: no project configured`);
-        }
+      if ((alreadyReported ? existingStatus!.reviewStatus : status === 'passed' ? 'passed' : 'blocked') === 'passed') {
+        console.log(`[specialists] ${issueId} review approved; reactive Cloister will dispatch the test role`);
       }
     } else if (name === 'test-agent') {
       const alreadyReported =
@@ -1079,23 +898,28 @@ const postSpecialistAutoCompleteRoute = HttpRouter.add(
         setReviewStatusBase(issueId, {
           testStatus: testPassed ? 'passed' : 'failed',
           testNotes: `Auto-detected: ${status}`,
-          // Set readyForMerge when test passes. Post-rebase verification in
-          // triggerMerge() is the real quality gate, not stale pre-merge verification.
-          // Without this, issues that go through per-project specialists never
-          // transition to readyForMerge (PAN-615).
-          ...(testPassed ? { readyForMerge: true } : {}),
         });
         if (testPassed) {
-          console.log(`[specialists] ${issueId} marked ready for merge after auto-detected test pass`);
+          // Emit test.passed so reactive Cloister dispatches the ship role
+          // (ship sets readyForMerge: true per the PAN-1048 invariant).
+          yield* eventStore.append({
+            type: 'test.passed',
+            timestamp: new Date().toISOString(),
+            payload: { issueId },
+          });
+          console.log(`[specialists] ${issueId} emitted test.passed after auto-detected test pass`);
         }
       }
     }
 
-    yield* eventStore.append({
-      type: 'specialist.completed',
-      timestamp: new Date().toISOString(),
-      payload: { name: name as SpecialistType, issueId },
-    });
+    const eventRole = specialistEventRole(name);
+    if (eventRole) {
+      yield* eventStore.append({
+        type: 'specialist.completed',
+        timestamp: new Date().toISOString(),
+        payload: { name: eventRole, issueId },
+      });
+    }
 
     return jsonResponse({
       success: true,
@@ -1106,46 +930,36 @@ const postSpecialistAutoCompleteRoute = HttpRouter.add(
 );
 
 // ─── Route: GET /api/specialists/:project/:issueId/:type/status ───────────────
+//
+// PAN-1048 review feedback 003 (REQ-16): the legacy specialist-status route
+// returned metadata sourced from ~/.panopticon/specialists/registry.json, which
+// the role-primitive refactor explicitly retires. The startup cleanup in
+// service.ts deletes that directory on every boot; preserving the read path
+// would silently recreate it via getRunMetadata() → loadRegistry()/saveRegistry().
+//
+// The route is now a 410 Gone with a pointer to the role-aware status surface.
+// The frontend's only caller (AgentOutputPanel) only fires when
+// parseSpecialistSession(agentId) matches the legacy `specialist-…` session
+// naming, which the new role spawns no longer use, so the dead-letter response
+// is invisible to current dashboards.
 
 const getProjectSpecialistStatusRoute = HttpRouter.add(
   'GET',
   '/api/specialists/:project/:issueId/:type/status',
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
-    const project = params['project'] as string;
-    const issueId = params['issueId'] as string;
-    const type = params['type'] as string;
-
-    if (!validateSpecialistType(type)) {
-      return jsonResponse(
-        { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
-        { status: 400 },
-      );
-    }
-
-    const {
-      makeSpecialistRegistryKey,
-      getRunMetadata,
-      getTmuxSessionName,
-      isProjectSpecialistActivelyRunning,
-    } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const { getAgentRuntimeStateAsync } = yield* Effect.promise(() => import('../../../lib/agents.js'));
-
-    const registryKey = makeSpecialistRegistryKey(type, issueId);
-    const metadata = getRunMetadata(project, registryKey);
-    const tmuxSession = metadata.tmuxSession ?? getTmuxSessionName(type, project, issueId);
-    const runtimeState = yield* Effect.promise(() => getAgentRuntimeStateAsync(tmuxSession));
-    const isRunning = isProjectSpecialistActivelyRunning(runtimeState, metadata.currentRun !== null);
-
-    return jsonResponse({
-      name: type,
-      state: isRunning ? 'active' : 'sleeping',
-      isRunning,
-      tmuxSession,
-      currentIssue: issueId,
-      sessionId: metadata.sessionId,
-      contextTokens: undefined,
-    });
+    return jsonResponse(
+      {
+        error: 'specialist-status route retired',
+        hint: 'Specialist identity is replaced by the role primitive. Use GET /api/agents and read the role/status fields off the AgentSnapshot for the role-scoped session (e.g. agent-pan-509-review).',
+        retiredFor: {
+          project: params['project'],
+          issueId: params['issueId'],
+          type: params['type'],
+        },
+      },
+      { status: 410 },
+    );
   })),
 );
 
@@ -1160,7 +974,7 @@ const postProjectSpecialistKillRoute = HttpRouter.add(
     const issueId = params['issueId'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1174,8 +988,8 @@ const postProjectSpecialistKillRoute = HttpRouter.add(
     const tmuxSession = getRunMetadata(project, registryKey).tmuxSession
       ?? getTmuxSessionName(type, project, issueId);
 
-    yield* Effect.promise(() => killSessionAsync(tmuxSession).catch(() => {}));
-    // Do NOT clearSessionId — the Claude session persists and should be resumed on next dispatch
+    yield* Effect.promise(() => Effect.runPromise(killSession(tmuxSession)).catch(() => {}));
+    // Leave Claude JSONL/session artifacts intact; only reset Panopticon runtime state.
     saveAgentRuntimeState(tmuxSession, {
       state: 'idle',
       lastActivity: new Date().toISOString(),
@@ -1188,50 +1002,20 @@ const postProjectSpecialistKillRoute = HttpRouter.add(
 );
 
 // ─── Route: POST /api/specialists/:project/:type/spawn ───────────────────────
-
-const postProjectSpecialistSpawnRoute = HttpRouter.add(
-  'POST',
-  '/api/specialists/:project/:type/spawn',
-  httpHandler(Effect.gen(function* () {
-    const params = yield* HttpRouter.params;
-    const project = params['project'] as string;
-    const type = params['type'] as string;
-    const body = yield* readJsonBody;
-    const { issueId, branch, workspace, prUrl, context } = body as {
-      issueId?: string;
-      branch?: string;
-      workspace?: string;
-      prUrl?: string;
-      context?: unknown;
-    };
-
-    if (!issueId) {
-      return jsonResponse({ error: 'issueId is required' }, { status: 400 });
-    }
-
-    if (!validateSpecialistType(type)) {
-      return jsonResponse(
-        { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
-        { status: 400 },
-      );
-    }
-
-    const { spawnEphemeralSpecialist } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const result = yield* Effect.promise(() => spawnEphemeralSpecialist(project, type, {
-      issueId,
-      branch,
-      workspace,
-      prUrl,
-      context,
-    }));
-
-    if (result.success) {
-      return jsonResponse(result);
-    } else {
-      return jsonResponse({ error: result.message }, { status: 500 });
-    }
-  })),
-);
+//
+// PAN-1048 R1: removed. The legacy /spawn endpoint dispatched arbitrary
+// "specialist types" (review-agent, test-agent, merge-agent) by issuing a
+// generic spawnEphemeralSpecialist call. Under the role primitive this is
+// expressed as spawnRun(issueId, role, opts) — review/test/ship are first-
+// class roles, not opaque specialist names. The endpoint had no remaining
+// in-tree caller and is replaced by reactive Cloister scheduling on issue
+// state transitions plus the role spawn primitive.
+//
+// Old shape (removed):
+//   POST /api/specialists/:project/:type/spawn { issueId, branch, ... }
+//
+// Replacement: drive role spawns via lifecycle.transitionTo() and the
+// reactive scheduler in src/lib/cloister/service.ts.
 
 // ─── Route: GET /api/specialists/:project/:type/runs ──────────────────────────
 
@@ -1256,8 +1040,8 @@ const getProjectSpecialistRunsRoute = HttpRouter.add(
       if (offsetParam) offset = parseInt(offsetParam, 10);
     }
 
-    const { listRunLogs } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
-    const runs = listRunLogs(project, type, { limit, offset });
+    const { listRunLogsSync } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
+    const runs = listRunLogsSync(project, type, { limit, offset });
     return jsonResponse(runs);
   })),
 );
@@ -1367,9 +1151,9 @@ const getProjectSpecialistRunRoute = HttpRouter.add(
     const type = params['type'] as string;
     const runId = params['runId'] as string;
 
-    const { getRunLog, parseLogMetadata } =
+    const { getRunLogSync, parseLogMetadata } =
       yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
-    const content = getRunLog(project, type, runId);
+    const content = getRunLogSync(project, type, runId);
 
     if (!content) {
       return jsonResponse({ error: 'Run log not found' }, { status: 404 });
@@ -1390,7 +1174,7 @@ const postProjectSpecialistRunTerminateRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1413,7 +1197,7 @@ const postProjectSpecialistGracePauseRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1444,7 +1228,7 @@ const postProjectSpecialistGraceResumeRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1475,7 +1259,7 @@ const postProjectSpecialistGraceExitRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1501,7 +1285,7 @@ const getProjectSpecialistGraceRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1585,7 +1369,7 @@ const postProjectSpecialistCompleteRoute = HttpRouter.add(
       );
     }
 
-    if (!validateSpecialistType(type)) {
+    if (!validateSpecialistAgentName(type)) {
       return jsonResponse(
         { error: 'Invalid specialist type. Must be review-agent, test-agent, or merge-agent' },
         { status: 400 },
@@ -1594,7 +1378,7 @@ const postProjectSpecialistCompleteRoute = HttpRouter.add(
 
     const { signalSpecialistCompletion } =
       yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    signalSpecialistCompletion(project, type, { status, notes }, issueId);
+    signalSpecialistCompletion(project, type, { status: status as 'passed' | 'failed' | 'blocked', notes }, issueId);
     return jsonResponse({
       success: true,
       message: 'Specialist completion signaled, grace period started',
@@ -1645,11 +1429,11 @@ const postProjectSpecialistLogsCleanupRoute = HttpRouter.add(
     const project = params['project'] as string;
     const type = params['type'] as string;
 
-    const { cleanupOldLogs } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
+    const { cleanupOldLogsSync } = yield* Effect.promise(() => import('../../../lib/cloister/specialist-logs.js'));
     const { getSpecialistRetention } = yield* Effect.promise(() => import('../../../lib/projects.js'));
 
     const retention = getSpecialistRetention(project);
-    const deleted = cleanupOldLogs(project, type, retention);
+    const deleted = cleanupOldLogsSync(project, type, { maxDays: retention.max_days, maxRuns: retention.max_runs });
 
     return jsonResponse({
       success: true,
@@ -1670,21 +1454,139 @@ const postProjectSpecialistResetSessionRoute = HttpRouter.add(
     const params = yield* HttpRouter.params;
     const projectKey = params['project'] ?? '';
     const name = params['name'] ?? '';
-
-    const { bumpSessionGeneration } = yield* Effect.promise(() => import('../../../lib/cloister/specialists.js'));
-    const specialistType = name as any;
-    const newGen = bumpSessionGeneration(specialistType, projectKey);
-
-    // Also kill the tmux session so it doesn't linger with old context.
-    // NOTE: try/catch does NOT work with yield* in Effect.gen — use .catch() in the Promise chain.
-    const tmuxSession = `specialist-${projectKey}-${name}`;
-    yield* Effect.promise(() =>
-      killSessionAsync(tmuxSession)
-        .catch(() => { /* no session to kill */ })
+    return jsonResponse(
+      { error: `Legacy specialist session rotation is no longer supported for ${projectKey}/${name}.` },
+      { status: 410 },
     );
+  })),
+);
 
-    console.log(`[specialist] Reset session for ${projectKey}/${name} → generation ${newGen}`);
-    return jsonResponse({ success: true, specialist: name, project: projectKey, generation: newGen });
+// ─── Route: POST /api/specialists/:project/:issueId/review/restart ───────────
+// Kills all reviewer tmux sessions + coordinator, then dispatches a fresh review.
+
+const postProjectReviewRestartRoute = HttpRouter.add(
+  'POST',
+  '/api/specialists/:project/:issueId/review/restart',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const project = params['project'] as string;
+    const issueId = params['issueId'] as string;
+    const body = yield* readJsonBody;
+    const { model } = body as { model?: string };
+
+    const { killAllReviewerSessions } = yield* Effect.promise(
+      () => import('../../../lib/cloister/review-agent.js'),
+    );
+    const killResult = yield* killAllReviewerSessions(project, issueId);
+
+    // Resolve workspace info for re-dispatch
+    const projectConfig = resolveProjectFromIssueSync(issueId);
+    if (!projectConfig) {
+      return jsonResponse({ error: `Cannot resolve project for ${issueId}` }, { status: 404 });
+    }
+    const workspacePath = join(projectConfig.projectPath, 'workspaces', `feature-${issueId.toLowerCase()}`);
+    if (!existsSync(workspacePath)) {
+      return jsonResponse({ error: `Workspace not found: ${workspacePath}` }, { status: 404 });
+    }
+
+    // Detect branch
+    let branch = 'unknown';
+    try {
+      const { stdout } = yield* Effect.promise(() => execAsync(
+        `cd "${workspacePath}" && git branch --show-current`,
+        { encoding: 'utf-8', timeout: 5000 },
+      ));
+      branch = stdout.trim() || 'unknown';
+    } catch { /* non-fatal */ }
+
+    // PAN-1048 R3: review now spawns through the role primitive.
+    const { spawnReviewRoleForIssue } = yield* Effect.promise(
+      () => import('../../../lib/cloister/review-agent.js'),
+    );
+    const prUrl = getReviewStatusSync(issueId)?.prUrl;
+    const result = yield* Effect.promise(() => spawnReviewRoleForIssue({
+      issueId,
+      workspace: workspacePath,
+      branch,
+      prUrl,
+      model,
+    }));
+
+    return jsonResponse({
+      success: result.success,
+      message: result.message,
+      killed: killResult.killed,
+      model: model ?? undefined,
+    });
+  })),
+);
+
+// ─── Route: POST /api/specialists/:project/:issueId/reviewer/:role/restart ───
+//
+// PAN-1048 review feedback 005 (C5): the per-reviewer restart endpoint is
+// retired. The role primitive launches the four code-review-* sub-agents in a
+// single review-role run via the Agent tool — there is no longer a per-axis
+// tmux session to restart, no `pan-review-agent` shell to relaunch, and no
+// per-reviewer prompt file to feed back in. Returning 410 with a pointer to
+// the supported restart surface keeps any frontend cache/intent that still
+// hits this URL from silently re-establishing the legacy machinery.
+
+const postProjectReviewerRoleRestartRoute = HttpRouter.add(
+  'POST',
+  '/api/specialists/:project/:issueId/reviewer/:role/restart',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    return jsonResponse(
+      {
+        error: 'per-reviewer restart route retired',
+        hint: 'The review role launches all four code-review-* sub-agents in a single run via the Agent tool. To re-run a review, POST /api/review/:issueId/trigger (full review restart through spawnReviewRoleForIssue), which dispatches role: review and re-fans-out the convoy.',
+        retiredFor: {
+          project: params['project'],
+          issueId: params['issueId'],
+          role: params['role'],
+        },
+      },
+      { status: 410 },
+    );
+  })),
+);
+
+// ─── Route: GET /api/models/resolve ──────────────────────────────────────────
+// Returns the resolved default model for each session/work type.
+
+const getModelsResolveRoute = HttpRouter.add(
+  'GET',
+  '/api/models/resolve',
+  httpHandler(Effect.gen(function* () {
+    const { loadConfigSync, resolveModel } = yield* Effect.promise(
+      () => import('../../../lib/config-yaml.js'),
+    );
+    const config = loadConfigSync().config;
+
+    const routes = [
+      { key: 'role:plan', role: 'plan' },
+      { key: 'role:work', role: 'work' },
+      { key: 'role:work.inspect', role: 'work', subRole: 'inspect' },
+      { key: 'role:work.inspect-deep', role: 'work', subRole: 'inspect-deep' },
+      { key: 'role:review', role: 'review' },
+      { key: 'role:review.correctness', role: 'review', subRole: 'correctness' },
+      { key: 'role:review.security', role: 'review', subRole: 'security' },
+      { key: 'role:review.performance', role: 'review', subRole: 'performance' },
+      { key: 'role:review.requirements', role: 'review', subRole: 'requirements' },
+      { key: 'role:test', role: 'test' },
+      { key: 'role:ship', role: 'ship' },
+    ] as const;
+
+    const resolved: Record<string, string | null> = {};
+    for (const route of routes) {
+      try {
+        resolved[route.key] = resolveModel(route.role, (route as { subRole?: string }).subRole, config);
+      } catch {
+        resolved[route.key] = null;
+      }
+    }
+
+    return jsonResponse(resolved);
   })),
 );
 
@@ -1713,9 +1615,9 @@ export const specialistsRouteLayer = Layer.mergeAll(
   postSpecialistAutoCompleteRoute,
 
   // ── Per-project /api/specialists/:project/:type/* routes ──
+  // PAN-1048 R1: postProjectSpecialistSpawnRoute removed (see above).
   getProjectSpecialistStatusRoute,
   postProjectSpecialistKillRoute,
-  postProjectSpecialistSpawnRoute,
   getProjectSpecialistRunsRoute,
   getProjectSpecialistRunStreamRoute,       // /runs/:runId/stream — before /runs/:runId
   getProjectSpecialistRunRoute,             // /runs/:runId
@@ -1730,6 +1632,9 @@ export const specialistsRouteLayer = Layer.mergeAll(
   getProjectSpecialistLatestLogRoute,       // /latest-log
   postProjectSpecialistLogsCleanupRoute,    // /logs/cleanup
   postProjectSpecialistResetSessionRoute,  // /reset-session
+  postProjectReviewRestartRoute,           // /:project/:issueId/review/restart
+  postProjectReviewerRoleRestartRoute,     // /:project/:issueId/reviewer/:role/restart
+  getModelsResolveRoute,                   // /models/resolve
 );
 
 export default specialistsRouteLayer;

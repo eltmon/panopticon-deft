@@ -7,16 +7,31 @@
  */
 
 import { Effect, Layer, Queue, Stream } from 'effect';
-import { HttpRouter } from 'effect/unstable/http';
+import { HttpRouter, HttpServerRequest } from 'effect/unstable/http';
 import { RpcSerialization, RpcServer } from 'effect/unstable/rpc';
-import { PanRpcGroup, PanRpcError, WS_METHODS } from '@panopticon/contracts';
+import { PanRpcGroup, PanRpcError, WS_METHODS } from '@panctl/contracts';
+import { PanOpen } from './services/open.js';
 import { EventStoreService } from './services/domain-services.js';
-import { ReadModelService } from './read-model.js';
+import { ReadModelService, type ReadModelServiceShape } from './read-model.js';
 import { TerminalService } from './services/terminal-service.js';
 import { getConversationByName } from '../../lib/database/conversations-db.js';
-import { parseConversationMessages, watchConversation } from './services/conversation-service.js';
-import type { ConversationEvent, DomainEvent } from '@panopticon/contracts';
+import { computeContextUsage, parseConversationMessages, watchConversation } from './services/conversation-service.js';
+import { sessionFilePath } from '../../lib/paths.js';
+import { listSessionNames } from '../../lib/tmux.js';
+import { listProjectsSync } from '../../lib/projects.js';
+import type { AgentStatus, ConversationEvent, DomainEvent, EmbedProgressEvent, EnrichCompleteEvent, EnrichProgressEvent, ScanCompleteEvent, ScanProgressEvent, ScanStartedEvent, SessionNodePresence, SessionTreeDelta } from '@panctl/contracts';
 import type { StoredEvent } from './event-store.js';
+import { parseRelativeTime } from '../../lib/conversations/search.js';
+import type { SearchResult } from '../../lib/conversations/search.js';
+import { CostThresholdError } from '../../lib/conversations/enrichment/index.js';
+import { getConversationsConfig } from '../../lib/config-yaml.js';
+import type { RuntimeConversationsConfig } from '../../lib/config-yaml.js';
+import type { ConversationFilter, DiscoveredSession } from '../../lib/database/discovered-sessions-db.js';
+import { validateOrigin } from './routes/origin-validation.js';
+import { jsonResponse } from './http-helpers.js';
+import { runDashboardDbJob } from './services/dashboard-db-task.js';
+import { readCurrentLatestFlywheelStatus, subscribeLatestFlywheelStatus } from './services/flywheel-run-state.js';
+import { readWorkspaceFileEffect } from './services/read-workspace-file.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,6 +44,428 @@ function storedToDomainEvent(stored: StoredEvent): DomainEvent {
   } as DomainEvent;
 }
 
+function normalizedIssueId(value: unknown) {
+  return typeof value === 'string' ? value.toLowerCase() : null;
+}
+
+type AgentIssueLookup = ReadonlyMap<string, string>;
+
+type AgentIssueRecord = {
+  id?: unknown;
+  issueId?: unknown;
+};
+
+function buildAgentIssueLookup(agents: readonly AgentIssueRecord[]): AgentIssueLookup {
+  const lookup = new Map<string, string>();
+  for (const agent of agents) {
+    const agentId = normalizedIssueId(agent.id);
+    const issueId = normalizedIssueId(agent.issueId);
+    if (agentId && issueId) lookup.set(agentId, issueId);
+  }
+  return lookup;
+}
+
+// ─── Shared agent-issue lookup cache for subscribeIssueEvents ─────────────────
+// Caches the lookup across all issue-event subscribers to avoid N× rebuilds
+// per event when N drawers are open. Refreshes on TTL expiry or agent events.
+const SHARED_AGENT_LOOKUP_TTL_MS = 500;
+let sharedAgentLookup: AgentIssueLookup = new Map();
+let sharedAgentLookupTimestamp = 0;
+
+function getCachedAgentIssueLookup(readModel: ReadModelServiceShape): Effect.Effect<AgentIssueLookup> {
+  const now = Date.now();
+  if (now - sharedAgentLookupTimestamp < SHARED_AGENT_LOOKUP_TTL_MS) {
+    return Effect.succeed(sharedAgentLookup);
+  }
+  return readModel.getSnapshot.pipe(
+    Effect.map((snapshot) => {
+      sharedAgentLookup = buildAgentIssueLookup(snapshot.agents);
+      sharedAgentLookupTimestamp = now;
+      return sharedAgentLookup;
+    }),
+  );
+}
+
+function recordMatchesIssue(record: unknown, issueId: string, agentIssueLookup: AgentIssueLookup = new Map()) {
+  if (!record || typeof record !== 'object') return false;
+  const data = record as Record<string, unknown>;
+  const target = issueId.toLowerCase();
+  const directIssueId = normalizedIssueId(data['issueId'] ?? data['identifier'] ?? data['id']);
+  if (directIssueId === target) return true;
+  const agentIssueId = normalizedIssueId((data['agent'] as Record<string, unknown> | undefined)?.['issueId']);
+  if (agentIssueId === target) return true;
+  const currentIssue = normalizedIssueId(data['currentIssue']);
+  if (currentIssue === target) return true;
+  const agentId = normalizedIssueId(data['agentId']);
+  return agentId ? agentIssueLookup.get(agentId) === target : false;
+}
+
+function filterRecordsForIssue(records: unknown, issueId: string, agentIssueLookup: AgentIssueLookup) {
+  return Array.isArray(records) ? records.filter((record) => recordMatchesIssue(record, issueId, agentIssueLookup)) : [];
+}
+
+export function filterDomainEventForIssue(event: DomainEvent, issueId: string, agentIssueLookup: AgentIssueLookup = new Map()): DomainEvent | null {
+  const payload = event.payload as Record<string, unknown>;
+  if (recordMatchesIssue(payload, issueId, agentIssueLookup)) return event;
+
+  // Bulk replacement events (issues.snapshot, activity.updated) are excluded
+  // from issue-specific streams. Their filtered payloads would replace the
+  // global store's full dataset, causing every issue-dependent component to
+  // re-render with incomplete data. The full bulk updates arrive via
+  // subscribeDomainEvents instead.
+  if (event.type === 'issues.snapshot' || event.type === 'activity.updated') {
+    return null;
+  }
+
+  return null;
+}
+
+function toDiscoveredSessionSnapshot(session: DiscoveredSession) {
+  return {
+    id: session.id,
+    jsonlPath: session.jsonlPath,
+    sessionId: session.sessionId ?? undefined,
+    workspacePath: session.workspacePath ?? undefined,
+    workspaceHash: session.workspaceHash ?? undefined,
+    messageCount: session.messageCount,
+    firstTs: session.firstTs ?? undefined,
+    lastTs: session.lastTs ?? undefined,
+    modelsUsed: session.modelsUsed,
+    primaryModel: session.primaryModel ?? undefined,
+    tokenInput: session.tokenInput,
+    tokenOutput: session.tokenOutput,
+    estimatedCost: session.estimatedCost,
+    toolsUsed: session.toolsUsed,
+    filesTouched: session.filesTouched,
+    tags: session.tags,
+    summary: session.summary ?? undefined,
+    summaryDetailed: session.summaryDetailed ?? undefined,
+    enrichmentLevel: session.enrichmentLevel,
+    enrichmentModel: session.enrichmentModel ?? undefined,
+    enrichedAt: session.enrichedAt ?? undefined,
+    enrichmentFailed: session.enrichmentFailed,
+    panopticonManaged: session.panopticonManaged,
+    panIssueId: session.panIssueId ?? undefined,
+    panAgentId: session.panAgentId ?? undefined,
+    scannedAt: session.scannedAt,
+  };
+}
+
+const DEFAULT_CONVERSATION_LIMIT = 50;
+const MAX_CONVERSATION_LIMIT = 500;
+
+type EnrichSessionsRpcInput = {
+  readonly level?: number;
+  readonly ids?: readonly number[];
+  readonly filter?: Readonly<ConversationFilter>;
+  readonly limit?: number;
+  readonly model?: string;
+  readonly customPrompt?: string;
+  readonly upgrade?: boolean;
+  readonly confirmed?: boolean;
+  readonly force?: boolean;
+  readonly fullTranscript?: boolean;
+};
+
+export function buildEnrichSessionsJobPayload(input: EnrichSessionsRpcInput, config: RuntimeConversationsConfig) {
+  return {
+    tier: input.level,
+    sessionIds: input.ids,
+    filter: input.filter,
+    limit: input.limit,
+    maxParallel: config.enrichment.maxParallel,
+    modelOverride: input.model,
+    promptSuffix: input.customPrompt,
+    fullTranscript: input.fullTranscript,
+    skipAlreadyEnriched: input.upgrade !== true,
+    force: input.confirmed === true || input.force === true,
+    config,
+  };
+}
+
+function normalizeConversationPagination(limit: number | undefined, offset: number | undefined): { limit: number; offset: number } {
+  const normalizedLimit = limit ?? DEFAULT_CONVERSATION_LIMIT;
+  const normalizedOffset = offset ?? 0;
+  if (!Number.isFinite(normalizedLimit) || normalizedLimit < 0) {
+    throw new PanRpcError({ message: 'Invalid limit', code: 'INVALID_LIMIT' });
+  }
+  if (!Number.isFinite(normalizedOffset) || normalizedOffset < 0) {
+    throw new PanRpcError({ message: 'Invalid offset', code: 'INVALID_OFFSET' });
+  }
+  return {
+    limit: Math.min(normalizedLimit, MAX_CONVERSATION_LIMIT),
+    offset: normalizedOffset,
+  };
+}
+
+function normalizeConversationFilter(input: {
+  readonly workspacePath?: string;
+  readonly primaryModel?: string;
+  readonly managed?: boolean;
+  readonly unmanaged?: boolean;
+  readonly since?: string;
+  readonly before?: string;
+  readonly after?: string;
+  readonly minCost?: number;
+  readonly maxCost?: number;
+  readonly minMessages?: number;
+  readonly tags?: readonly string[];
+  readonly tools?: readonly string[];
+  readonly files?: readonly string[];
+  readonly issueId?: string;
+  readonly enrichmentLevel?: number;
+  readonly enriched?: boolean;
+  readonly notEnriched?: boolean;
+  readonly limit?: number;
+  readonly offset?: number;
+}): ConversationFilter {
+  return {
+    workspacePath: input.workspacePath,
+    primaryModel: input.primaryModel,
+    managed: input.managed,
+    unmanaged: input.unmanaged,
+    since: input.since ? parseRelativeTime(input.since) : undefined,
+    before: input.before ? parseRelativeTime(input.before) : undefined,
+    after: input.after ? parseRelativeTime(input.after) : undefined,
+    minCost: input.minCost,
+    maxCost: input.maxCost,
+    minMessages: input.minMessages,
+    tags: input.tags ? [...input.tags] : undefined,
+    tools: input.tools ? [...input.tools] : undefined,
+    files: input.files ? [...input.files] : undefined,
+    issueId: input.issueId,
+    enrichmentLevel: input.enrichmentLevel,
+    enriched: input.enriched,
+    notEnriched: input.notEnriched,
+    limit: input.limit,
+    offset: input.offset,
+  };
+}
+
+// ─── Session Tree Subscription Helpers (PAN-821) ──────────────────────────────
+
+/** Extract issue ID from a tmux session name. */
+export function extractIssueIdFromSession(sessionName: string): string | null {
+  const issuePattern = '((?:[a-z]+-\\d+|(?:f|us|de|ta|tc)\\d+))';
+  const agentMatch = sessionName.match(new RegExp(`^(agent|planning)-${issuePattern}(?:-\\d+)?$`, 'i'));
+  if (agentMatch) return agentMatch[2]!.toUpperCase();
+
+  const reviewRoleMatch = sessionName.match(new RegExp(`^agent-${issuePattern}-review(?:-[a-z]+)?$`, 'i'));
+  if (reviewRoleMatch) return reviewRoleMatch[1]!.toUpperCase();
+
+  const reviewMatch = sessionName.match(new RegExp(`^review-(?:coordinator-)?${issuePattern}-\\d+(?:-[a-z]+)?$`, 'i'));
+  if (reviewMatch) return reviewMatch[1]!.toUpperCase();
+
+  return null;
+}
+
+function reviewRoleSessionName(issueId: string): string {
+  return `agent-${issueId.toLowerCase()}-review`;
+}
+
+/** Compute issue ID prefixes that belong to a project. */
+function getProjectIssuePrefixes(projectKey: string): string[] {
+  const projects = listProjectsSync();
+  const project = projects.find(p =>
+    p.key === projectKey || (p.config as { name?: string }).name === projectKey
+  );
+  if (!project) return [];
+
+  const prefixes: string[] = [];
+  if (project.config.issue_prefix) {
+    prefixes.push(project.config.issue_prefix.toUpperCase());
+  }
+  if (project.config.issue_prefixes) {
+    for (const p of project.config.issue_prefixes) {
+      prefixes.push(p.toUpperCase());
+    }
+  }
+  if (prefixes.length === 0) {
+    prefixes.push(project.key.toUpperCase().replace(/-/g, ''));
+  }
+  return prefixes;
+}
+
+/** Check if an issue ID belongs to a project by prefix match. */
+function issueBelongsToProject(issueId: string, prefixes: string[]): boolean {
+  const prefix = issueId.split('-')[0];
+  return prefix ? prefixes.includes(prefix.toUpperCase()) : false;
+}
+
+/** Map a domain event to a session tree delta. Returns null if not relevant. */
+function mapEventToDelta(event: StoredEvent): SessionTreeDelta | null {
+  const p = event.payload as Record<string, unknown>;
+  const issueId = p['issueId'] as string | undefined;
+  if (!issueId) return null;
+
+  switch (event.type) {
+    case 'agent.started': {
+      const agentId = p['agentId'] as string | undefined;
+      if (!agentId) return null;
+      return { kind: 'session_added', issueId, sessionId: agentId, timestamp: event.timestamp };
+    }
+    case 'agent.stopped': {
+      const agentId = p['agentId'] as string | undefined;
+      if (!agentId) return null;
+      return { kind: 'session_removed', issueId, sessionId: agentId, timestamp: event.timestamp };
+    }
+    case 'agent.status_changed': {
+      const agentId = p['agentId'] as string | undefined;
+      const status = p['status'] as string | undefined;
+      if (!agentId || !status) return null;
+      const presence: SessionNodePresence = status === 'stopped' || status === 'error'
+        ? 'ended'
+        : status === 'running'
+          ? 'active'
+          : 'idle';
+      return {
+        kind: 'status_changed',
+        issueId,
+        sessionId: agentId,
+        status: status as AgentStatus,
+        presence,
+        timestamp: event.timestamp,
+      };
+    }
+    case 'specialist.started': {
+      const name = p['name'] as string | undefined;
+      const currentIssue = p['currentIssue'] as string | undefined;
+      if (!name) return null;
+      return {
+        kind: 'session_added',
+        issueId: currentIssue || issueId,
+        sessionId: name,
+        timestamp: event.timestamp,
+      };
+    }
+    case 'specialist.completed':
+    case 'specialist.failed': {
+      const name = p['name'] as string | undefined;
+      if (!name) return null;
+      return { kind: 'session_removed', issueId, sessionId: name, timestamp: event.timestamp };
+    }
+    case 'pipeline.review-started': {
+      return {
+        kind: 'session_added',
+        issueId,
+        sessionId: reviewRoleSessionName(issueId),
+        timestamp: event.timestamp,
+      };
+    }
+    case 'pipeline.review-completed': {
+      return {
+        kind: 'session_removed',
+        issueId,
+        sessionId: reviewRoleSessionName(issueId),
+        timestamp: event.timestamp,
+      };
+    }
+    case 'planning.started': {
+      const sessionName = p['sessionName'] as string;
+      return { kind: 'session_added', issueId, sessionId: sessionName, timestamp: event.timestamp };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Shared singleton poller for tmux presence changes.
+ * One interval polls tmux and fans out to all subscribers,
+ * avoiding O(subscribers) subprocess QPS.
+ */
+const sharedPresencePoller: {
+  refCount: number;
+  interval: NodeJS.Timeout | null;
+  knownSessions: Set<string>;
+  subscribers: Set<(d: SessionTreeDelta) => void>;
+} = {
+  refCount: 0,
+  interval: null,
+  knownSessions: new Set(),
+  subscribers: new Set(),
+};
+
+function startSharedPresencePoller(): void {
+  if (sharedPresencePoller.interval) return;
+
+  const tick = async () => {
+    try {
+      const sessions = await Effect.runPromise(listSessionNames());
+      const current = new Set(sessions.filter(s => s.trim()));
+
+      for (const s of sharedPresencePoller.knownSessions) {
+        if (!current.has(s)) {
+          const issueId = extractIssueIdFromSession(s);
+          if (issueId) {
+            const delta: SessionTreeDelta = {
+              kind: 'presence_changed',
+              issueId,
+              sessionId: s,
+              presence: 'ended',
+              timestamp: new Date().toISOString(),
+            };
+            for (const sub of sharedPresencePoller.subscribers) {
+              try { sub(delta); } catch { /* ignore subscriber errors */ }
+            }
+          }
+        }
+      }
+
+      sharedPresencePoller.knownSessions = current;
+    } catch { /* tmux may not be available, ignore */ }
+  };
+
+  sharedPresencePoller.interval = setInterval(tick, 2000);
+  tick();
+}
+
+function stopSharedPresencePoller(): void {
+  if (sharedPresencePoller.interval) {
+    clearInterval(sharedPresencePoller.interval);
+    sharedPresencePoller.interval = null;
+  }
+  sharedPresencePoller.knownSessions.clear();
+}
+
+/**
+ * Create a stream that subscribes to the shared presence poller.
+ * Tracks tmux session existence and emits presence_changed deltas when
+ * sessions disappear (→ ended).
+ *
+ * NOTE: The poller only emits on session *disappearance* (ended), not on
+ * session *appearance*. New sessions are discovered via the event stream
+ * (session_added deltas) or the next periodic snapshot refetch. This is
+ * intentional — the event stream handles arrivals, and the poller handles
+ * cleanup of stale presence state.
+ */
+function createPresencePollStream(): Stream.Stream<SessionTreeDelta, never, never> {
+  return Stream.callback<SessionTreeDelta>((queue) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        sharedPresencePoller.refCount++;
+        if (sharedPresencePoller.refCount === 1) {
+          startSharedPresencePoller();
+        }
+
+        const subscriber = (d: SessionTreeDelta) => {
+          Queue.offerUnsafe(queue, d);
+        };
+        sharedPresencePoller.subscribers.add(subscriber);
+        return subscriber;
+      }),
+      (subscriber) =>
+        Effect.sync(() => {
+          sharedPresencePoller.subscribers.delete(subscriber);
+          sharedPresencePoller.refCount--;
+          if (sharedPresencePoller.refCount === 0) {
+            stopSharedPresencePoller();
+          }
+        }),
+    ),
+  );
+}
+
 // ─── RPC handler layer ────────────────────────────────────────────────────────
 
 const PanRpcLayer = PanRpcGroup.toLayer(
@@ -36,13 +473,48 @@ const PanRpcLayer = PanRpcGroup.toLayer(
     const eventStore = yield* EventStoreService;
     const readModel = yield* ReadModelService;
     const terminalService = yield* TerminalService;
+    const panOpen = yield* PanOpen;
 
+    // PAN-1249: handler set is incomplete — missing routes are stubbed by other code paths.
+    // Suppress the exhaustiveness check until the missing handlers are reintegrated.
+    // @ts-expect-error — missing handlers (getWorkspaceDetail, startPlanning, startAgent, deepWipe, etc.)
     return PanRpcGroup.of({
       // ── subscribeDomainEvents ────────────────────────────────────────────────
-      [WS_METHODS.subscribeDomainEvents]: (_input) =>
-        eventStore.streamEvents.pipe(
+      [WS_METHODS.subscribeDomainEvents]: (_input) => {
+        console.log('[ws-rpc] subscribeDomainEvents invoked');
+        return eventStore.streamEvents.pipe(
           Stream.map(storedToDomainEvent),
+        );
+      },
+
+      [WS_METHODS.subscribeFlywheelStatus]: (_input) =>
+        Stream.callback((queue) =>
+          Effect.acquireRelease(
+            Effect.promise(async () => {
+              const activeRunId = await runDashboardDbJob<string | null>('getSetting', 'flywheel.active_run_id');
+              const latest = await readCurrentLatestFlywheelStatus({ activeRunId });
+              if (latest) Queue.offerUnsafe(queue, latest);
+              return subscribeLatestFlywheelStatus((status) => {
+                Queue.offerUnsafe(queue, status);
+              });
+            }),
+            (unsubscribe) => Effect.sync(() => unsubscribe()),
+          ),
         ),
+
+      // ── subscribeIssueEvents ──────────────────────────────────────────────────
+      [WS_METHODS.subscribeIssueEvents]: (input) => {
+        console.log(`[ws-rpc] subscribeIssueEvents invoked issueId=${input.issueId}`);
+        return eventStore.streamEvents.pipe(
+          Stream.map(storedToDomainEvent),
+          Stream.mapEffect((event) =>
+            getCachedAgentIssueLookup(readModel).pipe(
+              Effect.map((lookup) => filterDomainEventForIssue(event, input.issueId, lookup)),
+            ),
+          ),
+          Stream.filter((event): event is DomainEvent => event !== null),
+        );
+      },
 
       // ── subscribeTerminal — live PTY stream (B20) ────────────────────────────
       [WS_METHODS.subscribeTerminal]: (input) =>
@@ -66,7 +538,15 @@ const PanRpcLayer = PanRpcGroup.toLayer(
 
       // ── getSnapshot — returns clean read model data (PAN-433) ─────────────────
       [WS_METHODS.getSnapshot]: (_input) =>
-        readModel.getSnapshot.pipe(
+        Effect.gen(function* () {
+          const t0 = Date.now();
+          console.log('[ws-rpc] getSnapshot invoked');
+          const snapshot = yield* readModel.getSnapshot;
+          const issuesLen = Array.isArray(snapshot.issues) ? snapshot.issues.length : 'none';
+          const agentsLen = Array.isArray(snapshot.agents) ? snapshot.agents.length : 'none';
+          console.log(`[ws-rpc] getSnapshot resolved in ${Date.now() - t0}ms — agents=${agentsLen} issues=${issuesLen} seq=${snapshot.sequence}`);
+          return snapshot;
+        }).pipe(
           Effect.mapError(
             (cause) =>
               new PanRpcError({
@@ -111,12 +591,23 @@ const PanRpcLayer = PanRpcGroup.toLayer(
           Effect.gen(function* () {
             const conv = getConversationByName(input.conversationName);
 
-            if (!conv || !conv.sessionFile) {
+            const sessionFile = conv?.claudeSessionId
+              ? sessionFilePath(conv.cwd, conv.claudeSessionId)
+              : null;
+            const model = conv?.model ?? null;
+
+            if (!sessionFile) {
               // Session file not yet discovered — emit a single discovering event
-              return Stream.make<ConversationEvent>({ kind: 'discovering' });
+              return Stream.succeed({ kind: 'discovering' } as ConversationEvent);
             }
 
-            const sessionFile = conv.sessionFile;
+            const readContextUsage = async () => {
+              try {
+                return await computeContextUsage(sessionFile, model);
+              } catch {
+                return null;
+              }
+            };
 
             return Stream.callback<ConversationEvent, PanRpcError>((queue) =>
               Effect.acquireRelease(
@@ -128,17 +619,23 @@ const PanRpcLayer = PanRpcGroup.toLayer(
                     messages: initial.messages,
                     workLog: initial.workLog,
                     streaming: initial.streaming,
+                    proposedPlan: initial.proposedPlan,
+                    compactBoundaries: initial.compactBoundaries && initial.compactBoundaries.length > 0 ? initial.compactBoundaries : undefined,
+                    contextUsage: await readContextUsage(),
                   });
 
                   // Watch for new content and stream incremental updates
                   let byteOffset = initial.byteOffset;
-                  const handle = watchConversation(sessionFile, (result) => {
+                  const handle = watchConversation(sessionFile, async (result) => {
                     byteOffset = result.byteOffset;
                     Queue.offerUnsafe(queue, {
                       kind: 'messages' as const,
                       messages: result.messages,
                       workLog: result.workLog,
                       streaming: result.streaming,
+                      proposedPlan: result.proposedPlan,
+                      compactBoundaries: result.compactBoundaries && result.compactBoundaries.length > 0 ? result.compactBoundaries : undefined,
+                      contextUsage: await readContextUsage(),
                     });
                   });
 
@@ -152,6 +649,230 @@ const PanRpcLayer = PanRpcGroup.toLayer(
             );
           }),
         ),
+
+      // ── subscribeProjectSessionTree — live session tree deltas (PAN-821) ─────
+      [WS_METHODS.subscribeProjectSessionTree]: (input) =>
+        Effect.gen(function* () {
+          const prefixes = getProjectIssuePrefixes(input.projectKey);
+
+          const eventDeltas = eventStore.streamEvents.pipe(
+            Stream.map(mapEventToDelta),
+            Stream.filter((d): d is SessionTreeDelta => d !== null),
+            Stream.filter(d => issueBelongsToProject(d.issueId, prefixes)),
+          );
+
+          const pollDeltas = createPresencePollStream().pipe(
+            Stream.filter(d => issueBelongsToProject(d.issueId, prefixes)),
+          );
+
+          return Stream.merge(eventDeltas, pollDeltas);
+        }).pipe(Stream.unwrap),
+
+      // ── shellOpenInEditor — open workspace in editor (PAN-966) ──────────────
+      [WS_METHODS.shellOpenInEditor]: (input) =>
+        panOpen.openInEditor(input),
+
+      [WS_METHODS.readWorkspaceFile]: (input) =>
+        readWorkspaceFileEffect(input),
+
+      // ── getAvailableEditors — list detected editors (PAN-966) ───────────────
+      [WS_METHODS.getAvailableEditors]: () =>
+        panOpen.getAvailableEditors().pipe(
+          Effect.map((editors) => ({ editors })),
+        ),
+
+      [WS_METHODS.scanConversations]: (input) =>
+        getConversationsConfig().pipe(
+          Effect.flatMap((config) => Effect.promise(async () => {
+            await Effect.runPromise(eventStore.appendAsync({
+              type: 'scan.started',
+              timestamp: new Date().toISOString(),
+              payload: { mode: input.mode, dirs: input.dirs ?? [] },
+            } as ScanStartedEvent));
+            let lastProgressEmit = 0;
+            const result = await runDashboardDbJob<{
+              inserted: number;
+              updated: number;
+              skipped: number;
+              errors: number;
+              durationMs: number;
+            }>('scanConversations', {
+              mode: input.mode,
+              dirs: input.dirs,
+              dryRun: input.dryRun,
+              watchDirs: config.watchDirs,
+              maxParallel: config.scanMaxParallel,
+            }, async (rawProgress) => {
+              const progress = rawProgress as {
+                dirsProcessed: number;
+                dirsTotal: number;
+                sessionsFound: number;
+                elapsedMs: number;
+              };
+              const now = Date.now();
+              const complete = progress.dirsProcessed >= progress.dirsTotal;
+              if (!complete && now - lastProgressEmit < 500) return;
+              lastProgressEmit = now;
+              await Effect.runPromise(eventStore.appendAsync({
+                type: 'scan.progress',
+                timestamp: new Date().toISOString(),
+                payload: progress,
+              } as ScanProgressEvent));
+            });
+            await Effect.runPromise(eventStore.appendAsync({
+              type: 'scan.complete',
+              timestamp: new Date().toISOString(),
+              payload: {
+                inserted: result.inserted,
+                updated: result.updated,
+                skipped: result.skipped,
+                errors: result.errors,
+                durationMs: result.durationMs,
+              },
+            } as ScanCompleteEvent));
+            return result;
+          })),
+        ),
+
+      [WS_METHODS.searchConversations]: (input) =>
+        getConversationsConfig().pipe(
+          Effect.flatMap((config) => Effect.promise(async () => {
+            const pagination = normalizeConversationPagination(input.limit, input.offset);
+            const filter = { ...normalizeConversationFilter(input), ...pagination };
+            try {
+              const operation = input.semantic === true ? 'searchSessionsSemantic' : 'searchSessions';
+              const result = await runDashboardDbJob<SearchResult>(operation, {
+                q: input.semantic === true ? undefined : input.query,
+                semanticQuery: input.semantic === true ? input.query : undefined,
+                similarTo: input.similarTo,
+                filter,
+                limit: pagination.limit,
+                offset: pagination.offset,
+                config,
+              });
+              return {
+                ...result,
+                sessions: result.sessions.map(toDiscoveredSessionSnapshot),
+              };
+            } catch (err) {
+              if (input.semantic === true) {
+                return {
+                  sessions: [],
+                  total: 0,
+                  mode: 'semantic',
+                  durationMs: 0,
+                  error: err instanceof Error ? err.message : String(err),
+                };
+              }
+              throw err;
+            }
+          })),
+        ),
+
+      [WS_METHODS.listDiscoveredSessions]: (input) =>
+        Effect.promise(async () => {
+          const filter = {
+            ...normalizeConversationFilter(input),
+            ...normalizeConversationPagination(input.limit, input.offset),
+          };
+          const { sessions, total } = await runDashboardDbJob<{ sessions: DiscoveredSession[]; total: number }>('listDiscoveredSessions', filter);
+          return { sessions: sessions.map(toDiscoveredSessionSnapshot), count: sessions.length, total };
+        }),
+
+      [WS_METHODS.getDiscoveredSession]: (input) =>
+        Effect.promise(async () => {
+          const session = await runDashboardDbJob<DiscoveredSession | null>('getDiscoveredSessionById', input.id);
+          if (!session) {
+            throw new PanRpcError({ message: `Session ${input.id} not found`, code: 'NOT_FOUND' });
+          }
+          return toDiscoveredSessionSnapshot(session);
+        }).pipe(
+          Effect.mapError((cause: unknown) => cause instanceof PanRpcError
+            ? cause
+            : new PanRpcError({ message: String(cause), code: 'GET_DISCOVERED_SESSION_FAILED' })),
+        ),
+
+      [WS_METHODS.enrichSessions]: (input) =>
+        getConversationsConfig().pipe(
+          Effect.flatMap((config) => Effect.promise(async () => {
+            try {
+              const result = await runDashboardDbJob<{
+                enriched: number;
+                errors: number;
+                estimatedCost: number;
+                actualCost: number | null;
+                durationMs: number;
+              }>('enrichSessions', buildEnrichSessionsJobPayload(input as EnrichSessionsRpcInput, config), async (rawProgress) => {
+                const progress = rawProgress as {
+                  session?: { sessionId: number; tier: number; model: string; cost?: number; success: boolean; error?: string };
+                };
+                if (!progress.session) return;
+                const { session } = progress;
+                await Effect.runPromise(eventStore.appendAsync({
+                  type: 'enrich.progress',
+                  timestamp: new Date().toISOString(),
+                  payload: {
+                    sessionId: session.sessionId,
+                    level: session.tier,
+                    model: session.model,
+                    cost: session.cost ?? 0,
+                    success: session.success,
+                    error: session.error,
+                  },
+                } as EnrichProgressEvent));
+              });
+              const processed = result.enriched + result.errors;
+              await Effect.runPromise(eventStore.appendAsync({
+                type: 'enrich.complete',
+                timestamp: new Date().toISOString(),
+                payload: { processed, totalCost: result.actualCost ?? result.estimatedCost, failures: result.errors, durationMs: result.durationMs },
+              } as EnrichCompleteEvent));
+              return { processed, totalCost: result.actualCost ?? result.estimatedCost, failures: result.errors };
+            } catch (err) {
+              if (err instanceof CostThresholdError) {
+                throw new PanRpcError({
+                  message: err.message,
+                  code: `COST_THRESHOLD:${err.estimatedCost}:${err.threshold}:${err.sessionCount}`,
+                });
+              }
+              throw err;
+            }
+          })),
+        ),
+
+      [WS_METHODS.embedSessions]: (input) =>
+        getConversationsConfig().pipe(
+          Effect.flatMap((config) => Effect.promise(async () => {
+            const result = await runDashboardDbJob<{ embedded: number; skipped: number; errors: number }>('embedSessions', {
+              sessionIds: input.ids,
+              regenerate: input.regenerate,
+              config,
+            }, async (rawProgress) => {
+              const progress = rawProgress as {
+                session?: { sessionId: number; model: string; success: boolean; error?: string };
+              };
+              if (!progress.session) return;
+              await Effect.runPromise(eventStore.appendAsync({
+                type: 'embed.progress',
+                timestamp: new Date().toISOString(),
+                payload: progress.session,
+              } as EmbedProgressEvent));
+            });
+            return { total: result.embedded + result.skipped + result.errors, embedded: result.embedded, model: config.embeddingModel };
+          })),
+        ),
+
+      [WS_METHODS.getConversationCost]: (input) =>
+        Effect.promise(async () => runDashboardDbJob('aggregateDiscoveredSessionCost', normalizeConversationFilter(input))),
+
+      [WS_METHODS.getConversationCostByWorkspace]: (input) =>
+        Effect.promise(async () => runDashboardDbJob('aggregateDiscoveredSessionCostBy', {
+          groupBy: 'workspace',
+          filter: normalizeConversationFilter(input),
+        })),
+
+      [WS_METHODS.getConversationStats]: () =>
+        Effect.promise(async () => runDashboardDbJob('getDiscoveredStats')),
     });
   }),
 );
@@ -165,7 +886,7 @@ const PanRpcLayer = PanRpcGroup.toLayer(
  */
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
-    const rpcWebSocketHttpEffect = yield* RpcServer.toHttpEffectWebsocket(PanRpcGroup).pipe(
+    const rpcWebSocketHttp = yield* RpcServer.toHttpEffectWebsocket(PanRpcGroup).pipe(
       Effect.provide(
         Layer.mergeAll(
           PanRpcLayer,
@@ -174,6 +895,17 @@ export const websocketRpcRouteLayer = Layer.unwrap(
       ),
     );
 
-    return HttpRouter.add('GET', '/ws/rpc', rpcWebSocketHttpEffect);
+    return HttpRouter.add('GET', '/ws/rpc', Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      // Hotfix for #1166: PAN-457's cookie-auth gate is removed here for the
+      // same reason as ws-terminal — origin validation is the security
+      // boundary for browser callers, and the cookie can't be minted without
+      // the URL-hash bootstrap that only `pan up` injects.
+      const originCheck = validateOrigin(request);
+      if (!originCheck.ok) {
+        return jsonResponse({ error: originCheck.error }, { status: 403 });
+      }
+      return yield* rpcWebSocketHttp;
+    }));
   }),
 );

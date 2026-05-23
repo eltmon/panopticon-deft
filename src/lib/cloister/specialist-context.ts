@@ -8,16 +8,28 @@
  *   ~/.panopticon/specialists/{projectKey}/{specialistType}/context/latest-digest.md
  */
 
+import { Effect } from 'effect';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { exec } from 'child_process';
-import { promisify } from 'util';
 import { getPanopticonHome } from '../paths.js';
-import { getRecentRunLogs, type RunLogEntry } from './specialist-logs.js';
-import { getProject } from '../projects.js';
-import { getModelId } from '../work-type-router.js';
+import { getClaudePermissionFlagsStringSync } from '../claude-permissions.js';
+import type { RunLogEntry } from './specialist-logs.js';
+import { getProjectSync } from '../projects.js';
+import { loadConfigSync as loadYamlConfig, resolveModel } from '../config-yaml.js';
 
-const execAsync = promisify(exec);
+function execAsync(command: string, options: { encoding: 'utf-8'; maxBuffer: number; timeout: number }): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    exec(command, options, (error, stdout = '', stderr = '') => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve({ stdout, stderr });
+    });
+  });
+}
 
 /** Get specialists directory (lazy to support test env overrides) */
 function getSpecialistsDir(): string {
@@ -80,7 +92,7 @@ export function loadContextDigest(projectKey: string, specialistType: string): s
  * @returns Number of runs to include (default: 5)
  */
 function getContextRunsCount(projectKey: string): number {
-  const project = getProject(projectKey);
+  const project = getProjectSync(projectKey);
   return project?.specialists?.context_runs ?? 5;
 }
 
@@ -93,36 +105,32 @@ function getContextRunsCount(projectKey: string): number {
  * @param specialistType - Specialist type
  * @returns Model ID to use
  */
+function roleForSpecialist(specialistType: string): { role: 'plan' | 'work' | 'review' | 'test' | 'ship'; subRole?: string } {
+  const normalized = specialistType.replace(/-agent$/, '');
+  if (normalized === 'inspect') return { role: 'work', subRole: 'inspect' };
+  if (normalized === 'review') return { role: 'review' };
+  if (normalized === 'test' || normalized === 'uat') return { role: 'test' };
+  if (normalized === 'merge' || normalized === 'ship') return { role: 'ship' };
+  if (normalized === 'planning' || normalized === 'plan') return { role: 'plan' };
+  return { role: 'work' };
+}
+
 function getDigestModel(projectKey: string, specialistType: string): string {
-  const project = getProject(projectKey);
+  const project = getProjectSync(projectKey);
 
   // Check for explicit digest model in project config
   if (project?.specialists?.digest_model) {
     return project.specialists.digest_model;
   }
 
-  // Fall back to specialist's model
   try {
-    const workTypeId = `specialist-${specialistType}` as any;
-    return getModelId(workTypeId);
+    const { role, subRole } = roleForSpecialist(specialistType);
+    return resolveModel(role, subRole, loadYamlConfig().config);
   } catch (error) {
     // Default to Sonnet if can't resolve
     return 'claude-sonnet-4-6';
   }
-}
-
-/**
- * Generate a context digest from recent runs using AI
- *
- * Creates an AI-generated summary of recent specialist runs to provide
- * context for the next run. This includes patterns, learnings, and common issues.
- *
- * @param projectKey - Project identifier
- * @param specialistType - Specialist type
- * @param options - Generation options
- * @returns Generated digest or null if generation failed
- */
-export async function generateContextDigest(
+}async function generateContextDigestPromise(
   projectKey: string,
   specialistType: string,
   options: {
@@ -135,6 +143,7 @@ export async function generateContextDigest(
 
   // Get recent runs
   const runCount = options.runCount ?? getContextRunsCount(projectKey);
+  const { getRecentRunLogs } = await import('./specialist-logs.js');
   const recentRuns = getRecentRunLogs(projectKey, specialistType, runCount);
 
   if (recentRuns.length === 0 && !options.force) {
@@ -147,7 +156,7 @@ export async function generateContextDigest(
   const model = options.model ?? getDigestModel(projectKey, specialistType);
 
   try {
-    console.log(`[specialist-context] Generating digest for ${projectKey}/${specialistType} using ${model}...`);
+    console.log(`[claude-invoke] purpose=specialist-digest | model=${model} | source=specialist-context.ts:generateContextDigest | project=${projectKey} | specialist=${specialistType} | promptChars=${prompt.length}`);
 
     // Use Claude Code CLI to generate digest
     // Write prompt to temp file to avoid shell escaping issues
@@ -161,10 +170,11 @@ export async function generateContextDigest(
 
     // Run Claude Code with the prompt (include provider env vars for non-Anthropic models)
     const { getProviderEnvForModel } = await import('../agents.js');
-    const providerEnv = getProviderEnvForModel(model);
+    const providerEnv = await getProviderEnvForModel(model);
     const envPrefix = Object.entries(providerEnv).map(([k, v]) => `${k}="${v}"`).join(' ');
+    const permissionFlags = getClaudePermissionFlagsStringSync();
     const { stdout, stderr } = await execAsync(
-      `${envPrefix ? envPrefix + ' ' : ''}claude --dangerously-skip-permissions --permission-mode bypassPermissions --model ${model} "$(cat '${promptFile}')"`,
+      `${envPrefix ? envPrefix + ' ' : ''}claude ${permissionFlags} --model ${model} "$(cat '${promptFile}')"`,
       {
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024, // 10MB buffer
@@ -180,13 +190,13 @@ export async function generateContextDigest(
     }
 
     if (stderr && !stderr.includes('warning')) {
-      console.error(`[specialist-context] Claude stderr:`, stderr);
+      console.error(`[claude-invoke] STDERR purpose=specialist-digest | model=${model} | project=${projectKey} | specialist=${specialistType} | stderr="${stderr.slice(0, 200)}"`);
     }
 
     const digest = stdout.trim();
 
     if (!digest) {
-      console.error(`[specialist-context] Empty digest generated`);
+      console.error(`[claude-invoke] FAILED purpose=specialist-digest | model=${model} | project=${projectKey} | specialist=${specialistType} | error="empty output"`);
       return null;
     }
 
@@ -194,10 +204,10 @@ export async function generateContextDigest(
     const digestPath = getContextDigestPath(projectKey, specialistType);
     writeFileSync(digestPath, digest, 'utf-8');
 
-    console.log(`[specialist-context] Generated digest (${digest.length} chars)`);
+    console.log(`[claude-invoke] SUCCESS purpose=specialist-digest | model=${model} | project=${projectKey} | specialist=${specialistType} | outputChars=${digest.length}`);
     return digest;
   } catch (error: any) {
-    console.error(`[specialist-context] Failed to generate digest:`, error.message);
+    console.error(`[claude-invoke] FAILED purpose=specialist-digest | model=${model} | project=${projectKey} | specialist=${specialistType} | error="${error.message}"`);
     // Degrade gracefully - return null so specialist can continue without context
     return null;
   }
@@ -216,7 +226,7 @@ function buildDigestPrompt(
   specialistType: string,
   recentRuns: RunLogEntry[]
 ): string {
-  const project = getProject(projectKey);
+  const project = getProjectSync(projectKey);
   const projectName = project?.name || projectKey;
 
   let prompt = `You are analyzing the recent history of a ${specialistType} specialist for the ${projectName} project.
@@ -295,22 +305,11 @@ Generate a context digest that summarizes the key insights from these runs. Form
 Keep it concise, actionable, and focused on helping the specialist be more effective.`;
 
   return prompt;
-}
-
-/**
- * Regenerate the context digest
- *
- * Forces regeneration even if a digest already exists.
- *
- * @param projectKey - Project identifier
- * @param specialistType - Specialist type
- * @returns Generated digest or null if generation failed
- */
-export async function regenerateContextDigest(
+}async function regenerateContextDigestPromise(
   projectKey: string,
   specialistType: string
 ): Promise<string | null> {
-  return generateContextDigest(projectKey, specialistType, { force: true });
+  return (await Effect.runPromise(generateContextDigest(projectKey, specialistType, { force: true })));
 }
 
 /**
@@ -324,7 +323,7 @@ export async function regenerateContextDigest(
  */
 export function scheduleDigestGeneration(projectKey: string, specialistType: string): void {
   // Run async without awaiting
-  generateContextDigest(projectKey, specialistType).catch((error) => {
+  Effect.runPromise(generateContextDigest(projectKey, specialistType)).catch((error) => {
     console.error(
       `[specialist-context] Background digest generation failed for ${projectKey}/${specialistType}:`,
       error
@@ -368,3 +367,27 @@ export function deleteContextDigest(projectKey: string, specialistType: string):
     return false;
   }
 }
+
+// ─── Effect variants (PAN-1249) ──────────────────────────────────────────────
+
+/**
+ * Effect variant of {@link generateContextDigest}. The Promise version already
+ * resolves to `null` on every failure mode (claude unavailable, empty runs,
+ * write error), so the Effect form mirrors that contract via `Effect.promise`.
+ */
+export const generateContextDigest = (
+  projectKey: string,
+  specialistType: string,
+  options: { runCount?: number; model?: string; force?: boolean } = {},
+): Effect.Effect<string | null> =>
+  Effect.promise(() => generateContextDigestPromise(projectKey, specialistType, options));
+
+/**
+ * Effect variant of {@link regenerateContextDigest}. Same swallowed-failure
+ * semantics as the Promise version.
+ */
+export const regenerateContextDigest = (
+  projectKey: string,
+  specialistType: string,
+): Effect.Effect<string | null> =>
+  Effect.promise(() => regenerateContextDigestPromise(projectKey, specialistType));

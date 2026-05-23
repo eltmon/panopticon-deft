@@ -10,8 +10,11 @@
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
+import { Effect } from 'effect';
 import type {
   AgentRuntime,
+  AgentRuntimeSync,
+  AgentRuntimeError,
   Heartbeat,
   TokenUsage,
   CostBreakdown,
@@ -20,9 +23,10 @@ import type {
   Agent,
   ActivitySource,
 } from './types.js';
-import { getAgentState, getAgentDir, spawnAgent as spawnAgentImpl, saveAgentState, saveAgentRuntimeState } from '../agents.js';
-import { sessionExists, killSession, sendKeys, sendKeysAsync, getAgentSessions } from '../tmux.js';
-import { parseClaudeSession, getSessionFiles, getProjectDirs } from '../cost-parsers/jsonl-parser.js';
+import { getAgentStateSync, getAgentDir, spawnAgent as spawnAgentImpl, saveAgentStateSync, saveAgentRuntimeState, determineModel } from '../agents.js';
+import { sessionExistsSync, killSessionSync, sendKeys, getAgentSessionsSync } from '../tmux.js';
+import { parseClaudeSessionSync, getSessionFilesSync, getProjectDirsSync } from '../cost-parsers/jsonl-parser.js';
+import { ProcessSpawnError, TmuxError, FsError } from '../errors.js';
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 
@@ -39,7 +43,7 @@ interface SessionIndexEntry {
 /**
  * Claude Code Runtime implementation
  */
-export class ClaudeCodeRuntime implements AgentRuntime {
+export class ClaudeCodeRuntimeSync implements AgentRuntimeSync {
   readonly name = 'claude-code' as const;
 
   /**
@@ -54,7 +58,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     }
 
     // Get all project directories
-    const projectDirs = getProjectDirs();
+    const projectDirs = getProjectDirsSync();
 
     for (const projectDir of projectDirs) {
       // Check if this project's sessions-index.json references the workspace
@@ -113,7 +117,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Get the most recent JSONL file for a project
    */
   private getMostRecentJSONL(projectDir: string): string | null {
-    const files = getSessionFiles(projectDir);
+    const files = getSessionFilesSync(projectDir);
     return files.length > 0 ? files[0] : null;
   }
 
@@ -121,7 +125,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Get the session path for an agent
    */
   getSessionPath(agentId: string): string | null {
-    const state = getAgentState(agentId);
+    const state = getAgentStateSync(agentId);
     if (!state) {
       return null;
     }
@@ -246,7 +250,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       return null;
     }
 
-    const sessionUsage = parseClaudeSession(sessionPath);
+    const sessionUsage = parseClaudeSessionSync(sessionPath);
     if (!sessionUsage) {
       return null;
     }
@@ -263,7 +267,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       return null;
     }
 
-    const sessionUsage = parseClaudeSession(sessionPath);
+    const sessionUsage = parseClaudeSessionSync(sessionPath);
     if (!sessionUsage) {
       return null;
     }
@@ -296,11 +300,11 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Send a message to a running agent
    */
   async sendMessage(agentId: string, message: string): Promise<void> {
-    if (!sessionExists(agentId)) {
+    if (!sessionExistsSync(agentId)) {
       throw new Error(`Agent ${agentId} is not running`);
     }
 
-    await sendKeysAsync(agentId, message);
+    await Effect.runPromise(sendKeys(agentId, message));
 
     // Also save to mail queue for persistence
     const mailDir = join(getAgentDir(agentId), 'mail');
@@ -317,20 +321,20 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Kill an agent
    */
   killAgent(agentId: string): void {
-    if (!sessionExists(agentId)) {
+    if (!sessionExistsSync(agentId)) {
       throw new Error(`Agent ${agentId} is not running`);
     }
 
-    killSession(agentId);
+    killSessionSync(agentId);
 
     // Reset runtime state so deacon / merge-agent busy-wait don't see a phantom active session
     saveAgentRuntimeState(agentId, { state: 'idle', lastActivity: new Date().toISOString() });
 
     // Update agent state
-    const state = getAgentState(agentId);
+    const state = getAgentStateSync(agentId);
     if (state) {
       state.status = 'stopped';
-      saveAgentState(state);
+      saveAgentStateSync(state);
     }
   }
 
@@ -342,8 +346,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     const state = await spawnAgentImpl({
       issueId: config.agentId.replace(/^agent-/, ''),
       workspace: config.workspace,
-      runtime: 'claude',
-      model: config.model || 'sonnet',
+      harness: 'claude-code',
+      model: determineModel({ model: config.model, role: 'work' }),
+      role: 'work',
       prompt: config.prompt,
     });
 
@@ -371,7 +376,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       // Get sessions for specific workspace
       const projectDir = this.getProjectDirForWorkspace(workspace);
       if (projectDir) {
-        const files = getSessionFiles(projectDir);
+        const files = getSessionFilesSync(projectDir);
         for (const file of files) {
           const session = this.parseSessionFile(file, workspace);
           if (session) {
@@ -381,9 +386,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       }
     } else {
       // Get all sessions
-      const projectDirs = getProjectDirs();
+      const projectDirs = getProjectDirsSync();
       for (const projectDir of projectDirs) {
-        const files = getSessionFiles(projectDir);
+        const files = getSessionFilesSync(projectDir);
         for (const file of files) {
           const session = this.parseSessionFile(file);
           if (session) {
@@ -400,7 +405,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Parse a session file into a Session object
    */
   private parseSessionFile(file: string, workspace?: string): Session | null {
-    const sessionUsage = parseClaudeSession(file);
+    const sessionUsage = parseClaudeSessionSync(file);
     if (!sessionUsage) {
       return null;
     }
@@ -422,13 +427,98 @@ export class ClaudeCodeRuntime implements AgentRuntime {
    * Check if an agent is running
    */
   isRunning(agentId: string): boolean {
-    return sessionExists(agentId);
+    return sessionExistsSync(agentId);
   }
 }
 
 /**
  * Create a Claude Code runtime instance
  */
+export function createClaudeCodeRuntimeSync(): ClaudeCodeRuntimeSync {
+  return new ClaudeCodeRuntimeSync();
+}
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel adapter wrapping the legacy ClaudeCodeRuntime. The
+// promise/sync class above remains the canonical implementation used by
+// Cloister and the dashboard; this adapter is for new Effect-native callers.
+
+/**
+ * Effect-channel variant of {@link ClaudeCodeRuntimeSync}. Lifts the async
+ * send/kill/spawn methods into typed Effect channels (TmuxError /
+ * ProcessSpawnError) while keeping sync introspection methods sync.
+ */
+export class ClaudeCodeRuntime implements AgentRuntime {
+  readonly name = 'claude-code' as const;
+  private readonly inner: ClaudeCodeRuntimeSync;
+
+  constructor(inner: ClaudeCodeRuntimeSync = new ClaudeCodeRuntimeSync()) {
+    this.inner = inner;
+  }
+
+  getSessionPath(agentId: string): string | null {
+    return this.inner.getSessionPath(agentId);
+  }
+  getLastActivity(agentId: string): Date | null {
+    return this.inner.getLastActivity(agentId);
+  }
+  getHeartbeat(agentId: string): Heartbeat | null {
+    return this.inner.getHeartbeat(agentId);
+  }
+  getTokenUsage(agentId: string): TokenUsage | null {
+    return this.inner.getTokenUsage(agentId);
+  }
+  getSessionCost(agentId: string): CostBreakdown | null {
+    return this.inner.getSessionCost(agentId);
+  }
+  listSessions(workspace?: string): Session[] {
+    return this.inner.listSessions(workspace);
+  }
+
+  sendMessage(agentId: string, message: string): Effect.Effect<void, AgentRuntimeError> {
+    return Effect.tryPromise({
+      try: () => this.inner.sendMessage(agentId, message),
+      catch: (cause) =>
+        new TmuxError({
+          command: 'send-keys',
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    });
+  }
+
+  killAgent(agentId: string): Effect.Effect<void, AgentRuntimeError> {
+    return Effect.try({
+      try: () => this.inner.killAgent(agentId),
+      catch: (cause) =>
+        new TmuxError({
+          command: 'kill-session',
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    });
+  }
+
+  spawnAgent(config: SpawnConfig): Effect.Effect<Agent, AgentRuntimeError> {
+    return Effect.tryPromise({
+      try: () => this.inner.spawnAgent(config),
+      catch: (cause) =>
+        new ProcessSpawnError({
+          command: 'claude',
+          args: [],
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    });
+  }
+
+  isRunning(agentId: string): Effect.Effect<boolean> {
+    return Effect.sync(() => this.inner.isRunning(agentId));
+  }
+}
+
+/** Effect-flavored constructor companion to {@link createClaudeCodeRuntimeSync}. */
 export function createClaudeCodeRuntime(): ClaudeCodeRuntime {
   return new ClaudeCodeRuntime();
 }

@@ -13,6 +13,9 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { Data, Effect } from 'effect';
+
+import { PAN_DIRNAME } from '../pan-dir/index.js';
 
 const execAsync = promisify(exec);
 
@@ -28,19 +31,14 @@ export interface InferenceDocument {
   artifactsAnalyzed: string[];
   gaps: string[];
   risks: string[];
-}
-
-/**
- * Gather all available artifacts for analysis
- */
-export async function gatherArtifacts(config: MonitoringAgentConfig): Promise<{
+}async function gatherArtifactsPromise(config: MonitoringAgentConfig): Promise<{
   issueDescription?: string;
   comments: string[];
   transcripts: string[];
   notes: string[];
   codeChanges?: string;
 }> {
-  const planningDir = join(config.workspacePath, '.planning');
+  const planningDir = join(config.workspacePath, PAN_DIRNAME);
   const artifacts: {
     issueDescription?: string;
     comments: string[];
@@ -107,7 +105,7 @@ export async function gatherArtifacts(config: MonitoringAgentConfig): Promise<{
  */
 export function generateMonitoringPrompt(
   config: MonitoringAgentConfig,
-  artifacts: Awaited<ReturnType<typeof gatherArtifacts>>,
+  artifacts: Awaited<ReturnType<typeof gatherArtifactsPromise>>,
   existingInference?: string
 ): string {
   const sections: string[] = [];
@@ -152,7 +150,7 @@ export function generateMonitoringPrompt(
   sections.push(`5. **Risks**: Potential issues or concerns`);
   sections.push(`6. **Team Patterns**: How the team works, conventions observed`);
   sections.push(`7. **Recommendations**: Suggestions for the team`);
-  sections.push(`\nWrite the INFERENCE.md content to: ${join(config.workspacePath, '.planning', 'INFERENCE.md')}`);
+  sections.push(`\nWrite the INFERENCE.md content to: ${join(config.workspacePath, PAN_DIRNAME, 'INFERENCE.md')}`);
 
   return sections.join('\n');
 }
@@ -163,7 +161,7 @@ export function generateMonitoringPrompt(
  */
 export function generateBasicInference(
   config: MonitoringAgentConfig,
-  artifacts: Awaited<ReturnType<typeof gatherArtifacts>>
+  artifacts: Awaited<ReturnType<typeof gatherArtifactsPromise>>
 ): string {
   const now = new Date().toISOString();
   const sections: string[] = [];
@@ -206,17 +204,72 @@ export function generateBasicInference(
 /**
  * Update the INFERENCE.md file
  */
-export function updateInferenceDocument(workspacePath: string, content: string): void {
-  const planningDir = join(workspacePath, '.planning');
-  mkdirSync(planningDir, { recursive: true });
-  writeFileSync(join(planningDir, 'INFERENCE.md'), content, 'utf-8');
+export function updateInferenceDocumentSync(workspacePath: string, content: string): void {
+  const panDir = join(workspacePath, PAN_DIRNAME);
+  mkdirSync(panDir, { recursive: true });
+  writeFileSync(join(panDir, 'INFERENCE.md'), content, 'utf-8');
 }
 
 /**
  * Read existing INFERENCE.md if it exists
  */
-export function readInferenceDocument(workspacePath: string): string | null {
-  const filePath = join(workspacePath, '.planning', 'INFERENCE.md');
+export function readInferenceDocumentSync(workspacePath: string): string | null {
+  const filePath = join(workspacePath, PAN_DIRNAME, 'INFERENCE.md');
   if (!existsSync(filePath)) return null;
   return readFileSync(filePath, 'utf-8');
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Lifts the monitoring-agent I/O surface (gh issue view, git log, fs reads,
+// fs writes) into typed Effect channels so callers can compose Shadow
+// Engineering monitoring with other Effect-native pipelines without raw
+// try/catch.
+
+/** Tagged error for monitoring-agent Effect variants. */
+export class MonitoringAgentError extends Data.TaggedError('MonitoringAgentError')<{
+  readonly issueId: string;
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+const liftMonitoringError = (
+  issueId: string,
+  operation: string,
+  cause: unknown,
+): MonitoringAgentError =>
+  new MonitoringAgentError({
+    issueId,
+    operation,
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+  });
+
+/** Effect variant of `gatherArtifacts`. */
+export const gatherArtifacts = (
+  config: MonitoringAgentConfig,
+): Effect.Effect<Awaited<ReturnType<typeof gatherArtifactsPromise>>, MonitoringAgentError> =>
+  Effect.tryPromise({
+    try: () => gatherArtifactsPromise(config),
+    catch: (cause) => liftMonitoringError(config.issueId, 'gatherArtifacts', cause),
+  });
+
+/** Effect variant of `updateInferenceDocument`. */
+export const updateInferenceDocument = (
+  workspacePath: string,
+  content: string,
+): Effect.Effect<void, MonitoringAgentError> =>
+  Effect.try({
+    try: () => updateInferenceDocumentSync(workspacePath, content),
+    catch: (cause) => liftMonitoringError(workspacePath, 'updateInferenceDocument', cause),
+  });
+
+/** Effect variant of `readInferenceDocument`. */
+export const readInferenceDocument = (
+  workspacePath: string,
+): Effect.Effect<string | null, MonitoringAgentError> =>
+  Effect.try({
+    try: () => readInferenceDocumentSync(workspacePath),
+    catch: (cause) => liftMonitoringError(workspacePath, 'readInferenceDocument', cause),
+  });

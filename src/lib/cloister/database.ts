@@ -9,7 +9,19 @@ import type Database from 'better-sqlite3';
 import { createRequire } from 'module';
 import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
+import { Data, Effect } from 'effect';
 import { PANOPTICON_HOME } from '../paths.js';
+
+/**
+ * Local error class for the cloister health-history SQLite store. Distinct from
+ * `DatabaseError` in the application-settings store because this layer
+ * (better-sqlite3 / bun:sqlite, sync API) has different failure surfaces.
+ */
+export class CloisterDatabaseError extends Data.TaggedError('CloisterDatabaseError')<{
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
 declare const Bun: unknown;
 const _require = createRequire(import.meta.url);
@@ -97,7 +109,7 @@ export function initHealthDatabase(): Database.Database {
   `);
 
   // Run cleanup on initialization
-  cleanupOldEvents(db);
+  cleanupOldEventsSync(db);
 
   return db;
 }
@@ -128,7 +140,7 @@ export function closeHealthDatabase(): void {
  * @param event - Health event to store
  * @returns The ID of the inserted event
  */
-export function writeHealthEvent(event: Omit<HealthEvent, 'id'>): number {
+export function writeHealthEventSync(event: Omit<HealthEvent, 'id'>): number {
   const database = getHealthDatabase();
 
   const stmt = database.prepare(`
@@ -154,7 +166,7 @@ export function writeHealthEvent(event: Omit<HealthEvent, 'id'>): number {
  * @param events - Array of health events to store
  * @returns Number of events inserted
  */
-export function writeHealthEvents(events: Omit<HealthEvent, 'id'>[]): number {
+export function writeHealthEventsSync(events: Omit<HealthEvent, 'id'>[]): number {
   const database = getHealthDatabase();
 
   const stmt = database.prepare(`
@@ -187,7 +199,7 @@ export function writeHealthEvents(events: Omit<HealthEvent, 'id'>[]): number {
  * @param endTime - End of time range (ISO 8601)
  * @returns Array of health events, ordered by timestamp
  */
-export function getHealthHistory(
+export function getHealthHistorySync(
   agentId: string,
   startTime: string,
   endTime: string
@@ -218,7 +230,7 @@ export function getHealthHistory(
  * @param limit - Maximum number of events to return (default: 100)
  * @returns Array of health events, ordered by timestamp descending
  */
-export function getRecentHealthHistory(
+export function getRecentHealthHistorySync(
   agentId: string,
   limit: number = 100
 ): HealthEventWithMetadata[] {
@@ -251,7 +263,7 @@ export function getRecentHealthHistory(
  * @param endTime - End of time range (ISO 8601)
  * @returns Array of health events, ordered by timestamp
  */
-export function getAllHealthHistory(
+export function getAllHealthHistorySync(
   startTime: string,
   endTime: string
 ): HealthEventWithMetadata[] {
@@ -280,7 +292,7 @@ export function getAllHealthHistory(
  * @param agentId - Agent identifier
  * @returns Latest health event or null if none exist
  */
-export function getLatestHealthEvent(agentId: string): HealthEventWithMetadata | null {
+export function getLatestHealthEventSync(agentId: string): HealthEventWithMetadata | null {
   const database = getHealthDatabase();
 
   const stmt = database.prepare(`
@@ -309,7 +321,7 @@ export function getLatestHealthEvent(agentId: string): HealthEventWithMetadata |
  *
  * @returns Array of unique agent IDs
  */
-export function getAgentsWithHistory(): string[] {
+export function getAgentsWithHistorySync(): string[] {
   const database = getHealthDatabase();
 
   const stmt = database.prepare(`
@@ -329,7 +341,7 @@ export function getAgentsWithHistory(): string[] {
  * @param retentionDays - Number of days to retain (default: 7)
  * @returns Number of events deleted
  */
-export function cleanupOldEvents(
+export function cleanupOldEventsSync(
   database: Database.Database = getHealthDatabase(),
   retentionDays: number = RETENTION_DAYS
 ): number {
@@ -352,7 +364,7 @@ export function cleanupOldEvents(
  * @param agentId - Agent identifier
  * @returns Number of events deleted
  */
-export function deleteAgentHistory(agentId: string): number {
+export function deleteAgentHistorySync(agentId: string): number {
   const database = getHealthDatabase();
 
   const stmt = database.prepare(`
@@ -369,7 +381,7 @@ export function deleteAgentHistory(agentId: string): number {
  *
  * @returns Statistics about the health history database
  */
-export function getDatabaseStats(): {
+export function getDatabaseStatsSync(): {
   totalEvents: number;
   uniqueAgents: number;
   oldestEvent: string | null;
@@ -394,3 +406,159 @@ export function getDatabaseStats(): {
     newestEvent,
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// `better-sqlite3` (and `bun:sqlite`) are intentionally synchronous APIs, so
+// these wrappers stay sync at the call site and lift failures into a typed
+// `CloisterDatabaseError` channel via `Effect.try`. They exist so callers in
+// the Effect world can compose health-history reads/writes without manually
+// wrapping every call.
+
+/** Effect variant of `writeHealthEvent`. */
+export const writeHealthEvent = (
+  event: Omit<HealthEvent, 'id'>,
+): Effect.Effect<number, CloisterDatabaseError> =>
+  Effect.try({
+    try: () => writeHealthEventSync(event),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'writeHealthEvent',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `writeHealthEvents`. */
+export const writeHealthEvents = (
+  events: Omit<HealthEvent, 'id'>[],
+): Effect.Effect<number, CloisterDatabaseError> =>
+  Effect.try({
+    try: () => writeHealthEventsSync(events),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'writeHealthEvents',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getHealthHistory`. */
+export const getHealthHistory = (
+  agentId: string,
+  startTime: string,
+  endTime: string,
+): Effect.Effect<HealthEventWithMetadata[], CloisterDatabaseError> =>
+  Effect.try({
+    try: () => getHealthHistorySync(agentId, startTime, endTime),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getHealthHistory',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getRecentHealthHistory`. */
+export const getRecentHealthHistory = (
+  agentId: string,
+  limit?: number,
+): Effect.Effect<HealthEventWithMetadata[], CloisterDatabaseError> =>
+  Effect.try({
+    try: () => getRecentHealthHistorySync(agentId, limit),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getRecentHealthHistory',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getAllHealthHistory`. */
+export const getAllHealthHistory = (
+  startTime: string,
+  endTime: string,
+): Effect.Effect<HealthEventWithMetadata[], CloisterDatabaseError> =>
+  Effect.try({
+    try: () => getAllHealthHistorySync(startTime, endTime),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getAllHealthHistory',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getLatestHealthEvent`. */
+export const getLatestHealthEvent = (
+  agentId: string,
+): Effect.Effect<HealthEventWithMetadata | null, CloisterDatabaseError> =>
+  Effect.try({
+    try: () => getLatestHealthEventSync(agentId),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getLatestHealthEvent',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getAgentsWithHistory`. */
+export const getAgentsWithHistory = (): Effect.Effect<string[], CloisterDatabaseError> =>
+  Effect.try({
+    try: () => getAgentsWithHistorySync(),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getAgentsWithHistory',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `cleanupOldEvents`. */
+export const cleanupOldEvents = (
+  retentionDays?: number,
+): Effect.Effect<number, CloisterDatabaseError> =>
+  Effect.try({
+    try: () => cleanupOldEventsSync(getHealthDatabase(), retentionDays),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'cleanupOldEvents',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `deleteAgentHistory`. */
+export const deleteAgentHistory = (
+  agentId: string,
+): Effect.Effect<number, CloisterDatabaseError> =>
+  Effect.try({
+    try: () => deleteAgentHistorySync(agentId),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'deleteAgentHistory',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getDatabaseStats`. */
+export const getDatabaseStats = (): Effect.Effect<
+  {
+    totalEvents: number;
+    uniqueAgents: number;
+    oldestEvent: string | null;
+    newestEvent: string | null;
+  },
+  CloisterDatabaseError
+> =>
+  Effect.try({
+    try: () => getDatabaseStatsSync(),
+    catch: (cause) =>
+      new CloisterDatabaseError({
+        operation: 'getDatabaseStats',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });

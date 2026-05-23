@@ -5,8 +5,11 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { parse, stringify } from '@iarna/toml';
 import { join } from 'path';
+import { Effect } from 'effect';
+import { ConfigError, FsError } from '../errors.js';
 import { PANOPTICON_HOME } from '../paths.js';
 
 const CLOISTER_CONFIG_FILE = join(PANOPTICON_HOME, 'cloister.toml');
@@ -38,6 +41,8 @@ export interface AutoActions {
 export interface MonitoringConfig {
   check_interval: number; // seconds between health checks
   heartbeat_sources: ('jsonl_mtime' | 'tmux_activity' | 'git_activity' | 'active_heartbeat')[];
+  /** Patrol cycles between stash janitor sweeps. Default: hourly based on patrol cadence. */
+  stash_janitor_every_cycles?: number;
 }
 
 /**
@@ -116,6 +121,18 @@ export interface ModelSelectionConfig {
     inspect_agent?: 'opus' | 'sonnet' | 'haiku';
     uat_agent?: 'opus' | 'sonnet' | 'haiku';
   };
+  /**
+   * PAN-636 — per-role coding-agent harness override. Defaults to
+   * 'claude-code' for every role when unset. Absent keys are normal
+   * (forward compat with config files written before harness existed).
+   */
+  specialist_harnesses?: {
+    merge_agent?: 'claude-code' | 'pi';
+    review_agent?: 'claude-code' | 'pi';
+    test_agent?: 'claude-code' | 'pi';
+    inspect_agent?: 'claude-code' | 'pi';
+    uat_agent?: 'claude-code' | 'pi';
+  };
 }
 
 /**
@@ -177,8 +194,27 @@ export interface CostLimitsConfig {
  * Retention policy configuration
  */
 export interface RetentionConfig {
-  agent_state_days: number; // Days to keep agent state dirs (default: 30)
+  /**
+   * Days to keep work/planning agent state dirs after their session ends.
+   * Default 7. Event-driven cleanup (postMergeLifecycle, executeCloseOut)
+   * deletes state at the moment it becomes useless; this retention is only
+   * a safety net for cases where those events didn't fire.
+   */
+  agent_state_days: number;
+  /**
+   * Days to keep reviewer state dirs (review-* prefix). Default 1.
+   * runParallelReview Phase 6 deletes reviewer state immediately after the
+   * review posts; this retention catches crashed-mid-cleanup edge cases.
+   */
+  reviewer_state_days?: number;
   health_staleness_hours: number; // Hours before hiding stale agents in health API (default: 24)
+}
+
+export interface CloseOutConfig {
+  remove_workspace: boolean;
+  delete_feature_branch: boolean;
+  auto: boolean;
+  auto_delay_minutes: number;
 }
 
 /**
@@ -197,6 +233,7 @@ export interface CloisterConfig {
   auto_restart?: AutoRestartConfig;
   cost_limits?: CostLimitsConfig;
   retention?: RetentionConfig;
+  close_out?: CloseOutConfig;
 }
 
 /**
@@ -258,8 +295,13 @@ export const DEFAULT_CLOISTER_CONFIG: CloisterConfig = {
       expert: 'opus',
     },
     specialist_models: {
-      // PAN-754: no hardcoded defaults. User config.yaml overrides are authoritative.
-      // Resolution falls through to work-type-router, then to the global fallback model.
+      // PAN-754: no hardcoded defaults. User config.yaml role settings are authoritative.
+      // Resolution falls through to role model config, then to the global fallback model.
+    },
+    specialist_harnesses: {
+      // PAN-636: every role defaults to 'claude-code' when not overridden in
+      // config.yaml. Reads through ModelRouter.getSpecialistHarness which
+      // returns 'claude-code' for missing keys.
     },
   },
   handoffs: {
@@ -297,8 +339,15 @@ export const DEFAULT_CLOISTER_CONFIG: CloisterConfig = {
     alert_threshold: 0.8, // Alert at 80%
   },
   retention: {
-    agent_state_days: 30,
+    agent_state_days: 7,
+    reviewer_state_days: 1,
     health_staleness_hours: 24,
+  },
+  close_out: {
+    remove_workspace: false,
+    delete_feature_branch: false,
+    auto: false,
+    auto_delay_minutes: 60,
   },
 };
 
@@ -337,43 +386,64 @@ function deepMerge<T extends object>(defaults: T, overrides: Partial<T>): T {
   return result;
 }
 
+function applyEnvironmentOverrides(config: CloisterConfig): CloisterConfig {
+  const stashJanitorEnv = process.env.PAN_STASH_JANITOR_CYCLES;
+  if (stashJanitorEnv === undefined) return config;
+
+  const parsed = Number.parseInt(stashJanitorEnv, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return config;
+
+  return {
+    ...config,
+    monitoring: {
+      ...config.monitoring,
+      stash_janitor_every_cycles: parsed,
+    },
+  };
+}
+
+
 /**
  * Load Cloister configuration
  *
  * Reads from ~/.panopticon/cloister.toml and merges with defaults.
  * Creates default config file if it doesn't exist.
  */
-export function loadCloisterConfig(): CloisterConfig {
+export function loadCloisterConfigSync(): CloisterConfig {
   // Ensure panopticon home exists
   if (!existsSync(PANOPTICON_HOME)) {
     mkdirSync(PANOPTICON_HOME, { recursive: true });
   }
 
+  let config = DEFAULT_CLOISTER_CONFIG;
+
   // If config file doesn't exist, create it with defaults
   if (!existsSync(CLOISTER_CONFIG_FILE)) {
-    saveCloisterConfig(DEFAULT_CLOISTER_CONFIG);
-    return DEFAULT_CLOISTER_CONFIG;
+    saveCloisterConfigSync(DEFAULT_CLOISTER_CONFIG);
+  } else {
+    try {
+      const content = readFileSync(CLOISTER_CONFIG_FILE, 'utf-8');
+      const parsed = parse(content) as unknown as Partial<CloisterConfig>;
+
+      // Deep merge with defaults
+      config = deepMerge(DEFAULT_CLOISTER_CONFIG, parsed);
+    } catch (error) {
+      console.error('Failed to load Cloister config:', error);
+      console.error('Using default configuration');
+      config = DEFAULT_CLOISTER_CONFIG;
+    }
   }
 
-  try {
-    const content = readFileSync(CLOISTER_CONFIG_FILE, 'utf-8');
-    const parsed = parse(content) as unknown as Partial<CloisterConfig>;
-
-    // Deep merge with defaults
-    return deepMerge(DEFAULT_CLOISTER_CONFIG, parsed);
-  } catch (error) {
-    console.error('Failed to load Cloister config:', error);
-    console.error('Using default configuration');
-    return DEFAULT_CLOISTER_CONFIG;
-  }
+  return applyEnvironmentOverrides(config);
 }
+
 
 /**
  * Save Cloister configuration
  *
  * Writes configuration to ~/.panopticon/cloister.toml
  */
-export function saveCloisterConfig(config: CloisterConfig): void {
+export function saveCloisterConfigSync(config: CloisterConfig): void {
   // Ensure panopticon home exists
   if (!existsSync(PANOPTICON_HOME)) {
     mkdirSync(PANOPTICON_HOME, { recursive: true });
@@ -393,10 +463,10 @@ export function saveCloisterConfig(config: CloisterConfig): void {
  *
  * Merges partial config updates with existing config.
  */
-export function updateCloisterConfig(updates: Partial<CloisterConfig>): CloisterConfig {
-  const current = loadCloisterConfig();
+export function updateCloisterConfigSync(updates: Partial<CloisterConfig>): CloisterConfig {
+  const current = loadCloisterConfigSync();
   const updated = deepMerge(current, updates);
-  saveCloisterConfig(updated);
+  saveCloisterConfigSync(updated);
   return updated;
 }
 
@@ -411,7 +481,7 @@ export function getCloisterConfigPath(): string {
  * Check if Cloister should auto-start
  */
 export function shouldAutoStart(): boolean {
-  const config = loadCloisterConfig();
+  const config = loadCloisterConfigSync();
   return config.startup.auto_start;
 }
 
@@ -423,10 +493,100 @@ export function getHealthThresholdsMs(): {
   warning: number;
   stuck: number;
 } {
-  const config = loadCloisterConfig();
+  const config = loadCloisterConfigSync();
   return {
     stale: config.thresholds.stale * 60 * 1000,
     warning: config.thresholds.warning * 60 * 1000,
     stuck: config.thresholds.stuck * 60 * 1000,
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variants of the config helpers above. The sync
+// variants are preserved so existing callers (CLI scripts, top-level module
+// initialization) do not have to migrate; new Effect-based callers can compose
+// these directly without `Effect.runSync` round-tripping.
+
+/** Effect variant of `loadCloisterConfig`. Falls back to defaults on read/parse failures. */
+export const loadCloisterConfig = (): Effect.Effect<CloisterConfig, FsError | ConfigError> =>
+  Effect.gen(function* () {
+    yield* Effect.tryPromise({
+      try: () => mkdir(PANOPTICON_HOME, { recursive: true }),
+      catch: (cause) => new FsError({ path: PANOPTICON_HOME, operation: 'mkdir', cause }),
+    });
+
+    let config: CloisterConfig = DEFAULT_CLOISTER_CONFIG;
+
+    if (!existsSync(CLOISTER_CONFIG_FILE)) {
+      yield* saveCloisterConfig(DEFAULT_CLOISTER_CONFIG);
+    } else {
+      const content: string | null = yield* Effect.tryPromise({
+        try: () => readFile(CLOISTER_CONFIG_FILE, 'utf-8'),
+        catch: (cause) => new FsError({ path: CLOISTER_CONFIG_FILE, operation: 'readFile', cause }),
+      }).pipe(
+        Effect.catch((err: FsError) => {
+          console.error('Failed to load Cloister config:', err);
+          console.error('Using default configuration');
+          return Effect.succeed<string | null>(null);
+        }),
+      );
+
+      if (content !== null) {
+        try {
+          const parsed = parse(content) as unknown as Partial<CloisterConfig>;
+          config = deepMerge(DEFAULT_CLOISTER_CONFIG, parsed);
+        } catch (error) {
+          console.error('Failed to parse Cloister config:', error);
+          console.error('Using default configuration');
+          config = DEFAULT_CLOISTER_CONFIG;
+        }
+      }
+    }
+
+    const stashJanitorEnv = process.env.PAN_STASH_JANITOR_CYCLES;
+    if (stashJanitorEnv !== undefined) {
+      const parsedEnv = Number.parseInt(stashJanitorEnv, 10);
+      if (Number.isFinite(parsedEnv) && parsedEnv >= 0) {
+        config = {
+          ...config,
+          monitoring: {
+            ...config.monitoring,
+            stash_janitor_every_cycles: parsedEnv,
+          },
+        };
+      }
+    }
+
+    return config;
+  });
+
+/** Effect variant of `saveCloisterConfig`. */
+export const saveCloisterConfig = (config: CloisterConfig): Effect.Effect<void, FsError | ConfigError> =>
+  Effect.gen(function* () {
+    yield* Effect.tryPromise({
+      try: () => mkdir(PANOPTICON_HOME, { recursive: true }),
+      catch: (cause) => new FsError({ path: PANOPTICON_HOME, operation: 'mkdir', cause }),
+    });
+
+    const content = yield* Effect.try({
+      try: () => stringify(config as any),
+      catch: (cause) => new ConfigError({ message: 'Failed to serialize Cloister config', cause }),
+    });
+
+    yield* Effect.tryPromise({
+      try: () => writeFile(CLOISTER_CONFIG_FILE, content, 'utf-8'),
+      catch: (cause) => new FsError({ path: CLOISTER_CONFIG_FILE, operation: 'writeFile', cause }),
+    });
+  });
+
+/** Effect variant of `updateCloisterConfig`. */
+export const updateCloisterConfig = (
+  updates: Partial<CloisterConfig>,
+): Effect.Effect<CloisterConfig, FsError | ConfigError> =>
+  Effect.gen(function* () {
+    const current = yield* loadCloisterConfig();
+    const updated = deepMerge(current, updates);
+    yield* saveCloisterConfig(updated);
+    return updated;
+  });

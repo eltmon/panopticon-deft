@@ -1,12 +1,18 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "name": "Panopticon",
+  "name": "Panopticon — The IDE for the Agent Era",
   "theme": "maple",
   "layout": "topnav",
   "colors": {
     "primary": "#D4A27F",
     "light": "#E5C4A8",
     "dark": "#B8886A"
+  },
+  "background": {
+    "color": {
+      "light": "#FFFFFF",
+      "dark": "#0c0a09"
+    }
   },
   "favicon": "/favicon.svg",
   "logo": {
@@ -64,7 +70,8 @@
               "features/cloister",
               "features/skills",
               "features/workspaces",
-              "features/convoys"
+              "features/convoys",
+              "features/swarm"
             ]
           }
         ]
@@ -76,6 +83,7 @@
             "group": "Configuration",
             "pages": [
               "configuration/projects",
+              "configuration/harnesses",
               "configuration/issue-trackers",
               "configuration/polyrepo"
             ]
@@ -102,6 +110,8 @@
             "group": "Reference",
             "pages": [
               "reference/architecture",
+              "reference/harness-landscape",
+              "reference/template-conversations",
               "reference/prompts",
               "reference/troubleshooting"
             ]
@@ -111,7 +121,7 @@
     ]
   },
   "metadata": {
-    "og:image": "/docs/screenshot-board.png",
+    "og:image": "/docs/screenshot-board-light.png",
     "og:type": "website"
   },
   "footerSocials": {
@@ -120,10 +130,5 @@
   "feedback": {
     "thumbsRating": true,
     "suggestEdit": true
-  },
-  "analytics": {
-    "posthog": {
-      "apiKey": ""
-    }
   }
 }

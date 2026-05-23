@@ -5,35 +5,40 @@
  */
 
 export * from './interface.js';
-export { createClaudeAdapter } from './claude.js';
+export { createClaudeAdapterSync, createClaudeAdapter } from './claude.js';
 
-import type { RuntimeAdapter, RuntimeType, RuntimeRegistry } from './interface.js';
-import { createClaudeAdapter } from './claude.js';
+import { Effect } from 'effect';
+import type {
+  RuntimeAdapterLegacy,
+  RuntimeType,
+  RuntimeRegistry,
+} from './interface.js';
+import { createClaudeAdapterSync } from './claude.js';
 
 /**
  * Create a runtime registry with the Claude adapter
  */
 export function createRuntimeRegistry(): RuntimeRegistry {
-  const adapters = new Map<RuntimeType, RuntimeAdapter>();
+  const adapters = new Map<RuntimeType, RuntimeAdapterLegacy>();
 
-  const claude = createClaudeAdapter();
+  const claude = createClaudeAdapterSync();
   adapters.set('claude', claude);
 
   return {
-    register(adapter: RuntimeAdapter): void {
+    register(adapter: RuntimeAdapterLegacy): void {
       adapters.set(adapter.type, adapter);
     },
 
-    get(type: RuntimeType): RuntimeAdapter | undefined {
+    get(type: RuntimeType): RuntimeAdapterLegacy | undefined {
       return adapters.get(type);
     },
 
-    getAll(): RuntimeAdapter[] {
+    getAll(): RuntimeAdapterLegacy[] {
       return Array.from(adapters.values());
     },
 
-    async getAvailable(): Promise<RuntimeAdapter[]> {
-      const available: RuntimeAdapter[] = [];
+    async getAvailable(): Promise<RuntimeAdapterLegacy[]> {
+      const available: RuntimeAdapterLegacy[] = [];
 
       for (const adapter of adapters.values()) {
         if (await adapter.isAvailable()) {
@@ -65,11 +70,11 @@ export function createRuntimeRegistry(): RuntimeRegistry {
 /**
  * Get a runtime adapter by type
  */
-export function getRuntimeAdapter(type: RuntimeType): RuntimeAdapter {
+export function getRuntimeAdapter(type: RuntimeType): RuntimeAdapterLegacy {
   if (type !== 'claude') {
     throw new Error(`Unknown runtime type: ${type}. Only 'claude' is supported.`);
   }
-  return createClaudeAdapter();
+  return createClaudeAdapterSync();
 }
 
 /**
@@ -77,27 +82,46 @@ export function getRuntimeAdapter(type: RuntimeType): RuntimeAdapter {
  */
 export function getSupportedRuntimes(): RuntimeType[] {
   return ['claude'];
-}
-
-/**
- * Check if a runtime is installed
- */
-export async function isRuntimeInstalled(type: RuntimeType): Promise<boolean> {
+}async function isRuntimeInstalledPromise(type: RuntimeType): Promise<boolean> {
   const adapter = getRuntimeAdapter(type);
   return adapter.isAvailable();
-}
-
-/**
- * Get installed runtimes
- */
-export async function getInstalledRuntimes(): Promise<RuntimeType[]> {
+}async function getInstalledRuntimesPromise(): Promise<RuntimeType[]> {
   const installed: RuntimeType[] = [];
 
   for (const type of getSupportedRuntimes()) {
-    if (await isRuntimeInstalled(type)) {
+    if (await Effect.runPromise(isRuntimeInstalled(type))) {
       installed.push(type);
     }
   }
 
   return installed;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variants of the registry/install helpers. Sync and
+// promise variants above remain the canonical API for existing callers.
+
+/** Effect variant of {@link isRuntimeInstalled}. */
+export const isRuntimeInstalled = (
+  type: RuntimeType,
+): Effect.Effect<boolean> =>
+  Effect.promise(() => isRuntimeInstalledPromise(type));
+
+/** Effect variant of {@link getInstalledRuntimes}. */
+export const getInstalledRuntimes = (): Effect.Effect<RuntimeType[]> =>
+  Effect.promise(() => getInstalledRuntimesPromise());
+
+/** Effect variant of {@link RuntimeRegistry.getAvailable}. */
+export const registryGetAvailable = (
+  registry: RuntimeRegistry,
+): Effect.Effect<RuntimeAdapterLegacy[]> =>
+  Effect.promise(() => registry.getAvailable());
+
+/** Effect variant of {@link RuntimeRegistry.syncToAll}. */
+export const registrySyncToAll = (
+  registry: RuntimeRegistry,
+  sourceDir: string,
+  force?: boolean,
+): Effect.Effect<Map<RuntimeType, number>> =>
+  Effect.promise(() => registry.syncToAll(sourceDir, force));

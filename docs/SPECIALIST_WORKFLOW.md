@@ -18,87 +18,40 @@ Specialist agents are ephemeral Claude Code sessions that handle specific tasks:
 
 ### Full Pipeline
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  DURING IMPLEMENTATION (per-bead)                               │
-│                                                                 │
-│  Agent finishes bead                                            │
-│       │                                                         │
-│       │ pan inspect <issueId> --bead <beadId>                   │
-│       ▼                                                         │
-│  ┌──────────────────────────┐                                   │
-│  │  inspect-agent (Sonnet)  │                                   │
-│  │  - Spec fidelity check   │──── BLOCKED ──→ Agent fixes       │
-│  │  - Constraint compliance │                  and re-requests   │
-│  │  - Compile + smoke       │                                   │
-│  └──────────┬───────────────┘                                   │
-│             │ PASS                                               │
-│             │ (checkpoint saved)                                 │
-│             ▼                                                    │
-│       Agent continues to next bead                              │
-│       ... repeat for each bead ...                              │
-└─────────────────────────────────────────────────────────────────┘
+![Panopticon Specialist Pipeline](./diagrams/panopticon-specialist-pipeline.png)
 
-┌─────────────────────────────────────────────────────────────────┐
-│  AFTER ALL BEADS COMPLETE                                       │
-│                                                                 │
-│  Agent signals completion → Verification Gate                   │
-│       │                                                         │
-│       ▼                                                         │
-│  ┌──────────────────────────┐                                   │
-│  │  review-agent (Sonnet)   │                                   │
-│  │  - Full MR code review   │──── CHANGES_REQUESTED ──→ Agent   │
-│  │  - Security + perf       │                                   │
-│  │  - Test coverage         │                                   │
-│  └──────────┬───────────────┘                                   │
-│             │ APPROVED                                           │
-│             ▼                                                    │
-│  ┌──────────────────────────┐                                   │
-│  │  test-agent (Haiku)      │                                   │
-│  │  - Run test suite        │──── FAILED ──→ Agent fixes        │
-│  │  - Analyze failures      │                                   │
-│  └──────────┬───────────────┘                                   │
-│             │ PASSED                                             │
-│             ▼                                                    │
-│  ┌──────────────────────────┐                                   │
-│  │  uat-agent (Sonnet)      │                                   │
-│  │  - Real browser (PW)     │──── BLOCKED ──→ Agent fixes       │
-│  │  - CORS verification     │                                   │
-│  │  - Visual quality audit  │                                   │
-│  │  - Requirement check     │                                   │
-│  └──────────┬───────────────┘                                   │
-│             │ PASSED                                             │
-│             ▼                                                    │
-│  ┌──────────────────────────┐                                   │
-│  │  merge-agent (Sonnet)    │                                   │
-│  │  - Resolve conflicts     │                                   │
-│  │  - Validate + push       │                                   │
-│  │  - Post-merge cleanup    │                                   │
-│  └──────────────────────────┘                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+Source: [`docs/diagrams/panopticon-specialist-pipeline.excalidraw`](./diagrams/panopticon-specialist-pipeline.excalidraw)
 
 ## Inspect Specialist (PAN-382)
 
-The inspect specialist runs **during** implementation, after each bead. It catches architectural deviations early — before they cascade through subsequent beads.
+The inspect specialist runs **during** implementation — but only on beads the planning agent flagged with `metadata.requiresInspection: true`. It catches architectural deviations early on the foundational beads where downstream work could cascade off a wrong choice (the MIN-796 failure mode).
 
-**Jidoka principle: never pass a defect downstream.**
+**Jidoka principle (applied selectively): never pass a foundation-class defect downstream.**
+
+> **Per-bead opt-in (2026-05-08 design revision).** The original PAN-382 design made inspection mandatory after every `bd close`. In practice that turned mechanical refactors into per-step interviews and added compounding stall risk on the inspect-dispatch path. Inspection is now a planning-time decision recorded as `metadata.requiresInspection: true|false` on each plan item. See [PAN-382 PRD](prds/planned/PAN-382-inspect-specialist.md) and the planning prompt's "Inspection Requirement" section for the criteria the planning agent uses.
 
 ### Agent Workflow
 
-After completing each bead, agents must request inspection:
+After closing a bead, the work agent reads `metadata.requiresInspection` from `.pan/spec.vbrief.json`:
 
 ```bash
 # After closing a bead
 bd close <beadId> --reason="Implemented X"
 
-# Request inspection before starting next bead
-pan inspect <issueId> --bead <beadId>
+# Branch on the bead's flag:
+#   requiresInspection: false → continue straight to the next bead (default for most beads)
+#   requiresInspection: true  → re-read inspectionDepth and run pan inspect
+
+# When required:
+pan inspect <issueId> --bead <beadId>          # inspectionDepth: fast or omitted
+pan inspect <issueId> --bead <beadId> --deep   # inspectionDepth: deep
 
 # Wait for result — delivered via pan tell
 # INSPECTION PASSED → proceed to next bead
 # INSPECTION BLOCKED → fix issues, then re-request
 ```
+
+`pan inspect` is an explicit command the agent runs only for flagged beads. There is no auto-trigger from `bd close`. The work agent re-reads bead metadata after closing so late plan updates can switch between the fast inspector and `--deep`.
 
 ### What Inspect Checks
 
@@ -120,7 +73,8 @@ Checkpoints stored at: `~/.panopticon/specialists/<project>/inspect-agent/checkp
 ### CLI Reference
 
 ```bash
-pan inspect <issueId> --bead <beadId>           # Request inspection
+pan inspect <issueId> --bead <beadId>           # Fast inspection
+pan inspect <issueId> --bead <beadId> --deep    # Deep inspection
 pan inspect <issueId> --bead <beadId> --workspace /path  # With explicit workspace
 pan specialists done inspect <issueId> --status passed   # Signal completion (specialist only)
 ```
@@ -168,31 +122,29 @@ When a user clicks **Start Agent** in the dashboard (`POST /api/agents`), the sy
 
 ```
 1. Planning agent writes:
-   .planning/
-   ├── STATE.md              # Decisions, approach, remaining work
-   ├── PLANNING_PROMPT.md    # Planning agent's instructions (DO NOT READ during implementation)
-   ├── discussions/           # Discovery conversation transcripts
-   ├── notes/                 # Research notes
-   └── transcripts/           # Session transcripts
+   .pan/
+   ├── spec.vbrief.json      # Machine-readable work plan (scope vBRIEF)
+   ├── continue.json         # Session state (decisions, approach, resume point)
+   ├── prd.md                # Discovered/copied PRD
+   └── context.md            # Workspace context for agents
 
 2. User clicks "Start Agent" → POST /api/agents
 
 3. Dashboard server:
    a. Stops planning agent (marks state as 'stopped', stoppedReason: 'work-agent-started')
-   b. Commits .planning/ artifacts to git
-   c. Archives PLANNING_PROMPT.md → PLANNING_PROMPT.md.archived (PAN-250)
-   d. Determines phase: .planning/ exists → 'implementation', otherwise → 'exploration'
-   e. Evaluates work-agent lifecycle truth: real resumable stopped agent ⇒ resume path, orphaned placeholder/stale record ⇒ fresh start path
-   f. Shells out via detached `pan start <ID> --local --phase implementation` and records exact lifecycle + spawn output in `~/.panopticon/agents/agent-<id>/lifecycle.log` and `spawn.log`
+   b. Commits .pan/ artifacts to git
+   c. Determines phase: .pan/spec.vbrief.json exists → 'implementation', otherwise → 'exploration'
+   d. Evaluates work-agent lifecycle truth: real resumable stopped agent ⇒ resume path, orphaned placeholder/stale record ⇒ fresh start path
+   e. Shells out via detached `pan start <ID> --local --phase implementation` and records exact lifecycle + spawn output in `~/.panopticon/agents/agent-<id>/lifecycle.log` and `spawn.log`
 
 4. Dashboard UI shows `Starting...` / `Resuming...` immediately, then switches to the normal running controls once the work agent is actually live
 
-5. Work agent reads .planning/STATE.md and implements remaining work
+5. Work agent reads .pan/continue.json and .pan/spec.vbrief.json and implements remaining work
 ```
 
 ### Beads Prerequisite
 
-Beads are a hard prerequisite for starting work agents. The `POST /api/agents` endpoint returns **422** if `.beads/issues.jsonl` does not exist in the workspace. Cloister automatically creates beads from the vBRIEF plan via `createBeadsFromVBrief()` when the planning agent touches the `.planning-complete` marker. Manual `bd create` is no longer needed.
+Beads are a hard prerequisite for starting work agents. The `POST /api/agents` endpoint returns **422** if `.beads/issues.jsonl` does not exist in the workspace. Cloister automatically creates beads from the vBRIEF plan via `createBeadsFromVBrief()` when planning completes. Manual `bd create` is no longer needed.
 
 ### DAG-Aware Task Scheduling
 
@@ -214,7 +166,7 @@ Each vBRIEF item can have `subItems` with `metadata.kind: "acceptance_criterion"
 
 A PRD may already exist in `docs/prds/active/` or `docs/prds/drafts/` before the planning agent runs — e.g., written manually or by a previous session. The planning agent handles three cases:
 
-1. **PRD with `<task>` XML tags** (execution-ready): Skip discovery. Use existing tasks directly to create `.planning/STATE.md`, beads, and `config.json`.
+1. **PRD with `<task>` XML tags** (execution-ready): Skip discovery. Use existing tasks directly to create `.pan/spec.vbrief.json`, beads, and continue state.
 
 2. **Prose PRD** (architecture decisions, requirements, no `<task>` tags): Use as foundation — do NOT redo decisions already made. Run abbreviated discovery to fill gaps, then convert prose into executable `<task>` XML structure. The PRD provides the "what and why"; planning creates the "how and in what order."
 
@@ -311,6 +263,8 @@ After `pan done`:
 ## Specialist Agent Processing
 
 ### Review Agent Workflow
+
+> For the full end-to-end review architecture — `pan review run` CLI, the four-phase flow, prompt primitives under `src/lib/cloister/prompts/review/`, the dashboard-restart invariant, and synthesis as the judgment layer — see [`REVIEW-AGENT-ARCHITECTURE.md`](./REVIEW-AGENT-ARCHITECTURE.md). The summary below covers the specialist-pipeline integration only.
 
 1. **Dispatched immediately** via `spawnEphemeralSpecialist` when verification gate passes
 2. **Reads PR** using GitHub CLI (`gh pr view`, `gh pr diff`)
@@ -481,9 +435,46 @@ auto_wake = true
 
 ## Session Lifecycle
 
-Each specialist dispatch spawns a fresh ephemeral Claude Code session (random `--session-id`, no `--resume`). This is intentional: context compaction corrupts thinking block signatures when sessions are resumed with `--resume` (PAN-612). Fresh-session-per-dispatch avoids this class of failures at the cost of each cycle starting without prior conversation context.
+There are **two specialist session strategies** in the system, and they apply to
+different specialists:
 
-A preamble is injected at the start of every task prompt to handle the case where a session has run before:
+### 1. Reviewer canonical sessions (PAN-830) — persistent across rounds
+
+Per-issue reviewer specialists (`review-correctness`, `review-security`,
+`review-performance`, `review-requirements`, `review-synthesis`) use canonical
+tmux sessions named:
+
+```
+specialist-<projectKey>-<issueId>-review-<role>
+```
+
+These sessions are **kept alive between review rounds** with `remain-on-exit on`.
+On each new round, `dispatchParallelReview` checks whether the canonical session
+already exists. If it does, the new round's prompt is delivered into the running
+Claude Code process via `sendKeysAsync` (tmux `load-buffer`/`paste-buffer`/`C-m`)
+rather than spawning a fresh process.
+
+Why this is safe vs PAN-612: the corruption case in PAN-612 is specifically
+about resuming a serialized session via `claude --resume`, which re-parses the
+JSONL and trips the thinking-block-signature check. The canonical pattern never
+serializes/resumes — the Claude process stays alive in tmux across rounds, so
+the corruption path doesn't exist. Reviewers retain their accumulated
+understanding of the issue (codebase patterns, prior findings, decisions made)
+without paying the corruption tax.
+
+### 2. Other specialist dispatches (test-agent, merge-agent, etc.) — fresh per dispatch
+
+Non-reviewer specialist dispatches spawn a fresh ephemeral Claude Code session
+each time (random `--session-id`, no `--resume`). Reasons:
+
+1. Context compaction corrupts thinking block signatures, making `--resume`
+   permanently fail with "Invalid signature in thinking block" (PAN-612).
+2. These dispatches are task-based: each is a new task with a full prompt.
+3. For test-agent specifically, accumulated context caused false-FAILs from
+   stale analysis.
+
+A preamble is injected at the start of every task prompt to handle the case
+where a session has run before:
 
 ```
 IMPORTANT: This is a NEW task dispatch. You may have context from prior runs in this session —
@@ -492,11 +483,15 @@ that is useful background knowledge, but you MUST execute this task fresh RIGHT 
 
 ### Context Digest (cross-dispatch memory)
 
-Specialists write a **context digest** after each run (`specialist-context.ts`). This structured summary is injected into the next dispatch's prompt as background knowledge. It provides the specialist's accumulated understanding of the codebase without requiring session resume:
+For specialists that don't use canonical sessions, a **context digest** is
+written after each run (`specialist-context.ts`) and injected into the next
+dispatch's prompt as background knowledge. It provides accumulated
+understanding without requiring session resume:
 
-- **review-agent**: Patterns found, past decisions, recurring issues
 - **test-agent**: Known flaky tests, test runner quirks, infrastructure notes
 - **merge-agent**: Conflict patterns, resolution strategies
+
+Reviewers don't need a digest since their sessions persist (PAN-830).
 
 ### Resetting a Specialist
 
@@ -505,9 +500,25 @@ Specialists write a **context digest** after each run (`specialist-context.ts`).
 pan specialists reset review-agent
 ```
 
-### Future: Persistent Sessions (tracked in PAN-722)
+For canonical reviewer sessions, reset additionally kills the per-issue tmux
+sessions so the next round spawns fresh.
 
-Keeping specialist processes alive between dispatch cycles (so Claude's conversation context is preserved across review/test cycles for the same issue) is a planned enhancement. The tmux session should persist until the issue is merged; the specialist should receive new tasks into the existing session rather than being killed and re-spawned. This requires a launcher architecture change (interactive mode + task delivery via `sendKeysAsync`) and is tracked separately.
+### Event-driven status (PAN-915)
+
+Reviewer status (`reviewSubStatuses[role]`, `reviewSessionNames`,
+`reviewCoordinatorSessionName`) is now driven by domain events rather than tmux
+polling:
+
+- `review.coordinator_started` — emitted when `pan review run` is dispatched
+- `review.reviewer_started` — emitted when each reviewer session is spawned
+  or has a new prompt sent into an existing canonical session
+- `review.reviewer_completed` — emitted when a reviewer's output file is
+  written
+
+The dashboard's read model applies these events directly, so the kanban card
+reflects per-role status the instant a reviewer is dispatched. Snapshot rebuild
+still falls back to `enrichReviewStatusFromSessions()` (which reads tmux) for
+recovery from server restarts mid-review.
 
 ## Review Cycle Circuit Breaker
 
@@ -541,8 +552,8 @@ Agent runs `pan done` (Bash command)
         → APPROVED → queues test-agent
           → test-agent runs tests
             → PASS → marks ready for merge (human clicks MERGE or merge-agent handles)
-            → FAIL → feedback to .planning/feedback/ → agent fixes → re-requests review
-        → CHANGES REQUESTED → feedback to .planning/feedback/ → agent fixes → re-requests review
+            → FAIL → feedback to .pan/review/ → agent fixes → re-requests review
+        → CHANGES REQUESTED → feedback to .pan/review/ → agent fixes → re-requests review
           → This cycle repeats up to 3 times before circuit breaker trips
 ```
 

@@ -20,40 +20,59 @@ import { httpHandler } from './http-handler.js';
  *   POST /api/issues/:id/deep-wipe
  *   POST /api/issues/:id/close-out
  *   GET  /api/issues/:id/beads
+ *   POST /api/issues/:id/beads/:beadId/inspect
  *   GET  /api/issues/:id/costs
  */
 
 import { exec, execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { appendFile, copyFile, mkdir, readdir, readFile, rm, writeFile, access } from 'node:fs/promises';
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { spawnPlanningSession, type PlanningIssue } from '../../../lib/planning/spawn-planning-session.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { withBdMutex } from '../../../lib/bd-mutex.js';
+import { spawnInspectAgent } from '../../../lib/cloister/inspect-agent.js';
 
 import { Effect, Layer, Option, Stream } from 'effect';
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/unstable/http';
 
-import { extractTeamPrefix, findProjectByTeam, resolveProjectFromIssue } from '../../../lib/projects.js';
-import { extractPrefix } from '../../../lib/issue-id.js';
-import { loadWorkspaceMetadata as loadWorkspaceMetadataStatic } from '../../../lib/remote/workspace-metadata.js';
-import { resolveGitHubIssue as resolveGitHubIssueShared, resolveTrackerType } from '../../../lib/tracker-utils.js';
-import { clearReviewStatus } from '../review-status.js';
+import { extractTeamPrefix, findProjectByTeamSync, resolveProjectFromIssueSync } from '../../../lib/projects.js';
+import { extractPrefixSync, parseIssueIdSync } from '../../../lib/issue-id.js';
+import { findPlan, findWorkspaceDraftPlan, isPlanningComplete, readPlanSync, readPlan } from '../../../lib/vbrief/io.js';
+import { appendContinueSessionEntryForIssue } from '../../../lib/vbrief/lifecycle-io.js';
+import { asPanSpecDocument, findSpecByIssue, writeSpec, writeSpecForIssue } from '../../../lib/pan-dir/index.js';
+import type { CreateBeadsResult } from '../../../lib/vbrief/beads.js';
+import { loadWorkspaceMetadataSync as loadWorkspaceMetadataStatic } from '../../../lib/remote/workspace-metadata.js';
+import { resolveGitHubIssueSync as resolveGitHubIssueShared, resolveTrackerTypeSync } from '../../../lib/tracker-utils.js';
+import { clearReviewStatus, getReviewStatusSync } from '../review-status.js';
+import { rejectUnsafeDashboardMutationRequest } from './dashboard-auth.js';
 import { reopenWorkspaceState } from '../../../lib/reopen.js';
 import { getGitHubConfig, getRallyConfig } from '../services/tracker-config.js';
-import { syncCache, getCostsForIssue } from '../../../lib/costs/index.js';
+import { syncCacheSync, getCostsForIssueSync } from '../../../lib/costs/index.js';
 import { IssueDataService } from '../services/issue-data-service.js';
+import { getSharedIssueService } from '../services/issue-service-singleton.js';
 import { CacheService } from '../services/cache-service.js';
 import { EventStoreService } from '../services/domain-services.js';
+import { resolveIssueHeadlineCost } from '../services/issue-cost-resolver.js';
+import { getCachedRunningAgents } from '../services/running-agents-cache.js';
+import { invalidateAgentsCache } from './agents.js';
 import { IssueLifecycle, type IssueState } from '../services/issue-lifecycle.js';
 import { LinearClient } from '../services/linear-client.js';
 import { GitHubClient } from '../services/github-client.js';
 import { RallyClient } from '../services/rally-client.js';
-import { killSessionAsync, listSessionNamesAsync, sessionExistsAsync } from '../../../lib/tmux.js';
-import { getAgentStateAsync, normalizeAgentId } from '../../../lib/agents.js';
-import type { LifecycleContext, StepResult } from '../../../lib/lifecycle/types.js';
+import { killSession, listSessionNames, sessionExists } from '../../../lib/tmux.js';
+import { getAgentState, getProviderAuthMode, normalizeAgentId } from '../../../lib/agents.js';
+import { canUseHarnessSync } from '../../../lib/harness-policy.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../../lib/activity-logger.js';
+import type { LifecycleContext, StepResult, WorkflowResult } from '../../../lib/lifecycle/types.js';
+import { withConcurrencyLimit } from '../../../lib/concurrency.js';
+import {
+  getCachedResourceAllocatedIssues,
+  getResourceDetailIdentifiers,
+  sanitizeResourceAllocatedIssues,
+} from '../services/resource-discovery.js';
 import { setCanonicalState } from '../../../lib/lifecycle/reconciler/index.js';
-import { canonicalPrdSubdir } from '../../../lib/prd-locations.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -63,8 +82,6 @@ const execFileAsync = promisify(execFile);
 // onIssuesChanged callback → event store → WebSocket RPC.
 
 function getIssueDataService(): IssueDataService {
-  // Use the shared singleton — started by server.ts on boot
-  const { getSharedIssueService } = require('../services/issue-service-singleton.js');
   return getSharedIssueService();
 }
 
@@ -78,6 +95,58 @@ export async function cleanupAgentStateDirs(dirs: string[]): Promise<void> {
 
 export async function removeCompletionMarker(markerPath: string): Promise<void> {
   if (existsSync(markerPath)) await rm(markerPath);
+}
+
+export async function completePlanningArtifacts(options: {
+  projectPath: string;
+  workspacePath: string;
+  issueId: string;
+  createBeads?: (workspacePath: string) => Promise<CreateBeadsResult> | Effect.Effect<CreateBeadsResult, unknown>;
+}): Promise<{ proposed: { path: string; filename: string }; beadCount: number; beadsWarning: string | null }> {
+  const { projectPath, workspacePath, issueId } = options;
+  const issueLower = issueId.toLowerCase();
+  const upperIssueId = issueId.toUpperCase();
+  const workspacePlanPath = await Effect.runPromise(Effect.gen(function* () {
+    return (yield* findWorkspaceDraftPlan(workspacePath)) ?? (yield* findPlan(workspacePath));
+  }));
+  if (!workspacePlanPath) {
+    throw new Error(`No workspace vBRIEF found for ${upperIssueId} at ${workspacePath}/.pan/spec.vbrief.json`);
+  }
+
+  const workspaceDoc = await Effect.runPromise(readPlan(workspacePlanPath));
+  const workspaceIssueId = workspaceDoc.plan?.id;
+  if (workspaceIssueId && workspaceIssueId.toLowerCase() !== issueLower) {
+    throw new Error(`Workspace vBRIEF is for ${workspaceIssueId.toUpperCase()}, not ${upperIssueId}`);
+  }
+
+  const existingSpec = await Effect.runPromise(findSpecByIssue(projectPath, upperIssueId));
+  const proposed = existingSpec
+    ? await (async () => {
+        const nextDoc = asPanSpecDocument(workspaceDoc, 'proposed');
+        await Effect.runPromise(writeSpec(existingSpec.path, nextDoc));
+        return { path: existingSpec.path, filename: existingSpec.filename };
+      })()
+    : await Effect.runPromise(writeSpecForIssue(projectPath, workspaceDoc, 'proposed')).then((e) => ({ path: e.path, filename: e.filename }));
+
+  const createBeads = options.createBeads ?? (async (path: string) => {
+    const mod = await import('../../../lib/vbrief/beads.js');
+    return (await Effect.runPromise(mod.createBeadsFromVBrief(path)));
+  });
+  const rawBeadsResult = createBeads(workspacePath);
+  const beadsResult = Effect.isEffect(rawBeadsResult)
+    ? await Effect.runPromise(rawBeadsResult)
+    : await rawBeadsResult;
+  const created = beadsResult.created ?? [];
+  const errors = beadsResult.errors ?? [];
+  const planItemCount = workspaceDoc.plan.items?.length ?? 0;
+  if (planItemCount === 0 || !beadsResult.success || created.length !== planItemCount) {
+    const detail = errors.length > 0
+      ? errors.join('; ')
+      : `created ${created.length} beads for ${planItemCount} plan items`;
+    throw new Error(`Failed to materialize beads for ${upperIssueId}: ${detail}`);
+  }
+
+  return { proposed, beadCount: created.length, beadsWarning: null };
 }
 
 // ─── Local helpers ────────────────────────────────────────────────────────────
@@ -100,17 +169,30 @@ function getGitHubLocalPaths(): Record<string, string> {
   if (!ghConfig) return {};
   const out: Record<string, string> = {};
   for (const r of ghConfig.repos) {
-    if (r.localPath) {
-      out[`${r.owner}/${r.repo}`] = r.localPath;
+    const localPath = (r as { localPath?: unknown }).localPath;
+    if (typeof localPath === 'string') {
+      out[`${r.owner}/${r.repo}`] = localPath;
     }
   }
   return out;
 }
 
+/** Map Rally child-issue service contract into the planning-context shape. */
+export function buildChildStoriesFromRally(
+  children: readonly { ref: string; title: string; status: string; description: string }[],
+): Array<{ ref: string; title: string; status: string; description: string }> {
+  return children.map((c) => ({
+    ref: c.ref,
+    title: c.title,
+    status: c.status,
+    description: c.description || '',
+  }));
+}
+
 function getProjectPath(linearProjectId?: string, issuePrefix?: string): string {
   if (issuePrefix) {
     const issueId = `${issuePrefix}-1`;
-    const resolved = resolveProjectFromIssue(issueId);
+    const resolved = resolveProjectFromIssueSync(issueId);
     if (resolved) return resolved.projectPath;
   }
   if (issuePrefix) {
@@ -169,8 +251,8 @@ async function closeIssuePullRequest(issueId: string, reason = 'Canceled via Pan
       { encoding: 'utf-8', timeout: 15000 },
     );
     try {
-      const { setReviewStatus } = await import('../../../lib/review-status.js');
-      setReviewStatus(issueId.toUpperCase(), { prUrl: undefined });
+      const { setReviewStatusSync } = await import('../../../lib/review-status.js');
+      setReviewStatusSync(issueId.toUpperCase(), { prUrl: undefined });
     } catch { /* non-fatal — validator catches this downstream */ }
     return [`Closed PR #${prNumber} on ${githubCheck.owner}/${githubCheck.repo}`];
   } catch (err: any) {
@@ -180,8 +262,8 @@ async function closeIssuePullRequest(issueId: string, reason = 'Canceled via Pan
 
 function buildLifecycleContext(id: string, issueSource: string | undefined) {
   const issuePrefix = extractTeamPrefix(id);
-  const projectPath = getProjectPath(undefined, issuePrefix);
-  const projectConfig = findProjectByTeam(issuePrefix);
+  const projectPath = getProjectPath(undefined, issuePrefix ?? undefined);
+  const projectConfig = issuePrefix ? findProjectByTeamSync(issuePrefix) : null;
   const githubCheck = isGitHubIssue(id);
 
   const ctx: any = {
@@ -208,6 +290,37 @@ function buildLifecycleContext(id: string, issueSource: string | undefined) {
   return { ctx, projectConfig, githubCheck };
 }
 
+function isOrphanedIssue(issue: { status?: string; state?: string; rawTrackerState?: string; completedAt?: string | null }): boolean {
+  const status = issue.status?.toLowerCase() ?? '';
+  const state = issue.state?.toLowerCase() ?? '';
+  const rawTrackerState = issue.rawTrackerState?.toLowerCase() ?? '';
+  return Boolean(
+    issue.completedAt
+    || status.includes('closed')
+    || status.includes('done')
+    || status.includes('completed')
+    || state.includes('closed')
+    || state.includes('done')
+    || state.includes('completed')
+    || rawTrackerState.includes('closed')
+    || rawTrackerState.includes('done')
+    || rawTrackerState.includes('completed'),
+  );
+}
+
+function getIssueForCleanup(issueId: string) {
+  const issueDataService = getIssueDataService();
+  return issueDataService.getIssues({ includeCompleted: true }).find((issue: any) => {
+    const identifier = typeof issue?.identifier === 'string' ? issue.identifier : '';
+    return identifier.toUpperCase() === issueId.toUpperCase();
+  }) as {
+    status?: string;
+    state?: string;
+    rawTrackerState?: string;
+    completedAt?: string | null;
+  } | undefined;
+}
+
 async function runDestructiveIssueLifecycle(
   id: string,
   mode: 'reset' | 'cancel',
@@ -216,7 +329,7 @@ async function runDestructiveIssueLifecycle(
   const cleanupLog: string[] = [];
   const issueDataService = getIssueDataService();
   const issueSource = issueDataService.getIssueSource(id);
-  const { ctx, projectConfig } = buildLifecycleContext(id, issueSource);
+  const { ctx, projectConfig } = buildLifecycleContext(id, issueSource ?? undefined);
   const deleteWorkspace = opts.deleteWorkspace ?? true;
 
   cleanupLog.push(...await closeIssuePullRequest(
@@ -226,16 +339,53 @@ async function runDestructiveIssueLifecycle(
 
   const { resetToTodo, cancelIssueWorkflow } = await import('../../../lib/lifecycle/index.js');
   const workflow = mode === 'cancel' ? cancelIssueWorkflow : resetToTodo;
-  const result = await workflow(ctx, {
+  const result = await Effect.runPromise(workflow(ctx, {
     deleteWorkspace,
     deleteBranches: deleteWorkspace,
     resetIssue: true,
     workspaceConfig: projectConfig?.workspace,
     projectName: projectConfig?.name || '',
     onProgress: opts.onProgress ? (event) => opts.onProgress?.({ type: 'progress', ...event }) : undefined,
-  });
+  }));
 
   cleanupLog.push(...result.steps.flatMap((step: any) => step.details || [step.error].filter(Boolean)));
+
+  // vBRIEF lifecycle transition for cancel (PAN-946): move to cancelled/ on main.
+  if (mode === 'cancel') {
+    try {
+      const { transitionVBriefOnMain } = await import('../../../lib/vbrief/lifecycle-io.js');
+      const tx = await Effect.runPromise(transitionVBriefOnMain(
+        ctx.projectPath,
+        id,
+        'cancelled',
+        'cancelled',
+        `scope: cancel ${id.toUpperCase()} vBRIEF`,
+      ));
+      if (tx.moved) cleanupLog.push(`vBRIEF moved ${tx.fromDir} → cancelled`);
+      if (tx.committed) cleanupLog.push(`Committed vBRIEF cancellation on main`);
+    } catch (err: any) {
+      cleanupLog.push(`vBRIEF cancel transition failed (non-fatal): ${err?.message ?? err}`);
+    }
+  }
+
+  // Kill canonical reviewer/synthesis tmux sessions (PAN-915). They persist
+  // across review rounds to preserve context, so reset/cancel/deep-wipe is the
+  // right place to tear them down — the issue is going back to Todo or being
+  // canceled outright.
+  try {
+    const { killAllReviewerSessions } = await import('../../../lib/cloister/review-agent.js');
+    const { resolveProjectFromIssueSync } = await import('../../../lib/projects.js');
+    const resolved = resolveProjectFromIssueSync(id);
+    const projectKey = resolved?.projectKey;
+    if (projectKey) {
+      const { killed } = await Effect.runPromise(killAllReviewerSessions(projectKey, id.toUpperCase()));
+      if (killed.length > 0) {
+        cleanupLog.push(`Killed ${killed.length} reviewer session(s)`);
+      }
+    }
+  } catch (err) {
+    cleanupLog.push(`Reviewer session cleanup failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   try {
     clearReviewStatus(id.toUpperCase());
@@ -272,6 +422,14 @@ const readJsonBody = Effect.gen(function* () {
   }
 });
 
+async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 // ─── Route: GET /api/issues ───────────────────────────────────────────────────
 
 const getIssuesRoute = HttpRouter.add(
@@ -301,6 +459,9 @@ const getIssueAnalyzeRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const linear = yield* LinearClient;
 
     const issue = yield* Effect.promise(() =>
@@ -385,11 +546,14 @@ const postIssueCloseRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const issueId = params['issueId'] ?? '';
+    if (!parseIssueIdSync(issueId)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
 
     const { reason } = body as any;
-    const issuePrefix = extractPrefix(issueId) ?? issueId.split('-')[0];
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
     const projectPath = getProjectPath(undefined, issuePrefix);
 
     const { close: closeWorkflow } = yield* Effect.promise(() => import('../../../lib/lifecycle/index.js'));
@@ -418,7 +582,7 @@ const postIssueCloseRoute = HttpRouter.add(
       }
     }
 
-    const result = yield* Effect.promise(() => closeWorkflow(ctx, { reason }));
+    const result = yield* closeWorkflow(ctx, { reason });
 
     if (githubCheck.isGitHub) {
       execAsync('pan sync', { encoding: 'utf-8', timeout: 30000 }).catch(() => {});
@@ -459,6 +623,9 @@ const postIssueStartPlanningRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
     const linear = yield* LinearClient;
@@ -473,13 +640,19 @@ const postIssueStartPlanningRoute = HttpRouter.add(
       shadowMode = false,
       model: modelOverride,
       effort,
+      auto = false,
+      harness = 'claude-code',
     } = body as any;
+    const requestedHarness = harness === 'pi' || harness === 'claude-code' ? harness : 'claude-code';
 
     console.log(`[start-planning] START for ${id}, workspaceLocation=${workspaceLocation}, shadow=${shadowMode}`);
 
+    // Clear agents cache so the next dashboard poll sees the new planning agent
+    invalidateAgentsCache();
+
     // Check if a work agent is already running
     const issueLowerForCheck = id.toLowerCase();
-    const tmuxSessions = yield* Effect.promise(() => listSessionNamesAsync());
+    const tmuxSessions = yield* listSessionNames();
     const workAgentSession = tmuxSessions.find((s: string) => s === `agent-${issueLowerForCheck}`);
     if (workAgentSession) {
       return jsonResponse({
@@ -489,7 +662,7 @@ const postIssueStartPlanningRoute = HttpRouter.add(
       }, { status: 409 });
     }
 
-    const trackerTypeForIssue = resolveTrackerType(id);
+    const trackerTypeForIssue = resolveTrackerTypeSync(id);
     const githubCheck = isGitHubIssue(id);
 
     let issue: {
@@ -500,26 +673,22 @@ const postIssueStartPlanningRoute = HttpRouter.add(
       url: string;
       source: 'linear' | 'github' | 'rally';
       comments?: Array<{ author: string; body: string; createdAt: string }>;
+      artifactType?: string;
+      childStories?: Array<{ ref: string; title: string; status: string; description: string }>;
     };
     let newStateName = 'In Planning';
 
     if (trackerTypeForIssue === 'github' && githubCheck.isGitHub && githubCheck.owner && githubCheck.repo && githubCheck.number) {
       const { owner, repo, number } = githubCheck as { owner: string; repo: string; number: number };
-      const ghIssue = yield* Effect.promise(() =>
-        Effect.runPromise(github.getIssue(owner, repo, number).pipe(Effect.catch((e) => Effect.fail(e)))),
-      );
+      const ghIssue = yield* github.getIssue(owner, repo, number);
 
       const ghConfig = getGitHubConfig();
       const repoConfig = ghConfig?.repos.find((r: any) => r.owner === owner && r.repo === repo);
       const prefix = repoConfig?.prefix || repo.toUpperCase();
 
-      const ghComments = yield* Effect.promise(() =>
-        Effect.runPromise(
-          github.getComments(owner, repo, number, 50).pipe(
-            Effect.map((cs) => cs.map((c) => ({ author: c.user, body: c.body, createdAt: c.createdAt }))),
-            Effect.catch(() => Effect.succeed([] as Array<{ author: string; body: string; createdAt: string }>)),
-          ),
-        ),
+      const ghComments = yield* github.getComments(owner, repo, number, 50).pipe(
+        Effect.map((cs) => cs.map((c) => ({ author: c.user, body: c.body, createdAt: c.createdAt }))),
+        Effect.catch(() => Effect.succeed([] as Array<{ author: string; body: string; createdAt: string }>)),
       );
 
       issue = {
@@ -533,20 +702,19 @@ const postIssueStartPlanningRoute = HttpRouter.add(
       };
 
       // Add "planning" label (ensure it exists, then apply to issue)
-      yield* Effect.promise(() =>
-        Effect.runPromise(lifecycle.addLabel(id, 'planning').pipe(Effect.catch(() => Effect.void))),
-      );
+      yield* lifecycle.addLabel(id, 'planning').pipe(Effect.catch(() => Effect.void));
 
     } else if (trackerTypeForIssue === 'rally') {
-      const rallyIssue = yield* Effect.promise(() =>
-        Effect.runPromise(
-          rally.getIssue(id).pipe(
-            Effect.catchTag('TrackerNotConfigured', () =>
-              Effect.fail(new Error('RALLY_API_KEY not configured. Set it in ~/.panopticon.env')),
-            ),
-          ),
-        ),
-      );
+      const rallyIssue = yield* rally.getIssue(id);
+
+      // Fetch child stories for Rally Features
+      let childStories: Array<{ ref: string; title: string; status: string; description: string }> = [];
+      if (rallyIssue.artifactType?.includes('PortfolioItem')) {
+        const children = yield* rally.getChildIssues(id).pipe(
+          Effect.catch(() => Effect.succeed([] as readonly { ref: string; title: string; status: string; description: string }[])),
+        );
+        childStories = buildChildStoriesFromRally(children);
+      }
 
       issue = {
         id: rallyIssue.id,
@@ -555,19 +723,13 @@ const postIssueStartPlanningRoute = HttpRouter.add(
         description: rallyIssue.description || '',
         url: rallyIssue.url,
         source: 'rally',
+        artifactType: rallyIssue.artifactType,
+        childStories: childStories.length > 0 ? childStories : undefined,
       };
 
     } else {
       // Linear
-      const linearIssue = yield* Effect.promise(() =>
-        Effect.runPromise(
-          linear.getIssue(id).pipe(
-            Effect.catchTag('TrackerNotConfigured', () =>
-              Effect.fail(new Error('LINEAR_API_KEY not configured')),
-            ),
-          ),
-        ),
-      );
+      const linearIssue = yield* linear.getIssue(id);
 
       issue = {
         id: linearIssue.id,
@@ -577,18 +739,42 @@ const postIssueStartPlanningRoute = HttpRouter.add(
         url: linearIssue.url,
         source: 'linear',
       };
-
-      // Transition to "In Planning" state
-      yield* Effect.promise(() =>
-        Effect.runPromise(lifecycle.transitionTo(id, 'in_planning').pipe(Effect.catch(() => Effect.void))),
-      );
     }
 
-    const issuePrefix = extractPrefix(issue.identifier) ?? issue.identifier.split('-')[0];
+    const issuePrefix = extractPrefixSync(issue.identifier) ?? issue.identifier.split('-')[0];
     const projectPath = getProjectPath(undefined, issuePrefix);
     const issueLower = issue.identifier.toLowerCase();
     const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
     const sessionName = `planning-${issueLower}`;
+
+    // PAN-1048: Write preliminary agent state BEFORE lifecycle.transitionTo so
+    // reactive Cloister sees role: 'plan' for this issue the moment it observes
+    // the in_planning transition. Writing state.json AFTER transitionTo opened
+    // a small race window where Cloister's onIssueStateChange could run
+    // activeRoleRunExists() and find no plan agent, then spawn a duplicate
+    // planning run via spawnRun (session name 'agent-pan-X-plan') alongside
+    // the route's own planning-pan-x session.
+    // state.json must declare role: 'plan' — parseAgentState() drops state files
+    // lacking a valid role, so writing the legacy type/agentPhase shape would
+    // make the dashboard discard this planning session on the next startup scan.
+    const agentStateDir = join(homedir(), '.panopticon', 'agents', sessionName);
+    yield* Effect.promise(() => mkdir(agentStateDir, { recursive: true }));
+    yield* Effect.promise(() => writeFile(join(agentStateDir, 'state.json'), JSON.stringify({
+      id: sessionName,
+      issueId: issue.identifier,
+      workspace: workspacePath,
+      status: 'starting',
+      startedAt: new Date().toISOString(),
+      role: 'plan',
+      location: workspaceLocation,
+    }, null, 2)));
+
+    if (issue.source === 'linear') {
+      // Transition to "In Planning" state — emits issue.transitioned which
+      // reactive Cloister consumes. State.json was written above so the
+      // observer can see role: 'plan' before mapping in_planning → plan role.
+      yield* lifecycle.transitionTo(id, 'in_planning').pipe(Effect.catch(() => Effect.void));
+    }
 
     yield* eventStore.append({
       type: 'workspace.created',
@@ -600,26 +786,15 @@ const postIssueStartPlanningRoute = HttpRouter.add(
       timestamp: new Date().toISOString(),
       payload: { issueId: id, sessionName },
     });
-    yield* eventStore.append({
-      type: 'issue.statusChanged',
-      timestamp: new Date().toISOString(),
-      payload: { issueId: issue.identifier, status: newStateName, canonicalStatus: 'in_progress' },
-    });
+    // PAN-1048: lifecycle.transitionTo(id, 'in_planning') above already emits
+    // issue.transitioned with state 'in_planning'. The redundant
+    // issue.statusChanged emit (formerly broadcasting canonicalStatus
+    // 'in_progress', not 'in_planning') was a second source of truth that
+    // raced with reactive Cloister: 'in_progress' maps to the work role,
+    // so Cloister could spawn a work agent while the planning agent was
+    // still being created. Removed in favor of the single transitionTo emit.
 
-    // Write preliminary agent state so status endpoint knows planning is starting
-    const agentStateDir = join(homedir(), '.panopticon', 'agents', sessionName);
-    yield* Effect.promise(() => mkdir(agentStateDir, { recursive: true }));
-    yield* Effect.promise(() => writeFile(join(agentStateDir, 'state.json'), JSON.stringify({
-      id: sessionName,
-      issueId: issue.identifier,
-      workspace: workspacePath,
-      status: 'starting',
-      startedAt: new Date().toISOString(),
-      type: 'planning',
-      location: workspaceLocation,
-    }, null, 2)));
-
-    try { getIssueDataService().patchIssue(issue.identifier, { status: newStateName, canonicalStatus: 'in_progress' }); } catch { /* non-fatal */ }
+    try { getIssueDataService().patchIssue(issue.identifier, { status: newStateName, canonicalStatus: 'in_planning' }); } catch { /* non-fatal */ }
 
     // SSE stream: await spawnPlanningSession and stream progress events
     const encoder = new TextEncoder();
@@ -656,6 +831,11 @@ const postIssueStartPlanningRoute = HttpRouter.add(
         });
 
         try {
+          let effectiveHarness = requestedHarness;
+          if (typeof modelOverride === 'string' && modelOverride.trim()) {
+            const decision = canUseHarnessSync(requestedHarness, modelOverride.trim(), await getProviderAuthMode(modelOverride.trim()));
+            if (!decision.allowed) effectiveHarness = 'claude-code';
+          }
           const result = await spawnPlanningSession({
             issue: issue as PlanningIssue,
             workspacePath,
@@ -665,7 +845,9 @@ const postIssueStartPlanningRoute = HttpRouter.add(
             startDocker: body.startDocker,
             shadowMode,
             model: modelOverride || undefined,
+            harness: effectiveHarness,
             effort: effort || undefined,
+            auto: auto === true,
             onProgress: (event) => {
               console.log(`[start-planning] Progress: step=${event.step} label="${event.label}" status=${event.status} detail="${event.detail}"`);
               sendEvent({ type: 'progress', ...event });
@@ -712,6 +894,9 @@ const postIssueAbortPlanningRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const lifecycle = yield* IssueLifecycle;
     const linear = yield* LinearClient;
@@ -729,7 +914,7 @@ const postIssueAbortPlanningRoute = HttpRouter.add(
       sessionName = `planning-${id.toLowerCase()}`;
       // Remove planning label via IssueLifecycle
       yield* lifecycle.removeLabel(id, 'planning').pipe(Effect.catch(() => Effect.void));
-      revertedState = 'Todo (label removed)';
+      revertedState = 'Todo';
     } else {
       // Resolve issue identifier and session name via LinearClient, then transition to 'open' (Todo)
       const linearIssue = yield* linear.getIssue(id).pipe(Effect.catch(() => Effect.succeed(null)));
@@ -744,8 +929,8 @@ const postIssueAbortPlanningRoute = HttpRouter.add(
     }
 
     // Kill tmux sessions
-    yield* Effect.promise(() => killSessionAsync(sessionName).catch(() => {}));
-    yield* Effect.promise(() => killSessionAsync(`planning-${id.toLowerCase()}`).catch(() => {}));
+    yield* killSession(sessionName).pipe(Effect.ignore);
+    yield* killSession(`planning-${id.toLowerCase()}`).pipe(Effect.ignore);
 
     // Clean up agent state files (non-fatal, so absorbed inside the promise)
     const agentStateDir = join(homedir(), '.panopticon', 'agents', sessionName);
@@ -771,8 +956,8 @@ const postIssueAbortPlanningRoute = HttpRouter.add(
             projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`];
           }
           if (!projectPath) {
-            const prefix = extractPrefix(issueIdentifier!) ?? issueIdentifier!.split('-')[0].toUpperCase();
-            const projConfig = findProjectByTeam(prefix);
+            const prefix = extractPrefixSync(issueIdentifier!) ?? issueIdentifier!.split('-')[0].toUpperCase();
+            const projConfig = findProjectByTeamSync(prefix);
             if (projConfig) projectPath = projConfig.path;
           }
 
@@ -815,6 +1000,9 @@ const postIssueAbortPlanningRoute = HttpRouter.add(
     });
     try { getIssueDataService().patchIssue(issueIdentifier || id, { status: revertedState, canonicalStatus: 'todo' }); } catch { /* non-fatal */ }
 
+    // Clear agents cache so the dashboard stops showing the planning agent as active
+    invalidateAgentsCache();
+
     return jsonResponse({
       success: true,
       issueId: id,
@@ -835,6 +1023,9 @@ const postIssueCompletePlanningRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
     const linear = yield* LinearClient;
@@ -874,18 +1065,11 @@ const postIssueCompletePlanningRoute = HttpRouter.add(
       return { isRemotePlanning, remoteVmName };
     });
 
-    if (!skipKill) {
-      yield* Effect.promise(async () => {
-        try {
-          await killSessionAsync(sessionName);
-        } catch (error: unknown) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (!/can't find session|session not found|no session found/i.test(msg)) {
-            console.error(`[complete-planning] kill-session failed for ${sessionName}:`, msg);
-          }
-        }
-      });
-    }
+    // Session kill is deferred to after the HTTP response is sent. When
+    // `pan plan finalize` chains to this endpoint from inside the planning
+    // session itself, killing the session synchronously here would kill the
+    // caller mid-fetch and they would never see their own success response.
+    // Keep this name in scope; we schedule the kill at the very end.
 
     // Mark planning agent as stopped so KanbanBoard shows "Start Agent" instead of "Watch Planning"
     yield* Effect.promise(async () => {
@@ -912,102 +1096,81 @@ const postIssueCompletePlanningRoute = HttpRouter.add(
     }
     if (!projectPath) {
       const teamPrefix = extractTeamPrefix(id);
-      const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+      const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
       projectPath = projectConfig?.path || '';
     }
 
     // Git operations: write planning marker, commit, push (complex nested async — kept as async block)
     const { pushed: gitPushed, beadsWarning } = yield* Effect.promise(async (): Promise<{ pushed: boolean; beadsWarning: string | null }> => {
-      if (!projectPath) return { pushed: false, beadsWarning: null };
+      if (!projectPath) {
+        throw new Error(`Cannot complete planning for ${id}: project path could not be resolved`);
+      }
 
-      const workspacePlanningDir = join(projectPath, 'workspaces', `feature-${issueLower}`, '.planning');
-      const legacyPlanningDir = join(projectPath, '.planning', issueLower);
+      const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+      const gitRoot = workspacePath;
+      const upperIssueId = id.toUpperCase();
+      const { proposed, beadCount, beadsWarning } = await completePlanningArtifacts({ projectPath, workspacePath, issueId: id });
+      console.log(`[complete-planning] Wrote pan spec to ${proposed.path}`);
+      console.log(`[complete-planning] Materialized ${beadCount} beads for ${upperIssueId}`);
 
-      let planningDir = '';
-      if (existsSync(workspacePlanningDir)) planningDir = workspacePlanningDir;
-      else if (existsSync(legacyPlanningDir)) planningDir = legacyPlanningDir;
+      const filesToStage = [`.pan/specs/${proposed.filename}`];
+      const { stdout: branchStdout } = await execFileAsync(
+        'git',
+        ['rev-parse', '--abbrev-ref', 'HEAD'],
+        { cwd: projectPath, encoding: 'utf-8' },
+      );
+      const currentBranch = branchStdout.trim();
+      if (currentBranch === 'main') {
+        await execFileAsync('git', ['add', '--', ...filesToStage], { cwd: projectPath, encoding: 'utf-8' });
+        try {
+          await execFileAsync('git', ['diff', '--cached', '--quiet', '--', ...filesToStage], { cwd: projectPath, encoding: 'utf-8' });
+        } catch {
+          await execFileAsync(
+            'git',
+            ['commit', '-m', `chore(scope): propose ${upperIssueId} vBRIEF`, '--no-verify', '--', ...filesToStage],
+            { cwd: projectPath, encoding: 'utf-8' },
+          );
+          console.log(`[complete-planning] Committed pan spec on main for ${upperIssueId}`);
+          try {
+            const { stdout: remotes } = await execFileAsync('git', ['remote'], { cwd: projectPath, encoding: 'utf-8' });
+            if (remotes.trim()) {
+              const pushChild = spawn('git', ['push'], { cwd: projectPath, detached: true, stdio: 'ignore' });
+              pushChild.unref();
+            }
+          } catch { /* push failed — no remote or auth — non-fatal */ }
+        }
+      } else {
+        console.log(`[complete-planning] Project root not on main (${currentBranch}) — pan spec updated on disk but not committed on main`);
+      }
 
-      if (!planningDir) return { pushed: false, beadsWarning: null };
+      const isGitRepo = existsSync(join(gitRoot, '.git'));
+      if (!isGitRepo) {
+        await execFileAsync('git', ['init'], { cwd: gitRoot, encoding: 'utf-8' });
+      }
+
+      if (existsSync(join(gitRoot, '.pan'))) {
+        await execFileAsync('git', ['add', '-f', '.pan/'], { cwd: gitRoot, encoding: 'utf-8' });
+      }
+      if (existsSync(join(gitRoot, '.beads'))) {
+        await execFileAsync('git', ['add', '.beads/'], { cwd: gitRoot, encoding: 'utf-8' });
+      }
 
       try {
-        const gitRoot = planningDir.includes('/workspaces/')
-          ? join(projectPath, 'workspaces', `feature-${issueLower}`)
-          : projectPath;
-
-        // Beads are created by the planning agent via `pan plan-finalize`, which also
-        // writes .planning/.planning-complete. By the time this endpoint runs, the marker
-        // and beads are expected to already exist. We do not create beads here — fixing
-        // the planning prompt is the right place to enforce that contract.
-        const beadsWarning: string | null = null;
-
-        // Auto-copy planning artifacts to docs/prds/active/<issue-id>/ (skip if already exist).
-        // MUST use canonicalPrdSubdir() (lowercase) — passing the raw `id` previously stranded
-        // PRDs in uppercase directories that downstream readers/archivers couldn't find.
-        try {
-          const issueActiveDir = canonicalPrdSubdir(gitRoot, id, 'active');
-          await mkdir(issueActiveDir, { recursive: true });
-          const stateMd = join(planningDir, 'STATE.md');
-          const planVbrief = join(planningDir, 'plan.vbrief.json');
-          const destStateMd = join(issueActiveDir, 'STATE.md');
-          const destPlanVbrief = join(issueActiveDir, 'plan.vbrief.json');
-          if (existsSync(stateMd)) {
-            const stateMdExists = await access(destStateMd).then(() => true).catch(() => false);
-            if (!stateMdExists) {
-              await copyFile(stateMd, destStateMd);
-              console.log(`[complete-planning] Copied STATE.md to ${destStateMd}`);
-            }
-          }
-          if (existsSync(planVbrief)) {
-            const vbriefExists = await access(destPlanVbrief).then(() => true).catch(() => false);
-            if (!vbriefExists) {
-              await copyFile(planVbrief, destPlanVbrief);
-              console.log(`[complete-planning] Copied plan.vbrief.json to ${destPlanVbrief}`);
-            }
-          }
-        } catch (copyErr: any) {
-          console.warn(`[complete-planning] Artifact copy failed (non-fatal): ${copyErr.message}`);
-        }
-
-        // Sync beads
-        try {
-          await execAsync('bd sync 2>/dev/null || true', { cwd: gitRoot, encoding: 'utf-8', timeout: 10000 });
-        } catch { /* bd might not be installed */ }
-
-        // The .planning-complete marker is written by `pan plan-finalize` from the
-        // planning agent, not here. The Done button is gated on its existence, so by
-        // the time this endpoint fires the marker is already on disk.
-
-        // Git operations
-        const isGitRepo = existsSync(join(gitRoot, '.git'));
-        if (!isGitRepo) {
-          await execAsync('git init', { cwd: gitRoot, encoding: 'utf-8' });
-        }
-
-        await execAsync('git add -f .planning/', { cwd: gitRoot, encoding: 'utf-8' });
-        if (existsSync(join(gitRoot, '.beads'))) {
-          await execAsync('git add .beads/', { cwd: gitRoot, encoding: 'utf-8' });
-        }
-
-        try {
-          await execAsync('git diff --cached --quiet', { cwd: gitRoot, encoding: 'utf-8' });
-        } catch {
-          await execAsync(`git commit -m "Complete planning for ${id}"`, { cwd: gitRoot, encoding: 'utf-8' });
-        }
-
-        try {
-          const { stdout: remotes } = await execAsync('git remote', { cwd: gitRoot, encoding: 'utf-8' });
-          if (remotes.trim()) {
-            const pushChild = spawn('git', ['push'], { cwd: gitRoot, detached: true, stdio: 'ignore' });
-            pushChild.unref();
-            return { pushed: true, beadsWarning };
-          } else {
-            return { pushed: true, beadsWarning };
-          }
-        } catch { /* Non-fatal */ }
-      } catch (gitErr) {
-        console.error('Git commit/push failed:', gitErr);
+        await execFileAsync('git', ['diff', '--cached', '--quiet'], { cwd: gitRoot, encoding: 'utf-8' });
+      } catch {
+        await execFileAsync('git', ['commit', '-m', `chore(plan): complete planning for ${id}`, '--no-verify'], { cwd: gitRoot, encoding: 'utf-8' });
       }
-      return { pushed: false, beadsWarning: null };
+
+      try {
+        const { stdout: remotes } = await execFileAsync('git', ['remote'], { cwd: gitRoot, encoding: 'utf-8' });
+        if (remotes.trim()) {
+          const pushChild = spawn('git', ['push'], { cwd: gitRoot, detached: true, stdio: 'ignore' });
+          pushChild.unref();
+        }
+        return { pushed: true, beadsWarning };
+      } catch {
+        return { pushed: false, beadsWarning };
+      }
     });
 
     // Update Linear/GitHub issue state
@@ -1017,7 +1180,7 @@ const postIssueCompletePlanningRoute = HttpRouter.add(
     // planning finishes, but the user may have already clicked "Start Agent". Resetting the
     // issue to Planned would undo that and flash the card back to To Do.
     const workAgentSession = `agent-${issueLower}`;
-    const workAgentAlreadyRunning = yield* Effect.promise(() => sessionExistsAsync(workAgentSession));
+    const workAgentAlreadyRunning = yield* sessionExists(workAgentSession);
     if (workAgentAlreadyRunning) {
       console.log(`[complete-planning] Work agent ${workAgentSession} is already running — skipping status reset to Planned`);
     }
@@ -1069,8 +1232,41 @@ const postIssueCompletePlanningRoute = HttpRouter.add(
     });
     try { getIssueDataService().patchIssue(id, { status: newState, canonicalStatus: completeCanonical }); } catch { /* non-fatal */ }
 
+    // Clear agents cache so the dashboard stops showing the planning agent as active
+    invalidateAgentsCache();
+
+    // Emit activity + TTS for planning completion
+    emitActivityEntrySync({
+      source: 'plan',
+      level: 'info',
+      message: `${id} planning complete — ready for work`,
+      issueId: id,
+    });
+    emitActivityTtsSync({
+      utterance: `${id} planning complete, ready for work`,
+      priority: 2,
+      issueId: id,
+      source: 'planning-agent',
+      eventType: 'planning.complete',
+    });
+
     // Suppress unused variable warning — remoteVmName used for remote session cleanup if added later
     void isRemotePlanning; void remoteVmName;
+
+    // Deferred session kill: schedule after the response is flushed so a chained
+    // `pan plan finalize` call from inside the planning session can read its own
+    // success response before its tmux pane is destroyed. ~1.5s is enough for the
+    // body to leave the kernel buffer and for plan-finalize to print.
+    if (!skipKill) {
+      setTimeout(() => {
+        Effect.runPromise(killSession(sessionName)).catch((error: unknown) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (!/can't find session|session not found|no session found/i.test(msg)) {
+            console.error(`[complete-planning] deferred kill-session failed for ${sessionName}:`, msg);
+          }
+        });
+      }, 1500);
+    }
 
     return jsonResponse({
       success: true,
@@ -1093,6 +1289,9 @@ const postIssueAbortRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const eventStore = yield* EventStoreService;
 
     const result = yield* Effect.promise(() => runDestructiveIssueLifecycle(id, 'reset', { deleteWorkspace: true }));
@@ -1138,6 +1337,9 @@ const postIssueResetRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
 
@@ -1214,6 +1416,9 @@ const postIssueCancelRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
 
@@ -1249,6 +1454,14 @@ const postIssueReopenRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const authError = rejectUnsafeDashboardMutationRequest(request);
+    if (authError) return authError;
+
     const body = yield* readJsonBody;
     const lifecycle = yield* IssueLifecycle;
     const linear = yield* LinearClient;
@@ -1260,21 +1473,28 @@ const postIssueReopenRoute = HttpRouter.add(
     const issueDataService = getIssueDataService();
     const issueSource = issueDataService.getIssueSource(id);
 
-    let newState = 'In Progress';
+    const reviewStatus = getReviewStatusSync(id.toUpperCase());
+    const cachedIssue = issueDataService.getIssues()
+      .find((issue: any) => String(issue.identifier ?? issue.id ?? '').toUpperCase() === id.toUpperCase());
+    const reopenToVerifying = reviewStatus?.mergeStatus === 'merged' || cachedIssue?.mergeStatus === 'merged';
+    const targetState: IssueState = reopenToVerifying ? 'verifying_on_main' : 'in_progress';
+    const targetCanonicalStatus = targetState;
+
+    let newState = reopenToVerifying ? 'Verifying on Main' : 'In Progress';
     let issueIdentifier = id;
 
-    // Transition to 'in_progress' via IssueLifecycle (handles all three trackers)
-    yield* lifecycle.transitionTo(id, 'in_progress').pipe(Effect.catch(() => Effect.void));
+    yield* lifecycle.transitionTo(id, targetState).pipe(Effect.catch(() => Effect.void));
 
     if (issueSource === 'rally') {
       issueDataService.invalidateTracker('rally').catch(() => {});
-      newState = 'Open';
+      if (!reopenToVerifying) newState = 'Open';
 
     } else if (githubCheck.isGitHub) {
-      // Also clean up done/needs-close-out/merged labels and ensure in-progress is set
-      yield* lifecycle.removeLabel(id, 'done').pipe(Effect.catch(() => Effect.void));
-      yield* lifecycle.removeLabel(id, 'needs-close-out').pipe(Effect.catch(() => Effect.void));
-      yield* lifecycle.removeLabel(id, 'merged').pipe(Effect.catch(() => Effect.void));
+      if (!reopenToVerifying) {
+        yield* lifecycle.removeLabel(id, 'done').pipe(Effect.catch(() => Effect.void));
+        yield* lifecycle.removeLabel(id, 'needs-close-out').pipe(Effect.catch(() => Effect.void));
+        yield* lifecycle.removeLabel(id, 'merged').pipe(Effect.catch(() => Effect.void));
+      }
 
       // Reopen closed (not merged) PR for the feature branch if one exists
       yield* Effect.promise(async () => {
@@ -1295,29 +1515,28 @@ const postIssueReopenRoute = HttpRouter.add(
       });
 
       issueDataService.invalidateTracker('github').catch(() => {});
-      newState = 'In Progress';
+      if (!reopenToVerifying) newState = 'In Progress';
 
     } else {
-      // Linear: fetch updated state name
       const updatedIssue = yield* linear.getIssue(id).pipe(Effect.catch(() => Effect.succeed(null)));
       issueIdentifier = updatedIssue?.identifier ?? id;
-      newState = updatedIssue?.state.name ?? 'In Progress';
+      if (!reopenToVerifying) newState = updatedIssue?.state.name ?? 'In Progress';
       issueDataService.invalidateTracker('linear').catch(() => {});
     }
 
     // Reset specialist pipeline state, post-merge state, and agent markers (all non-fatal)
     yield* Effect.promise(async () => {
-      // Reset specialist pipeline state, remove from queues, and update STATE.md
+      // Reset specialist pipeline state, remove from queues, and update continue file
       // via reopenWorkspaceState (shared logic with `pan reopen` CLI command)
       try {
         const teamPrefix = extractTeamPrefix(id);
-        const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+        const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
         const projectPath = projectConfig?.path || '';
         const workspacePath = projectPath
           ? join(projectPath, 'workspaces', `feature-${id.toLowerCase()}`)
           : '';
         if (workspacePath) {
-          await reopenWorkspaceState(id.toUpperCase(), workspacePath, { reason: (body as any)?.reason });
+          await Effect.runPromise(reopenWorkspaceState(id.toUpperCase(), workspacePath, { reason: (body as any)?.reason }));
         } else {
           // Fallback: no workspace path, just clear review status
           clearReviewStatus(id.toUpperCase());
@@ -1347,21 +1566,21 @@ const postIssueReopenRoute = HttpRouter.add(
       try {
         const issueLower = id.toLowerCase();
         const teamPrefix = extractTeamPrefix(id);
-        const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+        const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
         const projectPath = projectConfig?.path || '';
         if (projectPath) {
           const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
-          const { findPlan } = await import('../../../lib/vbrief/io.js');
           const { createBeadsFromVBrief } = await import('../../../lib/vbrief/beads.js');
-          if (existsSync(workspacePath) && findPlan(workspacePath)) {
+          if (existsSync(workspacePath) && await Effect.runPromise(findPlan(workspacePath))) {
             try {
-              const { stdout: bdCheck } = await execAsync(
-                `bd list --json -l ${issueLower} --limit 1`,
+              const { stdout: bdCheck } = await Effect.runPromise(withBdMutex(() => execFileAsync(
+                'bd',
+                ['list', '--json', '-l', issueLower, '--limit', '1'],
                 { cwd: workspacePath, encoding: 'utf-8', timeout: 10000 },
-              );
+              )));
               const existing = JSON.parse(bdCheck.trim() || '[]');
               if (existing.length === 0) {
-                const result = await createBeadsFromVBrief(workspacePath);
+                const result = await Effect.runPromise(createBeadsFromVBrief(workspacePath));
                 if (result.created.length > 0) {
                   console.log(`[reopen] Recreated ${result.created.length} beads for ${id} from vBRIEF plan`);
                   return true;
@@ -1377,7 +1596,7 @@ const postIssueReopenRoute = HttpRouter.add(
     yield* eventStore.append({
       type: 'issue.statusChanged',
       timestamp: new Date().toISOString(),
-      payload: { issueId: issueIdentifier, status: newState, canonicalStatus: 'in_progress' },
+      payload: { issueId: issueIdentifier, status: newState, canonicalStatus: targetCanonicalStatus },
     });
     // Emit pipeline reset so frontend read model clears the stale readyForMerge badge
     yield* eventStore.append({
@@ -1393,7 +1612,7 @@ const postIssueReopenRoute = HttpRouter.add(
         },
       },
     });
-    try { getIssueDataService().patchIssue(issueIdentifier, { status: newState, canonicalStatus: 'in_progress' }); } catch { /* non-fatal */ }
+    try { getIssueDataService().patchIssue(issueIdentifier, { status: newState, canonicalStatus: targetCanonicalStatus }); } catch { /* non-fatal */ }
 
     return jsonResponse({
       success: true,
@@ -1415,6 +1634,9 @@ const postIssueRestartFromPlanRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const lifecycle = yield* IssueLifecycle;
     const eventStore = yield* EventStoreService;
     const issueLower = id.toLowerCase();
@@ -1427,7 +1649,7 @@ const postIssueRestartFromPlanRoute = HttpRouter.add(
       projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
     }
     if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0];
+      const issuePrefix = extractPrefixSync(id) ?? id.split('-')[0];
       try { projectPath = getProjectPath(undefined, issuePrefix); } catch { projectPath = ''; }
     }
 
@@ -1443,8 +1665,8 @@ const postIssueRestartFromPlanRoute = HttpRouter.add(
     yield* Effect.promise(async () => {
       const workAgentSession = `agent-${issueLower}`;
       try {
-        if (await sessionExistsAsync(workAgentSession)) {
-          await killSessionAsync(workAgentSession);
+        if (await Effect.runPromise(sessionExists(workAgentSession))) {
+          await Effect.runPromise(killSession(workAgentSession));
           console.log(`[restart-from-plan] Killed work agent session ${workAgentSession}`);
         }
       } catch { /* non-fatal */ }
@@ -1463,7 +1685,7 @@ const postIssueRestartFromPlanRoute = HttpRouter.add(
         join(workspacePath, '.pan', 'review'),
         join(workspacePath, '.pan', 'prompts'),
         join(workspacePath, '.pan', 'events'),
-        join(workspacePath, '.planning', 'feedback'),
+        join(workspacePath, '.pan', 'feedback'),
       ];
       for (const dir of dirsToClean) {
         if (existsSync(dir)) {
@@ -1475,123 +1697,123 @@ const postIssueRestartFromPlanRoute = HttpRouter.add(
       }
     });
 
-    // 3. Find the planning commit and reset to it
+    // 3. Find the planning commit and reset to it.
+    //
     // Planning commits come from two sources:
     //   - complete-planning endpoint: "Complete planning for PAN-XXX"
     //   - agent start flow: "chore: planning artifacts for PAN-XXX before agent start"
-    // Fall back to finding the commit that added plan.vbrief.json.
-    // If no commit is found, fall back to manual file cleanup preserving .planning/ and .beads/.
-    const resetResult = yield* Effect.promise(async (): Promise<{ success: boolean; error?: string; commit?: string; method?: string }> => {
+    // Fall back to finding the commit that added `.pan/spec.vbrief.json`.
+    //
+    // If no planning commit is found, we DO NOT auto-clean. The previous
+    // behaviour used a broad git-clean fallback that
+    // silently destroyed `.devcontainer/`, `.env`, `node_modules/`, and
+    // anything else untracked — see PAN-955/956. The fix is to surface a
+    // structured error pointing the user at `pan workspace deep-clean <id>`,
+    // which they invoke from a TTY after seeing what would be deleted.
+    type ResetOutcome =
+      | { success: true; commit: string; method: string }
+      | {
+          success: false;
+          code: 'DANGEROUS_OP_BLOCKED';
+          operation: 'git_clean';
+          reason: string;
+          recovery: string;
+        }
+      | { success: false; error: string };
+
+    const resetResult = yield* Effect.promise(async (): Promise<ResetOutcome> => {
       try {
-        let planningCommit = '';
-        let method = '';
+        const { runGitResetHard } = await import('../../../lib/safety/dangerous-git-ops.js');
 
-        // Try 1: complete-planning endpoint message
-        if (!planningCommit) {
+        async function findPlanningCommit(grep: string, label: string): Promise<{ sha: string; method: string } | null> {
           try {
             const { stdout } = await execAsync(
-              `git log --grep="Complete planning for ${id}" --format=%H -1`,
-              { cwd: workspacePath, encoding: 'utf-8', timeout: 10000 }
+              `git log --grep="${grep.replace(/"/g, '\\"')}" --format=%H -1`,
+              { cwd: workspacePath, encoding: 'utf-8', timeout: 10_000 },
             );
-            planningCommit = stdout.trim();
-            if (planningCommit) method = 'complete-planning message';
-          } catch { /* ignore */ }
+            const sha = stdout.trim();
+            return sha ? { sha, method: label } : null;
+          } catch {
+            return null;
+          }
         }
 
-        // Try 2: agent start flow message
-        if (!planningCommit) {
-          try {
-            const { stdout } = await execAsync(
-              `git log --grep="chore: planning artifacts for ${id}" --format=%H -1`,
-              { cwd: workspacePath, encoding: 'utf-8', timeout: 10000 }
-            );
-            planningCommit = stdout.trim();
-            if (planningCommit) method = 'agent-start message';
-          } catch { /* ignore */ }
+        const found =
+          (await findPlanningCommit(`Complete planning for ${id}`, 'complete-planning message')) ??
+          (await findPlanningCommit(`chore: planning artifacts for ${id}`, 'agent-start message')) ??
+          (await (async () => {
+            try {
+              const { stdout } = await execAsync(
+                `git log --diff-filter=A --format=%H -1 -- .pan/spec.vbrief.json`,
+                { cwd: workspacePath, encoding: 'utf-8', timeout: 10_000 },
+              );
+              const sha = stdout.trim();
+              return sha ? { sha, method: '.pan/spec.vbrief.json add' } : null;
+            } catch {
+              return null;
+            }
+          })());
+
+        if (!found) {
+          // No tracked planning state to reset to. Refuse to auto-clean —
+          // the user has to opt in via `pan workspace deep-clean <id>`.
+          return {
+            success: false,
+            code: 'DANGEROUS_OP_BLOCKED',
+            operation: 'git_clean',
+            reason:
+              `restart-from-plan could not find a planning commit for ${id}. The previous ` +
+              `behaviour was to auto-clean untracked files, which silently destroyed .devcontainer/, ` +
+              `.env, and other regenerable artifacts. That auto-clean is no longer allowed.`,
+            recovery:
+              `Run \`pan workspace deep-clean ${issueLower}\` from a terminal — it will list every ` +
+              `untracked file/dir before deleting anything and ask you to confirm. After that, retry ` +
+              `restart-from-plan.`,
+          };
         }
 
-        // Try 3: commit that added plan.vbrief.json (message-agnostic)
-        if (!planningCommit) {
-          try {
-            const { stdout } = await execAsync(
-              `git log --diff-filter=A --format=%H -1 -- .planning/plan.vbrief.json`,
-              { cwd: workspacePath, encoding: 'utf-8', timeout: 10000 }
-            );
-            planningCommit = stdout.trim();
-            if (planningCommit) method = 'plan.vbrief.json add';
-          } catch { /* ignore */ }
-        }
-
-        if (planningCommit) {
-          await execAsync(`git reset --hard ${planningCommit}`, { cwd: workspacePath, encoding: 'utf-8', timeout: 15000 });
-          console.log(`[restart-from-plan] Reset branch to planning commit ${planningCommit} for ${id}`);
-          return { success: true, commit: planningCommit, method };
-        }
-
-        // Fallback: manual cleanup — preserve .planning/ and .beads/, reset everything else to main
-        console.log(`[restart-from-plan] No planning commit for ${id}, using manual cleanup`);
-        method = 'manual-cleanup';
-
-        // 3a. Save planning artifacts and beads to temp
-        const tmpDir = join(homedir(), '.panopticon', 'tmp', `restart-${issueLower}`);
-        await mkdir(tmpDir, { recursive: true });
-        const planningDir = join(workspacePath, '.planning');
-        const beadsDir = join(workspacePath, '.beads');
-        if (existsSync(planningDir)) {
-          await execAsync(`cp -r "${planningDir}" "${tmpDir}/.planning"`, { encoding: 'utf-8' });
-        }
-        if (existsSync(beadsDir)) {
-          await execAsync(`cp -r "${beadsDir}" "${tmpDir}/.beads"`, { encoding: 'utf-8' });
-        }
-
-        // 3b. Reset all tracked files to main state
-        try {
-          await execAsync(`git checkout main -- .`, { cwd: workspacePath, encoding: 'utf-8', timeout: 30000 });
-        } catch { /* main may not have all files */ }
-
-        // 3c. Remove untracked files and directories (preserve .planning and .beads)
-        try {
-          await execAsync(`git clean -fd -e .planning -e .beads`, { cwd: workspacePath, encoding: 'utf-8', timeout: 30000 });
-        } catch { /* ignore */ }
-
-        // 3d. Restore saved artifacts
-        if (existsSync(join(tmpDir, '.planning'))) {
-          await execAsync(`rm -rf "${planningDir}" && cp -r "${tmpDir}/.planning" "${planningDir}"`, { encoding: 'utf-8' });
-        }
-        if (existsSync(join(tmpDir, '.beads'))) {
-          await execAsync(`rm -rf "${beadsDir}" && cp -r "${tmpDir}/.beads" "${beadsDir}"`, { encoding: 'utf-8' });
-        }
-        // Clean up temp
-        try { await rm(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-
-        console.log(`[restart-from-plan] Manual cleanup complete for ${id}`);
-        return { success: true, commit: 'manual-cleanup', method };
+        await Effect.runPromise(runGitResetHard({
+          workspacePath,
+          ref: found.sha,
+          reason: `restart-from-plan ${id} (${found.method})`,
+        }));
+        console.log(`[restart-from-plan] Reset branch to planning commit ${found.sha} for ${id}`);
+        return { success: true, commit: found.sha, method: found.method };
       } catch (err: any) {
         return { success: false, error: err.message || 'Git reset failed' };
       }
     });
 
     if (!resetResult.success) {
-      return jsonResponse({ success: false, error: resetResult.error }, { status: 400 });
+      if ('code' in resetResult && resetResult.code === 'DANGEROUS_OP_BLOCKED') {
+        return jsonResponse(
+          {
+            success: false,
+            error: resetResult.reason,
+            code: resetResult.code,
+            operation: resetResult.operation,
+            recovery: resetResult.recovery,
+          },
+          { status: 409 },
+        );
+      }
+      const errMsg = 'error' in resetResult ? resetResult.error : 'reason' in resetResult ? resetResult.reason : 'unknown error';
+      return jsonResponse({ success: false, error: errMsg }, { status: 400 });
     }
 
     // 4. Reset specialist pipeline states
     clearReviewStatus(id.toUpperCase());
 
-    // 5. Append "Restarted from Plan" section to STATE.md
+    // 5. Append restart entry to continue file (lifecycle-aware)
     yield* Effect.promise(async () => {
-      const statePath = join(workspacePath, '.planning', 'STATE.md');
-      if (existsSync(statePath)) {
-        const date = new Date().toISOString().slice(0, 10);
-        const lines = [
-          '',
-          `## Restarted from Plan — ${date}`,
-          '',
-          `**Branch reset to planning commit:** ${resetResult.commit}`,
-          '',
-          'All implementation work has been reset. Specialist states cleared. Resume implementation from the plan.',
-        ];
-        await appendFile(statePath, lines.join('\n') + '\n', 'utf-8');
+      const upperId = id.toUpperCase();
+      try {
+        appendContinueSessionEntryForIssue(projectPath, upperId, {
+          reason: 'resume',
+          note: `Restarted from plan — branch reset to planning commit ${resetResult.commit}. Specialist states cleared.`,
+        });
+      } catch {
+        // Non-fatal: continue file may not exist yet
       }
     });
 
@@ -1642,6 +1864,9 @@ const postIssueMoveStatusRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
     const lifecycle = yield* IssueLifecycle;
@@ -1729,7 +1954,16 @@ const postIssueCleanupWorkspaceRoute = HttpRouter.add(
   '/api/issues/:id/cleanup-workspace',
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
-    const id = params['id'] ?? '';
+    const rawId = params['id'] ?? '';
+    const parsedIssueId = parseIssueIdSync(rawId);
+    if (!parsedIssueId) {
+      return jsonResponse({ error: 'Invalid issue id: ' + rawId }, { status: 400 });
+    }
+    const id = parsedIssueId.raw.toUpperCase();
+    const issue = getIssueForCleanup(id);
+    if (!issue || !isOrphanedIssue(issue)) {
+      return jsonResponse({ error: 'Cleanup is only allowed for closed/orphaned issues' }, { status: 409 });
+    }
     const cleanupLog: string[] = [];
     const eventStore = yield* EventStoreService;
 
@@ -1744,7 +1978,7 @@ const postIssueCleanupWorkspaceRoute = HttpRouter.add(
     }
     if (!projectRoot) {
       const teamPrefix = extractTeamPrefix(id);
-      const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+      const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
       projectRoot = projectConfig?.path || null;
     }
 
@@ -1804,6 +2038,9 @@ const postIssueDeepWipeRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: 'Invalid issue id: ' + id }, { status: 400 });
+    }
     const body = yield* readJsonBody;
     const eventStore = yield* EventStoreService;
 
@@ -1880,6 +2117,9 @@ const postIssueCopySettingsRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
 
     const githubCheck = isGitHubIssue(id);
     let projectPath = '';
@@ -1888,7 +2128,7 @@ const postIssueCopySettingsRoute = HttpRouter.add(
       projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
     }
     if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0];
+      const issuePrefix = extractPrefixSync(id) ?? id.split('-')[0];
       try { projectPath = getProjectPath(undefined, issuePrefix); } catch { projectPath = ''; }
     }
 
@@ -1900,11 +2140,11 @@ const postIssueCopySettingsRoute = HttpRouter.add(
       return jsonResponse({ success: false, error: 'Workspace not found' }, { status: 404 });
     }
 
-    const { copyPanopticonSettingsToWorkspace } = yield* Effect.promise(() =>
+    const { copyPanopticonSettingsToWorkspaceSync } = yield* Effect.promise(() =>
       import('../../../lib/workspace-manager.js')
     );
 
-    const result = copyPanopticonSettingsToWorkspace(workspacePath);
+    const result = copyPanopticonSettingsToWorkspaceSync(workspacePath);
     return jsonResponse({
       success: result.errors.length === 0 || result.copied.length > 0,
       copied: result.copied.map(p => p.replace(workspacePath + '/', '')),
@@ -1912,6 +2152,73 @@ const postIssueCopySettingsRoute = HttpRouter.add(
     });
   })),
 );
+
+function buildCloseOutContext(id: string): LifecycleContext | null {
+  const resolvedProject = resolveProjectFromIssueSync(id);
+  if (!resolvedProject) return null;
+
+  const githubCheck = isGitHubIssue(id);
+  return {
+    issueId: id,
+    projectPath: resolvedProject.projectPath,
+    projectName: resolvedProject.projectName,
+    ...(githubCheck.isGitHub && githubCheck.owner && githubCheck.repo && githubCheck.number
+      ? { github: { owner: githubCheck.owner, repo: githubCheck.repo, number: githubCheck.number } }
+      : {}),
+  };
+}
+
+function closeOutFailureResponse(result: WorkflowResult) {
+  const failedStep = result.steps.find((s: StepResult) => !s.success && !s.skipped);
+  return jsonResponse({
+    ...result,
+    error: failedStep?.error ?? 'Close-out workflow failed',
+    failedStep,
+  }, { status: 422 });
+}
+
+const CLOSED_OUT_CACHE_WORKFLOW_LABELS = new Set([
+  'in-review',
+  'in-progress',
+  'needs-close-out',
+  'verifying-on-main',
+]);
+
+function buildClosedOutCacheLabels(labels: string[]): string[] {
+  return [
+    ...labels.filter((label) => {
+      const normalized = label.toLowerCase();
+      return normalized !== 'closed-out' && !CLOSED_OUT_CACHE_WORKFLOW_LABELS.has(normalized);
+    }),
+    'closed-out',
+  ];
+}
+
+function sanitizeCloseOutError(error: unknown): string {
+  console.error('Close-out route failed:', error);
+  return 'Internal server error';
+}
+
+function getCachedIssueForCloseOut(issueDataService: IssueDataService, issueId: string): any | undefined {
+  return issueDataService.getIssues().find(
+    (issue: any) => String(issue.identifier ?? issue.id ?? '').toUpperCase() === issueId.toUpperCase(),
+  );
+}
+
+function isCachedIssueClosedOut(issue: any | undefined): boolean {
+  return Array.isArray(issue?.labels)
+    && issue.labels.some((label: unknown) => String(label).toLowerCase() === 'closed-out');
+}
+
+function closeOutAlreadyCompletedResult(issueId: string): WorkflowResult {
+  return {
+    workflow: 'close-out',
+    issueId,
+    success: true,
+    steps: [{ step: 'close-out:idempotent', success: true, skipped: true, details: ['Issue already closed out'] }],
+    duration: 0,
+  };
+}
 
 // ─── Route: POST /api/issues/:id/close-out ───────────────────────────────────
 
@@ -1921,34 +2228,26 @@ const postIssueCloseOutRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const authError = rejectUnsafeDashboardMutationRequest(request);
+    if (authError) return authError;
+
+    const ctx = buildCloseOutContext(id);
+    if (!ctx) {
+      return jsonResponse({ error: `Could not resolve project for ${id}` }, { status: 404 });
+    }
+
     const eventStore = yield* EventStoreService;
-
-    const { closeOut } = yield* Effect.promise(() => import('../../../lib/lifecycle/index.js'));
-    const githubCheck = isGitHubIssue(id);
-    let projectPath = '';
-
-    if (githubCheck.isGitHub && githubCheck.owner && githubCheck.repo) {
-      const localPaths = getGitHubLocalPaths();
-      projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
-    }
-    if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0].toUpperCase();
-      projectPath = getProjectPath(undefined, issuePrefix);
-    }
-    if (!projectPath) {
-      return jsonResponse({ error: `Could not resolve project path for ${id}` }, { status: 400 });
-    }
-
-    const ctx: any = {
-      issueId: id,
-      projectPath,
-      ...(githubCheck.isGitHub && githubCheck.owner && githubCheck.repo && githubCheck.number
-        ? { github: { owner: githubCheck.owner, repo: githubCheck.repo, number: githubCheck.number } }
-        : {}),
-    };
-
     const issueDataService = getIssueDataService();
+    if (isCachedIssueClosedOut(getCachedIssueForCloseOut(issueDataService, id))) {
+      return jsonResponse(closeOutAlreadyCompletedResult(id));
+    }
     const issueSource = issueDataService.getIssueSource(id);
+    const githubCheck = isGitHubIssue(id);
 
     if (issueSource === 'rally') {
       const rallyConfig = getRallyConfig();
@@ -1967,29 +2266,55 @@ const postIssueCloseOutRoute = HttpRouter.add(
       setCanonicalState(id, 'merged');
     }
 
-    const result = yield* Effect.promise(() => closeOut(ctx));
+    const closeOutResult = yield* Effect.promise(async () => {
+      try {
+        const { closeOut } = await import('../../../lib/lifecycle/index.js');
+        // PAN-1249: closeOut returns Effect<WorkflowResult>; bridge to Promise.
+        const result = await Effect.runPromise(closeOut(ctx));
+        return { ok: true as const, result };
+      } catch (error) {
+        return { ok: false as const, error };
+      }
+    });
 
-    if (result.success) {
-      issueDataService.invalidateTracker('github').catch(() => {});
-      issueDataService.invalidateTracker('linear').catch(() => {});
-      yield* eventStore.append({
-        type: 'issue.statusChanged',
-        timestamp: new Date().toISOString(),
-        payload: { issueId: id, status: 'Done', canonicalStatus: 'done' },
-      });
-      try { issueDataService.patchIssue(id, { status: 'Done', canonicalStatus: 'done' }); } catch { /* non-fatal */ }
+    if (!closeOutResult.ok) {
+      return jsonResponse({ error: sanitizeCloseOutError(closeOutResult.error) }, { status: 500 });
     }
 
-    return jsonResponse({
-      success: result.success,
-      issueId: result.issueId,
-      steps: result.steps.map((s: StepResult) => ({
-        name: s.step,
-        status: s.success ? (s.skipped ? 'skipped' : 'passed') : 'failed',
-        message: s.error || (s.details ? s.details.join('; ') : undefined),
-      })),
-      error: result.success ? undefined : result.steps.find((s: StepResult) => !s.success)?.error,
+    const result = closeOutResult.result;
+    if (!result.success) {
+      return closeOutFailureResponse(result);
+    }
+
+    let newLabels: string[] = ['closed-out'];
+    try {
+      const cachedIssues = issueDataService.getIssues();
+      const cachedIssue = cachedIssues.find(
+        (i: any) => (i.identifier || '').toUpperCase() === id.toUpperCase()
+      );
+      const currentLabels: string[] = cachedIssue?.labels || [];
+      newLabels = buildClosedOutCacheLabels(currentLabels);
+      issueDataService.patchIssue(id, {
+        status: 'Done',
+        state: 'done',
+        canonicalStatus: 'done',
+        targetCanonicalState: 'done',
+        mergeStatus: undefined,
+        labels: newLabels,
+      });
+    } catch { /* non-fatal */ }
+
+    yield* eventStore.append({
+      type: 'issue.statusChanged',
+      timestamp: new Date().toISOString(),
+      payload: { issueId: id, status: 'Done', state: 'done', canonicalStatus: 'done', labels: newLabels },
     });
+
+    issueDataService.invalidateTracker('github').catch(() => {});
+    issueDataService.invalidateTracker('linear').catch(() => {});
+    issueDataService.invalidateTracker('rally').catch(() => {});
+
+    return jsonResponse(result);
   })),
 );
 
@@ -2003,21 +2328,31 @@ function normalizePlanningId(issueId: string): string {
   return `planning-${issueId.toLowerCase()}`;
 }
 
-async function hasActiveAgentForIssue(issueId: string): Promise<boolean> {
+function isInactiveAgentStatus(status: string | undefined): boolean {
+  return status === 'dead' || status === 'stopped' || status === 'failed';
+}
+
+function isPausedMergedAgentSafe(agentState: { paused?: boolean } | null | undefined, allowPausedMerged: boolean): boolean {
+  return allowPausedMerged && agentState?.paused === true;
+}
+
+async function hasActiveAgentForIssue(issueId: string, allowPausedMerged = false): Promise<boolean> {
   const agentId = normalizeAgentId(issueId);
   const planningId = normalizePlanningId(issueId);
 
-  // Only query tmux for valid session names (GitHub IDs like owner/repo#123 produce invalid names)
-  if (VALID_TMUX_NAME_RE.test(agentId) && await sessionExistsAsync(agentId)) return true;
-  if (VALID_TMUX_NAME_RE.test(planningId) && await sessionExistsAsync(planningId)) return true;
+  return Effect.runPromise(Effect.gen(function* () {
+    // Only query tmux for valid session names (GitHub IDs like owner/repo#123 produce invalid names)
+    if (VALID_TMUX_NAME_RE.test(agentId) && (yield* sessionExists(agentId))) return true;
+    if (VALID_TMUX_NAME_RE.test(planningId) && (yield* sessionExists(planningId))) return true;
 
-  const agentState = await getAgentStateAsync(agentId);
-  if (agentState && agentState.status !== 'dead' && agentState.status !== 'stopped' && agentState.status !== 'failed') return true;
+    const agentState = yield* getAgentState(agentId);
+    if (agentState && !isInactiveAgentStatus(agentState.status) && !isPausedMergedAgentSafe(agentState, allowPausedMerged)) return true;
 
-  const planningState = await getAgentStateAsync(planningId);
-  if (planningState && planningState.status !== 'dead' && planningState.status !== 'stopped' && planningState.status !== 'failed') return true;
+    const planningState = yield* getAgentState(planningId);
+    if (planningState && !isInactiveAgentStatus(planningState.status) && !isPausedMergedAgentSafe(planningState, allowPausedMerged)) return true;
 
-  return false;
+    return false;
+  }));
 }
 
 // ─── Route: POST /api/issues/bulk-close-out ──────────────────────────────────
@@ -2026,7 +2361,7 @@ async function hasActiveAgentForIssue(issueId: string): Promise<boolean> {
 function isValidIssueId(id: string): boolean {
   if (typeof id !== 'string') return false;
   // Linear-style: PREFIX-123
-  if (/^[A-Z][A-Z0-9]*-\d+$/.test(id)) return true;
+  if (/^[A-Za-z][A-Za-z0-9]*-\d+$/.test(id)) return true;
   // GitHub-style: owner/repo#number (alphanumeric, hyphens, underscores, periods only)
   if (/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+#\d+$/.test(id)) return true;
   return false;
@@ -2037,38 +2372,13 @@ const postIssuesBulkCloseOutRoute = HttpRouter.add(
   '/api/issues/bulk-close-out',
   httpHandler(Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
+    const authError = rejectUnsafeDashboardMutationRequest(request);
+    if (authError) return authError;
 
-    // Content-Type enforcement — exact match, no substring trickery
-    const contentType = (request.headers as Record<string, string | string[] | undefined>)['content-type'];
-    const contentTypeStr = Array.isArray(contentType) ? contentType[0] : contentType;
-    const isJsonContentType = (() => {
-      if (!contentTypeStr) return false;
-      const [mime] = contentTypeStr.toLowerCase().split(';');
-      return mime.trim() === 'application/json';
-    })();
-    if (!isJsonContentType) {
-      return jsonResponse({ error: 'Content-Type must be application/json' }, { status: 400 });
-    }
-
-    const body = yield* Effect.promise(() => request.json().catch(() => ({})));
+    const text = yield* request.text;
+    const body: Record<string, unknown> = (() => { try { return text ? JSON.parse(text) : {}; } catch { return {}; } })();
     const rawIssueIds = Array.isArray(body.issueIds) ? body.issueIds : [];
     const issueIds = [...new Set(rawIssueIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))];
-
-    // Origin check — parse as URL and validate hostname exactly
-    const origin = (request.headers as Record<string, string | string[] | undefined>)['origin'];
-    const originStr = Array.isArray(origin) ? origin[0] : origin;
-    const isValidOrigin = (() => {
-      if (!originStr) return false;
-      try {
-        const url = new URL(originStr);
-        return url.hostname === 'localhost' || url.hostname === '127.0.0.1';
-      } catch {
-        return false;
-      }
-    })();
-    if (!isValidOrigin) {
-      return jsonResponse({ error: 'Invalid origin' }, { status: 403 });
-    }
 
     // Input validation
     if (issueIds.length === 0) {
@@ -2087,13 +2397,28 @@ const postIssuesBulkCloseOutRoute = HttpRouter.add(
     const { closeOut } = yield* Effect.promise(() => import('../../../lib/lifecycle/index.js'));
     const issueDataService = getIssueDataService();
 
-    // Sequential execution — closeOut touches filesystem/git, parallel runs risk index-lock races
-    const results: Array<{ issueId: string; success: boolean; error?: string; skipped: boolean }> = [];
-    for (const id of issueIds) {
-      // Server-side active-agent guardrail
-      const hasActiveAgent = yield* Effect.promise(() => hasActiveAgentForIssue(id));
+    // Pre-validate all issues: run agent checks in parallel, then build contexts.
+    // CloseOut runs with bounded concurrency (max 3) to avoid unbounded
+    // resource use while keeping git index-lock risk low for independent issues.
+    type CloseOutTask = { id: string; ctx: LifecycleContext } | { id: string; skipped: true; error: string };
+    const tasks: CloseOutTask[] = [];
+
+    const agentChecks = yield* withConcurrencyLimit(
+      issueIds.map(id => Effect.promise(async () => {
+        const cachedIssue = issueDataService.getIssues().find(
+          (issue: any) => (issue.identifier || '').toUpperCase() === id.toUpperCase(),
+        );
+        const reviewStatus = getReviewStatusSync(id.toUpperCase());
+        const allowPausedMerged = reviewStatus?.mergeStatus === 'merged' || cachedIssue?.mergeStatus === 'merged';
+        const hasActiveAgent = await hasActiveAgentForIssue(id, allowPausedMerged);
+        return { id, hasActiveAgent };
+      })),
+      10
+    );
+
+    for (const { id, hasActiveAgent } of agentChecks) {
       if (hasActiveAgent) {
-        results.push({ issueId: id, success: false, error: 'Skipped: active agent running', skipped: true });
+        tasks.push({ id, skipped: true, error: 'Skipped: active agent running' });
         continue;
       }
 
@@ -2105,13 +2430,13 @@ const postIssuesBulkCloseOutRoute = HttpRouter.add(
         projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
       }
       if (!projectPath) {
-        const issuePrefix = extractPrefix(id);
+        const issuePrefix = extractPrefixSync(id);
         if (issuePrefix) {
           projectPath = getProjectPath(undefined, issuePrefix);
         }
       }
       if (!projectPath) {
-        results.push({ issueId: id, success: false, error: `Could not resolve project path for ${id}`, skipped: false });
+        tasks.push({ id, skipped: true, error: `Could not resolve project path for ${id}` });
         continue;
       }
 
@@ -2141,33 +2466,61 @@ const postIssuesBulkCloseOutRoute = HttpRouter.add(
         setCanonicalState(id, 'merged');
       }
 
-      const closeResult = yield* Effect.tryPromise({
-        try: () => closeOut(ctx),
-        catch: (error) => ({
-          workflow: 'close-out' as const,
-          issueId: id,
-          success: false,
-          steps: [{
-            step: 'close-out',
-            success: false,
-            skipped: false,
-            error: error instanceof Error ? error.message : 'Unknown error',
-          }],
-          duration: 0,
-        }),
-      });
+      tasks.push({ id, ctx });
+    }
 
-      if (closeResult.success) {
-        yield* eventStore.append({
-          type: 'issue.statusChanged',
-          timestamp: new Date().toISOString(),
-          payload: { issueId: id, status: 'Done', canonicalStatus: 'done' },
-        });
+    const closeOutTasks = tasks
+      .filter((t): t is { id: string; ctx: LifecycleContext } => !('skipped' in t))
+      .map(({ id, ctx }) => Effect.promise(async () => {
         try {
-          issueDataService.patchIssue(id, { status: 'Done', canonicalStatus: 'done' });
+          const closeResult = await Effect.runPromise(closeOut(ctx));
+          return { id, closeResult };
+        } catch (error) {
+          const closeResult: WorkflowResult = {
+            workflow: 'close-out',
+            issueId: id,
+            success: false,
+            steps: [{
+              step: 'close-out',
+              success: false,
+              skipped: false,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            }],
+            duration: 0,
+          };
+          return { id, closeResult };
+        }
+      }));
+
+    const closeOutResults = yield* withConcurrencyLimit(closeOutTasks, 3);
+
+    const results: Array<{ issueId: string; success: boolean; error?: string; skipped: boolean }> = [];
+    for (const { id, closeResult } of closeOutResults) {
+      if (closeResult.success) {
+        let newLabels: string[] = ['closed-out'];
+        try {
+          const cachedIssues = issueDataService.getIssues();
+          const cachedIssue = cachedIssues.find(
+            (i: any) => (i.identifier || '').toUpperCase() === id.toUpperCase()
+          );
+          const currentLabels: string[] = cachedIssue?.labels || [];
+          newLabels = buildClosedOutCacheLabels(currentLabels);
+          issueDataService.patchIssue(id, {
+            status: 'Done',
+            state: 'done',
+            canonicalStatus: 'done',
+            targetCanonicalState: 'done',
+            mergeStatus: undefined,
+            labels: newLabels,
+          });
         } catch (e) {
           console.error('Failed to patch issue status:', e);
         }
+        yield* eventStore.append({
+          type: 'issue.statusChanged',
+          timestamp: new Date().toISOString(),
+          payload: { issueId: id, status: 'Done', state: 'done', canonicalStatus: 'done', labels: newLabels },
+        });
       }
 
       const failedStep = closeResult.steps.find((s: StepResult) => !s.success);
@@ -2177,6 +2530,12 @@ const postIssuesBulkCloseOutRoute = HttpRouter.add(
         error: closeResult.success ? undefined : failedStep?.error,
         skipped: false,
       });
+    }
+
+    for (const task of tasks) {
+      if ('skipped' in task) {
+        results.push({ issueId: task.id, success: false, error: task.error, skipped: true });
+      }
     }
 
     // Invalidate trackers once if any issue closed successfully
@@ -2198,6 +2557,9 @@ const getIssueBeadsRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
 
     const issueLower = id.toLowerCase();
     const githubCheck = isGitHubIssue(id);
@@ -2208,7 +2570,7 @@ const getIssueBeadsRoute = HttpRouter.add(
       projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
     }
     if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0];
+      const issuePrefix = extractPrefixSync(id) ?? id.split('-')[0];
       try { projectPath = getProjectPath(undefined, issuePrefix); } catch { projectPath = ''; }
     }
 
@@ -2263,11 +2625,11 @@ const getIssueBeadsRoute = HttpRouter.add(
     const { beads, querySource } = yield* Effect.promise(async (): Promise<{ beads: any[]; querySource: string }> => {
       try {
         const bdSearchDir = (workspacePath && existsSync(workspacePath)) ? workspacePath : (projectPath || homedir());
-        const { stdout } = await execAsync(`bd list --json -l "${id.toLowerCase()}" --status all --limit 0`, {
+        const { stdout } = await Effect.runPromise(withBdMutex(() => execFileAsync('bd', ['list', '--json', '-l', id.toLowerCase(), '--status', 'all', '--limit', '0'], {
           cwd: bdSearchDir,
           encoding: 'utf-8',
           timeout: 10000,
-        });
+        })));
         return { beads: JSON.parse(stdout || '[]'), querySource: 'local' };
       } catch (bdError: any) {
         console.error('bd search failed:', bdError.message);
@@ -2282,6 +2644,9 @@ const getIssueBeadsRoute = HttpRouter.add(
       type: bead.issue_type || bead.type || 'task',
       blockedBy: bead.blocked_by || [],
       createdAt: bead.created_at,
+      startedAt: bead.started_at,
+      updatedAt: bead.updated_at,
+      closedAt: bead.closed_at,
       labels: bead.labels || [],
       priority: bead.priority,
     }));
@@ -2304,6 +2669,63 @@ const getIssueBeadsRoute = HttpRouter.add(
   })),
 );
 
+// ─── Route: POST /api/issues/:id/beads/:beadId/inspect ───────────────────────
+
+function isValidBeadId(beadId: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(beadId);
+}
+
+const postIssueBeadInspectRoute = HttpRouter.add(
+  'POST',
+  '/api/issues/:id/beads/:beadId/inspect',
+  httpHandler(Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const authError = rejectUnsafeDashboardMutationRequest(request);
+    if (authError) return authError;
+
+    const params = yield* HttpRouter.params;
+    const id = (params['id'] ?? '').toUpperCase();
+    const beadId = params['beadId'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+    if (!beadId.trim()) {
+      return jsonResponse({ error: 'Missing bead ID' }, { status: 400 });
+    }
+    if (!isValidBeadId(beadId)) {
+      return jsonResponse({ error: 'Invalid bead ID' }, { status: 400 });
+    }
+
+    const body = yield* readJsonBody;
+    const project = resolveProjectFromIssueSync(id);
+    if (!project) {
+      return jsonResponse({ error: `Could not resolve project for ${id}` }, { status: 404 });
+    }
+
+    const issueLower = id.toLowerCase();
+    const workspace = join(project.projectPath, 'workspaces', `feature-${issueLower}`);
+    const workspaceExists = yield* Effect.promise(() => pathIsDirectory(workspace));
+    if (!workspaceExists) {
+      return jsonResponse({ error: `No workspace found for ${id}` }, { status: 404 });
+    }
+
+    const result = yield* spawnInspectAgent({
+      projectKey: project.projectKey,
+      projectPath: project.projectPath,
+      issueId: id,
+      beadId,
+      workspace,
+      branch: `feature/${issueLower}`,
+    }, { deep: (body as { deep?: unknown }).deep === true });
+
+    if (!result.success) {
+      return jsonResponse({ success: false, error: result.error ?? result.message }, { status: 500 });
+    }
+
+    return jsonResponse({ success: true, runId: result.runId, tmuxSession: result.tmuxSession });
+  })),
+);
+
 // ─── Route: GET /api/issues/:id/planning-state ───────────────────────────────
 //
 // Lightweight summary of an issue's planning artifacts:
@@ -2317,6 +2739,9 @@ const getIssuePlanningStateRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const issueLower = id.toLowerCase();
 
     const githubCheck = isGitHubIssue(id);
@@ -2326,39 +2751,26 @@ const getIssuePlanningStateRoute = HttpRouter.add(
       projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
     }
     if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0];
+      const issuePrefix = extractPrefixSync(id) ?? id.split('-')[0];
       try { projectPath = getProjectPath(undefined, issuePrefix); } catch { projectPath = ''; }
     }
 
     const workspacePath = projectPath
       ? join(projectPath, 'workspaces', `feature-${issueLower}`)
       : '';
-    const planPath = workspacePath ? join(workspacePath, '.planning', 'plan.vbrief.json') : '';
-    const hasPlan = !!planPath && existsSync(planPath);
-    const planningComplete = workspacePath && existsSync(join(workspacePath, '.planning', '.planning-complete'));
+    const planPath = workspacePath ? yield* findPlan(workspacePath) : null;
+    const hasPlan = planPath !== null;
+    // planningComplete now means "plan.status indicates planning has finished" —
+    // any of proposed/approved/pending/running/completed/blocked.
+    // It's the definitive signal for "tasks have been generated from this plan."
+    const planningComplete = workspacePath ? yield* isPlanningComplete(workspacePath) : false;
 
-    // bd query is best-effort: a missing/broken database must NOT prevent the
-    // chip from coloring vBRIEF correctly. Errors are swallowed inside the
-    // promise so Effect.promise never sees a rejection.
-    const beadsCount = workspacePath && existsSync(workspacePath)
-      ? yield* Effect.promise(async () => {
-          try {
-            const { stdout } = await execAsync(
-              `bd list --json -l "${issueLower}" --status all --limit 0`,
-              { cwd: workspacePath, encoding: 'utf-8', timeout: 8000 },
-            );
-            const arr = JSON.parse(stdout || '[]');
-            return Array.isArray(arr) ? arr.length : 0;
-          } catch {
-            return 0;
-          }
-        })
-      : 0;
+    const hasBeads = !!planningComplete;
 
     return jsonResponse({
       hasPlan,
-      hasBeads: beadsCount > 0,
-      beadsCount,
+      hasBeads,
+      beadsCount: 0,  // Deprecated — use hasBeads. Kept for backward compat.
       planningComplete,
       workspacePath,
     });
@@ -2367,8 +2779,8 @@ const getIssuePlanningStateRoute = HttpRouter.add(
 
 // ─── Route: POST /api/issues/:id/generate-tasks ──────────────────────────────
 //
-// Runs createBeadsFromVBrief() against the workspace, then writes the
-// .planning-complete marker. Same logic as `pan plan-finalize`, exposed so the
+// Runs createBeadsFromVBrief() against the workspace. Same logic as
+// `pan plan finalize`, exposed so the
 // dashboard can offer a one-click "Generate Tasks" action when a vBRIEF plan
 // exists but beads were never created (e.g. plans authored before the
 // agent-driven finalize flow shipped).
@@ -2379,6 +2791,9 @@ const postIssueGenerateTasksRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
     const issueLower = id.toLowerCase();
 
     const githubCheck = isGitHubIssue(id);
@@ -2388,39 +2803,629 @@ const postIssueGenerateTasksRoute = HttpRouter.add(
       projectPath = localPaths[`${githubCheck.owner}/${githubCheck.repo}`] || '';
     }
     if (!projectPath) {
-      const issuePrefix = extractPrefix(id) ?? id.split('-')[0];
+      const issuePrefix = extractPrefixSync(id) ?? id.split('-')[0];
       try { projectPath = getProjectPath(undefined, issuePrefix); } catch { projectPath = ''; }
     }
 
     if (!projectPath) {
-      return jsonResponse({ success: false, error: `Could not resolve project path for ${id}` }, 404);
+      return jsonResponse({ success: false, error: `Could not resolve project path for ${id}` }, { status: 404 });
     }
 
     const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
-    const planPath = join(workspacePath, '.planning', 'plan.vbrief.json');
-    if (!existsSync(planPath)) {
+    const planPath = yield* findPlan(workspacePath);
+    if (!planPath || !existsSync(planPath)) {
       return jsonResponse(
-        { success: false, error: `No vBRIEF plan at ${planPath} — run planning first.` },
-        409,
+        { success: false, error: `No vBRIEF spec found on main for ${id} — run planning first.` },
+        { status: 409 },
       );
     }
 
     const { createBeadsFromVBrief } = yield* Effect.promise(() => import('../../../lib/vbrief/beads.js'));
-    const result = yield* Effect.promise(() => createBeadsFromVBrief(workspacePath));
+    const result = yield* createBeadsFromVBrief(workspacePath);
 
     if (!result.success || result.created.length === 0) {
       const errors = result.errors.length > 0 ? result.errors : ['Beads creation produced no tasks'];
-      return jsonResponse({ success: false, created: result.created, errors }, 500);
+      return jsonResponse({ success: false, created: result.created, errors }, { status: 500 });
     }
-
-    const markerPath = join(workspacePath, '.planning', '.planning-complete');
-    yield* Effect.promise(() => writeFile(markerPath, '', 'utf-8'));
 
     return jsonResponse({
       success: true,
       created: result.created,
       count: result.created.length,
     });
+  })),
+);
+
+// ─── Route: GET /api/issues/:id/pr ───────────────────────────────────────────
+//
+// Shells out to `gh pr view --head feature/<id-lower> --repo <owner>/<repo>`
+// and `gh pr diff <number> --repo <owner>/<repo> --patch` to assemble a
+// structured response for the Command Deck PR/Diff tab. Returns
+// `{ pr: null, diff: null }` when the issue is not a GitHub-tracked issue or
+// no PR exists for the feature branch yet.
+
+const GH_PR_VIEW_FIELDS = [
+  'number',
+  'title',
+  'url',
+  'state',
+  'isDraft',
+  'baseRefName',
+  'headRefName',
+  'author',
+  'createdAt',
+  'updatedAt',
+  'reviewDecision',
+  'reviewRequests',
+  'statusCheckRollup',
+  'additions',
+  'deletions',
+  'changedFiles',
+  'files',
+  'labels',
+  'mergeable',
+  'body',
+].join(',');
+
+export interface IssuePullRequestData {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  isDraft: boolean;
+  baseRefName: string;
+  headRefName: string;
+  author: { login?: string; name?: string } | null;
+  createdAt: string;
+  updatedAt: string;
+  reviewDecision: string | null;
+  reviewRequests: Array<{ login?: string; name?: string; __typename?: string }>;
+  statusCheckRollup: Array<{
+    name?: string;
+    state?: string;
+    conclusion?: string;
+    status?: string;
+    detailsUrl?: string;
+    workflowName?: string;
+    __typename?: string;
+  }>;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  files: Array<{ path: string; additions: number; deletions: number }>;
+  labels: Array<{ name?: string; color?: string }>;
+  mergeable: string | null;
+  body: string;
+}
+
+export interface IssuePrEndpointResponse {
+  issueId: string;
+  pr: IssuePullRequestData | null;
+  error?: string;
+}
+
+export interface IssuePrDiffEndpointResponse {
+  issueId: string;
+  diff: string | null;
+  error?: string;
+}
+
+export interface IssuePrDetailsResponse extends IssuePrEndpointResponse {
+  diff: string | null;
+}
+
+async function resolveIssuePullRequestRef(issueId: string): Promise<
+  | { issueId: string; repoArg: string; prNumber: string }
+  | { issueId: string; repoArg: null; prNumber: null; error?: string }
+> {
+  const upper = issueId.toUpperCase();
+  const githubCheck = isGitHubIssue(issueId);
+  if (!githubCheck.isGitHub || !githubCheck.owner || !githubCheck.repo) {
+    return { issueId: upper, repoArg: null, prNumber: null };
+  }
+
+  const branchName = `feature/${issueId.toLowerCase()}`;
+  const repoArg = `${githubCheck.owner}/${githubCheck.repo}`;
+
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'pr', 'list',
+        '--repo', repoArg,
+        '--head', branchName,
+        '--state', 'all',
+        '--json', 'number',
+        '--limit', '1',
+        '--jq', '.[0].number',
+      ],
+      { encoding: 'utf-8', timeout: 15000 },
+    );
+    const prNumber = stdout.trim();
+    if (!prNumber) {
+      return { issueId: upper, repoArg: null, prNumber: null };
+    }
+    return { issueId: upper, repoArg, prNumber };
+  } catch (err: any) {
+    return { issueId: upper, repoArg: null, prNumber: null, error: `gh pr list failed: ${err.message}` };
+  }
+}
+
+async function fetchIssuePullRequestFromRef(
+  prRef: Awaited<ReturnType<typeof resolveIssuePullRequestRef>>,
+): Promise<IssuePrEndpointResponse> {
+  if (!prRef.repoArg || !prRef.prNumber) {
+    return { issueId: prRef.issueId, pr: null, error: (prRef as { error?: string }).error};
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'pr', 'view', prRef.prNumber,
+        '--repo', prRef.repoArg,
+        '--json', GH_PR_VIEW_FIELDS,
+      ],
+      { encoding: 'utf-8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+    );
+    return {
+      issueId: prRef.issueId,
+      pr: JSON.parse(stdout) as IssuePullRequestData,
+    };
+  } catch (err: any) {
+    return { issueId: prRef.issueId, pr: null, error: `gh pr view failed: ${err.message}` };
+  }
+}
+
+export async function fetchIssuePullRequest(issueId: string): Promise<IssuePrEndpointResponse> {
+  const prRef = await resolveIssuePullRequestRef(issueId);
+  return fetchIssuePullRequestFromRef(prRef);
+}
+
+async function fetchIssuePullRequestDiffFromRef(
+  prRef: Awaited<ReturnType<typeof resolveIssuePullRequestRef>>,
+): Promise<IssuePrDiffEndpointResponse> {
+  if (!prRef.repoArg || !prRef.prNumber) {
+    return { issueId: prRef.issueId, diff: null, error: (prRef as { error?: string }).error};
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'pr', 'diff', prRef.prNumber,
+        '--repo', prRef.repoArg,
+        '--patch',
+      ],
+      { encoding: 'utf-8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    return { issueId: prRef.issueId, diff: stdout };
+  } catch (err: any) {
+    return { issueId: prRef.issueId, diff: null, error: `gh pr diff failed: ${err.message}` };
+  }
+}
+
+export async function fetchIssuePullRequestDiff(issueId: string): Promise<IssuePrDiffEndpointResponse> {
+  const prRef = await resolveIssuePullRequestRef(issueId);
+  return fetchIssuePullRequestDiffFromRef(prRef);
+}
+
+export async function fetchIssuePullRequestDetails(issueId: string): Promise<IssuePrDetailsResponse> {
+  const prRef = await resolveIssuePullRequestRef(issueId);
+  if (!prRef.repoArg || !prRef.prNumber) {
+    return { issueId: prRef.issueId, pr: null, diff: null, error: (prRef as { error?: string }).error};
+  }
+
+  const [prResult, diffResult] = await Promise.all([
+    fetchIssuePullRequestFromRef(prRef),
+    fetchIssuePullRequestDiffFromRef(prRef),
+  ]);
+
+  return {
+    issueId: prRef.issueId,
+    pr: prResult.pr,
+    diff: diffResult.diff,
+    error: prResult.error ?? diffResult.error,
+  };
+}
+
+const getIssuePrRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/:id/pr',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+    const result = yield* Effect.promise(() => fetchIssuePullRequest(id));
+    return jsonResponse(result);
+  })),
+);
+
+const getIssuePrDiffRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/:id/pr/diff',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+    const result = yield* Effect.promise(() => fetchIssuePullRequestDiff(id));
+    return jsonResponse(result);
+  })),
+);
+
+const getIssuePrDetailsRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/:id/pr/details',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+    const result = yield* Effect.promise(() => fetchIssuePullRequestDetails(id));
+    return jsonResponse(result);
+  })),
+);
+
+// ─── Route: GET /api/issues/:id/discussions ──────────────────────────────────
+// Combined Linear + GitHub timeline. Sources merged into a single chronological
+// list:
+//   - Linear issue comments (when tracker resolves to Linear)
+//   - GitHub issue comments (when tracker resolves to GitHub)
+//   - GitHub PR conversation comments (when a feature/<id> PR exists)
+//   - GitHub PR review submissions (approve / changes-requested / commented)
+//   - GitHub PR inline review comments (review-thread replies on diff lines)
+//
+// Linear comments are fetched via the LinearClient service so we reuse the
+// existing API key / retry plumbing. GitHub data is shelled out via `gh api`
+// (consistent with the PR endpoint — same rationale as D13).
+
+export type DiscussionSource =
+  | 'linear'
+  | 'github-issue'
+  | 'github-pr-conversation'
+  | 'github-pr-review'
+  | 'github-pr-review-comment';
+
+export interface DiscussionItem {
+  id: string;
+  source: DiscussionSource;
+  author: string;
+  body: string;
+  createdAt: string;
+  url?: string;
+  prNumber?: number;
+  reviewState?: string;
+  filePath?: string;
+  line?: number;
+}
+
+export interface IssueDiscussionsResponse {
+  issueId: string;
+  items: DiscussionItem[];
+  prNumber: number | null;
+  errors?: string[];
+}
+
+interface FetchDiscussionsDeps {
+  /** Resolve a Linear issue ref ("MIN-449") to its UUID. */
+  linearGetIssueId?: (ref: string) => Promise<string | null>;
+  /** Fetch comments for a Linear issue UUID. */
+  linearGetComments?: (
+    uuid: string,
+  ) => Promise<readonly { author: string; body: string; createdAt: string }[]>;
+}
+
+export async function fetchIssueDiscussions(
+  issueId: string,
+  deps: FetchDiscussionsDeps = {},
+): Promise<IssueDiscussionsResponse> {
+  const upper = issueId.toUpperCase();
+  const items: DiscussionItem[] = [];
+  const errors: string[] = [];
+  let prNumber: number | null = null;
+
+  const trackerType = resolveTrackerTypeSync(issueId);
+  const githubCheck = isGitHubIssue(issueId);
+
+  // Steps 1-3 are independent network calls. Fan them out with Promise.all
+  // so the slowest governs total wall-clock instead of the sum (PAN-847).
+  const linearTask = (async () => {
+    // 1. Linear issue comments — only when tracker is Linear and deps provided.
+    if (trackerType === 'linear' && deps.linearGetIssueId && deps.linearGetComments) {
+      try {
+        const uuid = await deps.linearGetIssueId(issueId);
+        if (uuid) {
+          const linearComments = await deps.linearGetComments(uuid);
+          const collected: DiscussionItem[] = [];
+          for (let i = 0; i < linearComments.length; i++) {
+            const c = linearComments[i]!;
+            collected.push({
+              id: `linear-${uuid}-${i}`,
+              source: 'linear',
+              author: c.author,
+              body: c.body,
+              createdAt: c.createdAt,
+            });
+          }
+          return collected;
+        }
+      } catch (err: any) {
+        errors.push(`linear comments failed: ${err?.message ?? String(err)}`);
+      }
+    }
+    return [] as DiscussionItem[];
+  })();
+
+  const ghIssueCommentsTask = (async () => {
+    // 2. GitHub issue comments — only when the tracker resolves the issue to
+    //    GitHub (not when we're in Linear and a PR happens to exist).
+    if (githubCheck.isGitHub && githubCheck.owner && githubCheck.repo && githubCheck.number) {
+      const { owner, repo, number } = githubCheck as { owner: string; repo: string; number: number };
+      try {
+        const { stdout } = await execAsync(
+          `gh api "repos/${owner}/${repo}/issues/${number}/comments?per_page=100"`,
+          { encoding: 'utf-8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const arr = JSON.parse(stdout) as Array<{
+          id: number;
+          user?: { login?: string } | null;
+          body?: string | null;
+          created_at?: string;
+          html_url?: string;
+        }>;
+        const collected: DiscussionItem[] = [];
+        for (const c of arr) {
+          collected.push({
+            id: `gh-issue-${c.id}`,
+            source: 'github-issue',
+            author: c.user?.login ?? 'unknown',
+            body: c.body ?? '',
+            createdAt: c.created_at ?? '',
+            url: c.html_url,
+          });
+        }
+        return collected;
+      } catch (err: any) {
+        errors.push(`gh issue comments failed: ${err?.message ?? String(err)}`);
+      }
+    }
+    return [] as DiscussionItem[];
+  })();
+
+  // 3. Resolve PR number for the feature branch (if a GitHub repo is mapped
+  //    via tracker config). This is independent of the issue tracker — even
+  //    Linear-tracked issues end up with feature/<id-lower> branches in a
+  //    GitHub repo, so PR comments belong on the timeline.
+  let prRepoArg: string | null = null;
+  let prOwner: string | null = null;
+  let prRepo: string | null = null;
+  if (githubCheck.isGitHub && githubCheck.owner && githubCheck.repo) {
+    prRepoArg = `${githubCheck.owner}/${githubCheck.repo}`;
+    prOwner = githubCheck.owner;
+    prRepo = githubCheck.repo;
+  } else {
+    // Try the project-resolved repo (Linear-tracked issues whose project maps
+    // to a GitHub repo — common for Panopticon).
+    const issuePrefix = extractPrefixSync(issueId);
+    const projectKey = issuePrefix ?? issueId.split('-')[0] ?? '';
+    const ghConfig = getGitHubConfig();
+    const repoConfig = ghConfig?.repos.find((r) => {
+      const prefix = (r.prefix ?? r.repo).toUpperCase().replace(/-/g, '');
+      return prefix === projectKey.toUpperCase();
+    });
+    if (repoConfig) {
+      prRepoArg = `${repoConfig.owner}/${repoConfig.repo}`;
+      prOwner = repoConfig.owner;
+      prRepo = repoConfig.repo;
+    }
+  }
+
+  const prNumberTask = (async () => {
+    if (prRepoArg) {
+      if (!parseIssueIdSync(issueId)) {
+        throw new Error(`Invalid issue id: ${issueId}`);
+      }
+      const branchName = `feature/${issueId.toLowerCase()}`;
+      try {
+        const { stdout } = await execFileAsync(
+          'gh',
+          [
+            'pr', 'list',
+            '--repo', prRepoArg,
+            '--head', branchName,
+            '--state', 'all',
+            '--json', 'number',
+            '--limit', '1',
+            '--jq', '.[0].number',
+          ],
+          { encoding: 'utf-8', timeout: 15000 },
+        );
+        const trimmed = stdout.trim();
+        if (trimmed) {
+          const parsed = parseInt(trimmed, 10);
+          if (Number.isFinite(parsed)) return parsed;
+        }
+      } catch (err: any) {
+        errors.push(`gh pr list failed: ${err?.message ?? String(err)}`);
+      }
+    }
+    return null;
+  })();
+
+  const [linearItems, ghIssueItems, resolvedPrNumber] = await Promise.all([
+    linearTask,
+    ghIssueCommentsTask,
+    prNumberTask,
+  ]);
+  items.push(...linearItems, ...ghIssueItems);
+  prNumber = resolvedPrNumber;
+
+  if (prNumber !== null && prRepoArg && prOwner && prRepo) {
+    // Three independent gh API calls. Each takes 200–800ms; running them
+    // sequentially compounded latency on every 30s poll. Fan out with
+    // Promise.all (each block catches its own error so the outer await never
+    // rejects) and the slowest call now governs total wall-clock instead of
+    // the sum of all three.
+    const collectedItems: DiscussionItem[] = [];
+
+    // 4. PR conversation comments (issue-comments endpoint against the PR).
+    const prConversation = (async () => {
+      try {
+        const { stdout } = await execAsync(
+          `gh api "repos/${prOwner}/${prRepo}/issues/${prNumber}/comments?per_page=100"`,
+          { encoding: 'utf-8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const arr = JSON.parse(stdout) as Array<{
+          id: number;
+          user?: { login?: string } | null;
+          body?: string | null;
+          created_at?: string;
+          html_url?: string;
+        }>;
+        for (const c of arr) {
+          collectedItems.push({
+            id: `gh-pr-conv-${c.id}`,
+            source: 'github-pr-conversation',
+            author: c.user?.login ?? 'unknown',
+            body: c.body ?? '',
+            createdAt: c.created_at ?? '',
+            url: c.html_url,
+            prNumber,
+          });
+        }
+      } catch (err: any) {
+        errors.push(`gh pr conversation failed: ${err?.message ?? String(err)}`);
+      }
+    })();
+
+    // 5. PR review submissions (approve / changes-requested / commented).
+    const prReviews = (async () => {
+      try {
+        const { stdout } = await execAsync(
+          `gh api "repos/${prOwner}/${prRepo}/pulls/${prNumber}/reviews?per_page=100"`,
+          { encoding: 'utf-8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const arr = JSON.parse(stdout) as Array<{
+          id: number;
+          user?: { login?: string } | null;
+          body?: string | null;
+          state?: string;
+          submitted_at?: string;
+          html_url?: string;
+        }>;
+        for (const r of arr) {
+          if (!r.body && r.state === 'COMMENTED') continue; // empty comment-only reviews are noise
+          collectedItems.push({
+            id: `gh-pr-review-${r.id}`,
+            source: 'github-pr-review',
+            author: r.user?.login ?? 'unknown',
+            body: r.body ?? '',
+            createdAt: r.submitted_at ?? '',
+            url: r.html_url,
+            prNumber,
+            reviewState: r.state,
+          });
+        }
+      } catch (err: any) {
+        errors.push(`gh pr reviews failed: ${err?.message ?? String(err)}`);
+      }
+    })();
+
+    // 6. Inline PR review comments (review-thread replies on diff lines).
+    const prInlineComments = (async () => {
+      try {
+        const { stdout } = await execAsync(
+          `gh api "repos/${prOwner}/${prRepo}/pulls/${prNumber}/comments?per_page=100"`,
+          { encoding: 'utf-8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const arr = JSON.parse(stdout) as Array<{
+          id: number;
+          user?: { login?: string } | null;
+          body?: string | null;
+          created_at?: string;
+          html_url?: string;
+          path?: string;
+          line?: number | null;
+        }>;
+        for (const c of arr) {
+          collectedItems.push({
+            id: `gh-pr-rc-${c.id}`,
+            source: 'github-pr-review-comment',
+            author: c.user?.login ?? 'unknown',
+            body: c.body ?? '',
+            createdAt: c.created_at ?? '',
+            url: c.html_url,
+            prNumber,
+            filePath: c.path,
+            line: typeof c.line === 'number' ? c.line : undefined,
+          });
+        }
+      } catch (err: any) {
+        errors.push(`gh pr review comments failed: ${err?.message ?? String(err)}`);
+      }
+    })();
+
+    await Promise.all([prConversation, prReviews, prInlineComments]);
+    items.push(...collectedItems);
+  }
+
+  // Sort chronologically (oldest first). Items with no createdAt sink to the bottom.
+  items.sort((a, b) => {
+    if (!a.createdAt && !b.createdAt) return 0;
+    if (!a.createdAt) return 1;
+    if (!b.createdAt) return -1;
+    return a.createdAt.localeCompare(b.createdAt);
+  });
+
+  return {
+    issueId: upper,
+    items,
+    prNumber,
+    ...(errors.length > 0 ? { errors } : {}),
+  };
+}
+
+const getIssueDiscussionsRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/:id/discussions',
+  httpHandler(Effect.gen(function* () {
+    const linear = yield* LinearClient;
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
+
+    const linearGetIssueId = async (ref: string): Promise<string | null> => {
+      try {
+        const issue = await Effect.runPromise(linear.getIssue(ref));
+        return issue.id;
+      } catch {
+        return null;
+      }
+    };
+    const linearGetComments = async (uuid: string) => {
+      try {
+        const comments = await Effect.runPromise(linear.getComments(uuid));
+        return comments.map((c) => ({
+          author: c.author,
+          body: c.body,
+          createdAt: c.createdAt,
+        }));
+      } catch {
+        return [];
+      }
+    };
+
+    const result = yield* Effect.promise(() =>
+      fetchIssueDiscussions(id, { linearGetIssueId, linearGetComments }),
+    );
+    return jsonResponse(result);
   })),
 );
 
@@ -2432,14 +3437,25 @@ const getIssueCostsRoute = HttpRouter.add(
   httpHandler(Effect.gen(function* () {
     const params = yield* HttpRouter.params;
     const id = params['id'] ?? '';
+    if (!parseIssueIdSync(id)) {
+      return jsonResponse({ error: "Invalid issue ID" }, { status: 400 });
+    }
 
-    syncCache();
-    const issueData = getCostsForIssue(id);
+    const issueData = getCostsForIssueSync(id);
+    const agents = yield* Effect.promise(() => getCachedRunningAgents());
+    const resolvedCost = resolveIssueHeadlineCost({
+      issueId: id,
+      aggregateCost: issueData?.totalCost,
+      agents,
+    });
 
     if (!issueData) {
       return jsonResponse({
         issueId: id.toUpperCase(),
         totalCost: 0,
+        resolvedTotalCost: resolvedCost.resolvedTotalCost,
+        aggregateCost: resolvedCost.aggregateCost,
+        liveCost: resolvedCost.liveCost,
         totalTokens: 0,
         inputTokens: 0,
         outputTokens: 0,
@@ -2448,6 +3464,7 @@ const getIssueCostsRoute = HttpRouter.add(
         models: {},
         providers: {},
         byModel: {},
+        sessions: [],
         byStage: {},
         budget: undefined,
         budgetWarning: false,
@@ -2457,6 +3474,9 @@ const getIssueCostsRoute = HttpRouter.add(
     return jsonResponse({
       issueId: id.toUpperCase(),
       totalCost: issueData.totalCost,
+      resolvedTotalCost: resolvedCost.resolvedTotalCost,
+      aggregateCost: resolvedCost.aggregateCost,
+      liveCost: resolvedCost.liveCost,
       totalTokens: issueData.inputTokens + issueData.outputTokens + issueData.cacheReadTokens + issueData.cacheWriteTokens,
       inputTokens: issueData.inputTokens,
       outputTokens: issueData.outputTokens,
@@ -2470,6 +3490,7 @@ const getIssueCostsRoute = HttpRouter.add(
           { cost: stats.cost, tokens: stats.tokens },
         ])
       ),
+      sessions: (issueData as unknown as { sessions?: unknown[] }).sessions ?? [],
       byStage: Object.fromEntries(
         Object.entries(issueData.stages || {}).map(([stage, stats]: [string, any]) => [
           stage,
@@ -2480,6 +3501,43 @@ const getIssueCostsRoute = HttpRouter.add(
       budgetWarning: issueData.budgetWarning,
       lastUpdated: issueData.lastUpdated,
     });
+  })),
+);
+
+const getResourceAllocatedIssuesRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/resource-allocated',
+  httpHandler(Effect.gen(function* () {
+    const issues = yield* Effect.tryPromise({
+      try: async () => sanitizeResourceAllocatedIssues(await getCachedResourceAllocatedIssues()),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    return jsonResponse(issues);
+  })),
+);
+
+const getIssueResourceDetailsRoute = HttpRouter.add(
+  'GET',
+  '/api/issues/:id/resource-details',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const rawId = params['id'] ?? '';
+    const parsedIssueId = parseIssueIdSync(rawId);
+    if (!parsedIssueId) {
+      return jsonResponse({ error: 'Invalid issue id: ' + rawId }, { status: 400 });
+    }
+    const id = parsedIssueId.raw.toUpperCase();
+
+    const details = yield* Effect.tryPromise({
+      try: () => getResourceDetailIdentifiers(id),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+
+    if (!details) {
+      return jsonResponse({ error: `No resource details found for ${id}` }, { status: 404 });
+    }
+
+    return jsonResponse(details);
   })),
 );
 
@@ -2504,9 +3562,16 @@ export const issuesRouteLayer = Layer.mergeAll(
   postIssueCloseOutRoute,
   postIssuesBulkCloseOutRoute,
   getIssueBeadsRoute,
+  postIssueBeadInspectRoute,
   getIssuePlanningStateRoute,
   postIssueGenerateTasksRoute,
   getIssueCostsRoute,
+  getResourceAllocatedIssuesRoute,
+  getIssueResourceDetailsRoute,
+  getIssuePrRoute,
+  getIssuePrDiffRoute,
+  getIssuePrDetailsRoute,
+  getIssueDiscussionsRoute,
 );
 
 export default issuesRouteLayer;

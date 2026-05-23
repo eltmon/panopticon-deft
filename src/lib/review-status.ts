@@ -1,24 +1,45 @@
 import { access, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { notifyPipeline } from './pipeline-notifier.js';
-import { emitActivityEntry, emitActivityTts } from './activity-logger.js';
+import { Data, Effect } from 'effect';
+import { findPlan } from './vbrief/io.js';
+import { notifyPipelineSync } from './pipeline-notifier.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from './activity-logger.js';
+import { buildPipelineMirrorFromStatus, writePipelineMirrorToPlanFile } from './vbrief/dag.js';
 import {
-  upsertReviewStatus as dbUpsert,
+  upsertReviewStatusSync as dbUpsert,
   deleteReviewStatus as dbDelete,
-  getReviewStatusFromDb,
+  getReviewStatusFromDbSync,
   getAllReviewStatusesFromDb,
+  getReviewStatusesFromDb,
   markWorkspaceStuck as dbMarkStuck,
   clearWorkspaceStuck as dbClearStuck,
   setDeaconIgnored as dbSetDeaconIgnored,
+  getReviewStatusFromDb,
 } from './database/review-status-db.js';
-import { normalizeReviewStatus } from './review-status-normalize.js';
+import { normalizeReviewStatusSync } from './review-status-normalize.js';
+
+function emitReactiveLifecycleEvent(type: 'review.approved' | 'test.passed', issueId: string): void {
+  try {
+    notifyPipelineSync({ type, issueId });
+  } catch (error) {
+    console.warn(`[review-status] Failed to emit ${type} for ${issueId}:`, error);
+  }
+}
 
 export interface StatusHistoryEntry {
   type: 'review' | 'test' | 'merge' | 'inspect' | 'uat';
   status: string;
   timestamp: string;
   notes?: string;
+}
+
+export interface BlockerReason {
+  type: 'failing_checks' | 'merge_conflict' | 'unresolved_conversations' | 'changes_requested' | 'draft_pr' | 'not_mergeable';
+  summary: string;
+  details?: string;
+  detectedAt: string;
 }
 
 export interface ReviewStatus {
@@ -41,10 +62,21 @@ export interface ReviewStatus {
   readyForMerge: boolean;
   autoRequeueCount?: number;
   mergeRetryCount?: number;
+  queuePosition?: number | null;
   prUrl?: string;
+  /** PAN-905: HEAD commit SHA of the tracked PR for webhook identity validation */
+  prHeadSha?: string;
+  /** PAN-905: GitHub PR number of the tracked PR for webhook identity validation */
+  prNumber?: number;
   history?: StatusHistoryEntry[];
+  /** PAN-905: GitHub-native merge blocker reasons */
+  blockerReasons?: BlockerReason[];
   /** HEAD commit SHA at the time review passed — used to detect new commits after review */
   reviewedAtCommit?: string;
+  /** HEAD commit SHA at the time the pre-review verification gate passed — used to skip redundant test-agent */
+  lastVerifiedCommit?: string;
+  /** Current merge pipeline step for granular merge progress tracking */
+  mergeStep?: string;
   /** PAN-653: workspace is stuck (e.g. main diverged mid-approve) — Deacon skips it */
   stuck?: boolean;
   /** PAN-653: reason workspace is stuck (e.g. 'main_diverged') */
@@ -69,9 +101,13 @@ export interface ReviewStatus {
   deaconIgnoredReason?: string;
   /** Commits at time of review request — used to detect new commits after review */
   lastReviewCommits?: { ahead: number; behind: number; branch: string; commits: string[] };
+  /** Active canonical review-temp stash for the current review cycle. */
+  reviewTempStashRef?: string;
+  reviewTempStashMessage?: string;
+  reviewTempStashSequence?: number;
 }
 
-function verificationSatisfied(status: Pick<ReviewStatus, 'verificationStatus'>): boolean {
+export function verificationSatisfied(status: Pick<ReviewStatus, 'verificationStatus'>): boolean {
   // Only block readyForMerge if verification explicitly FAILED.
   // 'pending' means "scheduled but not yet run this cycle" — not a failure signal.
   // request-review resets verificationStatus to 'pending' as part of its cycle reset,
@@ -93,6 +129,10 @@ export function loadReviewStatuses(filePath = DEFAULT_STATUS_FILE): Record<strin
     );
   }
   return getAllReviewStatusesFromDb();
+}
+
+export function loadReviewStatusesForIssues(issueIds: string[]): Record<string, ReviewStatus> {
+  return getReviewStatusesFromDb(issueIds);
 }
 
 export function saveReviewStatuses(statuses: Record<string, ReviewStatus>, filePath = DEFAULT_STATUS_FILE): void {
@@ -117,13 +157,34 @@ export function saveReviewStatuses(statuses: Record<string, ReviewStatus>, fileP
   }
 }
 
-export function setReviewStatus(
+export function setReviewStatusSync(
   issueId: string,
   update: Partial<ReviewStatus>,
+  existing?: ReviewStatus,
 ): ReviewStatus {
+  // Guard: bare numeric IDs (no alphabetic prefix) must never reach the DB.
+  // They would create orphaned rows that pollute pending lists and metrics.
+  if (/^\d+$/.test(issueId)) {
+    console.warn(
+      `[review-status] Rejecting setReviewStatus for bare numeric ID "${issueId}" — ` +
+      `issue IDs must include a project prefix (e.g. PAN-${issueId}).`
+    );
+    return {
+      issueId,
+      reviewStatus: 'pending' as const,
+      testStatus: 'pending' as const,
+      updatedAt: new Date().toISOString(),
+      readyForMerge: false,
+    };
+  }
+
+  issueId = issueId.toUpperCase();
+
   // Read only the single row we're updating (avoids TOCTOU: bulk read-modify-write
   // races when two concurrent calls for different issue IDs run concurrently).
-  const existing: ReviewStatus = getReviewStatusFromDb(issueId) ?? {
+  // If `existing` is provided (e.g. from mutateBlockers), skip the DB read to
+  // avoid double-read on the webhook ingestion path (PAN-905).
+  const status: ReviewStatus = existing ?? getReviewStatusFromDbSync(issueId) ?? {
     issueId,
     reviewStatus: 'pending' as const,
     testStatus: 'pending' as const,
@@ -134,52 +195,54 @@ export function setReviewStatus(
   // Guard: reject reviewStatus regression from 'passed' to 'reviewing' unless the caller
   // is explicitly resetting the merge lifecycle (update includes mergeStatus).
   // This is belt-and-suspenders — endpoint-level guards should catch this first.
-  if (update.reviewStatus === 'reviewing' && existing.reviewStatus === 'passed' && update.mergeStatus === undefined) {
+  if (update.reviewStatus === 'reviewing' && status.reviewStatus === 'passed' && update.mergeStatus === undefined) {
     console.warn(`[review-status] Rejecting reviewStatus regression from 'passed' to 'reviewing' for ${issueId} (mergeStatus not being reset)`);
-    return existing as ReviewStatus;
+    notifyPipelineSync({ type: 'status_changed', issueId, status: status as ReviewStatus });
+    return status as ReviewStatus;
   }
 
-  const merged = { ...existing, ...update };
+  // PAN-424: Reject testStatus regression from 'passed' to 'dispatch_failed' or 'failed'.
+  // Once tests pass, duplicate dispatch failures must not overwrite the result.
+  if (
+    (update.testStatus === 'dispatch_failed' || update.testStatus === 'failed') &&
+    status.testStatus === 'passed'
+  ) {
+    console.warn(`[review-status] Rejecting testStatus regression from 'passed' to '${update.testStatus}' for ${issueId}`);
+    delete update.testStatus;
+    delete update.testNotes;
+  }
+
+  const merged = { ...status, ...update };
 
   // Track status transitions in history (last 10 entries)
-  const history = [...(existing.history || [])];
+  const history = [...(status.history || [])];
   const now = new Date().toISOString();
-  if (update.reviewStatus && update.reviewStatus !== existing.reviewStatus) {
+  if (update.reviewStatus && update.reviewStatus !== status.reviewStatus) {
     history.push({ type: 'review', status: update.reviewStatus, timestamp: now, notes: update.reviewNotes });
   }
-  if (update.testStatus && update.testStatus !== existing.testStatus) {
+  if (update.testStatus && update.testStatus !== status.testStatus) {
     history.push({ type: 'test', status: update.testStatus, timestamp: now, notes: update.testNotes });
   }
-  if (update.uatStatus && update.uatStatus !== existing.uatStatus) {
+  if (update.uatStatus && update.uatStatus !== status.uatStatus) {
     history.push({ type: 'uat', status: update.uatStatus, timestamp: now, notes: update.uatNotes });
   }
-  if (update.mergeStatus && update.mergeStatus !== existing.mergeStatus) {
+  if (update.mergeStatus && update.mergeStatus !== status.mergeStatus) {
     history.push({ type: 'merge', status: update.mergeStatus, timestamp: now });
   }
   while (history.length > 10) history.shift();
 
-  // readyForMerge is true when all required gates pass.
-  // If uatStatus exists (UAT specialist has been involved), it must also be 'passed'.
-  // NOTE: we intentionally do NOT check verificationStatus here. Verification can fail
-  // on pre-existing test breakage or environment issues, but the test specialist's pass
-  // is the authoritative signal. The post-rebase gate in triggerMerge() is the real
-  // quality check. Blocking readyForMerge on a stale verificationStatus causes issues
-  // to get stuck after tests pass (PAN-714).
-  const readyForMerge = update.readyForMerge !== undefined
-    ? update.readyForMerge
-    : (
-        merged.reviewStatus === 'passed' &&
-        merged.testStatus === 'passed' &&
-        merged.mergeStatus !== 'merged' &&
-        // Don't auto-recompute rfm=true when the previous merge attempt failed —
-        // cycling: check-status gate → mergeStatus=failed → deacon restore → rfm=true → retry.
-        // checkFailedMergeRetry() handles transient retries explicitly with readyForMerge: true.
-        merged.mergeStatus !== 'failed' &&
-        // If UAT has been initiated, it must pass too
-        (merged.uatStatus === undefined || merged.uatStatus === 'passed')
-      );
+  // PAN-1048: readyForMerge is only set explicitly by the ship role after
+  // rebase/verify/push. Auto-derivation from review+test gate status is removed —
+  // the ship role is the single authority.
+  // PAN-905: GitHub-native blockers always override readyForMerge to false.
+  const hasBlockers = (merged.blockerReasons?.length ?? 0) > 0;
+  const readyForMerge = hasBlockers
+    ? false
+    : (update.readyForMerge !== undefined
+        ? update.readyForMerge
+        : merged.readyForMerge ?? false);
 
-  const updated: ReviewStatus = normalizeReviewStatus({
+  const updated: ReviewStatus = normalizeReviewStatusSync({
     ...merged,
     issueId,
     updatedAt: now,
@@ -188,7 +251,7 @@ export function setReviewStatus(
   });
 
   // Report commit statuses to GitHub when readyForMerge transitions to true (PAN-536)
-  if (readyForMerge && !existing.readyForMerge && updated.prUrl) {
+  if (readyForMerge && !status.readyForMerge && updated.prUrl) {
     (async () => {
       try {
         const { isGitHubAppConfigured, reportCommitStatus } = await import('./github-app.js');
@@ -206,9 +269,12 @@ export function setReviewStatus(
         );
         const sha = stdout.trim();
         if (sha) {
+          // panopticon/review is honest here — review just transitioned to readyForMerge.
+          // The panopticon/tests status is posted separately at the actual test-completion
+          // site (verification-runner success, test-agent POST in workspaces routes) so it
+          // accurately reflects which commit was tested.
           await reportCommitStatus(owner, repo, sha, 'success', 'panopticon/review', 'Review passed');
-          await reportCommitStatus(owner, repo, sha, 'success', 'panopticon/test', 'Tests passed');
-          console.log(`[review-status] Reported commit statuses for ${issueId} (${sha.slice(0, 8)})`);
+          console.log(`[review-status] Reported panopticon/review for ${issueId} (${sha.slice(0, 8)})`);
         }
       } catch (err: any) {
         console.warn(`[review-status] Failed to report commit status: ${err.message}`);
@@ -216,117 +282,138 @@ export function setReviewStatus(
     })();
   }
 
-  // Single-row upsert — atomic, no TOCTOU risk.
+  // Single-row upsert — atomic, no TOCTOU risk. SQLite remains authoritative
+  // for Phase 1 live runtime state; the vBRIEF pipeline mirror below is a
+  // corroborating durable task-graph view for pan-oversee/dashboard readers.
   dbUpsert(updated);
 
-  notifyPipeline({ type: 'status_changed', issueId, status: updated });
+  mirrorPipelineStatusToVBrief(issueId, updated);
+
+  notifyPipelineSync({ type: 'status_changed', issueId, status: updated });
 
   // Emit activity log entries for meaningful pipeline state transitions.
   // Each transition produces one entry so the ActivityPanel shows live pipeline progress.
-  if (update.verificationStatus && update.verificationStatus !== existing.verificationStatus) {
-    const vMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string }> = {
-      running:  { level: 'info',    msg: `${issueId} — verification running` },
-      passed:   { level: 'success', msg: `${issueId} — verification passed` },
-      failed:   { level: 'error',   msg: `${issueId} — verification failed${update.verificationNotes ? ': ' + update.verificationNotes : ''}` },
-      skipped:  { level: 'info',    msg: `${issueId} — verification skipped` },
+  if (update.verificationStatus && update.verificationStatus !== status.verificationStatus) {
+    const vMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string; ttsPriority?: number }> = {
+      running:  { level: 'info',    msg: `${issueId} — verification running`, tts: `${issueId} verification running` },
+      passed:   { level: 'success', msg: `${issueId} — verification passed`, tts: `${issueId} verification passed` },
+      failed:   { level: 'error',   msg: `${issueId} — verification failed`, tts: `${issueId} verification failed` },
+      skipped:  { level: 'info',    msg: `${issueId} — verification skipped`, tts: `${issueId} verification skipped`, ttsPriority: 2 },
     };
     const entry = vMap[update.verificationStatus];
-    if (entry) emitActivityEntry({ source: 'cloister', level: entry.level, message: entry.msg, issueId });
+    if (entry) emitActivityEntrySync({ source: 'cloister', level: entry.level, message: entry.msg, details: update.verificationNotes, issueId });
+    if (entry?.tts) emitActivityTtsSync({
+      utterance: entry.tts,
+      priority: entry.ttsPriority ?? (entry.level === 'error' ? 0 : 1),
+      issueId,
+      source: 'cloister',
+      eventType: `verificationStatus.${update.verificationStatus}`,
+    });
   }
-  if (update.reviewStatus && update.reviewStatus !== existing.reviewStatus) {
+  if (update.reviewStatus && update.reviewStatus !== status.reviewStatus) {
+    let reviewMsg = `${issueId} — review started`;
+    if (update.reviewStatus === 'reviewing') {
+      const retryCount = updated.reviewRetryCount ?? 0;
+      reviewMsg = retryCount > 0
+        ? `${issueId} — review re-dispatched (retry ${retryCount})`
+        : `${issueId} — review started (4 parallel reviewers)`;
+    }
     const rMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string }> = {
-      reviewing: { level: 'info',    msg: `${issueId} — review started` },
+      reviewing: { level: 'info',    msg: reviewMsg, tts: `${issueId} review started` },
       passed:    { level: 'success', msg: `${issueId} — review passed`, tts: `${issueId} review passed` },
-      failed:    { level: 'error',   msg: `${issueId} — review failed${update.reviewNotes ? ': ' + update.reviewNotes : ''}`, tts: `${issueId} review failed` },
-      blocked:   { level: 'warn',    msg: `${issueId} — review blocked${update.reviewNotes ? ': ' + update.reviewNotes : ''}` },
+      failed:    { level: 'error',   msg: `${issueId} — review failed`, tts: `${issueId} review failed` },
+      blocked:   { level: 'warn',    msg: `${issueId} — review blocked (changes requested)`, tts: `${issueId} review blocked` },
     };
     const entry = rMap[update.reviewStatus];
-    if (entry) emitActivityEntry({ source: 'review-specialist', level: entry.level, message: entry.msg, issueId });
-    if (entry?.tts) emitActivityTts({ utterance: entry.tts, priority: entry.level === 'error' ? 0 : 1, issueId });
+    if (entry) emitActivityEntrySync({ source: 'review', level: entry.level, message: entry.msg, details: update.reviewNotes, issueId });
+    if (entry?.tts) emitActivityTtsSync({
+      utterance: entry.tts,
+      priority: entry.level === 'error' ? 0 : 1,
+      issueId,
+      source: 'review-specialist',
+      eventType: `reviewStatus.${update.reviewStatus}`,
+    });
   }
-  if (update.testStatus && update.testStatus !== existing.testStatus) {
-    const tMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string }> = {
-      testing:         { level: 'info',    msg: `${issueId} — tests running` },
+  if (update.testStatus && update.testStatus !== status.testStatus) {
+    const tMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string; ttsPriority?: number }> = {
+      testing:         { level: 'info',    msg: `${issueId} — tests running`, tts: `${issueId} tests running`, ttsPriority: 2 },
       passed:          { level: 'success', msg: `${issueId} — tests passed`, tts: `${issueId} tests passed` },
-      failed:          { level: 'error',   msg: `${issueId} — tests failed${update.testNotes ? ': ' + update.testNotes : ''}`, tts: `${issueId} tests failed` },
-      skipped:         { level: 'info',    msg: `${issueId} — tests skipped` },
-      dispatch_failed: { level: 'warn',    msg: `${issueId} — test dispatch failed` },
+      failed:          { level: 'error',   msg: `${issueId} — tests failed`, tts: `${issueId} tests failed` },
+      skipped:         { level: 'info',    msg: `${issueId} — tests skipped`, tts: `${issueId} tests skipped`, ttsPriority: 2 },
+      dispatch_failed: { level: 'warn',    msg: `${issueId} — test dispatch failed`, tts: `${issueId} test dispatch failed`, ttsPriority: 1 },
     };
     const entry = tMap[update.testStatus];
-    if (entry) emitActivityEntry({ source: 'test-specialist', level: entry.level, message: entry.msg, issueId });
-    if (entry?.tts) emitActivityTts({ utterance: entry.tts, priority: entry.level === 'error' ? 0 : 1, issueId });
+    if (entry) emitActivityEntrySync({ source: 'test', level: entry.level, message: entry.msg, details: update.testNotes, issueId });
+    if (entry?.tts) emitActivityTtsSync({
+      utterance: entry.tts,
+      priority: entry.ttsPriority ?? (entry.level === 'error' ? 0 : 1),
+      issueId,
+      source: 'test-specialist',
+      eventType: `testStatus.${update.testStatus}`,
+    });
   }
-  if (update.mergeStatus && update.mergeStatus !== existing.mergeStatus) {
-    const mMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string }> = {
-      queued:    { level: 'info',    msg: `${issueId} — queued for merge` },
-      merging:   { level: 'info',    msg: `${issueId} — merge in progress` },
-      verifying: { level: 'info',    msg: `${issueId} — post-merge verification` },
+  if (update.mergeStatus && update.mergeStatus !== status.mergeStatus) {
+    const mMap: Record<string, { level: 'info' | 'warn' | 'error' | 'success'; msg: string; tts?: string; ttsPriority?: number }> = {
+      queued:    { level: 'info',    msg: `${issueId} — queued for merge`, tts: `${issueId} queued for merge`, ttsPriority: 2 },
+      merging:   { level: 'info',    msg: `${issueId} — merge in progress`, tts: `${issueId} merge in progress`, ttsPriority: 2 },
+      verifying: { level: 'info',    msg: `${issueId} — post-merge verification`, tts: `${issueId} post-merge verification running`, ttsPriority: 2 },
       merged:    { level: 'success', msg: `${issueId} — merged`, tts: `${issueId} merged to main` },
-      failed:    { level: 'error',   msg: `${issueId} — merge failed${update.mergeNotes ? ': ' + update.mergeNotes : ''}`, tts: `${issueId} merge failed` },
+      failed:    { level: 'error',   msg: `${issueId} — merge failed`, tts: `${issueId} merge failed` },
     };
     const entry = mMap[update.mergeStatus];
-    if (entry) emitActivityEntry({ source: 'merge-agent', level: entry.level, message: entry.msg, issueId });
-    if (entry?.tts) emitActivityTts({ utterance: entry.tts, priority: entry.level === 'error' ? 0 : 1, issueId });
+    if (entry) emitActivityEntrySync({ source: 'ship', level: entry.level, message: entry.msg, details: update.mergeNotes, issueId });
+    if (entry?.tts) emitActivityTtsSync({
+      utterance: entry.tts,
+      priority: entry.ttsPriority ?? (entry.level === 'error' ? 0 : 1),
+      issueId,
+      source: 'merge-agent',
+      eventType: `mergeStatus.${update.mergeStatus}`,
+    });
   }
-  if (update.readyForMerge === true && !existing.readyForMerge) {
-    emitActivityEntry({ source: 'cloister', level: 'success', message: `${issueId} — ready for merge`, issueId });
-    emitActivityTts({ utterance: `${issueId} ready for merge`, priority: 1, issueId });
+  if (update.readyForMerge === true && !status.readyForMerge) {
+    emitActivityEntrySync({ source: 'cloister', level: 'success', message: `${issueId} — ready for merge`, issueId });
+    emitActivityTtsSync({
+      utterance: `${issueId} ready for merge`,
+      priority: 1,
+      issueId,
+      source: 'cloister',
+      eventType: 'readyForMerge',
+    });
   }
 
-  // Dispatch test-agent when review transitions to 'passed'.
-  // This fires regardless of how setReviewStatus() is called (API or direct import),
-  // ensuring test-agent is dispatched even when review-agent bypasses the specialist
-  // dispatch endpoint.
+  // Reactive Cloister owns review→test and test→ship scheduling. setReviewStatus
+  // emits the lifecycle event here so API and direct-import callers share one path.
   if (
     update.reviewStatus === 'passed' &&
-    existing.reviewStatus !== 'passed' &&
+    status.reviewStatus !== 'passed' &&
     updated.testStatus === 'pending'
   ) {
-    (async () => {
-      try {
-        const { spawnEphemeralSpecialist } = await import('./cloister/specialists.js');
-        const { resolveProjectFromIssue } = await import('./projects.js');
-        const workAgentId = `agent-${issueId.toLowerCase()}`;
-        const workStateFile = join(homedir(), '.panopticon', 'agents', workAgentId, 'state.json');
-        let workspace: string | undefined;
-        let branch: string | undefined;
-        try {
-          await access(workStateFile);
-          const workState = JSON.parse(await readFile(workStateFile, 'utf-8'));
-          workspace = workState.workspace;
-          branch = workState.branch || `feature/${issueId.toLowerCase()}`;
-        } catch {}
+    const canSkipTests =
+      updated.reviewedAtCommit &&
+      updated.lastVerifiedCommit &&
+      updated.reviewedAtCommit === updated.lastVerifiedCommit;
 
-        const resolved = resolveProjectFromIssue(issueId);
-        if (!resolved) {
-          console.warn(`[review-status] No project configured for ${issueId} — cannot dispatch test-agent`);
-          setReviewStatus(issueId, { testStatus: 'dispatch_failed', testNotes: `No project configured for ${issueId}` });
-          return;
-        }
-        const result = await spawnEphemeralSpecialist(resolved.projectKey, 'test-agent', {
-          issueId,
-          workspace,
-          branch,
-        });
-        if (result.success) {
-          setReviewStatus(issueId, { testStatus: 'testing' });
-          console.log(`[review-status] Dispatched test-agent for ${issueId} after review passed`);
-        } else {
-          console.warn(`[review-status] Failed to dispatch test-agent for ${issueId}: ${result.message}`);
-          setReviewStatus(issueId, { testStatus: 'dispatch_failed', testNotes: `Dispatch failed: ${result.message}` });
-        }
-      } catch (err: any) {
-        console.warn(`[review-status] Failed to dispatch test-agent for ${issueId}: ${err.message}`);
-      }
-    })();
+    if (canSkipTests) {
+      console.log(`[review-status] Skipping test role for ${issueId} — no code drift since verification (HEAD=${updated.reviewedAtCommit!.slice(0, 8)})`);
+      emitActivityEntrySync({ source: 'cloister', level: 'info', message: `${issueId} — tests skipped (no code change since verification gate)`, issueId });
+      setReviewStatusSync(issueId, { testStatus: 'passed', testNotes: 'Skipped: no code changed since pre-review verification gate' });
+      void emitReactiveLifecycleEvent('test.passed', issueId);
+    } else {
+      void emitReactiveLifecycleEvent('review.approved', issueId);
+    }
+  }
+
+  if (update.testStatus === 'passed' && status.testStatus !== 'passed') {
+    void emitReactiveLifecycleEvent('test.passed', issueId);
   }
 
   return updated;
 }
 
-export function getReviewStatus(issueId: string): ReviewStatus | null {
-  return getReviewStatusFromDb(issueId) ?? null;
+export function getReviewStatusSync(issueId: string): ReviewStatus | null {
+  return getReviewStatusFromDbSync(issueId) ?? null;
 }
+
 
 /**
  * On server startup, clear any mergeStatus stuck at 'merging'.
@@ -350,7 +437,7 @@ export function clearStuckMergeStatuses(): void {
       (s.testStatus === 'passed' || s.testStatus === 'skipped') &&
       verificationSatisfied(s) &&
       (s.uatStatus === undefined || s.uatStatus === 'passed');
-    setReviewStatus(s.issueId, {
+    setReviewStatusSync(s.issueId, {
       mergeStatus: 'pending',
       ...(shouldBeReady ? { readyForMerge: true } : {}),
     });
@@ -387,7 +474,58 @@ export function fixStuckReadyForMerge(): void {
   console.log(`[review-status] Restoring readyForMerge for ${stuck.length} issue(s) with passed review+test`);
   for (const s of stuck) {
     console.log(`[review-status] Restoring readyForMerge=true for ${s.issueId} (verif=${s.verificationStatus}, merge=${s.mergeStatus})`);
-    setReviewStatus(s.issueId, { readyForMerge: true });
+    setReviewStatusSync(s.issueId, { readyForMerge: true });
+  }
+}
+
+/**
+ * PAN-869: On server startup, fix any issues where reviewStatus was incorrectly
+ * set to 'failed' due to the old COMMENTED → 'failed' mapping bug.
+ *
+ * This identifies records where:
+ * - reviewStatus = 'failed'
+ * - testStatus = 'passed' (CI green, so review wasn't genuinely bad)
+ * - mergeStatus is not terminal ('merged', 'failed')
+ * - readyForMerge = false
+ * - The last review history entry is type='review', status='failed'
+ *
+ * The old reviewResultToReviewStatus() mapped COMMENTED (regardless of success)
+ * to 'failed', so the history stores 'failed' for old COMMENTED reviews.
+ * We use testStatus='passed' as the signal that this was a successful review
+ * (CI was green), distinguishing it from genuinely failed reviews.
+ */
+export function fixStuckCommentedReviews(): void {
+  const statuses = loadReviewStatuses();
+  const candidates = Object.values(statuses).filter(s =>
+    s.reviewStatus === 'failed' &&
+    (s.testStatus === 'passed' || s.testStatus === 'skipped') &&
+    s.mergeStatus !== 'merged' &&
+    s.mergeStatus !== 'failed' &&
+    s.readyForMerge === false &&
+    s.verificationStatus !== 'failed'
+  );
+
+  if (candidates.length === 0) return;
+
+  const toFix: string[] = [];
+  for (const s of candidates) {
+    // Check if the last review history entry is 'failed' (the old COMMENTED mapping
+    // stored 'failed' in history). testStatus='passed' signals CI was green,
+    // so this was a successful review incorrectly stored as 'failed'.
+    const lastReviewEntry = [...(s.history || [])]
+      .reverse()
+      .find(h => h.type === 'review');
+    if (lastReviewEntry?.status === 'failed') {
+      toFix.push(s.issueId);
+    }
+  }
+
+  if (toFix.length === 0) return;
+  console.log(`[review-status] Restoring reviewStatus='passed' for ${toFix.length} issue(s) with COMMENTED reviews (PAN-869 backfill)`);
+  for (const issueId of toFix) {
+    console.log(`[review-status] Restoring reviewStatus='passed' for ${issueId}`);
+    // reviewStatus='passed' will trigger readyForMerge recomputation in setReviewStatus
+    setReviewStatusSync(issueId, { reviewStatus: 'passed' });
   }
 }
 
@@ -417,8 +555,8 @@ export function markWorkspaceStuck(
   try {
     dbMarkStuck(issueId, reason, details);
     console.log(`[review-status] Marked ${issueId} as stuck: ${reason}`);
-    const updated = getReviewStatus(issueId);
-    if (updated) notifyPipeline({ type: 'status_changed', issueId, status: updated });
+    const updated = getReviewStatusSync(issueId);
+    if (updated) notifyPipelineSync({ type: 'status_changed', issueId, status: updated });
   } catch (err) {
     console.error(`[review-status] Failed to mark ${issueId} as stuck:`, err);
   }
@@ -433,8 +571,8 @@ export function clearWorkspaceStuck(issueId: string): void {
   try {
     dbClearStuck(issueId);
     console.log(`[review-status] Cleared stuck state for ${issueId}`);
-    const updated = getReviewStatus(issueId);
-    if (updated) notifyPipeline({ type: 'status_changed', issueId, status: updated });
+    const updated = getReviewStatusSync(issueId);
+    if (updated) notifyPipelineSync({ type: 'status_changed', issueId, status: updated });
   } catch (err) {
     console.error(`[review-status] Failed to clear stuck state for ${issueId}:`, err);
   }
@@ -453,9 +591,84 @@ export function setDeaconIgnored(
   try {
     dbSetDeaconIgnored(issueId, ignored, reason);
     console.log(`[review-status] deaconIgnored=${ignored} for ${issueId}${reason ? ` (${reason})` : ''}`);
-    const updated = getReviewStatus(issueId);
-    if (updated) notifyPipeline({ type: 'status_changed', issueId, status: updated });
+    const updated = getReviewStatusSync(issueId);
+    if (updated) notifyPipelineSync({ type: 'status_changed', issueId, status: updated });
   } catch (err) {
     console.error(`[review-status] Failed to set deaconIgnored for ${issueId}:`, err);
   }
 }
+
+
+function mirrorPipelineStatusToVBrief(issueId: string, status: ReviewStatus): void {
+  void (async () => {
+    try {
+      const agentId = `agent-${issueId.toLowerCase()}`;
+      const workStateFile = join(homedir(), '.panopticon', 'agents', agentId, 'state.json');
+      if (!existsSync(workStateFile)) return;
+      const workState = JSON.parse(await readFile(workStateFile, 'utf-8')) as { workspace?: string };
+      if (!workState.workspace) return;
+      const planPath = await Effect.runPromise(findPlan(workState.workspace));
+      if (!planPath) {
+        console.warn(`[review-status] No canonical plan found for ${issueId}, skipping mirror`);
+        return;
+      }
+      const result = await Effect.runPromise(writePipelineMirrorToPlanFile(
+        planPath,
+        buildPipelineMirrorFromStatus(issueId, status as unknown as Record<string, unknown>),
+        `review-status-${process.pid}`,
+      ));
+      if (!result) {
+        console.warn(`[review-status] Failed to write pipeline mirror to ${planPath} for ${issueId}`);
+      }
+    } catch (err: any) {
+      console.warn(`[review-status] Failed to mirror pipeline state to vBRIEF for ${issueId}: ${err.message}`);
+    }
+  })();
+}
+
+
+/** Tagged error for review-status Effect variants. */
+export class ReviewStatusError extends Data.TaggedError('ReviewStatusError')<{
+  readonly issueId: string;
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+export const setReviewStatus = (
+  issueId: string,
+  update: Partial<ReviewStatus>,
+  existing?: ReviewStatus,
+): Effect.Effect<ReviewStatus, ReviewStatusError> =>
+  Effect.tryPromise({
+    try: () => new Promise<ReviewStatus>((resolve, reject) => {
+      setImmediate(() => {
+        try {
+          resolve(setReviewStatusSync(issueId, update, existing));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }),
+    catch: (cause) =>
+      new ReviewStatusError({
+        issueId,
+        operation: 'setReviewStatus',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+export const getReviewStatus = (
+  issueId: string,
+): Effect.Effect<ReviewStatus | null, ReviewStatusError> =>
+  getReviewStatusFromDb(issueId).pipe(
+    Effect.mapError((cause) =>
+      new ReviewStatusError({
+        issueId,
+        operation: 'getReviewStatus',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+    ),
+  );

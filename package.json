@@ -1,6 +1,6 @@
 {
-  "name": "panopticon-cli",
-  "version": "0.7.2",
+  "name": "@panctl/cli",
+  "version": "0.10.2",
   "description": "Multi-agent orchestration for AI coding assistants (Claude Code, Codex, Cursor, Gemini CLI)",
   "keywords": [
     "ai-agents",
@@ -27,32 +27,35 @@
   "workspaces": {
     "packages": [
       "packages/contracts",
+      "packages/moonshine-linux-x64",
+      "packages/qwen-tts-linux-x64",
+      "packages/pi-extension",
       "src/dashboard/server",
       "src/dashboard/frontend",
       "apps/desktop"
     ],
     "catalog": {
-      "effect": "4.0.0-beta.43",
-      "@effect/platform-bun": "4.0.0-beta.43",
-      "@effect/platform-node": "4.0.0-beta.43",
-      "@effect/sql-sqlite-bun": "4.0.0-beta.43",
-      "@effect/vitest": "4.0.0-beta.43",
+      "effect": "4.0.0-beta.45",
+      "@effect/platform-bun": "4.0.0-beta.45",
+      "@effect/platform-node": "4.0.0-beta.45",
+      "@effect/sql-sqlite-bun": "4.0.0-beta.45",
+      "@effect/vitest": "4.0.0-beta.45",
       "@effect/language-service": "0.84.2",
       "@types/bun": "^1.2.0",
       "typescript": "^5.7.3"
     }
   },
   "bin": {
-    "pan": "./dist/cli/index.js",
-    "panopticon": "./dist/cli/index.js"
+    "panctl": "./dist/cli/index.js",
+    "pan": "./dist/cli/index.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "templates",
-    "skills",
+    "sync-sources",
     "scripts",
+    "roles",
     "README.md",
     "LICENSE"
   ],
@@ -60,25 +63,31 @@
     "node": ">=22.0.0"
   },
   "overrides": {
-    "@effect/platform-node-shared": "4.0.0-beta.43"
+    "@effect/platform-node-shared": "4.0.0-beta.45"
   },
   "scripts": {
     "dev": "tsx watch src/cli/index.ts",
-    "build": "npm run build:cli && npm run build:scripts && npm run build:dashboard",
-    "build:cli": "node scripts/build-cli.mjs && mkdir -p dist/cli/caveman/skills/caveman dist/cli/caveman/skills/caveman-review dist/cli/caveman-compress && cp src/lib/caveman/*.js src/lib/caveman/caveman-statusline.sh dist/cli/caveman/ && cp src/lib/caveman/skills/caveman/SKILL.md dist/cli/caveman/skills/caveman/ && cp src/lib/caveman/skills/caveman-review/SKILL.md dist/cli/caveman/skills/caveman-review/ && cp src/lib/caveman/compress/*.py dist/cli/caveman-compress/",
-    "build:contracts": "cd packages/contracts && npm run build",
-    "build:scripts": "cd scripts && tsdown",
+    "build": "npm run build:contracts && npm run build:pi-extension && npm run build:cli && npm run build:scripts && npm run build:dashboard",
+    "build:pi-extension": "npm --prefix ./packages/pi-extension run build",
+    "build:cli": "node scripts/build-cli.mjs",
+    "build:contracts": "node scripts/fs-helper.mjs rmrf packages/contracts/dist && npm --prefix ./packages/contracts run build",
+    "build:scripts": "cd sync-sources/hooks && tsdown",
     "build:dashboard": "npm run build:dashboard:frontend && npm run build:dashboard:server",
-    "build:dashboard:frontend": "cd src/dashboard/frontend && npm run build",
-    "build:dashboard:server": "npm run build:contracts && cd src/dashboard/server && npm run build && mkdir -p ../../../dist/dashboard/prompts && cp ../../lib/cloister/prompts/*.md ../../../dist/dashboard/prompts/",
+    "build:dashboard:frontend": "npm --prefix ./src/dashboard/frontend run build",
+    "build:dashboard:server": "npm run build:contracts && npm --prefix ./src/dashboard/server run build && node scripts/fs-helper.mjs copy-ext .md src/lib/cloister/prompts dist/dashboard/prompts",
+    "build:sidecar": "node scripts/build-moonshine-sidecars.js",
     "build:desktop": "cd apps/desktop && bun run build && bun run dist:linux && bun run dist:mac && bun run dist:win",
     "build:desktop:linux": "cd apps/desktop && bun run build && bun run dist:linux",
     "build:desktop:mac": "cd apps/desktop && bun run build && bun run dist:mac",
     "build:desktop:win": "cd apps/desktop && bun run build && bun run dist:win",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/",
+    "lint": "eslint src/ && npm run lint:permissions && npm run lint:skills && npm run lint:labels",
+    "lint:permissions": "bash scripts/lint-permissions.sh",
+    "prelint:skills": "npm run build:contracts && npm run build:cli",
+    "lint:skills": "bash scripts/lint-skills.sh",
     "lint:labels": "scripts/check-no-direct-label-writes.sh",
-    "test": "vitest run",
+    "pretest": "npm run build:contracts && npm run build:pi-extension && npm run build:cli",
+    "test": "vitest run && npm --prefix ./src/dashboard/frontend run test -- src/lib/__tests__/issueActions.test.ts src/lib/__tests__/issueActions.no-actions-lost.test.ts src/lib/__tests__/issueActions.parity.test.tsx",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
     "test:e2e": "vitest run tests/e2e",
@@ -89,16 +98,26 @@
     "postinstall": "node scripts/postinstall.mjs || true",
     "prepare": "husky"
   },
+  "optionalDependencies": {
+    "moonshine-linux-x64": "workspace:*",
+    "qwen-tts-linux-x64": "workspace:*"
+  },
   "dependencies": {
-    "@effect/platform-bun": "4.0.0-beta.43",
-    "@effect/platform-node": "4.0.0-beta.43",
-    "@effect/platform-node-shared": "4.0.0-beta.43",
+    "@ai-sdk/openai": "^3.0.63",
+    "@anthropic-ai/sdk": "^0.96.0",
+    "@effect/platform-bun": "4.0.0-beta.45",
+    "@effect/platform-node": "4.0.0-beta.45",
+    "@effect/platform-node-shared": "4.0.0-beta.45",
+    "@effect/vitest": "4.0.0-beta.45",
+    "@google-cloud/speech": "^7.3.1",
     "@homebridge/node-pty-prebuilt-multiarch": "^0.13.1",
     "@iarna/toml": "^2.2.5",
     "@linear/sdk": "^70.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@octokit/rest": "^22.0.1",
     "@types/mustache": "^4.2.6",
     "@types/ws": "^8.18.1",
+    "ai": "^6.0.180",
     "better-sqlite3": "^12.6.2",
     "chalk": "^5.6.2",
     "commander": "^12.1.0",
@@ -108,25 +127,30 @@
     "js-yaml": "^4.1.1",
     "mustache": "^4.2.0",
     "ora": "^8.2.0",
+    "smee-client": "^5.0.0",
     "ws": "^8.20.0",
     "yaml": "^2.8.2"
   },
   "devDependencies": {
     "@commitlint/cli": "^20.5.0",
     "@commitlint/config-conventional": "^20.5.0",
-    "@panopticon/contracts": "workspace:*",
+    "@effect/vitest": "4.0.0-beta.45",
+    "@panctl/contracts": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
     "@types/inquirer": "^9.0.9",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.10.0",
-    "@vitest/coverage-v8": "^2.1.9",
+    "@typescript-eslint/parser": "6.21.0",
+    "@vitest/coverage-v8": "^4.1.6",
+    "@effect/vitest": "catalog:",
     "effect": "catalog:",
     "eslint": "^8.55.0",
     "husky": "^9.1.7",
+    "playwright": "^1.59.1",
     "tsdown": "^0.21.7",
     "tsx": "^4.6.2",
     "typedoc": "^0.25.0",
     "typescript": "^5.3.2",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.6"
   }
 }

@@ -1,6 +1,6 @@
 /**
  * WorkspaceStatusOverview — shared workspace status + actions used by both
- * the kanban IssueCard and the InspectorPanel. This ensures both views show
+ * the kanban IssueCard and the Issue Drawer. This ensures both views show
  * the same pipeline status, action buttons, and state badges.
  */
 
@@ -19,10 +19,11 @@ import {
   X,
 } from 'lucide-react';
 import { Issue, Agent, WorkAgentLifecycle, STATUS_LABELS } from '../types';
-import type { ReviewStatus, WorkspaceInfo } from './inspector/types';
-import { ReviewPipelineSection } from './inspector/ReviewPipelineSection';
+import type { ReviewStatus, WorkspaceInfo } from '../lib/workspace-types';
+import { ReviewPipelineSection } from './CommandDeck/ZoneCOverviewTabs/ReviewPipelineSection';
 import { isReviewPipelineStuck } from '../lib/pipeline-state';
-import { getFriendlyModelName } from './inspector/utils';
+import { getFriendlyModelName } from '../lib/dashboard-utils';
+import { VerifyingOnMainBadge } from './VerifyingOnMainBadge';
 
 export interface WorkspaceStatusOverviewProps {
   issue: Issue;
@@ -105,10 +106,11 @@ export function WorkspaceStatusOverview({
     return () => clearInterval(interval);
   }, [reviewStatus?.mergeStatus]);
 
-  const canonical = STATUS_LABELS[issue.status] || 'backlog';
+  const canonical = issue.state ?? STATUS_LABELS[issue.status] ?? 'backlog';
+  const isVerifyingOnMain = canonical === 'verifying_on_main';
   const isMerged = reviewStatus?.mergeStatus === 'merged' || issue.mergeStatus === 'merged' || issue.labels?.some(l => l.toLowerCase() === 'merged');
-  const isTerminal = isMerged || canonical === 'done' || canonical === 'canceled';
-  const isReadyToMerge = !isMerged && reviewStatus?.readyForMerge === true;
+  const isTerminal = (isMerged && !isVerifyingOnMain) || canonical === 'done' || canonical === 'canceled';
+  const isReadyToMerge = !isMerged && !isVerifyingOnMain && reviewStatus?.readyForMerge === true;
   const isPipelineStuck = !isTerminal && canonical === 'in_review' && isReviewPipelineStuck(reviewStatus);
   const hasVerificationState = !!reviewStatus?.verificationStatus && reviewStatus.verificationStatus !== 'pending';
   const showPipelineStatus = !!reviewStatus && (
@@ -117,10 +119,13 @@ export function WorkspaceStatusOverview({
     || hasVerificationState
   );
 
-  const isRunning = agent && agent.status !== 'dead' && agent.status !== 'stopped';
+  // PAN-1048: standby = stopped work agent with a live tmux session.
+  const isStandby = agent?.status === 'stopped' && (agent?.role ?? 'work') === 'work' && !!lifecycle?.hasLiveTmuxSession;
+  const isRunning = agent && agent.status !== 'dead' && (agent.status !== 'stopped' || isStandby);
   const isLaunching = agentLaunchState === 'starting' || agentLaunchState === 'resuming';
   const launchLabel = agentLaunchState === 'resuming' ? 'Resuming...' : 'Starting...';
-  const isResume = !!agent && agent.status === 'stopped' && lifecycle?.canResumeSession === true && !resetSessionSuccess;
+  const isResume = !!agent && agent.status === 'stopped' && !isStandby && lifecycle?.canResumeSession === true && !resetSessionSuccess;
+  const isLifecycleUnresolved = !!agent && agent.status === 'stopped' && !isStandby && !lifecycle;
 
   const mergingElapsed = reviewStatus?.mergeStatus === 'merging' && reviewStatus.updatedAt
     ? now - new Date(reviewStatus.updatedAt).getTime()
@@ -148,14 +153,15 @@ export function WorkspaceStatusOverview({
 
   // ─── Compact layout (kanban card) ───
   if (layout === 'compact') {
-    const actionBarClass = 'mt-3 flex items-center gap-2 flex-wrap rounded-xl border border-divider/70 bg-surface/80 px-2.5 py-2';
+    const actionBarClass = 'mt-3 flex items-center gap-2 flex-wrap rounded-xl border border-border/70 bg-card/80 px-2.5 py-2';
 
     return (
       <div className="space-y-2">
+        {isVerifyingOnMain && <VerifyingOnMainBadge compact />}
         {/* Pipeline status */}
         {showPipelineStatus && reviewStatus && (
           <div className="mt-2">
-            <ReviewPipelineSection reviewStatus={reviewStatus} />
+            <ReviewPipelineSection reviewStatus={reviewStatus} issueId={issue.id} />
           </div>
         )}
         {reviewActionHint && (
@@ -174,8 +180,8 @@ export function WorkspaceStatusOverview({
                 disabled={mergePending || ((reviewStatus?.mergeStatus === 'merging' || reviewStatus?.mergeStatus === 'verifying' || reviewStatus?.mergeStatus === 'queued') && !isMergeStuck)}
                 className={`flex items-center gap-1 text-xs rounded font-medium px-2 py-1 ${
                   isMergeStuck
-                    ? 'bg-warning text-white hover:bg-warning/90'
-                    : 'bg-success text-white hover:bg-success/90 disabled:opacity-50'
+                    ? 'bg-warning text-warning-foreground hover:bg-warning/90'
+                    : 'bg-success text-success-foreground hover:bg-success/90 disabled:opacity-50'
                 }`}
               >
                 {mergePending ? <Loader2 className="w-3 h-3 animate-spin" /> :
@@ -225,7 +231,7 @@ export function WorkspaceStatusOverview({
               </button>
             )}
             {agent?.model && (
-              <span className="flex-1 text-center text-[10px] text-content-body font-medium">
+              <span className="flex-1 text-center text-[10px] text-foreground font-medium">
                 {getFriendlyModelName(agent.model)}
               </span>
             )}
@@ -242,8 +248,8 @@ export function WorkspaceStatusOverview({
                   disabled={mergePending || ((reviewStatus?.mergeStatus === 'merging' || reviewStatus?.mergeStatus === 'verifying' || reviewStatus?.mergeStatus === 'queued') && !isMergeStuck)}
                   className={`flex items-center gap-1 text-xs rounded font-medium px-2 py-1 ${
                     isMergeStuck
-                      ? 'bg-warning text-white hover:bg-warning/90'
-                      : 'bg-success text-white hover:bg-success/90 disabled:opacity-50'
+                      ? 'bg-warning text-warning-foreground hover:bg-warning/90'
+                      : 'bg-success text-success-foreground hover:bg-success/90 disabled:opacity-50'
                   }`}
                 >
                   {mergePending ? <Loader2 className="w-3 h-3 animate-spin" /> :
@@ -321,18 +327,23 @@ export function WorkspaceStatusOverview({
             ) : onStartAgent ? (
               <button
                 onClick={(e) => { e.stopPropagation(); onStartAgent(); }}
-                disabled={startPending || isLaunching}
-                className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors disabled:opacity-50"
+                disabled={startPending || isLaunching || isLifecycleUnresolved}
+                className={`flex items-center gap-1 text-xs transition-colors disabled:opacity-60 ${
+                  isLifecycleUnresolved
+                    ? 'text-destructive cursor-not-allowed'
+                    : 'text-primary hover:text-primary/80'
+                }`}
+                title={isLifecycleUnresolved ? 'Checking for resumable session…' : undefined}
               >
-                {(startPending || isLaunching) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                {(startPending || isLaunching) ? 'Starting...' : 'Start Agent'}
+                {(startPending || isLaunching || isLifecycleUnresolved) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                {isLifecycleUnresolved ? 'Checking…' : ((startPending || isLaunching) ? 'Starting...' : 'Start Agent')}
               </button>
             ) : null}
             {!workspace?.exists && onCreateWorkspace && (
               <button
                 onClick={(e) => { e.stopPropagation(); onCreateWorkspace(); }}
                 disabled={createWorkspacePending}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-white rounded disabled:opacity-50 border bg-surface-emphasis border-divider"
+                className="flex items-center gap-1 px-2 py-1 text-xs text-card-foreground rounded disabled:opacity-50 border bg-card border-border"
               >
                 {createWorkspacePending ? <Loader2 className="w-3 h-3 animate-spin" /> : <FolderPlus className="w-3 h-3" />}
                 {createWorkspacePending ? 'Creating...' : 'Create Workspace'}
@@ -344,12 +355,12 @@ export function WorkspaceStatusOverview({
         {/* Resume message input */}
         {showResumeInput && onStartAgent && (
           <div className="mt-2" onClick={(e) => e.stopPropagation()}>
-            <label className="text-xs text-content-subtle">Message for agent (optional):</label>
+            <label className="text-xs text-muted-foreground">Message for agent (optional):</label>
             <textarea
               value={resumeMessage || ''}
               onChange={(e) => onResumeMessageChange?.(e.target.value)}
               placeholder="Tell the agent what to do..."
-              className="w-full px-2 py-1.5 text-xs bg-surface border border-divider rounded resize-none text-content placeholder:text-content-muted focus:outline-none focus:border-primary"
+              className="w-full px-2 py-1.5 text-xs bg-card border border-border rounded resize-none text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary"
               rows={2}
               autoFocus
               onKeyDown={(e) => {
@@ -369,14 +380,14 @@ export function WorkspaceStatusOverview({
                   onToggleResumeInput?.(false);
                 }}
                 disabled={startPending}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-white rounded bg-primary hover:bg-primary/90 disabled:opacity-50 font-medium"
+                className="flex items-center gap-1 px-2 py-1 text-xs text-primary-foreground rounded bg-primary hover:bg-primary/90 disabled:opacity-50 font-medium"
               >
                 {startPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                 {startPending ? 'Resuming...' : 'Resume'}
               </button>
               <button
                 onClick={() => onToggleResumeInput?.(false)}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-content-subtle rounded hover:bg-surface-emphasis"
+                className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground rounded hover:bg-card"
               >
                 Cancel
               </button>
@@ -390,6 +401,7 @@ export function WorkspaceStatusOverview({
   // ─── Full layout (inspector panel) ───
   return (
     <div className="space-y-2">
+      {isVerifyingOnMain && <VerifyingOnMainBadge />}
       {/* Pipeline status */}
       {showPipelineStatus && reviewStatus && (
         <ReviewPipelineSection reviewStatus={reviewStatus} />
@@ -411,8 +423,8 @@ export function WorkspaceStatusOverview({
             disabled={mergePending || ((reviewStatus?.mergeStatus === 'merging' || reviewStatus?.mergeStatus === 'verifying' || reviewStatus?.mergeStatus === 'queued') && !isMergeStuck)}
             className={`flex items-center gap-1 px-2 py-1 text-xs rounded font-medium ${
               isMergeStuck
-                ? 'bg-warning text-white hover:bg-warning/90'
-                : 'bg-success text-white hover:bg-success/90 disabled:opacity-50'
+                ? 'bg-warning text-warning-foreground hover:bg-warning/90'
+                : 'bg-success text-success-foreground hover:bg-success/90 disabled:opacity-50'
             }`}
           >
             {mergePending ? <Loader2 className="w-3 h-3 animate-spin" /> :
@@ -495,11 +507,16 @@ export function WorkspaceStatusOverview({
                   onStartAgent();
                 }
               }}
-              disabled={isLaunching || showResumeInput}
-              className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors disabled:opacity-50"
+              disabled={isLaunching || showResumeInput || isLifecycleUnresolved}
+              className={`flex items-center gap-1 text-xs transition-colors disabled:opacity-60 ${
+                isLifecycleUnresolved
+                  ? 'text-destructive cursor-not-allowed'
+                  : 'text-primary hover:text-primary/80'
+              }`}
+              title={isLifecycleUnresolved ? 'Checking for resumable session…' : undefined}
             >
-              {isLaunching ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-              <span>{isLaunching ? launchLabel : (isResume ? 'Resume Session' : 'Start Agent')}</span>
+              {(isLaunching || isLifecycleUnresolved) ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+              <span>{isLaunching ? launchLabel : isLifecycleUnresolved ? 'Checking…' : (isResume ? 'Resume Session' : 'Start Agent')}</span>
             </button>
             {isResume && onResetSession && (
               <button
@@ -516,7 +533,7 @@ export function WorkspaceStatusOverview({
               <button
                 onClick={onCreateWorkspace}
                 disabled={createWorkspacePending}
-                className="flex items-center gap-1 px-2 py-1 text-xs text-white rounded disabled:opacity-50 border bg-surface-emphasis border-divider"
+                className="flex items-center gap-1 px-2 py-1 text-xs text-card-foreground rounded disabled:opacity-50 border bg-card border-border"
               >
                 {createWorkspacePending ? <Loader2 className="w-3 h-3 animate-spin" /> : <FolderPlus className="w-3 h-3" />}
                 {createWorkspacePending ? 'Creating...' : 'Create Workspace'}
@@ -529,12 +546,12 @@ export function WorkspaceStatusOverview({
       {/* Resume message input */}
       {showResumeInput && onStartAgent && (
         <div className="mt-2 flex flex-col gap-1.5">
-          <label className="text-xs text-content-subtle">Message for agent (optional):</label>
+          <label className="text-xs text-muted-foreground">Message for agent (optional):</label>
           <textarea
             value={resumeMessage || ''}
             onChange={(e) => onResumeMessageChange?.(e.target.value)}
-            placeholder="Tell the agent what to do, e.g. 'Address the PR feedback about error handling' or leave empty to let it pick up from STATE.md"
-            className="w-full px-2 py-1.5 text-xs bg-surface border border-divider rounded resize-none text-content placeholder:text-content-muted focus:outline-none focus:border-primary"
+            placeholder="Tell the agent what to do, e.g. 'Address the PR feedback about error handling' or leave empty to let it pick up from the continue file"
+            className="w-full px-2 py-1.5 text-xs bg-card border border-border rounded resize-none text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary"
             rows={3}
             autoFocus
             onKeyDown={(e) => {
@@ -554,25 +571,25 @@ export function WorkspaceStatusOverview({
                 onToggleResumeInput?.(false);
               }}
               disabled={startPending}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-white rounded bg-primary hover:bg-primary/90 disabled:opacity-50 font-medium"
+              className="flex items-center gap-1 px-2 py-1 text-xs text-primary-foreground rounded bg-primary hover:bg-primary/90 disabled:opacity-50 font-medium"
             >
               {startPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
               {startPending ? 'Resuming...' : 'Resume'}
             </button>
             <button
               onClick={() => onToggleResumeInput?.(false)}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-content-subtle rounded hover:bg-surface-emphasis"
+              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground rounded hover:bg-card"
             >
               Cancel
             </button>
-            <span className="text-xs text-content-subtle ml-auto">Ctrl+Enter to send</span>
+            <span className="text-xs text-muted-foreground ml-auto">Ctrl+Enter to send</span>
           </div>
         </div>
       )}
 
       {/* Stopped agent reason */}
       {!!agent && agent.status === 'stopped' && lifecycle?.reason && (
-        <div className="text-xs text-content-subtle mt-2 px-2 py-1 rounded bg-surface-emphasis/40 border border-divider">
+        <div className="text-xs text-muted-foreground mt-2 px-2 py-1 rounded bg-card/40 border border-border">
           {lifecycle.reason}
         </div>
       )}

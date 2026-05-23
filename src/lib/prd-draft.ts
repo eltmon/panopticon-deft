@@ -2,111 +2,106 @@
  * Pre-workspace PRD Management
  *
  * Allows PRDs to be created and managed before a workspace exists.
- * PRDs are stored in ~/.panopticon/docs/prds/drafts/ and can be
- * promoted to workspace .planning/PRD.md when implementation begins.
+ * Drafts are now stored in the owning project's `.pan/drafts/` directory.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'fs';
-import { join, basename } from 'path';
-import { PRD_DRAFTS_DIR } from './paths.js';
+import { Effect } from 'effect';
+import { ConfigError, FsError } from './errors.js';
+import { listProjectsSync, resolveProjectFromIssueSync } from './projects.js';
+import {
+  deleteIssueDraft,
+  getIssueDraftInfo,
+  getIssueDraftPath,
+  hasIssueDraft,
+  listIssueDrafts,
+  readIssueDraft,
+  writeIssueDraft,
+} from './pan-dir/index.js';
 
-/**
- * Get the file path for a pre-workspace PRD draft
- */
-export function getPRDDraftPath(issueId: string): string {
-  return join(PRD_DRAFTS_DIR, `${issueId.toUpperCase()}.md`);
-}
-
-/**
- * Check if a pre-workspace PRD draft exists
- */
-export function hasPRDDraft(issueId: string): boolean {
-  return existsSync(getPRDDraftPath(issueId));
-}
-
-/**
- * Read a pre-workspace PRD draft
- * Returns null if not found
- */
-export function readPRDDraft(issueId: string): string | null {
-  const path = getPRDDraftPath(issueId);
-  if (!existsSync(path)) {
-    return null;
-  }
-  return readFileSync(path, 'utf-8');
-}
-
-/**
- * Create or update a pre-workspace PRD draft
- */
-export function writePRDDraft(issueId: string, content: string): string {
-  // Ensure drafts directory exists
-  if (!existsSync(PRD_DRAFTS_DIR)) {
-    mkdirSync(PRD_DRAFTS_DIR, { recursive: true });
+function resolveDraftProjectRoot(issueId: string): string {
+  const resolved = resolveProjectFromIssueSync(issueId);
+  if (resolved?.projectPath) {
+    return resolved.projectPath;
   }
 
-  const path = getPRDDraftPath(issueId);
-  writeFileSync(path, content, 'utf-8');
-  return path;
-}
-
-/**
- * List all PRD drafts
- * Returns array of issue IDs (filenames without .md extension)
- */
-export function listPRDDrafts(): string[] {
-  if (!existsSync(PRD_DRAFTS_DIR)) {
-    return [];
+  const projects = listProjectsSync();
+  if (projects.length === 1 && projects[0]?.config.path) {
+    return projects[0].config.path;
   }
 
-  return readdirSync(PRD_DRAFTS_DIR)
-    .filter((f) => f.endsWith('.md'))
-    .map((f) => basename(f, '.md'));
+  throw new Error(`Could not resolve project path for ${issueId}. Add the project to projects.yaml first.`);
 }
 
-/**
- * Delete a PRD draft
- */
-export function deletePRDDraft(issueId: string): boolean {
-  const path = getPRDDraftPath(issueId);
-  if (!existsSync(path)) {
-    return false;
+export function getPRDDraftPathSync(issueId: string): string {
+  return getIssueDraftPath(resolveDraftProjectRoot(issueId), issueId);
+}function hasPRDDraftPromise(issueId: string): Promise<boolean> {
+  return Effect.runPromise(hasIssueDraft(resolveDraftProjectRoot(issueId), issueId));
+}function readPRDDraftPromise(issueId: string): Promise<string | null> {
+  return Effect.runPromise(readIssueDraft(resolveDraftProjectRoot(issueId), issueId));
+}function writePRDDraftPromise(issueId: string, content: string): Promise<string> {
+  return Effect.runPromise(writeIssueDraft(resolveDraftProjectRoot(issueId), issueId, content));
+}function listPRDDraftsPromise(issueIdOrProjectPath?: string): Promise<string[]> {
+  if (issueIdOrProjectPath) {
+    const projectPath = issueIdOrProjectPath.includes('/')
+      ? issueIdOrProjectPath
+      : resolveDraftProjectRoot(issueIdOrProjectPath);
+    return Effect.runPromise(listIssueDrafts(projectPath));
   }
 
-  try {
-    // Move to a deleted folder for safety
-    const deletedDir = join(PRD_DRAFTS_DIR, 'deleted');
-    if (!existsSync(deletedDir)) {
-      mkdirSync(deletedDir, { recursive: true });
-    }
-    const deletedPath = join(deletedDir, `${issueId.toUpperCase()}-${Date.now()}.md`);
-    renameSync(path, deletedPath);
-    return true;
-  } catch {
-    return false;
+  const projects = listProjectsSync();
+  if (projects.length === 1 && projects[0]?.config.path) {
+    return Effect.runPromise(listIssueDrafts(projects[0].config.path));
   }
-}
 
-/**
- * Get metadata about a PRD draft
- */
-export function getPRDDraftInfo(issueId: string): {
+  return Promise.resolve([]);
+}function deletePRDDraftPromise(issueId: string): Promise<boolean> {
+  return Effect.runPromise(deleteIssueDraft(resolveDraftProjectRoot(issueId), issueId));
+}function getPRDDraftInfoPromise(issueId: string): Promise<{
   exists: boolean;
   path?: string;
   size?: number;
   modified?: Date;
-} {
-  const path = getPRDDraftPath(issueId);
-
-  if (!existsSync(path)) {
-    return { exists: false };
-  }
-
-  const stats = statSync(path);
-  return {
-    exists: true,
-    path,
-    size: stats.size,
-    modified: stats.mtime,
-  };
+}> {
+  return Effect.runPromise(getIssueDraftInfo(resolveDraftProjectRoot(issueId), issueId));
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// All PRD draft helpers delegate to pan-dir; the only failure mode unique to
+// this layer is resolveDraftProjectRoot throwing on missing project config.
+
+const wrapConfigErr = (op: string) => (cause: unknown): ConfigError =>
+  new ConfigError({
+    message: `prd-draft.${op}: ${cause instanceof Error ? cause.message : String(cause)}`,
+    cause,
+  });
+
+/** Effect variant of {@link getPRDDraftPathSync}. */
+export const getPRDDraftPath = (issueId: string): Effect.Effect<string, ConfigError> =>
+  Effect.try({ try: () => getPRDDraftPathSync(issueId), catch: wrapConfigErr('getPRDDraftPath') });
+
+/** Effect variant of {@link hasPRDDraft}. */
+export const hasPRDDraft = (issueId: string): Effect.Effect<boolean, ConfigError> =>
+  Effect.tryPromise({ try: () => hasPRDDraftPromise(issueId), catch: wrapConfigErr('hasPRDDraft') });
+
+/** Effect variant of {@link readPRDDraft}. */
+export const readPRDDraft = (issueId: string): Effect.Effect<string | null, ConfigError | FsError> =>
+  Effect.tryPromise({ try: () => readPRDDraftPromise(issueId), catch: wrapConfigErr('readPRDDraft') });
+
+/** Effect variant of {@link writePRDDraft}. */
+export const writePRDDraft = (issueId: string, content: string): Effect.Effect<string, ConfigError | FsError> =>
+  Effect.tryPromise({ try: () => writePRDDraftPromise(issueId, content), catch: wrapConfigErr('writePRDDraft') });
+
+/** Effect variant of {@link listPRDDrafts}. */
+export const listPRDDrafts = (issueIdOrProjectPath?: string): Effect.Effect<string[], ConfigError> =>
+  Effect.tryPromise({ try: () => listPRDDraftsPromise(issueIdOrProjectPath), catch: wrapConfigErr('listPRDDrafts') });
+
+/** Effect variant of {@link deletePRDDraft}. */
+export const deletePRDDraft = (issueId: string): Effect.Effect<boolean, ConfigError | FsError> =>
+  Effect.tryPromise({ try: () => deletePRDDraftPromise(issueId), catch: wrapConfigErr('deletePRDDraft') });
+
+/** Effect variant of {@link getPRDDraftInfo}. */
+export const getPRDDraftInfo = (
+  issueId: string,
+): Effect.Effect<{ exists: boolean; path?: string; size?: number; modified?: Date }, ConfigError> =>
+  Effect.tryPromise({ try: () => getPRDDraftInfoPromise(issueId), catch: wrapConfigErr('getPRDDraftInfo') });

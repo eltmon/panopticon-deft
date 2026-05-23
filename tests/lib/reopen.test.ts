@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * Tests for src/lib/reopen.ts — reopenWorkspaceState()
  *
@@ -15,6 +16,7 @@ import { initSchema } from '../../src/lib/database/schema.js';
 // ── In-memory DB injection ────────────────────────────────────────────────────
 
 let testDb: Database.Database;
+let projectStub: { projectPath: string } | null = null;
 
 vi.mock('../../src/lib/database/index.js', () => ({
   getDatabase: () => testDb,
@@ -22,12 +24,30 @@ vi.mock('../../src/lib/database/index.js', () => ({
 
 vi.mock('../../src/lib/pipeline-notifier.js', () => ({
   notifyPipeline: vi.fn(),
+  notifyPipelineSync: vi.fn(),
 }));
 
 vi.mock('../../src/lib/activity-logger.js', () => ({
   emitActivityEntry: vi.fn(),
+  emitActivityEntrySync: vi.fn(),
   emitActivityTts: vi.fn(),
+  emitActivityTtsSync: vi.fn(),
 }));
+
+// PAN-946 regression: the reopen flow now resolves the project path so it can
+// append a session breadcrumb beside the issue's current vBRIEF (which may live
+// in completed/ or cancelled/). Stub the resolver so the test controls the
+// project root and can seed the lifecycle layout below.
+vi.mock('../../src/lib/projects.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/lib/projects.js')>(
+    '../../src/lib/projects.js',
+  );
+  return {
+    ...actual,
+    resolveProjectFromIssue: () => projectStub,
+    resolveProjectFromIssueSync: () => projectStub,
+  };
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -61,15 +81,12 @@ function readStatus(issueId: string): Record<string, unknown> | null {
   return testDb.prepare('SELECT * FROM review_status WHERE issue_id = ?').get(issueId) as Record<string, unknown> | null;
 }
 
-/** Create a minimal workspace with a .planning/STATE.md */
-function createWorkspace(content?: string): string {
+/** Create a minimal workspace directory (no longer used directly by reopen, but
+ * kept for parity with callers that still pass workspacePath). */
+function createWorkspace(): string {
   const wsDir = mkdtempSync(join(tmpdir(), 'pan-reopen-ws-'));
   const planningDir = join(wsDir, '.planning');
   mkdirSync(planningDir, { recursive: true });
-  writeFileSync(
-    join(planningDir, 'STATE.md'),
-    content ?? '# PAN-999\n\n**STATUS: Implementation complete**\n\nSome previous content.\n',
-  );
   return wsDir;
 }
 
@@ -79,6 +96,7 @@ beforeEach(() => {
   testDb = new Database(':memory:');
   testDb.pragma('foreign_keys = ON');
   initSchema(testDb);
+  projectStub = null;
 });
 
 afterEach(() => {
@@ -98,7 +116,7 @@ describe('reopenWorkspaceState', () => {
     });
     const wsDir = createWorkspace();
 
-    const result = await reopenWorkspaceState('PAN-999', wsDir);
+    const result = await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     expect(result.specialistStatesReset).toBe(true);
     expect(result.previousReviewStatus).toBe('passed');
@@ -117,7 +135,7 @@ describe('reopenWorkspaceState', () => {
   it('creates initial pending status when no prior status exists', async () => {
     const wsDir = createWorkspace();
 
-    const result = await reopenWorkspaceState('PAN-999', wsDir);
+    const result = await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     expect(result.specialistStatesReset).toBe(true);
     expect(result.previousReviewStatus).toBeNull();
@@ -126,50 +144,6 @@ describe('reopenWorkspaceState', () => {
     const row = readStatus('PAN-999')!;
     expect(row.review_status).toBe('pending');
     expect(row.test_status).toBe('pending');
-
-    rmSync(wsDir, { recursive: true, force: true });
-  });
-
-  it('appends Reopened section to STATE.md', async () => {
-    const wsDir = createWorkspace('# PAN-999\n\n**STATUS: Implementation complete**\n\nSome work.\n');
-
-    const result = await reopenWorkspaceState('PAN-999', wsDir, { reason: 'Post-merge regression' });
-
-    expect(result.stateMdUpdated).toBe(true);
-
-    const content = readFileSync(join(wsDir, '.planning', 'STATE.md'), 'utf-8');
-    expect(content).toContain('## Reopened —');
-    expect(content).toContain('Post-merge regression');
-    expect(content).toContain('**Previous status:** Implementation complete');
-    expect(content).toContain('Specialist states reset to pending');
-    expect(content).toContain('**STATUS: Implementation complete**');
-    expect(content).toContain('Some work.');
-
-    rmSync(wsDir, { recursive: true, force: true });
-  });
-
-  it('appends tracker context to STATE.md when provided', async () => {
-    const wsDir = createWorkspace();
-
-    await reopenWorkspaceState('PAN-999', wsDir, {
-      trackerContext: '## Tracker Status\n\nUser requested fix for login bug.',
-    });
-
-    const content = readFileSync(join(wsDir, '.planning', 'STATE.md'), 'utf-8');
-    expect(content).toContain('Tracker context at reopen:');
-    expect(content).toContain('User requested fix for login bug.');
-
-    rmSync(wsDir, { recursive: true, force: true });
-  });
-
-  it('does not modify STATE.md if it does not exist', async () => {
-    const wsDir = mkdtempSync(join(tmpdir(), 'pan-reopen-nows-'));
-    mkdirSync(join(wsDir, '.planning'), { recursive: true });
-
-    const result = await reopenWorkspaceState('PAN-999', wsDir);
-
-    expect(result.stateMdUpdated).toBe(false);
-    expect(existsSync(join(wsDir, '.planning', 'STATE.md'))).toBe(false);
 
     rmSync(wsDir, { recursive: true, force: true });
   });
@@ -185,7 +159,7 @@ describe('reopenWorkspaceState', () => {
     });
     const wsDir = createWorkspace();
 
-    await reopenWorkspaceState('PAN-999', wsDir);
+    await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     const row = readStatus('PAN-999')!;
     expect(row.pr_url).toBe('https://github.com/org/repo/pull/42');
@@ -199,7 +173,7 @@ describe('reopenWorkspaceState', () => {
     });
     const wsDir = createWorkspace();
 
-    await reopenWorkspaceState('PAN-999', wsDir);
+    await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     const row = readStatus('PAN-999')!;
     expect(row.auto_requeue_count).toBe(0);
@@ -210,7 +184,7 @@ describe('reopenWorkspaceState', () => {
   it('returns empty queueItemsRemoved when no queue items exist', async () => {
     const wsDir = createWorkspace();
 
-    const result = await reopenWorkspaceState('PAN-999', wsDir);
+    const result = await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     expect(result.queueItemsRemoved).toEqual({});
 
@@ -231,7 +205,7 @@ describe('reopenWorkspaceState', () => {
     });
     const wsDir = createWorkspace();
 
-    await reopenWorkspaceState('PAN-999', wsDir);
+    await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     const row = readStatus('PAN-999')!;
     expect(row.stuck).toBeFalsy();
@@ -252,11 +226,96 @@ describe('reopenWorkspaceState', () => {
     });
     const wsDir = createWorkspace();
 
-    await reopenWorkspaceState('PAN-999', wsDir);
+    await Effect.runPromise(reopenWorkspaceState('PAN-999', wsDir));
 
     const row = readStatus('PAN-999')!;
     expect(row.reviewed_at_commit).toBeNull();
 
     rmSync(wsDir, { recursive: true, force: true });
+  });
+
+  // PAN-946 regression: when a continue file already exists at the canonical path,
+  // reopen MUST append the resume breadcrumb to that file rather than creating
+  // a new one alongside a lifecycle directory.
+  describe('lifecycle-aware continue file appends', () => {
+    function seedContinueFile(projectRoot: string, issueId: string): string {
+      const continueDir = join(projectRoot, '.pan', 'continues');
+      mkdirSync(continueDir, { recursive: true });
+      const continuePath = join(continueDir, `${issueId.toLowerCase()}.vbrief.json`);
+      writeFileSync(
+        continuePath,
+        JSON.stringify({
+          version: '1',
+          issueId,
+          created: '2026-05-04T00:00:00Z',
+          updated: '2026-05-04T00:00:00Z',
+          gitState: {},
+          decisions: [],
+          hazards: [],
+          resumePoint: null,
+          beadsMapping: {},
+          sessionHistory: [
+            { timestamp: '2026-05-04T00:00:00Z', reason: 'planning', note: 'initial seed' },
+          ],
+        }),
+        'utf-8',
+      );
+      return continuePath;
+    }
+
+    it('appends to a continue file in .pan/continues/ rather than creating a new one', async () => {
+      const projectRoot = mkdtempSync(join(tmpdir(), 'pan-reopen-project-'));
+      const continuePath = seedContinueFile(projectRoot, 'PAN-901');
+      const activeContinuePath = join(projectRoot, 'vbrief', 'active', 'continue-PAN-901.vbrief.json');
+      projectStub = { projectPath: projectRoot };
+
+      seedStatus({
+        'PAN-901': { reviewStatus: 'passed', testStatus: 'passed', mergeStatus: 'merged', readyForMerge: false },
+      });
+      const wsDir = createWorkspace();
+
+      const result = await Effect.runPromise(reopenWorkspaceState('PAN-901', wsDir, { reason: 'redo merge' }));
+      expect(result.continueFileUpdated).toBe(true);
+
+      // Active dir must NOT have been auto-created with a fresh continue file.
+      expect(existsSync(activeContinuePath)).toBe(false);
+
+      // Existing continue file in .pan/continues/ should have grown by exactly one entry.
+      const updated = JSON.parse(readFileSync(continuePath, 'utf-8'));
+      expect(updated.sessionHistory.length).toBe(2);
+      const last = updated.sessionHistory[1];
+      expect(last.reason).toBe('resume');
+      expect(last.timestamp).toBeTypeOf('string');
+      expect(last.note).toContain('Reopened on');
+      expect(last.note).toContain('reason: redo merge');
+      expect(last.note).toContain('review: passed → pending');
+      expect(last.note).toContain('merge: merged → pending');
+
+      rmSync(wsDir, { recursive: true, force: true });
+      rmSync(projectRoot, { recursive: true, force: true });
+    });
+
+    it('appends to existing continue file without creating one in vbrief/active/', async () => {
+      const projectRoot = mkdtempSync(join(tmpdir(), 'pan-reopen-project-'));
+      const continuePath = seedContinueFile(projectRoot, 'PAN-902');
+      const activeContinuePath = join(projectRoot, 'vbrief', 'active', 'continue-PAN-902.vbrief.json');
+      projectStub = { projectPath: projectRoot };
+
+      seedStatus({
+        'PAN-902': { reviewStatus: 'failed', testStatus: 'pending', readyForMerge: false },
+      });
+      const wsDir = createWorkspace();
+
+      await Effect.runPromise(reopenWorkspaceState('PAN-902', wsDir));
+
+      expect(existsSync(activeContinuePath)).toBe(false);
+
+      const updated = JSON.parse(readFileSync(continuePath, 'utf-8'));
+      expect(updated.sessionHistory.length).toBe(2);
+      expect(updated.sessionHistory[1].reason).toBe('resume');
+
+      rmSync(wsDir, { recursive: true, force: true });
+      rmSync(projectRoot, { recursive: true, force: true });
+    });
   });
 });

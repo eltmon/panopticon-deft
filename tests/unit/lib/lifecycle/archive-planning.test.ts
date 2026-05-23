@@ -20,7 +20,16 @@ vi.mock('util', async (importOriginal) => {
   };
 });
 
-import { movePrd, findWorkspacePath, archiveWorkspaceArtifacts } from '../../../../src/lib/lifecycle/archive-planning.js';
+import { Effect } from 'effect';
+import {
+  movePrd as movePrdProgram,
+  findWorkspacePath,
+  archiveWorkspaceArtifacts as archiveWorkspaceArtifactsProgram,
+} from '../../../../src/lib/lifecycle/archive-planning.js';
+
+const movePrd = (...args: Parameters<typeof movePrdProgram>) => Effect.runPromise(movePrdProgram(...args));
+const archiveWorkspaceArtifacts = (...args: Parameters<typeof archiveWorkspaceArtifactsProgram>) =>
+  Effect.runPromise(archiveWorkspaceArtifactsProgram(...args));
 
 describe('archive-planning', () => {
   let testDir: string;

@@ -11,9 +11,13 @@
  */
 
 /**
- * Supported runtime types for agent execution
+ * Supported runtime types for agent execution.
+ *
+ * PAN-636 widened this union to include 'pi' alongside Claude Code. Reads of
+ * AgentSnapshot.runtime should go through getHarness() from @panctl/contracts
+ * so unknown or legacy values normalize to 'claude-code'.
  */
-export type RuntimeName = 'claude-code';
+export type RuntimeName = 'claude-code' | 'pi';
 
 /**
  * Health state of an agent
@@ -108,7 +112,7 @@ export interface Agent {
  * Claude Code implements this interface
  * to provide Cloister with health monitoring capabilities.
  */
-export interface AgentRuntime {
+export interface AgentRuntimeSync {
   /**
    * Runtime identifier
    */
@@ -183,11 +187,13 @@ export interface AgentRuntime {
    * Kill an agent (terminate the session)
    *
    * This typically kills the tmux session and cleans up any state files.
+   * May be sync or async depending on the runtime; new runtimes should
+   * prefer async to avoid blocking the dashboard event loop.
    *
    * @param agentId - The agent identifier
    * @throws Error if agent cannot be killed
    */
-  killAgent(agentId: string): void;
+  killAgent(agentId: string): void | Promise<void>;
 
   /**
    * Spawn a new agent
@@ -209,12 +215,54 @@ export interface AgentRuntime {
   listSessions(workspace?: string): Session[];
 
   /**
-   * Check if an agent is running
+   * Check if an agent is running.
+   *
+   * May be sync or async depending on the runtime; new runtimes should
+   * prefer async to avoid blocking the dashboard event loop.
    *
    * @param agentId - The agent identifier
    * @returns True if agent has an active tmux session
    */
-  isRunning(agentId: string): boolean;
+  isRunning(agentId: string): boolean | Promise<boolean>;
+}
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Effect-channel runtime interface. The legacy sync/promise AgentRuntimeSync
+// shape above is preserved for the existing registry while new callers compose
+// through the canonical Effect API.
+
+import type { Effect } from 'effect';
+import type {
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  TmuxError,
+  FsError,
+} from '../errors.js';
+
+/** Tagged-error union the Effect runtime methods can fail with. */
+export type AgentRuntimeError =
+  | ProcessSpawnError
+  | ProcessTimeoutError
+  | TmuxError
+  | FsError;
+
+/**
+ * Runtime interface whose side-effecting methods return typed Effects. Pure-sync
+ * introspection methods stay sync because they read in-memory state.
+ */
+export interface AgentRuntime {
+  readonly name: RuntimeName;
+  getSessionPath(agentId: string): string | null;
+  getLastActivity(agentId: string): Date | null;
+  getHeartbeat(agentId: string): Heartbeat | null;
+  getTokenUsage(agentId: string): TokenUsage | null;
+  getSessionCost(agentId: string): CostBreakdown | null;
+  sendMessage(agentId: string, message: string): Effect.Effect<void, AgentRuntimeError>;
+  killAgent(agentId: string): Effect.Effect<void, AgentRuntimeError>;
+  spawnAgent(config: SpawnConfig): Effect.Effect<Agent, AgentRuntimeError>;
+  listSessions(workspace?: string): Session[];
+  isRunning(agentId: string): Effect.Effect<boolean>;
 }
 
 /**
@@ -224,22 +272,22 @@ export interface RuntimeRegistry {
   /**
    * Register a runtime
    */
-  register(runtime: AgentRuntime): void;
+  register(runtime: AgentRuntimeSync): void;
 
   /**
    * Get a runtime by name
    */
-  get(name: RuntimeName): AgentRuntime | undefined;
+  get(name: RuntimeName): AgentRuntimeSync | undefined;
 
   /**
    * Get all registered runtimes
    */
-  getAll(): AgentRuntime[];
+  getAll(): AgentRuntimeSync[];
 
   /**
    * Get the runtime for a specific agent
    *
    * Looks up the agent's state file to determine which runtime it's using.
    */
-  getRuntimeForAgent(agentId: string): AgentRuntime | null;
+  getRuntimeForAgent(agentId: string): AgentRuntimeSync | null;
 }

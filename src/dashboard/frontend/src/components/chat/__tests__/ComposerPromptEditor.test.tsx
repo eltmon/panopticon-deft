@@ -7,7 +7,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { ComposerPromptEditor, SlashMenu, type SlashCommand } from '../ComposerPromptEditor';
 
 // Mock the CSS module — must match class names used in ComposerPromptEditor
-vi.mock('../../MissionControl/styles/mission-control.module.css', () => ({
+vi.mock('../../CommandDeck/styles/command-deck.module.css', () => ({
   default: {
     composerEditor: 'composerEditor',
     composerEditorDisabled: 'composerEditorDisabled',
@@ -375,6 +375,33 @@ describe('ComposerPromptEditor', () => {
         fireEvent.keyDown(document, { key: 'ArrowDown' });
       });
       expect(screen.getByText('/cancel').closest('button')).toHaveAttribute('aria-selected', 'true');
+    });
+
+    it('keeps menu open when typing spaces after /', () => {
+      render(
+        <ComposerPromptEditor
+          conversationName="test-conversation"
+          onCommandKeyDown={mockOnCommandKeyDown}
+        />,
+      );
+
+      fireEvent.keyDown(capturedRootElement, { key: '/' });
+      act(() => {
+        mockLexicalText = '/';
+        onChangePluginCallback?.({}, mockEditor, new Set());
+      });
+      expect(screen.getByRole('listbox', { name: 'Slash commands' })).toBeInTheDocument();
+
+      // Simulate typing a space and more text
+      act(() => {
+        mockLexicalText = '/pan work';
+        onChangePluginCallback?.({}, mockEditor, new Set());
+      });
+
+      // Menu should still be open and filtered
+      expect(screen.getByRole('listbox', { name: 'Slash commands' })).toBeInTheDocument();
+      expect(screen.queryByText('/model')).not.toBeInTheDocument();
+      expect(screen.getByRole('option', { name: /pan workspace create/i })).toBeInTheDocument();
     });
 
     it('navigates up with ArrowUp', () => {

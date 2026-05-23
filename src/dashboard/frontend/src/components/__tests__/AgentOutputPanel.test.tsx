@@ -19,7 +19,7 @@ vi.mock('../XTerminal', () => ({
   ),
 }));
 
-vi.mock('../MissionControl/ActivityView', () => ({
+vi.mock('../CommandDeck/ActivityView', () => ({
   ActivityView: ({ issueId }: { issueId: string }) => (
     <div data-testid="activity-view" data-issue={issueId} />
   ),
@@ -62,6 +62,10 @@ describe('deriveAgentIssueId', () => {
     expect(deriveAgentIssueId('agent-PAN-123')).toBe('PAN-123');
   });
 
+  it('derives parent issueId from swarm slot work agent id', () => {
+    expect(deriveAgentIssueId('agent-pan-505-2')).toBe('PAN-505');
+  });
+
   it('returns agentIssueId directly when provided (work agent)', () => {
     expect(deriveAgentIssueId('agent-pan-505', 'PAN-505')).toBe('PAN-505');
   });
@@ -77,6 +81,10 @@ describe('deriveAgentIssueId', () => {
 
   it('returns agentIssueId directly when provided (planning agent)', () => {
     expect(deriveAgentIssueId('planning-pan-503', 'PAN-503')).toBe('PAN-503');
+  });
+
+  it('derives issueId from role-suffixed test run id', () => {
+    expect(deriveAgentIssueId('agent-pan-503-test')).toBe('PAN-503');
   });
 
   // Non-matching ids
@@ -110,6 +118,14 @@ describe('AgentOutputPanel — planning agent rendering (AC4)', () => {
     expect(screen.queryByTestId('xterm')).not.toBeInTheDocument();
   });
 
+  it('renders ActivityView for slot work agent with parent issueId', () => {
+    renderPanel('agent-pan-503-2');
+
+    expect(screen.getByTestId('activity-view')).toBeInTheDocument();
+    expect(screen.getByTestId('activity-view')).toHaveAttribute('data-issue', 'PAN-503');
+    expect(screen.queryByTestId('xterm')).not.toBeInTheDocument();
+  });
+
   it('falls back to XTerminal (not placeholder) for planning agent with non-derivable issueId', () => {
     // 'planning-orphan' does not match /^(?:agent|planning)-([a-z]+)-(\d+)$/i
     renderPanel('planning-orphan');
@@ -120,6 +136,20 @@ describe('AgentOutputPanel — planning agent rendering (AC4)', () => {
     expect(screen.getByTestId('xterm')).toHaveAttribute('data-session', 'planning-orphan');
   });
 
+  it('renders ActivityView for persisted test role runs using state.role and issueId', () => {
+    (useDashboardStore as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'agent-custom-test',
+      role: 'test',
+      issueId: 'PAN-503',
+    });
+
+    renderPanel('agent-custom-test');
+
+    expect(screen.getByTestId('activity-view')).toBeInTheDocument();
+    expect(screen.getByTestId('activity-view')).toHaveAttribute('data-issue', 'PAN-503');
+    expect(screen.queryByText(/No issue associated/)).not.toBeInTheDocument();
+  });
+
   it('shows No issue associated placeholder for non-planning agent with non-derivable id', () => {
     renderPanel('unknown-session');
 
@@ -128,14 +158,7 @@ describe('AgentOutputPanel — planning agent rendering (AC4)', () => {
     expect(screen.getByText(/No issue associated/)).toBeInTheDocument();
   });
 
-  it('fetches specialist status with project and issue scoped route', async () => {
-    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ isRunning: true }) }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    renderPanel('specialist-panopticon-PAN-509-review-agent');
-
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith('/api/specialists/panopticon/PAN-509/review-agent/status');
-    });
-  });
+  // The /api/specialists/:project/:issue/:type/status endpoint was retired
+  // in PAN-1048 — specialist running state is now derived from the agent
+  // snapshot's status field. No fetch is expected.
 });

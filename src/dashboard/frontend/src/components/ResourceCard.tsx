@@ -6,6 +6,7 @@
 import { ContainerStats, ContainerHistory, Agent } from '../types';
 import { ResourceBar } from './ResourceBar';
 import { Sparkline } from './Sparkline';
+import { getHarness } from '@panctl/contracts';
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)}GiB`;
@@ -44,9 +45,12 @@ const AGENT_STATUS_DOT: Record<Agent['status'], string> = {
   warning: 'bg-warning',
   stuck: 'bg-warning',
   dead: 'bg-destructive',
-  stopped: 'bg-surface-overlay',
+  stopped: 'bg-popover',
   starting: 'bg-signal-review',
+  running: 'bg-primary',
   failed: 'bg-destructive',
+  error: 'bg-destructive',
+  unknown: 'bg-warning',
 };
 
 export function ContainerCard({ container, history, onClick }: ContainerCardProps) {
@@ -58,14 +62,14 @@ export function ContainerCard({ container, history, onClick }: ContainerCardProp
   return (
     <button
       onClick={() => onClick(container)}
-      className="w-full text-left bg-surface-raised border border-divider rounded-lg p-3 hover:border-primary/50 hover:bg-surface-overlay transition-colors"
+      className="w-full text-left bg-card border border-border rounded-lg p-3 hover:border-primary/50 hover:bg-popover transition-colors"
     >
       <div className="flex items-center gap-2 mb-2">
         <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[container.status]}`} />
-        <span className="text-xs font-medium text-content truncate flex-1" title={container.name}>
+        <span className="text-xs font-medium text-foreground truncate flex-1" title={container.name}>
           {container.name}
         </span>
-        <span className="text-xs text-content-subtle shrink-0">{STATUS_LABEL[container.status]}</span>
+        <span className="text-xs text-muted-foreground shrink-0">{STATUS_LABEL[container.status]}</span>
       </div>
 
       <div className="flex gap-2 items-end">
@@ -73,7 +77,7 @@ export function ContainerCard({ container, history, onClick }: ContainerCardProp
           <ResourceBar value={container.cpuPercent} label="CPU" />
           <ResourceBar value={container.memoryPercent} label="MEM" />
           {container.memoryLimit > 0 && (
-            <div className="text-xs text-content-subtle">
+            <div className="text-xs text-muted-foreground">
               {formatBytes(container.memoryUsage)} / {formatBytes(container.memoryLimit)}
             </div>
           )}
@@ -92,23 +96,23 @@ export function AgentCard({ agent, onNavigate }: AgentCardProps) {
   return (
     <button
       onClick={() => onNavigate(agent.id)}
-      className="w-full text-left bg-surface-raised border border-divider rounded-lg p-3 hover:border-primary/50 hover:bg-surface-overlay transition-colors"
+      className="w-full text-left bg-card border border-border rounded-lg p-3 hover:border-primary/50 hover:bg-popover transition-colors"
     >
       <div className="flex items-center gap-2 mb-2">
         <span className={`w-2 h-2 rounded-full shrink-0 ${AGENT_STATUS_DOT[agent.status]}`} />
-        <span className="text-xs font-medium text-content truncate flex-1" title={agent.issueId ?? agent.id}>
+        <span className="text-xs font-medium text-foreground truncate flex-1" title={agent.issueId ?? agent.id}>
           {agent.issueId ?? agent.id}
         </span>
-        <span className="text-xs text-content-subtle shrink-0">{agent.status}</span>
+        <span className="text-xs text-muted-foreground shrink-0">{agent.status}</span>
       </div>
-      <div className="text-xs text-content-subtle space-y-0.5">
+      <div className="text-xs text-muted-foreground space-y-0.5">
         <div className="flex justify-between">
           <span>Model</span>
-          <span className="text-content">{agent.model}</span>
+          <span className="text-foreground">{agent.model}</span>
         </div>
         <div className="flex justify-between">
           <span>Runtime</span>
-          <span className="text-content">{agent.runtime}</span>
+          <span className="text-foreground">{getHarness(agent)}</span>
         </div>
         {agent.consecutiveFailures > 0 && (
           <div className="flex justify-between text-warning">

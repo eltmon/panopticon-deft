@@ -4,15 +4,17 @@ import { Cause, Effect, Exit } from 'effect';
 // ─── Mock RallyTracker ────────────────────────────────────────────────────────
 
 const mockGetIssue = vi.fn();
+const mockGetChildIssues = vi.fn();
 const mockTransitionIssue = vi.fn();
 const mockAddComment = vi.fn();
 
 vi.mock('../../../../lib/tracker/rally.js', () => ({
-  RallyTracker: vi.fn().mockImplementation(() => ({
+  RallyTracker: vi.fn().mockImplementation(function () { return {
     getIssue: mockGetIssue,
+    getChildIssues: mockGetChildIssues,
     transitionIssue: mockTransitionIssue,
     addComment: mockAddComment,
-  })),
+  }; }),
 }));
 
 // ─── Mock tracker-config ──────────────────────────────────────────────────────
@@ -40,17 +42,18 @@ function makeRawIssue(overrides: Record<string, unknown> = {}) {
     url: 'https://rally1.rallydev.com/#/detail/userstory/1',
     state: 'in_progress',
     labels: ['feature'],
+    artifactType: 'HierarchicalRequirement',
     ...overrides,
   };
 }
 
-async function runEffect<A, E>(effect: Effect.Effect<A, E, never>): Promise<A> {
+async function runProgram<A, E>(effect: Effect.Effect<A, E, never>): Promise<A> {
   const exit = await Effect.runPromise(Effect.exit(effect));
   if (Exit.isSuccess(exit)) return exit.value;
   throw Cause.squash(exit.cause);
 }
 
-async function runEffectFail<A, E>(effect: Effect.Effect<A, E, never>): Promise<E> {
+async function runProgramFail<A, E>(effect: Effect.Effect<A, E, never>): Promise<E> {
   const exit = await Effect.runPromise(Effect.exit(effect));
   if (Exit.isSuccess(exit))
     throw new Error('Expected effect to fail, got: ' + JSON.stringify(exit.value));
@@ -63,9 +66,10 @@ describe('RallyClient Effect service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetRallyConfig.mockReturnValue(RALLY_CONFIG);
-    mockGetIssue.mockResolvedValue(makeRawIssue());
-    mockTransitionIssue.mockResolvedValue(undefined);
-    mockAddComment.mockResolvedValue({ id: 'comment-1' });
+    mockGetIssue.mockReturnValue(Effect.succeed(makeRawIssue()));
+    mockGetChildIssues.mockReturnValue(Effect.succeed([]));
+    mockTransitionIssue.mockReturnValue(Effect.succeed(undefined));
+    mockAddComment.mockReturnValue(Effect.succeed({ id: 'comment-1' }));
   });
 
   describe('RallyClientLive layer', () => {
@@ -79,7 +83,7 @@ describe('RallyClient Effect service', () => {
         return yield* client.getIssue('US1234');
       }).pipe(Effect.provide(RallyClientLive));
 
-      const err = await runEffectFail(program);
+      const err = await runProgramFail(program);
       expect((err as any)._tag).toBe('TrackerNotConfigured');
       expect((err as any).tracker).toBe('rally');
     });
@@ -94,7 +98,7 @@ describe('RallyClient Effect service', () => {
         return yield* client.getIssue('US1234');
       }).pipe(Effect.provide(RallyClientLive));
 
-      const issue = await runEffect(program);
+      const issue = await runProgram(program);
       expect(issue.ref).toBe('US1234');
       expect(issue.title).toBe('Test Story');
       expect(issue.state).toBe('in_progress');
@@ -102,7 +106,7 @@ describe('RallyClient Effect service', () => {
     });
 
     it('wraps not-found as IssueNotFound', async () => {
-      mockGetIssue.mockRejectedValue(new Error('0 results found'));
+      mockGetIssue.mockReturnValue(Effect.fail(new Error('0 results found')));
 
       const { RallyClient, RallyClientLive } = await import('../rally-client.js');
 
@@ -111,12 +115,12 @@ describe('RallyClient Effect service', () => {
         return yield* client.getIssue('US9999');
       }).pipe(Effect.provide(RallyClientLive));
 
-      const err = await runEffectFail(program);
+      const err = await runProgramFail(program);
       expect((err as any)._tag).toBe('IssueNotFound');
     });
 
     it('wraps unknown errors as TrackerApiError', async () => {
-      mockGetIssue.mockRejectedValue(new Error('Rally WSAPI error 500'));
+      mockGetIssue.mockReturnValue(Effect.fail(new Error('Rally WSAPI error 500')));
 
       const { RallyClient, RallyClientLive } = await import('../rally-client.js');
 
@@ -125,9 +129,46 @@ describe('RallyClient Effect service', () => {
         return yield* client.getIssue('US1234');
       }).pipe(Effect.provide(RallyClientLive));
 
-      const err = await runEffectFail(program);
+      const err = await runProgramFail(program);
       expect((err as any)._tag).toBe('TrackerApiError');
       expect((err as any).tracker).toBe('rally');
+    });
+  });
+
+  describe('getChildIssues', () => {
+    it('returns normalized child issues', async () => {
+      mockGetChildIssues.mockReturnValue(Effect.succeed([
+        { id: 'child-1', ref: 'US100', title: 'Child A', state: 'open', description: 'Desc A', labels: [] },
+        { id: 'child-2', ref: 'US101', title: 'Child B', state: 'in_progress', description: 'Desc B', labels: [] },
+      ]));
+
+      const { RallyClient, RallyClientLive } = await import('../rally-client.js');
+
+      const program = Effect.gen(function* () {
+        const client = yield* RallyClient;
+        return yield* client.getChildIssues('F123');
+      }).pipe(Effect.provide(RallyClientLive));
+
+      const children = await runProgram(program);
+      expect(children).toHaveLength(2);
+      expect(children[0].ref).toBe('US100');
+      expect(children[0].status).toBe('open');
+      expect(children[1].ref).toBe('US101');
+      expect(mockGetChildIssues).toHaveBeenCalledWith('F123');
+    });
+
+    it('wraps errors as TrackerApiError', async () => {
+      mockGetChildIssues.mockReturnValue(Effect.fail(new Error('Rally WSAPI error 500')));
+
+      const { RallyClient, RallyClientLive } = await import('../rally-client.js');
+
+      const program = Effect.gen(function* () {
+        const client = yield* RallyClient;
+        return yield* client.getChildIssues('F123');
+      }).pipe(Effect.provide(RallyClientLive));
+
+      const err = await runProgramFail(program);
+      expect((err as any)._tag).toBe('TrackerApiError');
     });
   });
 
@@ -140,7 +181,7 @@ describe('RallyClient Effect service', () => {
         yield* client.updateState('US1234', 'closed');
       }).pipe(Effect.provide(RallyClientLive));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockTransitionIssue).toHaveBeenCalledWith('US1234', 'closed');
     });
   });
@@ -154,7 +195,7 @@ describe('RallyClient Effect service', () => {
         yield* client.addComment('US1234', 'PR merged!');
       }).pipe(Effect.provide(RallyClientLive));
 
-      await runEffect(program);
+      await runProgram(program);
       expect(mockAddComment).toHaveBeenCalledWith('US1234', 'PR merged!');
     });
   });

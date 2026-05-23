@@ -9,9 +9,21 @@
  * directly (zero-roundtrip) — this module is for everything else.
  */
 
-import type { AgentRuntimeSnapshot, Activity, AgentResolution, WaitingReason } from '@panopticon/contracts'
+import { Data, Effect } from 'effect'
+import type {
+  AgentRuntimeSnapshot,
+  Activity,
+  AgentResolution,
+  ChannelReplyArtifactRef,
+  ChannelReplyKind,
+  WaitingReason,
+} from '@panctl/contracts'
 
-const DASHBOARD_URL = process.env['PANOPTICON_DASHBOARD_URL'] || 'http://localhost:3011'
+// Use 127.0.0.1 explicitly: when /etc/hosts resolves `localhost` to ::1
+// (IPv6 first), Node's undici-based fetch() connects to [::1]:3011 and
+// fails because the dashboard listens on the IPv4 wildcard 0.0.0.0.
+// curl falls back to IPv4; Node's fetch in this version does not.
+const DASHBOARD_URL = process.env['PANOPTICON_DASHBOARD_URL'] || 'http://127.0.0.1:3011'
 const DEFAULT_TIMEOUT_MS = 1500
 
 function abortSignal(ms: number): AbortSignal {
@@ -20,19 +32,28 @@ function abortSignal(ms: number): AbortSignal {
   return controller.signal
 }
 
-export async function getAgentRuntimeSnapshot(
+class AgentRuntimeFetchError extends Data.TaggedError('AgentRuntimeFetchError')<{
+  readonly url: string
+  readonly cause?: unknown
+}> {}
+
+export const getAgentRuntimeSnapshot = (
   agentId: string,
-): Promise<AgentRuntimeSnapshot | null> {
-  if (!agentId) return null
+): Effect.Effect<AgentRuntimeSnapshot | null> => {
+  if (!agentId) return Effect.succeed(null)
   const url = `${DASHBOARD_URL}/api/agents/${encodeURIComponent(agentId)}/runtime`
-  try {
-    const res = await fetch(url, { signal: abortSignal(DEFAULT_TIMEOUT_MS) })
+  return Effect.gen(function* () {
+    const res = yield* Effect.tryPromise({
+      try: () => fetch(url, { signal: abortSignal(DEFAULT_TIMEOUT_MS) }),
+      catch: (cause) => new AgentRuntimeFetchError({ url, cause }),
+    })
     if (!res.ok) return null
-    const body = (await res.json()) as { success: boolean; snapshot?: AgentRuntimeSnapshot }
+    const body = yield* Effect.tryPromise({
+      try: () => res.json() as Promise<{ success: boolean; snapshot?: AgentRuntimeSnapshot }>,
+      catch: (cause) => new AgentRuntimeFetchError({ url, cause }),
+    })
     return body.success && body.snapshot ? body.snapshot : null
-  } catch {
-    return null
-  }
+  }).pipe(Effect.orElseSucceed(() => null))
 }
 
 type HeartbeatBody =
@@ -42,6 +63,7 @@ type HeartbeatBody =
   | { kind: 'waiting_start'; reason: WaitingReason; message?: string }
   | { kind: 'waiting_clear'; clearedBy: 'user_response' | 'timeout' | 'stopped' | 'tool_resumed' }
   | { kind: 'message_received'; direction: 'to_agent' | 'from_agent'; source: 'user' | 'cloister' | 'specialist' | 'automated' }
+  | { kind: 'channel_reply'; reply: { kind: ChannelReplyKind; summary: string; artifactRefs?: ChannelReplyArtifactRef[] } }
   | { kind: 'model_set'; model: string; claudeSessionId?: string }
   | { kind: 'resolution_set'; resolution: AgentResolution; resolutionCount: number }
   | { kind: 'current_issue_set'; currentIssue?: string }
@@ -52,20 +74,25 @@ type HeartbeatBody =
  * semantics — no retry, no buffering. The bash hooks have their own
  * pending-events.jsonl fallback; in-process callers just log and move on.
  */
-export async function emitAgentEvent(agentId: string, body: HeartbeatBody): Promise<boolean> {
-  if (!agentId) return false
+export const emitAgentEvent = (
+  agentId: string,
+  body: HeartbeatBody,
+): Effect.Effect<boolean> => {
+  if (!agentId) return Effect.succeed(false)
   const url = `${DASHBOARD_URL}/api/agents/${encodeURIComponent(agentId)}/heartbeat`
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, timestamp: new Date().toISOString() }),
-      signal: abortSignal(DEFAULT_TIMEOUT_MS),
+  return Effect.gen(function* () {
+    const res = yield* Effect.tryPromise({
+      try: () =>
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, timestamp: new Date().toISOString() }),
+          signal: abortSignal(DEFAULT_TIMEOUT_MS),
+        }),
+      catch: (cause) => new AgentRuntimeFetchError({ url, cause }),
     })
     return res.ok
-  } catch {
-    return false
-  }
+  }).pipe(Effect.orElseSucceed(() => false))
 }
 
 // ─── Convenience wrappers mirroring the event taxonomy ────────────────────────
@@ -74,33 +101,38 @@ export const emitActivity = (
   agentId: string,
   activity: Activity,
   tool?: string,
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'activity', activity, tool })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'activity', activity, tool })
 
 export const emitWaitingStart = (
   agentId: string,
   reason: WaitingReason,
   message?: string,
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'waiting_start', reason, message })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'waiting_start', reason, message })
 
 export const emitWaitingClear = (
   agentId: string,
   clearedBy: 'user_response' | 'timeout' | 'stopped' | 'tool_resumed' = 'user_response',
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'waiting_clear', clearedBy })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'waiting_clear', clearedBy })
 
 export const emitModelSet = (
   agentId: string,
   model: string,
   claudeSessionId?: string,
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'model_set', model, claudeSessionId })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'model_set', model, claudeSessionId })
 
 export const emitMessageReceived = (
   agentId: string,
   direction: 'to_agent' | 'from_agent',
   source: 'user' | 'cloister' | 'specialist' | 'automated',
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'message_received', direction, source })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'message_received', direction, source })
+
+export const emitChannelReply = (
+  agentId: string,
+  reply: { kind: ChannelReplyKind; summary: string; artifactRefs?: ChannelReplyArtifactRef[] },
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'channel_reply', reply })
 
 export const emitResolution = (
   agentId: string,
   resolution: AgentResolution,
   resolutionCount: number,
-): Promise<boolean> => emitAgentEvent(agentId, { kind: 'resolution_set', resolution, resolutionCount })
+): Effect.Effect<boolean> => emitAgentEvent(agentId, { kind: 'resolution_set', resolution, resolutionCount })

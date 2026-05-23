@@ -1,8 +1,9 @@
 import React from 'react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import App, {
+  SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY,
   buildConversationUrl,
   getConversationRouteState,
   getConversationViewModeFromSearch,
@@ -11,43 +12,113 @@ import App, {
   serializeConversationViewModes,
 } from './App';
 
-vi.mock('./components/KanbanBoard', () => ({ KanbanBoard: () => null }));
-vi.mock('./components/AgentList', () => ({ AgentList: () => null }));
-vi.mock('./components/AgentOutputPanel', () => ({ AgentOutputPanel: () => null }));
+const {
+  mockDashboardState,
+  mockOpenIssue,
+  mockRefreshDashboardState,
+  mockToastError,
+  mockToastInfo,
+  mockToastSuccess,
+} = vi.hoisted(() => {
+  const mockOpenIssue = vi.fn();
+
+  return {
+    mockOpenIssue,
+    mockDashboardState: {
+      agents: [],
+      issues: [{ identifier: 'PAN-123', url: 'https://example.com/issues/PAN-123' }],
+      dashboardLifecycle: { active: false },
+      channelPermissionRequestsById: {},
+      drawer: { issueId: null, tab: 'overview' },
+      openIssue: mockOpenIssue,
+    },
+    mockRefreshDashboardState: vi.fn().mockResolvedValue(undefined),
+    mockToastError: vi.fn(),
+    mockToastInfo: vi.fn(),
+    mockToastSuccess: vi.fn(),
+  };
+})
+
+vi.mock('./components/KanbanBoard', () => ({
+  KanbanBoard: ({ onSelectIssue }: { onSelectIssue?: (issueId: string | null) => void }) => (
+    <button onClick={() => onSelectIssue?.('PAN-123')}>Open issue</button>
+  ),
+}));
+vi.mock('./components/Agents/FleetAgentsView', () => ({ FleetAgentsView: () => null }));
 vi.mock('./components/HealthDashboard', () => ({ HealthDashboard: () => null }));
 vi.mock('./components/SkillsList', () => ({ SkillsList: () => null }));
 vi.mock('./components/ActivityPanel', () => ({ ActivityPanel: () => null }));
-vi.mock('./components/AwaitingMergePage', () => ({ AwaitingMergePage: () => null }));
 vi.mock('./components/ConfirmationDialog', () => ({
   ConfirmationDialog: () => null,
+}));
+vi.mock('./components/ChannelPermissionDialog', () => ({
+  ChannelPermissionDialog: ({ request, isOpen, onAllow, onDeny }: {
+    request: { requestId: string; toolName: string } | null;
+    isOpen: boolean;
+    onAllow: () => void;
+    onDeny: () => void;
+  }) => isOpen && request ? (
+    <div>
+      <div data-testid="channel-permission-request">{request.requestId}:{request.toolName}</div>
+      <button onClick={onAllow}>Allow channel permission</button>
+      <button onClick={onDeny}>Deny channel permission</button>
+    </div>
+  ) : null,
 }));
 vi.mock('./components/EventRouter', () => ({ EventRouter: () => null }));
 vi.mock('./components/MetricsSummaryRow', () => ({ MetricsSummaryRow: () => null }));
 vi.mock('./components/MetricsPage', () => ({ MetricsPage: () => null }));
 vi.mock('./components/CostsPage', () => ({ CostsPage: () => null }));
 vi.mock('./components/Settings/SettingsPage', () => ({ SettingsPage: () => null }));
+vi.mock('./components/sessionFeed/SessionFeedSidebar', () => ({
+  SessionFeedSidebar: ({ onClose }: { onClose: () => void }) => (
+    <aside data-testid="session-feed-sidebar">
+      <button onClick={onClose}>Close activity feed</button>
+    </aside>
+  ),
+}));
 vi.mock('./components/search/SearchModal', () => ({ SearchModal: () => null }));
 vi.mock('./components/CommandPalette', () => ({ CommandPalette: () => null }));
 vi.mock('./components/ResourcesPanel', () => ({ ResourcesPanel: () => null }));
 vi.mock('./components/GodView', () => ({ GodViewPage: () => null }));
+vi.mock('./components/flywheel/FlywheelConversationPane', () => ({ FlywheelConversationPane: () => <div data-testid="flywheel-page" /> }));
 vi.mock('./components/Sidebar', () => ({ Sidebar: () => null }));
 vi.mock('./components/BootstrapGate', () => ({ BootstrapGate: ({ children }: { children: React.ReactNode }) => <>{children}</> }));
 vi.mock('./components/skeletons/KanbanSkeleton', () => ({ KanbanSkeleton: () => null }));
-vi.mock('./components/skeletons/AgentListSkeleton', () => ({ AgentListSkeleton: () => null }));
+vi.mock('./components/skeletons/AgentsSkeleton', () => ({ AgentsSkeleton: () => null }));
 vi.mock('./components/skeletons/GodViewSkeleton', () => ({ GodViewSkeleton: () => null }));
-vi.mock('./components/DetailPanelLayout', () => ({ DetailPanelLayout: () => null }));
+vi.mock('./components/skeletons/PipelineSkeleton', () => ({ PipelineSkeleton: () => null }));
 vi.mock('./components/StandaloneTerminal', () => ({ StandaloneTerminal: () => null }));
-vi.mock('lucide-react', () => ({ AlertTriangle: () => null, RefreshCw: () => null, X: () => null, ArrowRight: () => null }));
+vi.mock('./hooks/useCodexAutoRetry', () => ({ useCodexAutoRetry: () => null }));
+vi.mock('./components/SystemHealthPill', () => ({ SystemHealthPill: () => null }));
+vi.mock('lucide-react', () => ({ AlertTriangle: () => null, RefreshCw: () => null, History: () => null, X: () => null, ArrowRight: () => null, Loader2: () => null, ChevronDown: () => null, Cpu: () => null, MemoryStick: () => null, Skull: () => null }));
 vi.mock('./components/upgrade-announcement/UpgradeAnnouncement', () => ({ UpgradeAnnouncement: () => null }));
-vi.mock('sonner', () => ({ Toaster: () => null, toast: { info: vi.fn() } }));
-vi.mock('./lib/store', () => ({
-  useDashboardStore: vi.fn(() => []),
-  selectAgentList: vi.fn(),
-  selectIssues: vi.fn(),
-  selectDashboardLifecycle: vi.fn(),
+vi.mock('sonner', () => ({
+  Toaster: () => null,
+  toast: {
+    error: mockToastError,
+    info: mockToastInfo,
+    success: mockToastSuccess,
+  },
 }));
-vi.mock('./components/MissionControl', () => ({
-  MissionControl: ({ conversationViewMode, onConversationViewModeChange }: {
+vi.mock('./lib/store', () => ({
+  useDashboardStore: vi.fn((selector?: unknown) => {
+    if (typeof selector === 'function') {
+      return selector(mockDashboardState);
+    }
+    return [];
+  }),
+  selectAgents: (state: { agents: unknown[] }) => state.agents,
+  selectChannelPermissionRequests: (state: { channelPermissionRequestsById?: Record<string, unknown> }) =>
+    Object.values(state.channelPermissionRequestsById ?? {}),
+  selectIssues: (state: { issues: unknown[] }) => state.issues,
+  selectDashboardLifecycle: (state: { dashboardLifecycle: { active: boolean } }) => state.dashboardLifecycle,
+}));
+vi.mock('./lib/refresh-dashboard-state', () => ({
+  refreshDashboardState: mockRefreshDashboardState,
+}));
+vi.mock('./components/CommandDeck', () => ({
+  CommandDeck: ({ conversationViewMode, onConversationViewModeChange }: {
     conversationViewMode?: 'conversation' | 'terminal';
     onConversationViewModeChange?: (mode: 'conversation' | 'terminal') => void;
   }) => (
@@ -57,6 +128,12 @@ vi.mock('./components/MissionControl', () => ({
       <button onClick={() => onConversationViewModeChange?.('conversation')}>Conversation</button>
     </div>
   ),
+}));
+vi.mock('./components/Pipeline/PipelineView', () => ({
+  PipelineView: () => <div data-testid="pipeline-view" />,
+}));
+vi.mock('./components/drawer/IssueDrawer', () => ({
+  IssueDrawer: () => null,
 }));
 
 function renderApp() {
@@ -74,6 +151,21 @@ function renderApp() {
   );
 }
 
+beforeEach(() => {
+  mockDashboardState.agents = []
+  mockDashboardState.issues = [{ identifier: 'PAN-123', url: 'https://example.com/issues/PAN-123' }]
+  mockDashboardState.dashboardLifecycle = { active: false }
+  mockDashboardState.channelPermissionRequestsById = {}
+  mockDashboardState.drawer = { issueId: null, tab: 'overview' }
+  mockDashboardState.openIssue = mockOpenIssue
+  mockOpenIssue.mockClear()
+  mockRefreshDashboardState.mockClear()
+  mockToastError.mockClear()
+  mockToastInfo.mockClear()
+  mockToastSuccess.mockClear()
+  window.localStorage.removeItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)
+})
+
 describe('conversation route helpers', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/');
@@ -85,8 +177,9 @@ describe('conversation route helpers', () => {
     expect(getConversationViewModeFromSearch('')).toBe('conversation');
   });
 
-  it('extracts conversation id from conversation paths only', () => {
+  it('extracts conversation route keys from conversation paths only', () => {
     expect(getConvIdFromPath('/conv/123')).toBe('123');
+    expect(getConvIdFromPath('/conv/20260523-1234')).toBe('20260523-1234');
     expect(getConvIdFromPath('/command-deck')).toBeNull();
   });
 
@@ -118,6 +211,29 @@ describe('conversation route helpers', () => {
       },
     });
   });
+
+  it('maps the Flywheel URL to the flywheel tab', () => {
+    window.history.replaceState(null, '', '/flywheel');
+
+    expect(getConversationRouteState()).toMatchObject({
+      tab: 'flywheel',
+      convId: null,
+    });
+  });
+
+  it('resolves Pipeline as the default route and Board as /board', () => {
+    window.history.replaceState(null, '', '/');
+    expect(getConversationRouteState().tab).toBe('pipeline');
+    window.history.replaceState(null, '', '/pipeline');
+    expect(getConversationRouteState().tab).toBe('pipeline');
+
+    window.history.replaceState(null, '', '/board');
+    expect(getConversationRouteState().tab).toBe('kanban');
+
+    window.history.replaceState(null, '', '/unknown');
+    expect(getConversationRouteState().tab).toBe('pipeline');
+  });
+
 });
 
 describe('App conversation view routing', () => {
@@ -176,3 +292,196 @@ describe('App conversation view routing', () => {
     expect(window.location.search).toBe('?views=77:terminal,161:terminal');
   });
 });
+
+describe('App Pipeline routing', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/version') {
+        return new Response(JSON.stringify({ version: '0.5.0' }), { status: 200 });
+      }
+      if (url === '/api/tracker-status') {
+        return new Response(JSON.stringify({ primary: 'github', configured: [] }), { status: 200 });
+      }
+      if (url === '/api/confirmations') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }));
+  });
+
+  it('renders PipelineView at /', () => {
+    window.history.replaceState(null, '', '/');
+    renderApp();
+    expect(screen.getByTestId('pipeline-view')).toBeInTheDocument();
+  });
+
+  it('renders PipelineView at /pipeline', () => {
+    window.history.replaceState(null, '', '/pipeline');
+    renderApp();
+    expect(screen.getByTestId('pipeline-view')).toBeInTheDocument();
+  });
+
+  it('marks the parent surface when the drawer is open', () => {
+    mockDashboardState.drawer = { issueId: 'PAN-123', tab: 'overview' };
+    window.history.replaceState(null, '', '/');
+    renderApp();
+    expect(screen.getByRole('main')).toHaveAttribute('data-drawer-open', 'true');
+  });
+
+  it('renders Board at /board', () => {
+    window.history.replaceState(null, '', '/board');
+    renderApp();
+    expect(screen.getByText('Open issue')).toBeInTheDocument();
+  });
+});
+
+describe('App session feed sidebar', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/version') {
+        return new Response(JSON.stringify({ version: '0.5.0' }), { status: 200 });
+      }
+      if (url === '/api/tracker-status') {
+        return new Response(JSON.stringify({ primary: 'github', configured: [] }), { status: 200 });
+      }
+      if (url === '/api/confirmations') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }));
+  });
+
+  it('keeps the sidebar closed by default', () => {
+    renderApp();
+
+    expect(screen.queryByTestId('session-feed-sidebar')).toBeNull();
+  });
+
+  it('opens the sidebar from the toggle and persists the open state', () => {
+    renderApp();
+
+    fireEvent.click(screen.getByLabelText('Toggle activity feed'));
+
+    expect(screen.getByTestId('session-feed-sidebar')).toBeInTheDocument();
+    expect(window.localStorage.getItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)).toBe('true');
+  });
+
+  it('restores the open sidebar from localStorage on mount', () => {
+    window.localStorage.setItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY, 'true');
+
+    renderApp();
+
+    expect(screen.getByTestId('session-feed-sidebar')).toBeInTheDocument();
+  });
+
+  it('closes from the in-sidebar close button and persists the closed state', () => {
+    window.localStorage.setItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY, 'true');
+    renderApp();
+
+    fireEvent.click(screen.getByText('Close activity feed'));
+
+    expect(screen.queryByTestId('session-feed-sidebar')).toBeNull();
+    expect(window.localStorage.getItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)).toBe('false');
+  });
+});
+
+describe('App kanban issue details', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/board');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/version') {
+        return new Response(JSON.stringify({ version: '0.5.0' }), { status: 200 });
+      }
+      if (url === '/api/tracker-status') {
+        return new Response(JSON.stringify({ primary: 'github', configured: [] }), { status: 200 });
+      }
+      if (url === '/api/confirmations') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }));
+  });
+
+  it('opens the issue drawer from kanban selection', () => {
+    renderApp();
+
+    fireEvent.click(screen.getByText('Open issue'));
+
+    expect(mockOpenIssue).toHaveBeenCalledWith('PAN-123');
+  });
+});
+
+describe('App channel permission requests', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/');
+    mockDashboardState.agents = [{ id: 'agent-987', issueId: 'PAN-987' }]
+    mockDashboardState.channelPermissionRequestsById = {
+      'perm-123': {
+        requestId: 'perm-123',
+        agentId: 'agent-987',
+        issueId: 'PAN-987',
+        toolName: 'Bash',
+        description: 'Run npm test',
+        inputPreview: '{"command":"npm test"}',
+        createdAt: '2026-05-07T18:30:00.000Z',
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/version') {
+        return new Response(JSON.stringify({ version: '0.5.0' }), { status: 200 })
+      }
+      if (url === '/api/tracker-status') {
+        return new Response(JSON.stringify({ primary: 'github', configured: [] }), { status: 200 })
+      }
+      if (url === '/api/confirmations') {
+        return new Response(JSON.stringify([]), { status: 200 })
+      }
+      if (url === '/api/agents/agent-987/permissions/perm-123/respond') {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    }))
+  })
+
+  it('submits allow decisions for pending channel permission requests', async () => {
+    renderApp()
+
+    expect(screen.getByTestId('channel-permission-request')).toHaveTextContent('perm-123:Bash')
+    fireEvent.click(screen.getByText('Allow channel permission'))
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        '/api/agents/agent-987/permissions/perm-123/respond',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ behavior: 'allow' }),
+        }),
+      )
+    })
+    expect(screen.queryByTestId('channel-permission-request')).toBeNull()
+    expect(mockRefreshDashboardState).toHaveBeenCalledTimes(1)
+    expect(mockToastSuccess).toHaveBeenCalledWith('Allowed agent-987 to continue')
+  })
+
+  it('submits deny decisions for pending channel permission requests', async () => {
+    renderApp()
+
+    fireEvent.click(screen.getByText('Deny channel permission'))
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        '/api/agents/agent-987/permissions/perm-123/respond',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ behavior: 'deny' }),
+        }),
+      )
+    })
+    expect(mockToastSuccess).toHaveBeenCalledWith('Denied permission request for agent-987')
+  })
+})

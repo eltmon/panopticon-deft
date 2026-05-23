@@ -1,0 +1,5100 @@
+/* Command Deck layout utilities — theme via global semantic tokens */
+
+.commandDeck {
+  font-family: "DM Sans", system-ui, sans-serif;
+  color: var(--foreground);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  height: 100%;
+}
+
+/* Layout */
+.layout {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.sidebar {
+  background: var(--card);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.resizeHandle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.15s;
+  position: relative;
+}
+
+.resizeHandle:hover,
+.resizeHandle:active {
+  background: var(--primary);
+}
+
+.sidebarHeader {
+  padding: 8px 12px 8px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* Account for the fixed hamburger menu button on small screens */
+@media (max-width: 767px) {
+  .sidebarHeader {
+    padding-left: 48px;
+  }
+}
+
+.sidebarHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.sidebarHeaderGroup {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 1;
+  min-width: 24px;
+}
+
+.sidebarTitle {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.sidebarSubtitle {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin: 0;
+}
+
+/* Segmented control */
+.segmentControl {
+  display: flex;
+  background: var(--background);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.segmentButton {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  border-radius: calc(8px - 2px);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: "DM Sans", system-ui, sans-serif;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+  white-space: nowrap;
+}
+
+.segmentButton:hover {
+  color: var(--foreground);
+}
+
+.segmentButtonActive {
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+.segmentCount {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  background: var(--accent);
+  padding: 0 5px;
+  border-radius: 8px;
+  line-height: 16px;
+}
+
+.projectTree {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.sidebarSection {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sidebarSectionCollapsed {
+  flex: 0 0 auto;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: color 0.15s;
+}
+
+.sectionHeader:hover {
+  color: var(--foreground);
+}
+
+.sectionTitle {
+  flex: 1;
+}
+
+.sectionBody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+/* Project Node */
+.projectNode {
+  margin-bottom: 4px;
+}
+
+.projectHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+
+.projectHeader:hover {
+  background: var(--accent);
+}
+
+.chevron {
+  transition: transform 0.15s;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.chevronOpen {
+  transform: rotate(90deg);
+}
+
+.projectName {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.featureCount {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-weight: 400;
+}
+
+.projectAddConvBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, opacity 0.1s;
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+
+.projectAddConvBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+  opacity: 1;
+}
+
+/* Feature Item */
+.featureItem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 3px;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 12px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  color: var(--foreground);
+}
+
+.featureItem:hover {
+  background: var(--accent);
+}
+
+.featureItemSelected {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.featureStatus {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.featureLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.featureLabelUntitled {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+
+.featureBadgeGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.featureBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.featureBadge_running {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 40%, transparent);
+}
+
+.featureBadge_stopped {
+  background: color-mix(in srgb, var(--muted-foreground) 10%, transparent);
+  color: var(--muted-foreground);
+  border-color: color-mix(in srgb, var(--muted-foreground) 22%, transparent);
+}
+
+.featureBadge_error {
+  background: color-mix(in srgb, var(--destructive) 16%, transparent);
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 40%, transparent);
+}
+
+.featureBadge_waiting {
+  background: color-mix(in srgb, var(--warning) 22%, transparent);
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 52%, transparent);
+  font-weight: 700;
+}
+
+.featureActivityError {
+  background: var(--destructive) !important;
+  opacity: 1 !important;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--destructive) 45%, transparent);
+}
+
+.featureResourceStrip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+}
+
+.featureResourceIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+}
+
+.featureResourceStrip:hover .featureResourceIcon {
+  opacity: 1;
+}
+
+.featureResourcePopover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 220px;
+  max-width: 360px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  font-size: 10px;
+  z-index: 20;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+
+.featureResourceRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.featureResourcePopover .featureResourceCleanupButton {
+  pointer-events: auto;
+  border: 1px solid var(--border);
+  background: var(--accent);
+  color: var(--foreground);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.featureResourcePopover .featureResourceCleanupButton:hover {
+  background: color-mix(in srgb, var(--warning) 18%, var(--accent));
+}
+
+/* Feature ID — technical identifier, mono per PAN-698 policy */
+.featureId_sidebar {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  flex-shrink: 0;
+  min-width: 56px;
+}
+
+.featureState {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.featureState_done {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 32%, transparent);
+}
+
+.featureState_progress {
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 36%, transparent);
+}
+
+.featureState_review {
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 36%, transparent);
+}
+
+.featureState_context {
+  background: color-mix(in srgb, #14b8a6 16%, transparent);
+  color: #0f766e;
+  border-color: color-mix(in srgb, #14b8a6 36%, transparent);
+}
+
+.featureState_planning {
+  background: color-mix(in srgb, #8b5cf6 16%, transparent);
+  color: #7c3aed;
+  border-color: color-mix(in srgb, #8b5cf6 36%, transparent);
+}
+
+.featureState_todo {
+  background: var(--accent);
+  color: var(--muted-foreground);
+  border-color: color-mix(in srgb, var(--muted-foreground) 16%, transparent);
+}
+
+/* Feature Item Wrapper (expandable) */
+.featureItemWrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+.featureItemWrapperSelected {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.featureItemRow {
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+}
+
+.featureItemCaret {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  flex-shrink: 0;
+  padding: 4px 0;
+  cursor: pointer;
+  background: none;
+  border: none;
+  color: var(--muted-foreground);
+  transition: color 0.1s;
+}
+
+.featureItemCaret:hover {
+  color: var(--foreground);
+}
+
+.featureItemCaretPlaceholder {
+  display: block;
+  width: 16px;
+  flex-shrink: 0;
+}
+
+.sessionList {
+  display: flex;
+  flex-direction: column;
+}
+
+.treeFilterRow {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.treeFilterButton {
+  flex: 1;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 400;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+
+.treeFilterButtonActive {
+  font-weight: 600;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--foreground);
+}
+
+/* Issue Header (compact contextual header) */
+.issueHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.issueHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.issueHeaderLeft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.issueHeaderId {
+  font-size: 12px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--primary);
+  text-decoration: none;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+.issueHeaderId:hover {
+  text-decoration: underline;
+}
+
+.issueHeaderTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issueHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.pipelineDots {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pipelineDotGroup {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.pipelineDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.pipelineDotLabel {
+  font-size: 9px;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.issueHeaderCost {
+  font-size: 12px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--muted-foreground);
+}
+
+.issueHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.issueHeaderBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  font-size: 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  cursor: pointer;
+  transition: all 0.1s;
+  color: var(--muted-foreground);
+}
+
+.issueHeaderBtn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.issueHeaderBtnDisabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.issueHeaderBtnDisabled:hover {
+  border-color: var(--border);
+  color: var(--muted-foreground);
+}
+
+.issueHeaderBadge {
+  font-size: 9px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--muted-foreground);
+  margin-left: 2px;
+}
+
+/* Session Panel */
+.sessionPanel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sessionPanelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.sessionPanelInfo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sessionPanelType {
+  font-size: 10px;
+  text-transform: lowercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.sessionPanelPresence {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sessionPanelModel {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionPanelDuration {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  flex-shrink: 0;
+}
+
+.sessionPanelToggle {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.sessionPanelToggleBtn {
+  padding: 2px 10px;
+  font-size: 10px;
+  border: none;
+  background: var(--background);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: all 0.1s;
+}
+
+.sessionPanelToggleBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.sessionPanelToggleBtnActive {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.sessionPanelToggleBtnActive:hover {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.deliveryMethodSelect {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+.deliveryMethodSelect:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sessionPanelContent {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── ReviewSummary ────────────────────────────────────── */
+.reviewSummary {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  gap: 16px;
+}
+
+.reviewSummaryBanner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--muted);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.reviewerStrip {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.reviewerCard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+}
+
+.reviewerCard:last-child {
+  border-bottom: none;
+}
+
+.reviewerCardLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 130px;
+  flex-shrink: 0;
+}
+
+.reviewerCardStats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  margin-left: auto;
+}
+
+.reviewSynthesis {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.reviewSynthesisHeading {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* ────────────────────────────────────────────────────── */
+
+.sessionPanelTranscript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.sessionPanelEmpty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+/* Session Node (child of FeatureItem) */
+.sessionNode {
+  display: grid;
+  grid-template-columns: 12px 12px 16px minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  column-gap: 6px;
+  padding: 4px 8px 4px calc(8px + 24px);
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 12px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  color: var(--foreground);
+}
+
+.sessionNode:hover {
+  background: var(--accent);
+}
+
+.sessionNodeSelected {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.sessionToggleSlot,
+.sessionDotSlot,
+.sessionIconSlot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+
+.sessionToggleButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sessionTypeBadge {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  white-space: nowrap;
+  text-transform: lowercase;
+}
+
+.sessionLabel {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionStatus {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  text-transform: lowercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  white-space: nowrap;
+}
+
+.sessionStatus_running {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.sessionStatus_error {
+  color: var(--destructive);
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+}
+
+.sessionStatus_starting {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+
+.sessionStatus_stopped,
+.sessionStatus_unknown,
+.sessionStatus_idle {
+  color: var(--muted-foreground);
+  background: var(--accent);
+}
+
+.sessionStatus_working {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.sessionStatus_thinking {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+
+.sessionStatus_waiting {
+  color: var(--orange, #f97316);
+  background: color-mix(in srgb, var(--orange, #f97316) 12%, transparent);
+}
+
+.sessionDuration {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+/* Cost value — technical numeric data, mono for alignment per PAN-698 policy */
+.featureCost {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.emptyProject {
+  padding: 8px 24px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+
+.inactiveProjectsSection {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.inactiveProjectsSectionHeader {
+  padding: 4px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted-foreground);
+}
+
+.sessionChildList {
+  padding-left: 8px;
+}
+
+/* Draggable section divider */
+.sectionDivider {
+  height: 4px;
+  cursor: row-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.15s;
+  position: relative;
+}
+
+.sectionDivider:hover,
+.sectionDivider:active {
+  background: var(--primary);
+}
+
+/* Project-scoped conversation items — reuses conversationRow affordances */
+.projectConvItem {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 22px 3px 28px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 11px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  color: var(--muted-foreground);
+}
+
+.projectConvItem:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.projectConvItemSelected {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--foreground);
+}
+
+.projectConvLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Hover actions for nested project conversations */
+.projectConvItem .conversationActions {
+  gap: 2px;
+}
+
+.projectConvItem:hover .conversationActions,
+.projectConvItem:focus-within .conversationActions {
+  max-width: 100px;
+  opacity: 1;
+  margin-left: 0;
+}
+
+.projectConvItem .conversationStopBtn {
+  left: 18px;
+  width: 14px;
+  height: 14px;
+}
+
+.projectConvItem:hover .conversationStopBtn {
+  opacity: 1;
+}
+
+.projectConvItem .conversationStarBtn,
+.projectConvItem .conversationStarPersistent {
+  right: 6px;
+  width: 16px;
+  height: 16px;
+}
+
+.projectConvItem:hover .conversationStarBtn,
+.projectConvItem:focus-within .conversationStarBtn {
+  opacity: 1;
+}
+
+/* Hide timestamp in nested view — too compact */
+.projectConvItem .conversationTime {
+  display: none;
+}
+
+/* Content Area */
+.content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.contentEmpty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--muted-foreground);
+  font-size: 14px;
+}
+
+/* Feature Header */
+.featureHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+
+.featureTitle {
+  font-size: 20px;
+  font-weight: 600;
+  flex: 1;
+  margin: 0;
+}
+
+/* Feature ID — technical identifier, mono per PAN-698 policy */
+.featureId {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+/* Badge Bar */
+.badgeBar {
+  display: flex;
+  gap: 8px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  cursor: pointer;
+  transition: all 0.1s;
+  color: var(--muted-foreground);
+}
+
+.badge:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.badgeDisabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.badgeDisabled:hover {
+  border-color: var(--border);
+  color: var(--muted-foreground);
+}
+
+/* Activity View */
+.activityContainer {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Agent Section */
+.agentSection {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 8px;
+  overflow: clip;  /* clip for border-radius but doesn't create scroll context */
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.agentSection:hover {
+  border-color: var(--input);
+}
+
+.agentSectionExpanded {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--card);
+  cursor: pointer;
+  transition: background 0.1s;
+  user-select: none;
+}
+
+.agentSectionExpanded .sectionHeader {
+  border-bottom: 1px solid var(--border);
+}
+
+.sectionHeader:hover {
+  background: var(--accent);
+}
+
+.sectionChevron {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.sectionType {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.typePlanning {
+  background: #DBEAFE;
+  color: #1E40AF;
+}
+
+.typeWork {
+  background: #D1FAE5;
+  color: #065F46;
+}
+
+.typeReview {
+  background: #FEF3C7;
+  color: #92400E;
+}
+
+.typeTest {
+  background: #E0E7FF;
+  color: #3730A3;
+}
+
+.typeMerge {
+  background: #FCE7F3;
+  color: #9D174D;
+}
+
+/* Section type badges always use light mode colors — see comment above */
+
+/* Model ID — technical identifier, mono per PAN-698 policy */
+.sectionModel {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.sectionTime {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin-left: auto;
+}
+
+.sectionCost {
+  font-size: 12px;
+  color: var(--success);
+  font-weight: 500;
+  padding: 0 4px;
+}
+
+.costSummary {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  text-align: right;
+  padding: 4px 8px;
+  font-weight: 500;
+}
+
+.sectionStatus {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.statusRunning {
+  background: var(--success);
+  animation: pulse 2s infinite;
+}
+
+.statusCompleted {
+  background: var(--muted-foreground);
+}
+
+.statusFailed {
+  background: var(--destructive);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Preview line shown when section is collapsed */
+/* Log preview — terminal-like content, mono per PAN-698 policy */
+.sectionPreview {
+  padding: 8px 16px;
+  font-size: 12px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--background);
+  border-top: 1px solid var(--border);
+  line-height: 1.4;
+}
+
+/* Section content — pre-wrap log output, mono per PAN-698 policy */
+.sectionContent {
+  padding: 16px;
+  font-size: 12px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--background);
+  line-height: 1.6;
+  color: var(--foreground);
+  /* No max-height by default — content flows at natural height.
+     activityContainer is the single scroll context.
+     max-height + overflow-y: auto are applied via inline style
+     only when user explicitly drags the resize handle. */
+}
+
+/* When user constrains via resize handle, enable internal scroll */
+.sectionContentConstrained {
+  overflow-y: auto;
+}
+
+/* Resize handle at bottom of expanded sections */
+.sectionResizeHandle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 12px;
+  cursor: row-resize;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  transition: background 0.1s;
+}
+
+.sectionResizeHandle:hover {
+  background: var(--accent);
+}
+
+.sectionResizeHandle:hover svg {
+  opacity: 1 !important;
+}
+
+.unreadDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  flex-shrink: 0;
+}
+
+/* Isolation Mode */
+.isolationOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: var(--background);
+  display: flex;
+  flex-direction: column;
+}
+
+.isolationHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.isolationClose {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.1s;
+}
+
+.isolationClose:hover {
+  border-color: var(--muted-foreground);
+  color: var(--foreground);
+}
+
+/* Isolation content — pre-wrap terminal output, mono per PAN-698 policy */
+.isolationContent {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+/* Modal */
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.modalContent {
+  background: var(--background);
+  border-radius: 12px;
+  max-width: 800px;
+  width: 100%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modalTitle {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.modalClose {
+  padding: 4px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  transition: all 0.1s;
+}
+
+.modalClose:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+
+.modalBody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+/* Upload UI */
+.uploadZone {
+  border: 2px dashed var(--border);
+  border-radius: 8px;
+  padding: 32px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: var(--muted-foreground);
+}
+
+.uploadZone:hover,
+.uploadZoneActive {
+  border-color: var(--primary);
+  background: rgba(37, 99, 235, 0.04);
+  color: var(--primary);
+}
+
+.uploadIcon {
+  margin-bottom: 8px;
+}
+
+.uploadText {
+  font-size: 12px;
+  margin: 0;
+}
+
+.uploadHint {
+  font-size: 12px;
+  margin: 4px 0 0;
+}
+
+.artifactList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.artifactItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.1s;
+}
+
+.artifactItem:hover {
+  background: var(--accent);
+}
+
+.artifactName {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifactDate {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+/* Sync Button */
+.syncButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--background);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: all 0.1s;
+}
+
+.syncButton:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.syncButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+/* Shadow Engineering toggle */
+.shadowToggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 12px;
+}
+
+.shadowLabel {
+  flex: 1;
+}
+
+.shadowTitle {
+  font-size: 12px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.shadowDesc {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin: 2px 0 0;
+}
+
+/* Markdown rendered content */
+.markdownContent {
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.markdownContent h1 { font-size: 20px; font-weight: 600; margin: 24px 0 12px; }
+.markdownContent h2 { font-size: 16px; font-weight: 600; margin: 20px 0 8px; }
+.markdownContent h3 { font-size: 14px; font-weight: 600; margin: 16px 0 8px; }
+.markdownContent p { margin: 0 0 12px; }
+.markdownContent ul, .markdownContent ol { margin: 0 0 12px; padding-left: 24px; }
+.markdownContent li { margin-bottom: 4px; }
+/* Inline code — mono per PAN-698 policy */
+.markdownContent code {
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--accent);
+}
+/* Code block — mono per PAN-698 policy */
+.markdownContent pre {
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  padding: 12px;
+  border-radius: 4px;
+  background: var(--card);
+  overflow-x: auto;
+  margin: 0 0 12px;
+}
+.markdownContent pre code {
+  padding: 0;
+  background: none;
+}
+
+/* Markdown tables (remark-gfm) */
+.markdownContent table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 12px;
+  font-size: 12px;
+}
+.markdownContent th,
+.markdownContent td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+.markdownContent th {
+  background: var(--card);
+  font-weight: 600;
+}
+.markdownContent tr:nth-child(even) {
+  background: var(--accent);
+}
+
+/* Kbd hint for Isolation mode */
+/* Keyboard shortcut hint — mono per PAN-698 policy */
+.kbdHint {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  background: var(--card);
+  border: 1px solid var(--input);
+  border-radius: 3px;
+  box-shadow: 0 1px 0 var(--border);
+  margin-right: 4px;
+}
+
+.isolationClose:hover .kbdHint {
+  border-color: var(--muted-foreground);
+}
+
+/* Deacon Status Panel */
+.deaconPanel {
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.deaconHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.deaconHeader:hover {
+  background: var(--accent);
+}
+
+.deaconTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.deaconMeta {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin-left: auto;
+}
+
+.deaconActionCount {
+  font-size: 10px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-radius: 8px;
+  padding: 0 5px;
+  min-width: 16px;
+  text-align: center;
+  line-height: 16px;
+}
+
+.deaconSpecialists {
+  padding: 0 16px 8px;
+  display: flex;
+  gap: 12px;
+}
+
+.deaconSpecRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.deaconSpecDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.deaconSpecName {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.deaconSpecFailures {
+  font-size: 10px;
+  color: var(--destructive);
+  font-weight: 600;
+}
+
+.deaconActions {
+  padding: 0 16px 8px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.deaconAction {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  padding: 2px 0;
+  line-height: 1.4;
+}
+
+/* Deacon log toggle button */
+.deaconLogToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 10px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  border-top: 1px solid var(--border);
+  transition: color 0.15s ease;
+}
+
+.deaconLogToggle:hover {
+  color: var(--muted-foreground);
+}
+
+/* Deacon log viewer */
+/* Deacon log viewer — structured log output, mono per PAN-698 policy */
+.deaconLogViewer {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.15);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.deaconLogEmpty {
+  color: var(--muted-foreground);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+.deaconLogEntry {
+  display: flex;
+  gap: 6px;
+  padding: 1px 0;
+  white-space: nowrap;
+}
+
+.deaconLogTime {
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+  min-width: 60px;
+}
+
+.deaconLogLevel {
+  flex-shrink: 0;
+  min-width: 24px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.deaconLogMessage {
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Sidebar Footer */
+.sidebarFooter {
+  border-top: 1px solid var(--border);
+  padding: 4px 12px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Version label — technical identifier string, mono per PAN-698 policy */
+.versionLabel {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.03em;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Conversations Section (PAN-416)
+   ─────────────────────────────────────────────────────────────────────────── */
+
+.conversationSection {
+  flex-shrink: 0;
+}
+
+.conversationHeader {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px 4px 0;
+}
+
+.conversationToggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  padding: 8px 8px 8px 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.1s;
+  border-radius: 4px;
+}
+
+.conversationToggle:hover {
+  background: var(--accent);
+}
+
+.conversationTitle {
+  flex: 1;
+}
+
+.conversationAddBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  margin-right: 8px;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+}
+
+.conversationAddBtn:hover {
+  background: var(--accent);
+  color: var(--primary);
+}
+
+/* Wrapper around controls + list */
+.conversationListWrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Controls bar: tabs + sort */
+.conversationControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 4px 16px;
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* All / Favorites tab bar */
+.convTabBar {
+  display: flex;
+  gap: 2px;
+}
+
+.convTab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  transition: background 0.1s, color 0.1s;
+  white-space: nowrap;
+}
+
+.convTab:hover {
+  background: var(--accent);
+  color: var(--muted-foreground);
+}
+
+.convTabActive {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.convTabCount {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* Sort dropdown */
+.convSortSelect {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 2px 20px 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--muted) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%236b7280' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 5px center;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "DM Sans", system-ui, sans-serif;
+  cursor: pointer;
+  outline: none;
+  flex-shrink: 0;
+  min-width: 96px;
+}
+
+.convSortSelect:hover {
+  border-color: var(--input);
+  color: var(--muted-foreground);
+}
+
+.convSortSelect:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.conversationList {
+  padding: 4px 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.conversationAddForm {
+  padding: 4px 12px;
+}
+
+.conversationInput {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--input);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: "DM Sans", system-ui, sans-serif;
+  color: var(--foreground);
+  background: var(--background);
+  box-sizing: border-box;
+  outline: none;
+}
+
+.conversationInput:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.conversationError {
+  font-size: 12px;
+  color: var(--destructive);
+  margin-top: 4px;
+}
+
+.conversationEmpty {
+  padding: 8px 16px 8px 32px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+/* Loading skeletons */
+@keyframes shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+
+.skeletonList {
+  padding: 8px 16px 8px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeletonItem {
+  height: 14px;
+  width: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--accent) 25%, color-mix(in srgb, var(--primary) 8%, transparent) 50%, var(--accent) 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.conversationItem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 30px 4px 24px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-size: 12px;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  color: var(--foreground);
+}
+
+.conversationItem:hover {
+  background: var(--accent);
+}
+
+/* Hover-only action group — collapses to 0 width when row is not hovered,
+   letting the title flex into the freed space. Negative margin nullifies the
+   parent's 6px gap when collapsed so no visual artifact remains. */
+.conversationActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-left: -6px;
+  transition: max-width 0.15s ease, opacity 0.15s ease, margin-left 0.15s ease;
+}
+
+.conversationItem:hover .conversationActions,
+.conversationItem:focus-within .conversationActions {
+  max-width: 120px;
+  opacity: 1;
+  margin-left: 0;
+}
+
+.conversationItemConfirming .conversationActions {
+  max-width: none;
+  overflow: visible;
+  opacity: 1;
+  margin-left: 0;
+}
+
+.conversationItemSelected {
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+}
+
+.conversationStopBtn {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+  padding: 0;
+}
+
+.conversationItem:hover .conversationStopBtn {
+  opacity: 1;
+}
+
+.conversationStopBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.conversationDot {
+  flex-shrink: 0;
+}
+
+.conversationWorkingSpinner {
+  flex-shrink: 0;
+  color: var(--success);
+  animation: spin 1s linear infinite;
+}
+
+/* Tool-call waiting state in sidebar — pulse instead of spin */
+.conversationWorkingPulse {
+  flex-shrink: 0;
+  color: var(--success);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.conversationName {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.conversationArchiveBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.archiveConfirmInline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.archiveConfirmLabelInline {
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.archiveConfirmYesInline,
+.archiveConfirmNoInline {
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 10px;
+  color: var(--foreground);
+  line-height: 1.3;
+  transition: background 0.15s;
+}
+
+.archiveConfirmYesInline:hover {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+  border-color: var(--destructive);
+}
+
+.archiveConfirmNoInline:hover {
+  background: var(--accent);
+}
+
+/* Last-accessed timestamp */
+.conversationTime {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--muted-foreground);
+  opacity: 0.7;
+  white-space: nowrap;
+  font-family: "DM Sans", system-ui, sans-serif;
+  letter-spacing: 0;
+}
+
+.conversationStarBtn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+  padding: 0;
+  color: var(--muted-foreground);
+  opacity: 0;
+  transition: background 0.1s, color 0.1s, opacity 0.15s ease;
+}
+
+.conversationItem:hover .conversationStarBtn,
+.conversationItem:focus-within .conversationStarBtn {
+  opacity: 1;
+}
+
+.conversationStarPersistent {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+  padding: 0;
+  color: var(--primary);
+  transition: background 0.1s, color 0.1s;
+}
+
+.conversationStarPersistent:hover {
+  background: var(--accent);
+}
+
+.conversationStarBtn:hover {
+  background: var(--accent);
+  color: var(--primary);
+}
+
+.conversationArchiveBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.conversationSummaryForkBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.conversationSummaryForkBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.conversationCopyBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.conversationCopyBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.conversationEditBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.conversationEditBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+/* Conversation name input — prose title, not a technical identifier */
+.conversationNameInput {
+  flex: 1;
+  min-width: 0;
+  background: var(--background);
+  border: 1px solid var(--primary);
+  border-radius: 4px;
+  color: var(--foreground);
+  font-size: 12px;
+  padding: 1px 4px;
+  outline: none;
+}
+
+/* Archive button in orphaned conversation state */
+.conversationArchiveBtnLarge {
+  padding: 8px 16px;
+  background: var(--accent);
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.conversationArchiveBtnLarge:hover {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--foreground);
+}
+
+/* Model picker bar in sidebar — shown above conversation list */
+.conversationModelBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+}
+
+/* Model label — technical identifier (model ID), mono per PAN-698 policy */
+.conversationModelLabel {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+/* Conversation Terminal Panel */
+.conversationTerminal {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+.conversationTerminalHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--card);
+}
+
+.conversationHeaderContainer {
+  container-type: inline-size;
+}
+
+.conversationTerminalTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinnerIcon {
+  animation: spin 1s linear infinite;
+  flex-shrink: 0;
+  color: var(--primary);
+}
+
+/* Tool-call waiting state — pulse instead of spin */
+.pulseIcon {
+  animation: pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+  color: var(--primary);
+}
+
+.conversationTerminalStatus {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Session ID — technical identifier, mono per PAN-698 policy */
+.conversationSessionId {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  opacity: 0.5;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  user-select: all;
+  flex: 0 1 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.copyLinkButton {
+  background: transparent;
+  border: none;
+  padding: 4px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s, background 0.15s;
+}
+
+.copyLinkButton:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+
+.archiveConfirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.archiveConfirmLabel {
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.archiveConfirmYes,
+.archiveConfirmNo {
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--foreground);
+  transition: background 0.15s;
+}
+
+.archiveConfirmYes:hover {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+  border-color: var(--destructive);
+}
+
+.archiveConfirmNo:hover {
+  background: var(--accent);
+}
+
+.conversationTitleEditBtn {
+  background: transparent;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  opacity: 0.4;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+.conversationTerminalTitle:hover .conversationTitleEditBtn {
+  opacity: 1;
+}
+
+.conversationTitleEditBtn:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+
+.conversationTitleInput {
+  flex: 1;
+  min-width: 0;
+  background: var(--background);
+  border: 1px solid var(--primary);
+  border-radius: 4px;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: "DM Sans", system-ui, sans-serif;
+  padding: 2px 6px;
+  outline: none;
+}
+
+.conversationTerminalBody {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* "About this conversation" drawer — collapsible summary beneath the header */
+.conversationAboutDrawer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.conversationAboutText {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--foreground);
+}
+
+.conversationAboutMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.conversationAboutMuted {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.conversationResumeOverlay {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--muted-foreground);
+}
+
+.conversationResumeBar {
+  padding: 12px;
+  display: flex;
+  justify-content: center;
+  border-top: 1px solid var(--border);
+}
+
+.conversationResumeBtn {
+  padding: 8px 16px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.conversationResumeBtn:hover {
+  background: var(--primary);
+}
+
+.conversationResumeBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* View toggle: [Conversation] [Terminal] */
+.viewToggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px;
+  flex-shrink: 0;
+}
+
+.viewToggleBtn {
+  padding: 3px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--muted-foreground);
+  transition: background 0.1s, color 0.1s;
+}
+
+.viewToggleBtn:hover {
+  background: var(--card);
+  color: var(--foreground);
+}
+
+.viewToggleBtnActive {
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* Conversation view area */
+.conversationView {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Empty state shown when no messages have been sent yet */
+.conversationEmptyState {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px;
+  color: var(--muted-foreground);
+}
+
+.conversationEmptyStateTitle {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--foreground);
+  text-align: center;
+}
+
+.conversationEmptyStateSubtitle {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+.conversationConnecting {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+/* ─── MessagesTimeline ──────────────────────────────────────────────────────── */
+
+.messagesTimeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.messagesTimelineInner {
+  max-width: 760px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Context injection block (e.g. conversation summary fork) — collapsible */
+.contextMessageRow {
+  padding: 2px 0;
+}
+
+.contextMessageBlock {
+  width: 100%;
+  background: color-mix(in srgb, var(--primary) 6%, var(--card));
+  border-left: 3px solid var(--primary);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.contextMessageToggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.contextMessageToggle:hover {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.contextMessageIcon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.contextMessageLabel {
+  flex: 1;
+}
+
+.contextMessageContent {
+  padding: 0 16px 12px;
+  border-top: 1px solid color-mix(in srgb, var(--primary) 15%, transparent);
+}
+
+/* User message — right-aligned bubble */
+.userMessageRow {
+  display: flex;
+  justify-content: flex-end;
+  padding: 2px 0;
+}
+
+.userMessageBubble {
+  max-width: 80%;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  border-radius: 18px 18px 4px 18px; /* rounded-2xl rounded-br-sm */
+  padding: 12px 16px;
+}
+
+.userMessageText {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Assistant message — left-aligned with bot avatar */
+.assistantMessageRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 0;
+  max-width: 100%;
+}
+
+.assistantMessageAvatar {
+  flex-shrink: 0;
+  margin-top: 3px; /* align with first line of text */
+  color: var(--primary);
+  opacity: 0.7;
+}
+
+.assistantMessageContent {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Message timestamp (T3Code: text-[10px] text-muted-foreground/30) */
+.messageTimestamp {
+  font-size: 10px;
+  color: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+}
+
+/* Metadata line below assistant messages (timestamp + duration) */
+.messageMetadata {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding-left: 2px;
+}
+
+.messageSeparator {
+  font-size: 10px;
+  color: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+}
+
+/* Work log group */
+.workLogGroup {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--accent);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workLogEntry {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  min-height: 20px;
+}
+
+/* Terminal icon character — mono for glyph alignment per PAN-698 policy */
+.workLogTerminalIcon {
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  line-height: 1;
+  margin-top: 1px;
+}
+
+.workLogLabel {
+  font-weight: 500;
+  color: var(--foreground);
+  flex-shrink: 0;
+}
+
+/* Work log detail — technical identifier/path data, mono per PAN-698 policy */
+.workLogDetail {
+  color: var(--muted-foreground);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+/* Work log result — terminal/command output, mono per PAN-698 policy */
+.workLogResult {
+  margin: 2px 0 4px 18px;
+  padding: 6px 8px;
+  background: var(--muted);
+  border-radius: 4px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  line-height: 1.4;
+}
+
+.workLogThinkingResult {
+  margin: 2px 0 4px 18px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--muted) 60%, transparent);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.5;
+  font-style: italic;
+}
+
+.workLogExpandBtn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--primary);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  align-self: flex-start;
+}
+
+.failedPromptList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.failedPromptCard {
+  border: 1px solid var(--destructive);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--destructive) 6%, var(--background));
+}
+
+.failedPromptHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--destructive);
+  margin-bottom: 4px;
+}
+
+.failedPromptText {
+  font-size: 13px;
+  color: var(--foreground);
+  margin: 0 0 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.failedPromptActions {
+  display: flex;
+  gap: 8px;
+}
+
+.failedPromptActions button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  transition: background 0.1s, color 0.1s;
+}
+
+.failedPromptActions button:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+/* Working indicator */
+.workingIndicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.workingDots {
+  display: flex;
+  gap: 3px;
+}
+
+.workingDots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+  animation: workingDotBounce 1.2s ease-in-out infinite;
+}
+
+.workingDots span:nth-child(2) { animation-delay: 0.2s; }
+.workingDots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes workingDotBounce {
+  0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+  40% { transform: scale(1.2); opacity: 1; }
+}
+
+.workingLabel {
+  font-size: 12px;
+}
+
+/* ─── ChatMarkdown ──────────────────────────────────────────────────────────── */
+
+.chatMarkdown {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--foreground);
+  word-break: break-word;
+  white-space: normal;
+}
+
+.chatMarkdown p { margin: 0 0 8px; }
+.chatMarkdown p:last-child { margin-bottom: 0; }
+.chatMarkdown ul, .chatMarkdown ol { margin: 8px 0; padding-left: 24px; }
+.chatMarkdown li { margin: 2px 0; }
+.chatMarkdown h1, .chatMarkdown h2, .chatMarkdown h3 {
+  font-weight: 600;
+  margin: 12px 0 8px;
+  color: var(--foreground);
+}
+.chatMarkdown h1 { font-size: 20px; }
+.chatMarkdown h2 { font-size: 16px; }
+.chatMarkdown h3 { font-size: 14px; }
+.chatMarkdown blockquote {
+  border-left: 3px solid var(--input);
+  margin: 8px 0;
+  padding-left: 12px;
+  color: var(--muted-foreground);
+}
+.chatMarkdown table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  margin: 8px 0;
+}
+.chatMarkdown th, .chatMarkdown td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.chatMarkdown th { background: var(--accent); font-weight: 600; }
+.chatMarkdown code:not(pre code) {
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+  background: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+/* Code block */
+.codeBlock {
+  position: relative;
+  margin: 8px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.codeBlock:hover .copyButton { opacity: 1; }
+
+.copyButton {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+  color: var(--muted-foreground);
+}
+
+.copyButton:hover { color: var(--foreground); }
+
+.shikiOutput {
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.shikiOutput :global(pre) {
+  margin: 0 !important;
+  padding: 12px 16px !important;
+  background: var(--accent) !important;
+}
+
+/* Plain code block — mono per PAN-698 policy */
+.codePlain {
+  margin: 0;
+  padding: 12px 16px;
+  background: var(--accent);
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.mdLink {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Markdown fallback — raw text output, mono per PAN-698 policy */
+.mdFallback {
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+/* ─── ComposerFooter ──────────────────────────────────────────────────────────── */
+
+/* Outer wrapper: padding only, no background strip, max-width centered */
+.composerFooter {
+  flex-shrink: 0;
+  padding: 12px 16px 16px;
+}
+
+/* Single unified container — the only visible box (T3Chat style) */
+.composerBox {
+  max-width: 760px;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--background);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.composerBox:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.composerBoxDisabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* Lexical editor inside the unified box — no border of its own */
+.composerEditor {
+  position: relative;
+  min-height: 60px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 12px 12px 8px;
+}
+
+.composerEditorDisabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.composerEditable {
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  min-height: 36px;
+  color: var(--foreground);
+  font-family: "DM Sans", system-ui, sans-serif;
+}
+
+.composerEditable p { margin: 0; }
+
+.composerPlaceholder {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  color: var(--muted-foreground);
+  font-size: 14px;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Slash command menu — opens upward from the composer */
+.slashMenu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 300px;
+  max-width: 360px;
+  max-height: min(60vh, 480px);
+  overflow-y: auto;
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.16);
+  padding: 4px;
+}
+
+.slashMenuItem {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+  text-align: left;
+  gap: 2px;
+}
+
+.slashMenuItem:hover,
+.slashMenuItemSelected {
+  background: var(--accent);
+}
+
+/* Slash command label — command identifier (e.g. /help), mono per PAN-698 policy */
+.slashMenuLabel {
+  font-size: 14px;
+  font-family: "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.slashMenuDescription {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.slashMenuMatch {
+  background: color-mix(in srgb, var(--primary) 24%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+/* Toolbar row: inside the box, below the textarea */
+.composerToolbar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 8px 12px;
+}
+
+.composerToolbarSpacer {
+  flex: 1;
+}
+
+/* Pipe divider between toolbar items (matches t3code style) */
+.composerToolbarDivider {
+  width: 1px;
+  height: 16px;
+  background: var(--input);
+  opacity: 0.5;
+  flex-shrink: 0;
+  margin: 0 4px;
+}
+
+/* Send button — rounded, inside the box */
+.sendButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.1s;
+  flex-shrink: 0;
+}
+
+.sendButton:hover:not(:disabled) {
+  background: var(--primary);
+}
+
+.sendButton:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.voiceToolbarButton,
+.voiceToolbarButtonActive {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-right: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+
+.voiceToolbarButton {
+  background: var(--card);
+  color: var(--muted-foreground);
+}
+
+.voiceToolbarButtonActive {
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+}
+
+.voiceToolbarButton:hover:not(:disabled),
+.voiceToolbarButtonActive:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.voiceToolbarButton:disabled,
+.voiceToolbarButtonActive:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.voiceWidget {
+  margin: 0 8px 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--card) 92%, var(--primary) 8%);
+}
+
+.voiceWidgetHeader,
+.voiceWidgetActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.voiceWidgetTitle {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--foreground);
+}
+
+.voiceWidgetMeta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.voiceModeToggle {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--background);
+}
+
+.voiceModeButton,
+.voiceModeActive {
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.voiceModeButton {
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.voiceModeActive {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.voiceWidgetControls {
+  display: grid;
+  grid-template-columns: 1fr 120px;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.voiceFieldLabel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted-foreground);
+}
+
+.voiceSelect {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.voiceWaveformCanvas {
+  display: block;
+  width: 100%;
+  height: 56px;
+  margin-top: 10px;
+  border-radius: 10px;
+  background: var(--background);
+}
+
+.voiceTranscriptPreview {
+  width: 100%;
+  min-height: 58px;
+  margin-top: 10px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.voiceWidgetActions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.voiceStartButton,
+.voiceStopButton,
+.voiceSecondaryButton,
+.voiceSendButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.voiceStartButton,
+.voiceSendButton {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-color: var(--primary);
+}
+
+.voiceStopButton {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+  border-color: var(--destructive);
+}
+
+.voiceSecondaryButton {
+  background: var(--background);
+  color: var(--muted-foreground);
+}
+
+/* ─── Composer Image Strip ──────────────────────────────────────────────────── */
+
+.composerImageStrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+
+.composerImageCard {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 200px;
+}
+
+.composerImageThumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.composerImageMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composerImageName {
+  font-size: 11px;
+  color: var(--foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composerImageStatus {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.composerImageError {
+  font-size: 10px;
+  color: var(--destructive);
+}
+
+.composerImageRemoveButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  border-radius: 4px;
+  margin-left: auto;
+  padding: 0;
+}
+
+.composerImageRemoveButton:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+/* Spinner animation for uploading images */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+/* Model/Effort pickers */
+.pickerContainer {
+  position: relative;
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.pickerBtn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.pickerBtn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.pickerBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pickerHint {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  padding: 4px 8px;
+  font-style: italic;
+}
+
+.pickerLabel {
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Provider icon inside picker trigger button */
+.pickerProviderIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+/* Two-panel picker: provider sidebar (left) + main panel (right) */
+.pickerDropdown {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 4px);
+  z-index: 9999;
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  min-width: 300px;
+  max-width: min(calc(100vw - 16px), 460px);
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+.pickerDropdownUp {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+/* ── Provider filter sidebar ── */
+.pickerProviderSidebar {
+  width: 44px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 6px 0;
+  gap: 2px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+}
+
+.pickerProviderBtn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted-foreground);
+  transition: background 0.1s, color 0.1s;
+  position: relative;
+  padding: 0;
+}
+
+.pickerProviderBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.pickerProviderBtnActive {
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+}
+
+.pickerProviderBtnActive::after {
+  content: '';
+  position: absolute;
+  left: -6px;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--primary);
+}
+
+/* SVG icon inside sidebar button */
+.pickerProviderBtnIcon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+
+/* Small colored letter badge for providers without an SVG icon */
+.providerBadge {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-size: 9px;
+  font-weight: 800;
+  font-family: inherit;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+/* ── Main panel ── */
+.pickerMainPanel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Harness section header is slightly indented vs the model section headers */
+.pickerHarnessHeader {
+  padding-top: 8px;
+}
+
+/* ── Search bar ── */
+.pickerSearchWrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 6px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.pickerSearchIcon {
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+  opacity: 0.55;
+}
+
+.pickerSearchInput {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--foreground);
+}
+
+.pickerSearchInput::placeholder {
+  color: var(--muted-foreground);
+  opacity: 0.55;
+}
+
+/* ── Scrollable model list ── */
+.pickerScrollContent {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  min-height: 0;
+  padding: 4px;
+}
+
+/* ── Model row ── */
+.pickerOption {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 12px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--foreground);
+  position: relative;
+  transition: background 0.1s;
+}
+
+.pickerOption:hover {
+  background: var(--accent);
+}
+
+.pickerOptionActive {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.pickerOptionActive:hover {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.pickerOptionActive::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--primary);
+}
+
+.pickerOptionLocked {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pickerOptionLocked:hover {
+  background: none;
+}
+
+.pickerOptionLockIcon {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  color: var(--muted-foreground);
+}
+
+/* Two-row content inside each model row */
+.pickerOptionContent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Top row: label + cost badges */
+.pickerOptionRow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+/* Provider subtitle row */
+.pickerOptionSubtitle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--muted-foreground);
+  opacity: 0.75;
+  line-height: 1.2;
+}
+
+/* Tiny colored dot in subtitle */
+.pickerOptionProviderDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Empty search results */
+.pickerNoResults {
+  padding: 20px 12px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  text-align: center;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.pickerGroupHeader {
+  padding: 6px 12px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted-foreground);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* "no key" badge in group header */
+.pickerGroupNoKey {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-warning, #f59e0b) 12%, transparent);
+  color: var(--color-warning, #f59e0b);
+  border: 1px solid color-mix(in srgb, var(--color-warning, #f59e0b) 22%, transparent);
+}
+
+/* Entire group dimmed when provider has no credentials */
+.pickerGroupDisabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Thin rule separating harness section from model list inside the dropdown */
+.pickerSectionDivider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 8px;
+  flex-shrink: 0;
+}
+
+/* "Pi" pill shown in the trigger button when Pi harness is active */
+.harnessIndicator {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+
+/* pickerDropdownSplit / pickerScrollArea — superseded by two-panel layout; kept as no-ops for safety */
+.pickerDropdownSplit {}
+.pickerScrollArea {}
+
+/* Harness radio-list inside the model picker dropdown.
+   Vertical layout scales to any number of harnesses. */
+.harnessOption {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  font-family: inherit;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s;
+}
+
+.harnessOption:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+.harnessOptionActive {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.harnessOptionActive:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary) 13%, transparent);
+}
+
+.harnessOptionLocked {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.harnessOptionIcon {
+  width: 14px;
+  flex-shrink: 0;
+  padding-top: 1px;
+  color: var(--primary);
+  display: flex;
+  align-items: flex-start;
+}
+
+.harnessOptionBody {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.harnessOptionName {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--foreground);
+  line-height: 1.3;
+}
+
+.harnessOptionActive .harnessOptionName {
+  font-weight: 600;
+  color: var(--primary);
+}
+
+.harnessOptionDesc {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.pickerOptionLabel {
+  flex: 1;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.pickerCostBadge {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Subscription plan badge (e.g. "MAX", "Pro") */
+.pickerAuthBadge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--color-primary, #6366f1) 18%, transparent);
+  color: var(--color-primary, #6366f1);
+  border: 1px solid color-mix(in srgb, var(--color-primary, #6366f1) 30%, transparent);
+}
+
+.pickerAuthBadgeWarn {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--color-warning, #f59e0b) 15%, transparent);
+  color: var(--color-warning, #f59e0b);
+  border: 1px solid color-mix(in srgb, var(--color-warning, #f59e0b) 25%, transparent);
+}
+
+/* ─── Restart Popover ────────────────────────────────────────────────────── */
+
+.restartPopover {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 100;
+  width: 240px;
+  background: var(--primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  padding: 8px;
+  margin-top: 4px;
+}
+
+.restartPopoverTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  padding: 2px 4px;
+}
+
+.restartPopoverDivider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.restartPopoverLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--foreground);
+  transition: background 0.1s;
+}
+
+.restartPopoverLabel:hover {
+  background: var(--accent);
+}
+
+.restartPopoverLabel input[type="checkbox"] {
+  accent-color: var(--primary);
+  margin: 0;
+}
+
+.restartPopoverCount {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.restartPopoverActions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
+.restartPopoverCancel {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.restartPopoverCancel:hover {
+  background: var(--accent);
+}
+
+.restartPopoverConfirm {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+
+.restartPopoverConfirm:hover {
+  opacity: 0.9;
+}
+
+.restartPopoverConfirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.restartPopoverError {
+  color: var(--destructive);
+  font-size: 12px;
+  padding: 4px;
+  margin-top: 2px;
+}
+
+/* ─── Fork status indicators ─────────────────────────────────────────────── */
+
+.conversationForkStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--primary);
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.conversationForkFailed {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--destructive);
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  cursor: help;
+}
+
+/* ─── Fork progress view (conversation detail) ──────────────────────────── */
+
+.forkProgressView {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.forkProgressCard {
+  width: 100%;
+  max-width: 420px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.forkProgressHeader {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.forkProgressIcon {
+  color: var(--primary);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.forkProgressTitle {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--foreground);
+  margin: 0;
+  line-height: 1.3;
+}
+
+.forkProgressSubtitle {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin: 2px 0 0;
+  line-height: 1.4;
+}
+
+.forkProgressSubtitle strong {
+  color: var(--muted-foreground);
+  font-weight: 500;
+}
+
+.forkProgressTimeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding-left: 4px;
+}
+
+.forkProgressStep {
+  display: flex;
+  gap: 12px;
+  position: relative;
+  min-height: 48px;
+}
+
+.forkProgressStep:last-child {
+  min-height: unset;
+}
+
+.forkProgressStepIndicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  width: 18px;
+  position: relative;
+}
+
+.forkProgressStepLine {
+  position: absolute;
+  top: 22px;
+  width: 2px;
+  bottom: -4px;
+  background: var(--border);
+  border-radius: 1px;
+}
+
+.forkProgressStep--done .forkProgressStepLine {
+  background: var(--primary);
+}
+
+.forkProgressStepContent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 12px;
+}
+
+.forkProgressStepLabel {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.forkProgressStepDesc {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  line-height: 1.4;
+}
+
+.forkProgressStep--done {
+  color: var(--primary);
+}
+
+.forkProgressStep--done .forkProgressStepDesc {
+  color: var(--muted-foreground);
+}
+
+.forkProgressStep--active {
+  color: var(--primary);
+}
+
+.forkProgressStep--active .forkProgressStepLabel {
+  color: var(--foreground);
+}
+
+.forkProgressStep--pending {
+  color: var(--muted-foreground);
+}
+
+.forkProgressStep--pending .forkProgressStepLabel {
+  color: var(--muted-foreground);
+}
+
+.forkProgressStep--failed {
+  color: var(--destructive);
+}
+
+.forkProgressStep--failed .forkProgressStepLabel {
+  color: var(--destructive);
+}
+
+@keyframes forkSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.forkProgressSpinner {
+  animation: forkSpin 1s linear infinite;
+}
+
+.forkProgressError {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--destructive);
+  padding: 12px;
+  background: color-mix(in srgb, var(--destructive) 8%, transparent);
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--destructive) 20%, transparent);
+  line-height: 1.4;
+}
+
+.forkProgressError svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* ─── Fork dialog ────────────────────────────────────────────────────────── */
+
+.forkOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.forkDialog {
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 440px;
+  max-width: 100%;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+}
+
+.forkHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.forkHeaderLeft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.forkHeaderIcon {
+  color: var(--primary);
+  flex-shrink: 0;
+}
+
+.forkTitle {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.forkClose {
+  padding: 4px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  transition: all 0.1s;
+}
+
+.forkClose:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+
+.forkBody {
+  padding: 16px 20px 8px;
+}
+
+.forkDesc {
+  margin: 0 0 16px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  line-height: 1.5;
+}
+
+.forkFields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.forkTitleInput {
+  width: 100%;
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--foreground);
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.forkTitleInput:focus {
+  border-color: var(--primary);
+}
+
+/* ─── Fork footer ────────────────────────────────────────────────────────── */
+
+.forkFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+}
+
+.forkCancelBtn {
+  padding: 7px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s, color 0.1s;
+}
+
+.forkCancelBtn:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.forkConfirmBtn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  border: none;
+  border-radius: 4px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+  transition: filter 0.1s, opacity 0.1s;
+}
+
+.forkConfirmBtn:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+.forkConfirmBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.forkModeGroup {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0 0 4px;
+}
+
+.forkModeGroup legend {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.forkCheckboxRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.forkCheckboxRow input[type="checkbox"],
+.forkCheckboxRow input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+.forkCheckboxRow label,
+.forkCheckboxRow span {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  user-select: none;
+}
+
+.forkWarning {
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #d4a017;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+
+.forkHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ─── Fork help dialog ──────────────────────────────────────────────────── */
+
+.forkHelpOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.forkHelpDialog {
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 560px;
+  max-width: 100%;
+  max-height: 80vh;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+}
+
+.forkHelpBody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+}
+
+/* Failed message outbox — unsent messages with Retry/Discard */
+.failedOutbox {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.failedMessage {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.failedMessageBubble {
+  max-width: 80%;
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--destructive) 30%, transparent);
+  border-radius: 18px 18px 4px 18px;
+  padding: 12px 16px;
+  opacity: 0.85;
+}
+
+.failedMessageActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.failedMessageLabel {
+  color: var(--destructive);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.failedMessageBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.failedMessageBtn:hover {
+  color: var(--foreground);
+  border-color: var(--foreground);
+}
+
+/* ─── Plan Card ──────────────────────────────────────────────────────────── */
+
+.planCard {
+  margin: 8px 0;
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  background: var(--card, var(--background));
+  overflow: hidden;
+}
+
+.planCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.planCardToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--foreground);
+  font: inherit;
+}
+
+.planCardTitle {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.planCardBadge,
+.planCardBadgeApproved,
+.planCardBadgeRejected {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.planCardBadge {
+  background: color-mix(in srgb, var(--primary) 15%, transparent);
+  color: var(--primary);
+}
+
+.planCardBadgeApproved {
+  background: color-mix(in srgb, #22c55e 15%, transparent);
+  color: #22c55e;
+}
+
+.planCardBadgeRejected {
+  background: color-mix(in srgb, #f59e0b 15%, transparent);
+  color: #f59e0b;
+}
+
+.planCardResolved {
+  border-color: var(--border);
+}
+
+.planCardResolved .planCardHeader {
+  background: transparent;
+}
+
+.planCardBody {
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.planCardActions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.planCardApproveBtn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: none;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.planCardApproveBtn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.planCardApproveBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.planCardFeedbackBtn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.planCardFeedbackBtn:hover:not(:disabled) {
+  background: var(--muted);
+  border-color: var(--foreground);
+}
+
+.planCardFeedbackBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.planCardCancelBtn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.planCardCancelBtn:hover:not(:disabled) {
+  color: var(--foreground);
+  border-color: var(--foreground);
+}
+
+.planCardFeedbackArea {
+  padding: 8px 12px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.planCardTextarea {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+  outline: none;
+}
+
+.planCardTextarea:focus {
+  border-color: var(--primary);
+}
+
+.planCardFeedbackActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* ─── Compact Boundary Divider ───────────────────────────────────────────── */
+
+.compactBoundaryDivider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+}
+
+.compactBoundaryLine {
+  flex: 1;
+  height: 1px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--border) 0,
+    var(--border) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+}
+
+.compactBoundaryLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.compactBoundaryDetail {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.compactingIndicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  animation: compactingPulse 1.5s ease-in-out infinite;
+}
+
+.compactingIcon {
+  animation: compactingSpin 2s linear infinite;
+}
+
+@keyframes compactingPulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+@keyframes compactingSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* ─── Conversation permission-awaiting alert icon ────────────────────────── */
+
+.conversationPermissionAlert {
+  color: var(--warning);
+  animation: permissionAlertPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes permissionAlertPulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
+/* ─── Session permissions banner ─────────────────────────────────────────── */
+
+.sessionPermissionsRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 10.5px;
+  color: var(--muted-foreground);
+  opacity: 0.7;
+}
+
+.sessionPermissionsIcon {
+  flex-shrink: 0;
+  color: var(--primary);
+  opacity: 0.6;
+}
+
+.sessionPermissionsLabel {
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.sessionPermissionsTools {
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resourcesGroup {
+  margin-top: 2px;
+  border-top: 1px solid var(--divider);
+  padding-top: 4px;
+}
+
+.resourcesGroupHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 28px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  user-select: none;
+  background: none;
+  border: none;
+  width: 100%;
+  text-align: left;
+}
+
+.resourcesGroupHeader:hover {
+  background: var(--accent);
+}
+
+.resourcesGroupSummary {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted-foreground);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.containerNode {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 40px;
+  font-size: 11px;
+  cursor: default;
+}
+
+.containerNode:hover {
+  background: var(--accent);
+}
+
+.containerName {
+  font-weight: 500;
+  color: var(--foreground);
+  min-width: 64px;
+}
+
+.containerMetric {
+  font-family: var(--font-mono, 'SF Mono', monospace);
+  font-size: 10px;
+  color: var(--muted-foreground);
+  min-width: 36px;
+  text-align: right;
+}
+
+.branchNode {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 40px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.branchBadge {
+  font-size: 9px;
+  color: var(--muted-foreground);
+}
+
+.prNode {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 40px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.prNode:hover {
+  background: var(--accent);
+  text-decoration: underline;
+}
+
+.prNumber {
+  font-family: var(--font-mono, 'SF Mono', monospace);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.prTitle {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}

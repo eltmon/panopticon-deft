@@ -19,14 +19,17 @@ import React, {
   useCallback,
   useRef,
   useEffect,
+  useMemo,
   type ReactNode,
 } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CheckIcon, CopyIcon } from 'lucide-react';
 import type { Components } from 'react-markdown';
 import type { DiffsThemeNames } from '@pierre/diffs';
-import styles from '../MissionControl/styles/mission-control.module.css';
+import { resolveMarkdownFileLinkMeta, shouldPreserveMarkdownFileLinkHref, splitMarkdownTextFileLinks } from '../../markdown-links';
+import { MarkdownFileLink } from './MarkdownFileLink';
+import styles from '../CommandDeck/styles/command-deck.module.css';
 
 // ─── LRU Cache for syntax highlighting ───────────────────────────────────────
 
@@ -66,6 +69,70 @@ function fnv1a32(str: string): number {
 
 function cacheKey(code: string, lang: string): string {
   return `${fnv1a32(code)}:${code.length}:${lang}`;
+}
+
+/** Sanitize Shiki HTML output before rendering with dangerouslySetInnerHTML.
+ *  Only allows the tags and attributes that Shiki legitimately produces. */
+const ALLOWED_SHIKI_TAGS = new Set(['span', 'pre', 'code', 'div', 'br']);
+const ALLOWED_SHIKI_ATTRS = new Set(['class', 'style']);
+
+const ALLOWED_CSS_PROPERTIES = new Set([
+  'color', 'background-color', 'font-style', 'font-weight',
+  'text-decoration', 'opacity',
+]);
+
+function sanitizeStyleAttr(styleValue: string): string {
+  return styleValue.split(';')
+    .map((d) => d.trim()).filter(Boolean)
+    .filter((d) => {
+      const [prop] = d.split(':');
+      return prop && ALLOWED_CSS_PROPERTIES.has(prop.trim().toLowerCase());
+    })
+    .join('; ');
+}
+
+const sharedDomParser = new DOMParser();
+
+function sanitizeShikiHtml(html: string): string {
+  const doc = sharedDomParser.parseFromString(html, 'text/html');
+
+  function walk(node: Node): Node | null {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return document.createTextNode(node.textContent || '');
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return null;
+    }
+    const el = node as Element;
+    const tagName = el.tagName.toLowerCase();
+    if (!ALLOWED_SHIKI_TAGS.has(tagName)) {
+      return null;
+    }
+    const newEl = document.createElement(tagName);
+    for (const attr of Array.from(el.attributes)) {
+      if (!ALLOWED_SHIKI_ATTRS.has(attr.name.toLowerCase())) continue;
+      if (attr.name === 'style') {
+        const safe = sanitizeStyleAttr(attr.value);
+        if (safe) newEl.setAttribute('style', safe);
+      } else {
+        newEl.setAttribute(attr.name, attr.value);
+      }
+    }
+    for (const child of Array.from(el.childNodes)) {
+      const sanitized = walk(child);
+      if (sanitized) newEl.appendChild(sanitized);
+    }
+    return newEl;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const child of Array.from(doc.body.childNodes)) {
+    const sanitized = walk(child);
+    if (sanitized) fragment.appendChild(sanitized);
+  }
+  const wrapper = document.createElement('div');
+  wrapper.appendChild(fragment);
+  return wrapper.innerHTML;
 }
 
 // ─── Highlighter (lazy-loaded) ────────────────────────────────────────────────
@@ -146,6 +213,11 @@ function CodeBlock({ code, lang, isStreaming }: CodeBlockProps) {
     return () => { abortRef.current = true; };
   }, [code, lang, isStreaming]);
 
+  const sanitizedHtml = useMemo(
+    () => (highlighted ? sanitizeShikiHtml(highlighted) : null),
+    [highlighted],
+  );
+
   const handleCopy = useCallback(() => {
     void navigator.clipboard.writeText(code).then(() => {
       setCopied(true);
@@ -162,11 +234,11 @@ function CodeBlock({ code, lang, isStreaming }: CodeBlockProps) {
       >
         {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
       </button>
-      {highlighted ? (
+      {sanitizedHtml ? (
         <div
           className={styles.shikiOutput}
           // eslint-disable-next-line react/no-danger
-          dangerouslySetInnerHTML={{ __html: highlighted }}
+          dangerouslySetInnerHTML={{ __html: sanitizedHtml }}
         />
       ) : (
         <pre className={styles.codePlain}>
@@ -179,7 +251,53 @@ function CodeBlock({ code, lang, isStreaming }: CodeBlockProps) {
 
 // ─── Custom markdown components ───────────────────────────────────────────────
 
-function makeComponents(isStreaming: boolean): Components {
+function transformMarkdownUrl(url: string): string {
+  return shouldPreserveMarkdownFileLinkHref(url) ? url : defaultUrlTransform(url);
+}
+
+type ReactMarkdownRemarkPlugins = React.ComponentProps<typeof ReactMarkdown>['remarkPlugins'];
+
+interface MarkdownNode {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: string | null;
+  children?: MarkdownNode[];
+}
+
+const TEXT_LINK_SKIP_NODE_TYPES = new Set(['code', 'inlineCode', 'link', 'linkReference', 'definition']);
+
+function remarkBareFileTextLinks(options: { cwd?: string } = {}) {
+  return (tree: MarkdownNode) => {
+    const visit = (node: MarkdownNode) => {
+      if (!node.children || TEXT_LINK_SKIP_NODE_TYPES.has(node.type)) return;
+
+      const children: MarkdownNode[] = [];
+      for (const child of node.children) {
+        if (child.type === 'text' && child.value !== undefined) {
+          for (const segment of splitMarkdownTextFileLinks(child.value, options.cwd)) {
+            children.push(segment.href
+              ? {
+                type: 'link',
+                url: segment.href,
+                title: null,
+                children: [{ type: 'text', value: segment.text }],
+              }
+              : { type: 'text', value: segment.text });
+          }
+        } else {
+          visit(child);
+          children.push(child);
+        }
+      }
+      node.children = children;
+    };
+
+    visit(tree);
+  };
+}
+
+function makeComponents(isStreaming: boolean, cwd: string | undefined, issueId: string | null | undefined): Components {
   return {
     pre({ children }) {
       // Extract code block contents
@@ -208,9 +326,21 @@ function makeComponents(isStreaming: boolean): Components {
       );
     },
     a({ href, children }) {
+      const fileLinkMeta = resolveMarkdownFileLinkMeta(href, cwd);
+      if (fileLinkMeta) {
+        return <MarkdownFileLink {...fileLinkMeta} issueId={issueId} />;
+      }
+
+      // Block javascript: and data: URIs to prevent XSS from assistant markdown
+      const safeHref =
+        typeof href === 'string' &&
+        href.trim().length > 0 &&
+        !/^(javascript|data|vbscript):/i.test(href.trim())
+          ? href
+          : undefined;
       return (
         <a
-          href={href}
+          href={safeHref}
           target="_blank"
           rel="noopener noreferrer"
           className={styles.mdLink}
@@ -227,18 +357,26 @@ function makeComponents(isStreaming: boolean): Components {
 interface ChatMarkdownProps {
   text: string;
   isStreaming?: boolean;
+  cwd?: string;
+  issueId?: string | null;
 }
 
 export const ChatMarkdown = memo(function ChatMarkdown({
   text,
   isStreaming = false,
+  cwd,
+  issueId,
 }: ChatMarkdownProps) {
-  const components = makeComponents(isStreaming);
+  const components = useMemo(() => makeComponents(isStreaming, cwd, issueId), [isStreaming, cwd, issueId]);
+  const remarkPlugins = useMemo(
+    () => [remarkGfm, [remarkBareFileTextLinks, { cwd }]] as ReactMarkdownRemarkPlugins,
+    [cwd],
+  );
 
   return (
     <ChatMarkdownErrorBoundary fallback={<pre className={styles.mdFallback}>{text}</pre>}>
       <div className={styles.chatMarkdown}>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={transformMarkdownUrl}>
           {text}
         </ReactMarkdown>
       </div>

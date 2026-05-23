@@ -1,7 +1,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useDashboardStore, selectAgentList, selectSpecialistList, selectIssuesByCycle, selectReviewStatus } from '../lib/store';
-/* Drag-and-drop disabled pending rework (PAN-TODO)
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useDashboardStore, selectAgents, selectIssuesByCycle, selectReviewStatus } from '../lib/store';
 import {
   DndContext,
   DragOverlay,
@@ -10,39 +9,39 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
-  DragStartEvent,
-  DragEndEvent,
+  type DragStartEvent,
+  type DragOverEvent,
+  type DragEndEvent,
   defaultDropAnimationSideEffects,
-  DropAnimation,
-} from '@dnd-kit/core';
-import {
+  type DropAnimation,
   useDraggable,
   useDroppable,
 } from '@dnd-kit/core';
-*/
 import { Issue, Agent, LinearProject, STATUS_ORDER, STATUS_LABELS, CanonicalState } from '../types';
-import { getFriendlyModelName } from './inspector/utils';
-import { ExternalLink, User, Tag, Play, Eye, MessageCircle, X, Loader2, Filter, FileText, Github, List, CheckCircle, DollarSign, RotateCcw, CheckCheck, HelpCircle, Cloud, Monitor, AlertTriangle, Undo, Check, ChevronDown, ChevronRight, GitMerge, Sparkles, XCircle, AlertCircle, ScrollText, Pause } from 'lucide-react';
+import { getFriendlyModelName } from '../lib/dashboard-utils';
+import { ExternalLink, User, Tag, Play, Eye, X, Filter, FileText, List, DollarSign, RotateCcw, AlertTriangle, Undo, Check, ChevronDown, ChevronRight, Sparkles, XCircle, ScrollText, Pause } from 'lucide-react';
 import { PlanDialog } from './PlanDialog';
 import { BeadsTasksPanel } from './BeadsTasksPanel';
 import { parseDifficultyLabel, ComplexityLevel } from '../../../../lib/cloister/complexity.js';
-import { SpecialistAgent } from './SpecialistAgentCard';
-import { useConfirm, useAlert } from './DialogProvider';
+// PAN-1048 — SpecialistAgent type retired; specialist-style indicators now
+// derive directly from role-tagged AgentSnapshots (review / test / ship).
 import { CostBreakdownModal } from './CostBreakdownModal';
 import { VBriefDialog } from './vbrief/VBriefDialog';
-import { useUIPreferences } from '../hooks/useUIPreferences';
-import { ResetIssueButton } from './ResetIssueButton';
-import { StopAgentButton } from './StopAgentButton';
-import { ArtifactLinks } from './ArtifactLinks';
-import { MergeButton } from './MergeButton';
-import { RecoverButton } from './RecoverButton';
-import { hasActualPendingQuestion, isReviewPipelineStuck } from '../lib/pipeline-state';
+import { deriveIssueActionPhase, type PipelinePhase } from '../lib/issueActions';
 import { refreshDashboardState } from '../lib/refresh-dashboard-state';
-import type { ReviewStatusSnapshot } from '@panopticon/contracts';
+import { cn } from '../lib/utils';
+import { dashboardMutationJsonHeaders } from '../lib/wsTransport';
+import { getIssueWorkAgentMap, isAgentSessionAttachable } from '../lib/swarmSlots';
+import type { ReviewStatusSnapshot } from '@panctl/contracts';
 import { useBulkSelection } from '../hooks/useBulkSelection';
 import { BulkActionBar } from './BulkActionBar';
 import { BulkAgentWarningDialog } from './BulkAgentWarningDialog';
 import { BulkCloseOutProgress, type BulkCloseResult } from './BulkCloseOutProgress';
+import { useWorkspaceStackHealthQuery, type WorkspaceData } from './CommandDeck/ZoneCOverviewTabs/queries';
+import { IssueActionMenu, useIssueActions } from './IssueActionMenu';
+import IssueCardPrimitive from './primitives/IssueCard';
+import VerbBadge from './primitives/VerbBadge';
+import { VerifyingOnMainBadge } from './VerifyingOnMainBadge';
 
 
 // Difficulty badge colors
@@ -60,32 +59,6 @@ function DifficultyBadge({ level }: { level: ComplexityLevel }) {
   return (
     <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${color}`}>
       {level}
-    </span>
-  );
-}
-
-// Agent type icons for badges
-const AGENT_ICONS: Record<string, string> = {
-  work: '🤖',
-  review: '👁️',
-  test: '🧪',
-  merge: '🔀'
-};
-
-// Agent attribution badge component
-function AgentBadge({
-  type,
-  isConflict
-}: {
-  type: 'work' | 'review' | 'test' | 'merge';
-  isConflict: boolean;
-}) {
-  const icon = AGENT_ICONS[type];
-  const conflictClass = isConflict ? 'animate-[pulse_2s_ease-in-out_infinite]' : '';
-
-  return (
-    <span className={`inline-flex items-center text-xs text-primary ${conflictClass}`}>
-      <span>{icon}</span>
     </span>
   );
 }
@@ -131,12 +104,42 @@ function formatCost(cost: number): string {
 }
 
 // Get cost badge color based on amount
-function getLabelStyle(_label: string): string {
-  return 'bg-muted text-muted-foreground border border-border';
+function getCostColor(_cost: number): string {
+  return 'bg-popover text-muted-foreground';
 }
 
-function getCostColor(_cost: number): string {
-  return 'bg-surface-overlay text-content-subtle';
+function formatRuntime(startedAt: string): string {
+  const elapsed = Date.now() - new Date(startedAt).getTime();
+  const minutes = Math.floor(elapsed / 60000);
+  if (minutes < 1) return '<1 min';
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins} min`;
+}
+
+function cardAvatarInitials(name: string): string {
+  const parts = name.trim().split(/[-\s_]+/).filter(Boolean);
+  if (parts.length > 1) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return name.slice(0, 2).toUpperCase();
+}
+
+const AVATAR_GRADIENTS = [
+  'linear-gradient(135deg, #a855f7, #06b6d4)',
+  'linear-gradient(135deg, #f59e0b, #ef4444)',
+  'linear-gradient(135deg, #10b981, #06b6d4)',
+  'linear-gradient(135deg, #60a5fa, #a855f7)',
+  'linear-gradient(135deg, #ef4444, #f59e0b)',
+];
+
+function avatarGradient(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i += 1) {
+    hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  }
+  return AVATAR_GRADIENTS[hash % AVATAR_GRADIENTS.length];
 }
 
 export function applyReviewStateToIssue(
@@ -157,6 +160,17 @@ export function applyReviewStateToIssue(
   labels.delete('review ready');
   labels.delete('Review Ready');
   labels.add('merged');
+
+  // PAN-1190: keep verifying_on_main visible after merge until close-out completes.
+  const canonicalState = issue.targetCanonicalState ?? issue.state ?? STATUS_LABELS[issue.status];
+  if (canonicalState === 'verifying_on_main') {
+    return {
+      ...issue,
+      mergeStatus: 'merged',
+      labels: Array.from(labels),
+      targetCanonicalState: 'verifying_on_main',
+    };
+  }
 
   return {
     ...issue,
@@ -248,6 +262,7 @@ export function groupByStatus(issues: Issue[], showClosedOut: boolean = false): 
     todo: [],
     in_progress: [],
     in_review: [],
+    verifying_on_main: [],
     done: [],
     canceled: [],
   };
@@ -603,7 +618,7 @@ function TrackerShadowBadges({ issue, compact = false }: { issue: Issue; compact
         <ExternalLink className="w-2.5 h-2.5" />
         {trackerState}
       </span>
-      <span className="text-content-muted">→</span>
+      <span className="text-muted-foreground">→</span>
       <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded badge-bg-signal-review text-signal-review-foreground">
         <Eye className="w-2.5 h-2.5" />
         {shadowLabel}
@@ -614,17 +629,29 @@ function TrackerShadowBadges({ issue, compact = false }: { issue: Issue; compact
 
 // Feature card — rich card for Rally Features with progress and expand/collapse
 // Children (user stories) render INSIDE the card
-function FeatureCard({
+export function FeatureCard({
   feature,
   childCount,
   isExpanded,
   onToggle,
+  isSelected,
+  onSelect,
+  onPlan,
+  onViewBeads,
+  onViewVBrief,
+  planningState: planningStateProp,
   children,
 }: {
   feature: Issue;
   childCount: number;
   isExpanded: boolean;
   onToggle: () => void;
+  isSelected?: boolean;
+  onSelect?: () => void;
+  onPlan?: () => void;
+  onViewBeads?: () => void;
+  onViewVBrief?: () => void;
+  planningState?: PlanningState;
   children?: React.ReactNode;
 }) {
   const completed = feature.completedChildCount ?? 0;
@@ -637,13 +664,22 @@ function FeatureCard({
     ((feature.derivedStatus === 'in_progress' && feature.rawTrackerState !== 'Developing') ||
      (feature.derivedStatus === 'closed' && feature.rawTrackerState !== 'Done'));
 
+  const hasPlan = planningStateProp?.hasPlan ?? feature.hasPlan ?? false;
+  const hasBeads = planningStateProp?.hasBeads ?? feature.hasBeads ?? false;
+  const planLabelExists = hasPlan || feature.labels?.some(l => l.toLowerCase() === 'planned');
+
   return (
-    <div className="bg-surface-overlay rounded-lg border-l-4 border-l-primary overflow-hidden">
+    <IssueCardPrimitive
+      issueId={feature.identifier}
+      priority={feature.priority}
+      selected={isSelected}
+      onClick={onSelect}
+      className="rounded-lg bg-popover hover:translate-y-0"
+    >
       <div
-        onClick={onToggle}
-        className="flex items-start gap-2 px-3 py-2.5 cursor-pointer hover:bg-primary/10 transition-colors"
+        className="relative flex items-start gap-2 px-3 py-2.5 cursor-pointer hover:bg-primary/10 transition-colors"
       >
-        <div className="flex items-center gap-1 shrink-0 mt-0.5">
+        <div className="flex items-center gap-1 shrink-0 mt-0.5" onClick={(e) => { e.stopPropagation(); onToggle(); }}>
           {isExpanded ? (
             <ChevronDown className="w-4 h-4 text-primary/70" />
           ) : (
@@ -655,7 +691,7 @@ function FeatureCard({
             </span>
           )}
         </div>
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0" onClick={onSelect}>
           <div className="flex items-center gap-2 flex-wrap">
             {feature.project && (
               <span
@@ -680,7 +716,7 @@ function FeatureCard({
             )}
             <TrackerShadowBadges issue={feature} />
           </div>
-          <p className="text-sm text-content-body mt-1 line-clamp-2">{feature.title}</p>
+          <p className="text-sm text-foreground mt-1 line-clamp-2">{feature.title}</p>
 
           {/* Progress bar and summary */}
           {total > 0 && (
@@ -691,66 +727,122 @@ function FeatureCard({
                   style={{ width: `${progressPct}%` }}
                 />
               </div>
-              <span className="text-[11px] text-content-muted mt-0.5 block">
+              <span className="text-[11px] text-muted-foreground mt-0.5 block">
                 {completed}/{total} done{inProgress > 0 ? `, ${inProgress} active` : ''}
               </span>
             </div>
           )}
+
+          {/* Action bar for features — Plan, vBRIEF, Tasks; NO Start Agent */}
+          <div className="mt-2 flex items-center gap-2 flex-wrap rounded-xl border border-border/70 bg-card/80 px-2.5 py-2">
+            {STATUS_LABELS[feature.status] !== 'done' && STATUS_LABELS[feature.status] !== 'canceled' && (
+              <button
+                data-testid={`action-plan-${feature.identifier}`}
+                onClick={(e) => { e.stopPropagation(); onPlan && onPlan(); }}
+                className={`flex items-center gap-1 text-xs transition-colors ${
+                  planLabelExists
+                    ? 'text-success hover:text-success/80'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+                title={planLabelExists ? 'See plan / continue planning' : 'Plan'}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                {planLabelExists ? 'See Plan' : 'Plan'}
+              </button>
+            )}
+            {(hasBeads || (hasPlan && !hasBeads)) && (
+              <button
+                data-testid={`action-tasks-${feature.identifier}`}
+                onClick={(e) => { e.stopPropagation(); onViewBeads && onViewBeads(); }}
+                className="flex items-center gap-1 text-xs text-success hover:text-success/80 transition-colors"
+                title="Tasks"
+              >
+                <List className="w-3.5 h-3.5" />
+                Tasks
+              </button>
+            )}
+            {hasPlan && (
+              <button
+                data-testid={`action-vbrief-${feature.identifier}`}
+                onClick={(e) => { e.stopPropagation(); onViewVBrief && onViewVBrief(); }}
+                className="flex items-center gap-1 text-xs text-success hover:text-success/80 transition-colors"
+                title="vBRIEF"
+              >
+                <ScrollText className="w-3.5 h-3.5" />
+                vBRIEF
+              </button>
+            )}
+          </div>
         </div>
       </div>
       {/* Child stories rendered inside the card */}
       {isExpanded && children && (
-        <div className="border-t border-border/50 bg-surface-raised/50">
+        <div className="relative border-t border-border/50 bg-card/50">
           {children}
         </div>
       )}
-    </div>
+    </IssueCardPrimitive>
   );
 }
 
 // Compact child card — slim inline card for stories under a Feature
-function CompactChildCard({
+export function CompactChildCard({
   issue,
   agents,
+  isSelected,
+  onSelect,
 }: {
   issue: Issue;
   agents: Agent[];
+  isSelected?: boolean;
+  onSelect?: () => void;
 }) {
   const canonical = STATUS_LABELS[issue.status] || 'backlog';
   const dotColor = canonical === 'done' ? 'bg-success' :
+                   canonical === 'verifying_on_main' ? 'bg-info' :
                    canonical === 'in_progress' ? 'bg-warning' :
                    canonical === 'in_review' ? 'bg-signal-review' :
                    'bg-muted-foreground';
 
   const issueIdLower = issue.identifier.toLowerCase();
   const hasAgent = agents.some(
-    a => a.issueId?.toLowerCase() === issueIdLower && a.status !== 'dead'
+    a => a.issueId?.toLowerCase() === issueIdLower && isAgentSessionAttachable(a)
   );
 
   return (
-    <div className="flex items-center gap-2 px-3 py-1.5 rounded hover:bg-surface-overlay/50 transition-colors group">
-      <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
-      <a
-        href={issue.url}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        className="text-xs font-medium text-primary/70 hover:text-primary shrink-0"
-      >
-        {issue.identifier}
-      </a>
-      <span className="text-xs text-content-body truncate flex-1">{issue.title}</span>
-      <TrackerShadowBadges issue={issue} compact />
-      {hasAgent && (
-        <span className="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" title="Agent running" />
-      )}
-    </div>
+    <IssueCardPrimitive
+      issueId={issue.identifier}
+      priority={issue.priority}
+      selected={isSelected}
+      runningCard={hasAgent}
+      onClick={onSelect}
+      className="rounded-none border-0 bg-transparent shadow-none hover:translate-y-0 hover:bg-popover/50"
+    >
+      <div className="relative flex items-center gap-2 px-3 py-1.5 transition-colors">
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
+        <a
+          href={issue.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="text-xs font-medium text-primary/70 hover:text-primary shrink-0"
+        >
+          {issue.identifier}
+        </a>
+        <span className="text-xs text-foreground truncate flex-1">{issue.title}</span>
+        <TrackerShadowBadges issue={issue} compact />
+        {hasAgent && (
+          <span className="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" title="Agent running" />
+        )}
+      </div>
+    </IssueCardPrimitive>
   );
 }
 
 // List view row — compact row for list view grouped by labels
 export function ListIssueRow({
   issue,
+  issueWorkAgentsById,
   agents,
   specialists,
   issueCosts,
@@ -762,13 +854,15 @@ export function ListIssueRow({
   onBulkToggle,
 }: {
   issue: Issue;
+  issueWorkAgentsById?: Map<string, Agent[]>;
   agents: Agent[];
-  specialists: SpecialistAgent[];
+  /** PAN-1048 — role-tagged agents (review / test / ship) for the visible cycle. */
+  specialists: Agent[];
   issueCosts: Record<string, IssueCost>;
   costsLoading?: boolean;
   selectedIssue: string | null | undefined;
   onSelectIssue: (id: string | null) => void;
-  onPlan: (issue: Issue) => void;
+  onPlan: (issue: Issue, autoStart?: boolean) => void;
   isBulkSelected?: boolean;
   onBulkToggle?: () => void;
 }) {
@@ -785,6 +879,7 @@ export function ListIssueRow({
 
   // Status indicator color
   const statusColor = canonical === 'done' ? 'bg-success' :
+                      canonical === 'verifying_on_main' ? 'bg-info' :
                       canonical === 'in_review' ? 'bg-signal-review' :
                       canonical === 'in_progress' ? 'bg-warning' :
                       canonical === 'todo' ? 'bg-primary' :
@@ -793,146 +888,189 @@ export function ListIssueRow({
   // Get cost for this issue
   const cost = issueCosts[issue.identifier.toLowerCase()];
 
-  // Check for running agents
+  // Check for running agents (exclude planning agents — they don't block the plan button)
   const issueIdLower = issue.identifier.toLowerCase();
-  const activeAgent = agents.find(
-    a => a.issueId?.toLowerCase() === issueIdLower && a.status !== 'dead'
+  const workAgents = useMemo(() => {
+    if (issueWorkAgentsById) {
+      return issueWorkAgentsById.get(issueIdLower) ?? [];
+    }
+    return getIssueWorkAgentMap(agents).get(issueIdLower) ?? [];
+  }, [agents, issueWorkAgentsById, issueIdLower]);
+  // PAN-1048: standby = work agent that finished its run but kept its tmux session
+  // alive for review/UAT response. Replaces the legacy agentPhase === 'review-response'
+  // signal — agentPhase no longer exists after the role primitive hard cut.
+  const standbyAgent = workAgents.find(
+    (workAgent) =>
+      workAgent.status === 'stopped' &&
+      (workAgent.role ?? 'work') === 'work' &&
+      !!workAgent.lifecycle?.hasLiveTmuxSession,
   );
-  const isRunning = !!activeAgent;
+  const isRunning = workAgents.some(isAgentSessionAttachable) || !!standbyAgent;
+  const hasMultipleWorkAgents = workAgents.length > 1;
 
-  // Check for specialists
+  // Check for specialists — PAN-1048 — role-tagged agents whose issueId matches.
   const issueSpecialists = specialists.filter(
-    s => s.currentIssue?.toLowerCase() === issueIdLower
+    (s) => s.issueId?.toLowerCase() === issueIdLower && s.status !== 'stopped'
   );
 
   // Parse difficulty from labels
   const difficulty = parseDifficultyLabel(issue.labels || []);
 
   return (
-    <div
+    <IssueCardPrimitive
       ref={rowRef}
+      testId={`list-issue-card-${issue.identifier}`}
+      issueId={issue.identifier}
+      priority={issue.priority}
+      selected={isSelected}
+      bulkSelected={isBulkSelected}
+      runningCard={isRunning}
       onClick={() => onSelectIssue(isSelected ? null : issue.identifier)}
-      className={`flex items-center gap-3 px-4 py-3 hover:bg-surface-overlay/50 transition-colors cursor-pointer ${
-        isSelected ? 'bg-surface-overlay' : isBulkSelected ? 'bg-primary/[0.03]' : ''
-      }`}
+      className="rounded-none border-0 border-b border-border/60 bg-transparent shadow-none hover:translate-y-0 hover:bg-popover/50"
     >
-      {/* Bulk selection checkbox */}
-      {onBulkToggle && (
-        <input
-          type="checkbox"
-          checked={isBulkSelected || false}
-          onChange={(e) => {
-            e.stopPropagation();
-            onBulkToggle();
-          }}
-          onClick={(e) => e.stopPropagation()}
-          className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
-          aria-label={`Select ${issue.identifier}`}
-        />
-      )}
-      {/* Status indicator */}
-      <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} title={canonical} />
+      <div className="relative flex items-center gap-3 px-4 py-3 transition-colors">
+        {/* Bulk selection checkbox */}
+        {onBulkToggle && (
+          <input
+            type="checkbox"
+            checked={isBulkSelected || false}
+            onChange={(e) => {
+              e.stopPropagation();
+              onBulkToggle();
+            }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-4 h-4 rounded border-border text-primary focus:ring-primary cursor-pointer shrink-0"
+            aria-label={`Select ${issue.identifier}`}
+            data-testid={`card-select-${issue.identifier}`}
+          />
+        )}
+        {/* Status indicator */}
+        <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor}`} title={canonical} />
 
-      {/* Issue identifier — clicking selects the card, use ExternalLink icon to open in tracker */}
-      <span className="text-xs text-content-subtle shrink-0 font-mono">
-        {issue.identifier}
-      </span>
-
-      {/* Title - dimmed/strikethrough for canceled issues */}
-      <span className={`text-sm truncate flex-1 min-w-0 ${
-        canonical === 'canceled'
-          ? 'text-content-muted line-through'
-          : 'text-content-body'
-      }`}>{issue.title}</span>
-
-      {/* Priority indicator */}
-      {issue.priority === 1 && <span className="text-xs text-destructive-foreground font-medium shrink-0">Urgent</span>}
-      {issue.priority === 2 && <span className="text-xs text-warning-foreground font-medium shrink-0">High</span>}
-
-      {/* Difficulty badge */}
-      {difficulty && (
-        <DifficultyBadge level={difficulty} />
-      )}
-
-      {/* Cost */}
-      {costsLoading && !cost && (
-        <span className="w-10 h-4 bg-surface-overlay rounded animate-pulse shrink-0" />
-      )}
-      {cost && cost.totalCost > 0 && (
-        <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${getCostColor(cost.totalCost)}`}>
-          {formatCost(cost.totalCost)}
+        {/* Issue identifier — clicking selects the card, use ExternalLink icon to open in tracker */}
+        <span className="text-xs text-muted-foreground shrink-0 font-mono">
+          {issue.identifier}
         </span>
-      )}
 
-      {/* Assignee */}
-      {issue.assignee && (
-        <span className="text-xs text-content-subtle flex items-center gap-1 shrink-0">
-          <User className="w-3 h-3" />
-          {issue.assignee.name.split(' ')[0]}
-        </span>
-      )}
+        {/* Title - dimmed/strikethrough for canceled issues */}
+        <span className={`text-sm truncate flex-1 min-w-0 ${
+          canonical === 'canceled'
+            ? 'text-muted-foreground line-through'
+            : 'text-foreground'
+        }`}>{issue.title}</span>
 
-      {/* Running agent indicator */}
-      {isRunning && (
-        <span className="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" title="Agent running" />
-      )}
+        {/* Priority indicator */}
+        {issue.priority === 1 && <span className="text-xs text-destructive-foreground font-medium shrink-0">Urgent</span>}
+        {issue.priority === 2 && <span className="text-xs text-warning-foreground font-medium shrink-0">High</span>}
 
-      {/* Specialist indicators */}
-      {issueSpecialists.map(s => (
-        <span key={s.name} className="text-xs text-primary shrink-0" title={`${s.displayName} specialist`}>
-          {s.name === 'review-agent' ? '👁️' : s.name === 'test-agent' ? '🧪' : s.name === 'merge-agent' ? '🔀' : '🤖'}
-        </span>
-      ))}
+        {/* Difficulty badge */}
+        {difficulty && (
+          <DifficultyBadge level={difficulty} />
+        )}
 
-      {/* Action buttons */}
-      <div className="flex items-center gap-1 shrink-0">
-        {/* Plan/Start button for backlog/todo items */}
-        {!isRunning && (canonical === 'backlog' || canonical === 'todo') && (
+        {/* Cost */}
+        {costsLoading && !cost && (
+          <span className="w-10 h-4 bg-popover rounded animate-pulse shrink-0" />
+        )}
+        {cost && cost.totalCost > 0 && (
+          <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${getCostColor(cost.totalCost)}`}>
+            {formatCost(cost.totalCost)}
+          </span>
+        )}
+
+        {/* Assignee */}
+        {issue.assignee && (
+          <span className="text-xs text-muted-foreground flex items-center gap-1 shrink-0">
+            <User className="w-3 h-3" />
+            {issue.assignee.name.split(' ')[0]}
+          </span>
+        )}
+
+        {/* Running agent indicator */}
+        {isRunning && (
+          <span className="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" title="Agent running" />
+        )}
+        {hasMultipleWorkAgents && (
+          <span className="rounded-full border border-border/70 bg-card px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground shrink-0">
+            {workAgents.length} slots
+          </span>
+        )}
+
+        {/* Specialist indicators — PAN-1048 keyed on role primitive */}
+        {issueSpecialists.map((s) => (
+          <span key={s.id} className="text-xs text-primary shrink-0" title={`${s.role} agent`}>
+            {s.role === 'review' ? '👁️' : s.role === 'test' ? '🧪' : s.role === 'ship' ? '🔀' : '🤖'}
+          </span>
+        ))}
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-1 shrink-0">
+          {/* Plan/Start button for backlog/todo, plus in_progress issues with no running
+              agent (e.g. PAN-977 hit the empty-spawn bug and needs re-planning). */}
+          {!isRunning && (canonical === 'backlog' || canonical === 'todo' || canonical === 'in_progress') && (
+            <div className="inline-flex items-center rounded border border-border/70 overflow-hidden">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPlan(issue);
+                }}
+                className="p-1 text-muted-foreground hover:text-primary transition-colors"
+                title={canonical === 'in_progress' ? 'Re-plan issue' : 'Plan issue'}
+                data-testid={`list-plan-${issue.identifier}`}
+              >
+                <Play className="w-3.5 h-3.5" />
+              </button>
+              {canonical !== 'in_progress' && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPlan(issue, true);
+                  }}
+                  className="p-1 text-primary hover:text-primary/80 border-l border-border/70 transition-colors"
+                  title="Auto-plan issue"
+                  data-testid={`list-auto-plan-${issue.identifier}`}
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* View button */}
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onPlan(issue);
+              onSelectIssue(issue.identifier);
             }}
-            className="p-1 text-content-subtle hover:text-primary transition-colors"
-            title="Plan issue"
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+            title="View details"
           >
-            <Play className="w-3.5 h-3.5" />
+            <Eye className="w-3.5 h-3.5" />
           </button>
-        )}
 
-        {/* View button */}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onSelectIssue(issue.identifier);
-          }}
-          className="p-1 text-content-subtle hover:text-content transition-colors"
-          title="View details"
-        >
-          <Eye className="w-3.5 h-3.5" />
-        </button>
-
-        {/* External link */}
-        <a
-          href={issue.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="p-1 text-content-subtle hover:text-content transition-colors"
-          title="Open in tracker"
-        >
-          <ExternalLink className="w-3.5 h-3.5" />
-        </a>
+          {/* External link */}
+          <a
+            href={issue.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+            title="Open in tracker"
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
       </div>
-    </div>
+    </IssueCardPrimitive>
   );
 }
 
 const COLUMN_COLORS: Record<string, string> = {
-  backlog: 'border-divider-strong',
-  todo: 'border-divider-strong',
+  backlog: 'border-border',
+  todo: 'border-border',
   in_progress: 'border-primary',
   in_review: 'border-warning',
+  verifying_on_main: 'border-info',
   done: 'border-success',
 };
 
@@ -941,6 +1079,7 @@ const COLUMN_TITLES: Record<string, string> = {
   todo: 'To Do',
   in_progress: 'In Progress',
   in_review: 'In Review',
+  verifying_on_main: 'Verifying',
   done: 'Done',
 };
 
@@ -969,6 +1108,11 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
   const [internalSelectedIssue, setInternalSelectedIssue] = useState<string | null>(null);
   const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set()); // Empty = all projects
   const [planDialogIssue, setPlanDialogIssue] = useState<Issue | null>(null); // Lifted dialog state
+  const [planDialogAutoStart, setPlanDialogAutoStart] = useState(false);
+  const openPlanDialog = useCallback((issue: Issue, autoStart = false) => {
+    setPlanDialogAutoStart(autoStart);
+    setPlanDialogIssue(issue);
+  }, []);
 
   // Notify parent when plan dialog opens/closes so it can suppress the detail panel terminal
   useEffect(() => {
@@ -994,10 +1138,10 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     });
   }, []);
 
-  /* DnD state disabled pending rework
   const [activeDragIssue, setActiveDragIssue] = useState<Issue | null>(null);
   const [activeDragStatus, setActiveDragStatus] = useState<CanonicalState | null>(null);
-  */
+  const [activeOverId, setActiveOverId] = useState<string | null>(null);
+  const [columnOrderOverrides, setColumnOrderOverrides] = useState<Record<string, string[]>>({});
 
   // Undo state
   const [undoHistory, setUndoHistory] = useState<UndoEntry[]>([]);
@@ -1021,8 +1165,16 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
 
   // Event-sourced state from Zustand store (PAN-433 read model)
   const issues = useDashboardStore(selectIssuesByCycle(cycleFilter, includeCompleted)) as unknown as Issue[];
-  const agents = useDashboardStore(selectAgentList) as unknown as Agent[];
-  const specialists = useDashboardStore(selectSpecialistList) as unknown as SpecialistAgent[];
+  const agents = useDashboardStore(selectAgents) as unknown as Agent[];
+  const openIssue = useDashboardStore((state) => state.openIssue);
+  // PAN-1048 — derive specialist-role agents (review / test / ship) from the
+  // unified agent list. Replaces the retired specialistsByName projection.
+  const specialists = useMemo(
+    () => agents.filter(
+      (a) => a.role === 'review' || a.role === 'test' || a.role === 'ship',
+    ),
+    [agents],
+  );
   const reviewStatusByIssueId = useDashboardStore((s) => s.reviewStatusByIssueId);
 
   // Bulk selection state — key based on filters so selection survives data refreshes
@@ -1043,7 +1195,7 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     mutationFn: async (issueIds: string[]) => {
       const res = await fetch('/api/issues/bulk-close-out', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await dashboardMutationJsonHeaders(),
         body: JSON.stringify({ issueIds }),
       });
       if (!res.ok) {
@@ -1087,11 +1239,13 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
   );
   const issuesWithAgents = useMemo(() => {
     // Build a Set of issueIds that have at least one active agent
+    const selectedIssueById = new Map(selectedIssues.map(issue => [issue.identifier.toLowerCase(), issue]));
     const activeAgentIssueIds = new Set<string>();
     for (const agent of agents) {
-      if (agent.issueId && agent.status !== 'dead' && agent.status !== 'stopped' && agent.status !== 'failed') {
-        activeAgentIssueIds.add(agent.issueId.toLowerCase());
-      }
+      if (!agent.issueId || agent.status === 'dead' || agent.status === 'stopped' || agent.status === 'failed') continue;
+      const issue = selectedIssueById.get(agent.issueId.toLowerCase());
+      if (agent.paused && issue?.mergeStatus === 'merged') continue;
+      activeAgentIssueIds.add(agent.issueId.toLowerCase());
     }
     return selectedIssues.filter(issue => activeAgentIssueIds.has(issue.identifier.toLowerCase()));
   }, [selectedIssues, agents]);
@@ -1130,7 +1284,6 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     bulkSelection.clear();
   }, [bulkSelection]);
 
-  /* DnD sensors disabled pending rework
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: {
@@ -1139,7 +1292,6 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     }),
     useSensor(KeyboardSensor)
   );
-  */
 
   // Move status mutation
   const moveStatusMutation = useMutation({
@@ -1205,7 +1357,6 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     setUndoTimeoutId(timeoutId);
   }, [undoTimeoutId]);
 
-  /* Drag handlers disabled pending rework
   // Handle drag start
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const { active } = event;
@@ -1217,47 +1368,38 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     }
   }, [issues]);
 
+  // Handle drag over
+  const handleDragOver = useCallback((event: DragOverEvent) => {
+    setActiveOverId((event.over?.id as string) ?? null);
+  }, []);
+
   // Handle drag end
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over } = event;
+    const activeIssue = active.data.current?.issue as Issue | undefined;
+    const overIssue = issues.find((issue) => issue.id === over?.id || issue.identifier === over?.id);
+
+    if (activeIssue && overIssue && activeIssue.id !== overIssue.id) {
+      const activeStatus = STATUS_LABELS[activeIssue.status] as CanonicalState | undefined;
+      const overStatus = STATUS_LABELS[overIssue.status] as CanonicalState | undefined;
+      if (activeStatus && activeStatus === overStatus) {
+        setColumnOrderOverrides((prev) => {
+          const sourceOrder = prev[activeStatus] ?? issues
+            .filter((issue) => STATUS_LABELS[issue.status] === activeStatus)
+            .map((issue) => issue.identifier);
+          const nextOrder = sourceOrder.filter((id) => id !== activeIssue.identifier);
+          const overIndex = nextOrder.indexOf(overIssue.identifier);
+          if (overIndex === -1) return prev;
+          nextOrder.splice(overIndex, 0, activeIssue.identifier);
+          return { ...prev, [activeStatus]: nextOrder };
+        });
+      }
+    }
+
     setActiveDragIssue(null);
     setActiveDragStatus(null);
-
-    if (!over) return;
-
-    const issueId = active.id as string;
-    const targetStatus = over.id as CanonicalState;
-
-    const issue = issues?.find(i => i.id === issueId);
-    if (!issue) return;
-
-    const currentStatus = STATUS_LABELS[issue.status] as CanonicalState;
-
-    // No change
-    if (currentStatus === targetStatus) return;
-
-    // Check for active agents
-    const issueIdLower = issue.identifier.toLowerCase();
-    const hasActiveAgent = agents.some(
-      a => a.issueId?.toLowerCase() === issueIdLower && a.status !== 'dead'
-    );
-
-    if (hasActiveAgent) {
-      setAgentWarningDialog({ open: true, issue, targetStatus });
-      return;
-    }
-
-    // Check if moving to done
-    if (targetStatus === 'done') {
-      setSyncPromptDialog({ open: true, issue });
-      return;
-    }
-
-    // Proceed with move
-    showUndoNotification(issue.identifier, currentStatus, targetStatus);
-    moveStatusMutation.mutate({ issueId: issue.identifier, targetStatus });
-  }, [issues, agents, moveStatusMutation, showUndoNotification]);
-  */
+    setActiveOverId(null);
+  }, [issues]);
 
   // Confirm agent warning
   const confirmAgentMove = useCallback(() => {
@@ -1317,7 +1459,6 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
     }
   }, [syncPromptDialog, moveStatusMutation, showUndoNotification, agents, queryClient]);
 
-  /* Drop animation config disabled pending rework
   const dropAnimation: DropAnimation = {
     sideEffects: defaultDropAnimationSideEffects({
       styles: {
@@ -1327,7 +1468,6 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
       },
     }),
   };
-  */
 
   // Fetch costs for all issues
   const { data: issueCosts = {}, isLoading: costsLoading } = useQuery({
@@ -1423,6 +1563,8 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
 
   const allExpanded = collapsedFeatures.size === 0;
 
+  const issueWorkAgentsById = useMemo(() => getIssueWorkAgentMap(agents), [agents]);
+
   // Group by labels for list view - MUST be before any conditional returns (Rules of Hooks)
   const groupedByLabels = useMemo(() => groupByLabels(filteredIssues), [filteredIssues]);
   const groupedByProject = useMemo(() => groupByProject(filteredIssues), [filteredIssues]);
@@ -1441,29 +1583,21 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
   };
 
 
-  const grouped = groupByStatus(filteredIssues, includeCompleted);
+  const grouped = useMemo(() => groupByStatus(filteredIssues, includeCompleted), [filteredIssues, includeCompleted]);
 
-  // Fetch planning state for all Todo issues so we can sort
-  // "ready to start" items to the top and pass full state to cards (avoids per-card fan-out).
-  const todoPlanningStates = useQueries({
-    queries: (grouped.todo ?? []).map(issue => ({
-      queryKey: ['planning-state', issue.identifier],
-      queryFn: async () => {
-        const res = await fetch(`/api/issues/${issue.identifier}/planning-state`);
-        if (!res.ok) return { hasPlan: false, hasBeads: false, beadsCount: 0, planningComplete: false };
-        return res.json() as Promise<PlanningState>;
-      },
-      staleTime: 30000,
-    })),
-  });
-
+  // Planning-state is embedded in each issue from the /api/issues response
+  // (computed server-side via cheap filesystem checks). No per-card fetches needed.
   const planningStateById = useMemo(() => {
     const map: Record<string, PlanningState> = {};
-    (grouped.todo ?? []).forEach((issue, i) => {
-      map[issue.identifier] = todoPlanningStates[i]?.data ?? { hasPlan: false, hasBeads: false, beadsCount: 0, planningComplete: false };
-    });
+    for (const issue of filteredIssues) {
+      map[issue.identifier] = {
+        hasPlan: issue.hasPlan ?? false,
+        hasBeads: issue.hasBeads ?? false,
+        planningComplete: issue.planningComplete ?? false,
+      };
+    }
     return map;
-  }, [grouped.todo, todoPlanningStates]);
+  }, [filteredIssues]);
 
   // Sort Todo: planning-complete first, then updatedAt desc
   const sortedGrouped = useMemo(() => {
@@ -1476,8 +1610,29 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
         return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
       });
     }
+
+    for (const status of Object.keys(result)) {
+      const order = columnOrderOverrides[status];
+      if (!order) continue;
+      const rank = new Map(order.map((id, index) => [id, index]));
+      result[status] = [...result[status]].sort((a, b) => {
+        const aRank = rank.get(a.identifier) ?? Number.MAX_SAFE_INTEGER;
+        const bRank = rank.get(b.identifier) ?? Number.MAX_SAFE_INTEGER;
+        if (aRank !== bRank) return aRank - bRank;
+        return 0;
+      });
+    }
+
     return result;
-  }, [grouped, planningStateById]);
+  }, [columnOrderOverrides, grouped, planningStateById]);
+
+  const kanbanIssueIds = useMemo(() => {
+    if (cycleFilter === 'all' || cycleFilter === 'backlog' || cycleFilter === 'canceled') return [];
+    return STATUS_ORDER
+      .filter((status) => status !== 'backlog')
+      .flatMap((status) => sortedGrouped[status].map((issue) => issue.identifier));
+  }, [cycleFilter, sortedGrouped]);
+  const stackHealthByIssue = useWorkspaceStackHealthQuery(kanbanIssueIds).data?.workspaces ?? {};
 
   return (
     <div className="space-y-4">
@@ -1567,8 +1722,8 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                     isExplicitlySelected
                       ? 'bg-accent text-foreground border-foreground/20'
                       : selectedProjects.size === 0
-                        ? 'bg-surface-raised text-foreground/70 border-foreground/15 hover:bg-accent hover:text-foreground hover:border-foreground/25'
-                        : 'bg-surface-raised text-muted-foreground border-foreground/10 hover:border-foreground/20 hover:text-foreground opacity-50'
+                        ? 'bg-card text-foreground/70 border-foreground/15 hover:bg-accent hover:text-foreground hover:border-foreground/25'
+                        : 'bg-card text-muted-foreground border-foreground/10 hover:border-foreground/20 hover:text-foreground opacity-50'
                   }`}
                   title={isExplicitlySelected ? `Remove ${project.name} filter` : `Filter to ${project.name}`}
                 >
@@ -1596,12 +1751,12 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
       {cycleFilter === 'all' ? (
         <div className="space-y-6 overflow-y-auto pb-4">
           {Object.entries(groupedByLabels).map(([label, labelIssues]) => (
-            <div key={label} className="bg-surface-raised rounded-lg">
-              <div className="px-4 py-3 border-b border-divider">
+            <div key={label} className="bg-card rounded-lg">
+              <div className="px-4 py-3 border-b border-border">
                 <div className="flex items-center gap-2">
                   <Tag className="w-4 h-4 text-primary" />
-                  <h3 className="font-semibold text-content">{label}</h3>
-                  <span className="text-sm text-content-subtle">({labelIssues.length})</span>
+                  <h3 className="font-semibold text-foreground">{label}</h3>
+                  <span className="text-sm text-muted-foreground">({labelIssues.length})</span>
                 </div>
               </div>
               <div className="divide-y divide-divider">
@@ -1609,13 +1764,14 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                   <ListIssueRow
                     key={issue.id}
                     issue={issue}
+                    issueWorkAgentsById={issueWorkAgentsById}
                     agents={agents}
                     specialists={specialists}
                     issueCosts={issueCosts}
                     costsLoading={costsLoading}
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
-                    onPlan={setPlanDialogIssue}
+                    onPlan={openPlanDialog}
                     isBulkSelected={bulkSelection.isSelected(issue.identifier)}
                     onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
@@ -1628,15 +1784,15 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
         /* Backlog - List View (grouped by project) */
         <div className="space-y-6 overflow-y-auto pb-4">
           {groupedByProject.map((group) => (
-            <div key={group.name} className="bg-surface-raised rounded-lg">
-              <div className="px-4 py-3 border-b border-divider">
+            <div key={group.name} className="bg-card rounded-lg">
+              <div className="px-4 py-3 border-b border-border">
                 <div className="flex items-center gap-2">
                   <span
                     className="w-3 h-3 rounded-full shrink-0"
                     style={{ backgroundColor: group.color || '#6b7280' }}
                   />
-                  <h3 className="font-semibold text-content">{group.name}</h3>
-                  <span className="text-sm text-content-subtle">({group.issues.length})</span>
+                  <h3 className="font-semibold text-foreground">{group.name}</h3>
+                  <span className="text-sm text-muted-foreground">({group.issues.length})</span>
                 </div>
               </div>
               <div className="divide-y divide-divider">
@@ -1644,13 +1800,14 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                   <ListIssueRow
                     key={issue.id}
                     issue={issue}
+                    issueWorkAgentsById={issueWorkAgentsById}
                     agents={agents}
                     specialists={specialists}
                     issueCosts={issueCosts}
                     costsLoading={costsLoading}
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
-                    onPlan={setPlanDialogIssue}
+                    onPlan={openPlanDialog}
                     isBulkSelected={bulkSelection.isSelected(issue.identifier)}
                     onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
@@ -1659,7 +1816,7 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
             </div>
           ))}
           {groupedByProject.length === 0 && (
-            <div className="text-center py-12 text-content-subtle">
+            <div className="text-center py-12 text-muted-foreground">
               No backlog items
             </div>
           )}
@@ -1668,12 +1825,12 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
         /* Canceled - List View (grouped by cancellation type) */
         <div className="space-y-6 overflow-y-auto pb-4">
           {groupedByCanceledType.map((group) => (
-            <div key={group.name} className="bg-surface-raised rounded-lg">
-              <div className="px-4 py-3 border-b border-divider">
+            <div key={group.name} className="bg-card rounded-lg">
+              <div className="px-4 py-3 border-b border-border">
                 <div className="flex items-center gap-2">
                   <X className="w-4 h-4 text-destructive-foreground" />
-                  <h3 className="font-semibold text-content">{group.name}</h3>
-                  <span className="text-sm text-content-subtle">({group.issues.length})</span>
+                  <h3 className="font-semibold text-foreground">{group.name}</h3>
+                  <span className="text-sm text-muted-foreground">({group.issues.length})</span>
                 </div>
               </div>
               <div className="divide-y divide-divider">
@@ -1681,13 +1838,14 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                   <ListIssueRow
                     key={issue.id}
                     issue={issue}
+                    issueWorkAgentsById={issueWorkAgentsById}
                     agents={agents}
                     specialists={specialists}
                     issueCosts={issueCosts}
                     costsLoading={costsLoading}
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
-                    onPlan={setPlanDialogIssue}
+                    onPlan={openPlanDialog}
                     isBulkSelected={bulkSelection.isSelected(issue.identifier)}
                     onBulkToggle={() => bulkSelection.toggle(issue.identifier)}
                   />
@@ -1696,24 +1854,34 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
             </div>
           ))}
           {groupedByCanceledType.length === 0 && (
-            <div className="text-center py-12 text-content-subtle">
+            <div className="text-center py-12 text-muted-foreground">
               No canceled issues
             </div>
           )}
         </div>
       ) : (
-        /* Kanban columns - DnD disabled pending rework (PAN-TODO) */
-        <div className="flex gap-4 overflow-hidden pb-4">
-          {STATUS_ORDER.filter(s => s !== 'backlog').map((status) => {
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCorners}
+          onDragStart={handleDragStart}
+          onDragOver={handleDragOver}
+          onDragEnd={handleDragEnd}
+        >
+          <div className="flex gap-4 overflow-hidden pb-4">
+            {STATUS_ORDER.filter(s => s !== 'backlog').map((status) => {
             const columnIssueIds = sortedGrouped[status].map(i => i.identifier);
             const selectedInColumn = columnIssueIds.filter(id => bulkSelection.isSelected(id));
             const allSelected = columnIssueIds.length > 0 && selectedInColumn.length === columnIssueIds.length;
             const someSelected = selectedInColumn.length > 0 && selectedInColumn.length < columnIssueIds.length;
 
             return (
-              <div key={status} className="flex-1 min-w-0">
-                <div className={`border-t-4 ${COLUMN_COLORS[status]} bg-surface-raised rounded-lg transition-colors`}>
-                  <div className="px-4 py-3 border-b border-divider bg-surface-raised">
+              <DroppableColumn key={status} status={status} activeDragStatus={activeDragStatus} overId={activeOverId} issueIds={sortedGrouped[status].map(i => i.id)}>
+                <div
+                  className="flex-1 min-w-0"
+                  data-testid={`kanban-column-${status.replace(/_/g, '-')}`}
+                >
+                  <div className={`border-t-4 ${COLUMN_COLORS[status]} bg-card rounded-lg transition-colors`}>
+                  <div className="px-4 py-3 border-b border-border bg-card">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
                         <input
@@ -1729,23 +1897,25 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                               bulkSelection.selectAll(columnIssueIds);
                             }
                           }}
-                          className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
+                          className="w-4 h-4 rounded border-border text-primary focus:ring-primary cursor-pointer shrink-0"
                           aria-label={`Select all ${COLUMN_TITLES[status]}`}
                         />
-                        <h3 className="font-semibold text-content">{COLUMN_TITLES[status]}</h3>
+                        <h3 className="font-semibold text-foreground">{COLUMN_TITLES[status]}</h3>
                       </div>
-                      <span className="text-sm text-content-subtle">{sortedGrouped[status].length}</span>
+                      <span className="text-sm text-muted-foreground">{sortedGrouped[status].length}</span>
                     </div>
                   </div>
                   <ColumnContent
                     issues={sortedGrouped[status]}
+                    issueWorkAgentsById={issueWorkAgentsById}
                     agents={agents}
                     specialists={specialists}
                     issueCosts={issueCosts}
                     costsLoading={costsLoading}
                     selectedIssue={selectedIssue}
                     onSelectIssue={onSelectIssue}
-                    onPlan={setPlanDialogIssue}
+                    onOpenIssue={openIssue}
+                    onPlan={openPlanDialog}
                     onViewBeads={setBeadsDialogIssue}
                     onViewVBrief={setVbriefDialogIssue}
                     collapsedFeatures={collapsedFeatures}
@@ -1753,12 +1923,19 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
                     bulkSelectedIds={bulkSelection.selectedIds}
                     onBulkToggle={bulkSelection.toggle}
                     planningStateById={planningStateById}
+                    workspaceByIssueId={stackHealthByIssue}
                   />
+                  {/* TODO(PAN-1242): + New issue column footer button — see PRD §4.7.6 */}
+                  </div>
                 </div>
-              </div>
+              </DroppableColumn>
             );
           })}
-        </div>
+          </div>
+          <DragOverlay dropAnimation={dropAnimation}>
+            {activeDragIssue ? <DragOverlayCard issue={activeDragIssue} /> : null}
+          </DragOverlay>
+        </DndContext>
       )}
 
       {/* Undo Toast */}
@@ -1789,12 +1966,17 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
         <PlanDialog
           issue={planDialogIssue}
           isOpen={true}
-          onClose={() => setPlanDialogIssue(null)}
+          onClose={() => {
+            setPlanDialogIssue(null);
+            setPlanDialogAutoStart(false);
+          }}
           onComplete={async () => {
             setPlanDialogIssue(null);
+            setPlanDialogAutoStart(false);
             await refreshDashboardState(queryClient);
           }}
           onTerminalReleased={() => onPlanDialogChange?.(null)}
+          autoStart={planDialogAutoStart}
         />
       )}
 
@@ -1843,12 +2025,14 @@ export function KanbanBoard({ selectedIssue: externalSelectedIssue, onSelectIssu
 // ColumnContent — renders issues with Rally hierarchy grouping
 function ColumnContent({
   issues,
+  issueWorkAgentsById,
   agents,
   specialists,
   issueCosts,
   costsLoading,
   selectedIssue,
   onSelectIssue,
+  onOpenIssue,
   onPlan,
   onViewBeads,
   onViewVBrief,
@@ -1857,15 +2041,19 @@ function ColumnContent({
   bulkSelectedIds,
   onBulkToggle,
   planningStateById,
+  workspaceByIssueId,
 }: {
   issues: Issue[];
+  issueWorkAgentsById: Map<string, Agent[]>;
   agents: Agent[];
-  specialists: SpecialistAgent[];
+  /** PAN-1048 — role-tagged agents (review / test / ship). */
+  specialists: Agent[];
   issueCosts: Record<string, IssueCost>;
   costsLoading?: boolean;
   selectedIssue: string | null | undefined;
   onSelectIssue: (id: string | null) => void;
-  onPlan: (issue: Issue) => void;
+  onOpenIssue: (id: string) => void;
+  onPlan: (issue: Issue, autoStart?: boolean) => void;
   onViewBeads: (issue: Issue) => void;
   onViewVBrief?: (issue: Issue) => void;
   collapsedFeatures: Set<string>;
@@ -1873,6 +2061,7 @@ function ColumnContent({
   bulkSelectedIds?: Set<string>;
   onBulkToggle?: (issueId: string) => void;
   planningStateById?: Record<string, PlanningState>;
+  workspaceByIssueId?: Record<string, WorkspaceData>;
 }) {
   // Check if any Rally issues with hierarchy exist
   const hasRallyHierarchy = issues.some(i => i.artifactType?.includes('PortfolioItem'));
@@ -1880,43 +2069,43 @@ function ColumnContent({
 
   const renderIssueCard = (issue: Issue) => {
     const issueIdLower = issue.identifier.toLowerCase();
-    const workAgent = agents.find(
-      (a) => a.issueId?.toLowerCase() === issueIdLower && a.agentPhase !== 'planning'
-    );
+    const workAgents = issueWorkAgentsById.get(issueIdLower) ?? [];
+    const workAgent = workAgents[0];
     const planningAgent = agents.find(
-      (a) => a.issueId?.toLowerCase() === issueIdLower && a.agentPhase === 'planning'
+      (a) => a.issueId?.toLowerCase() === issueIdLower && a.id?.startsWith('planning-')
     );
     const issueSpecialists = specialists.filter(
-      (s) => s.currentIssue?.toLowerCase() === issueIdLower
+      (s) => s.issueId?.toLowerCase() === issueIdLower && s.status !== 'stopped'
     );
 
     return (
-      <IssueCard
-        key={issue.id}
-        issue={issue}
+      <DraggableCardWrapper key={issue.id} issue={issue}>
+        <IssueCard
+          issue={issue}
         workAgent={workAgent}
+        workAgents={workAgents}
         planningAgent={planningAgent}
         specialists={issueSpecialists}
         cost={issueCosts[issue.identifier.toLowerCase()]}
         costsLoading={costsLoading}
         isSelected={selectedIssue === issue.identifier}
-        onSelect={() => onSelectIssue(
-          selectedIssue === issue.identifier ? null : issue.identifier
-        )}
-        onPlan={() => onPlan(issue)}
+        onSelect={() => onOpenIssue(issue.identifier)}
+        onPlan={(autoStart) => onPlan(issue, autoStart)}
         onViewBeads={(i) => onViewBeads(i)}
         onViewVBrief={onViewVBrief ? (i) => onViewVBrief(i) : undefined}
         isBulkSelected={bulkSelectedIds?.has(issue.identifier)}
         onBulkToggle={onBulkToggle ? () => onBulkToggle(issue.identifier) : undefined}
         planningState={planningStateById?.[issue.identifier]}
-      />
+          workspace={workspaceByIssueId?.[issue.identifier.toUpperCase()]}
+        />
+      </DraggableCardWrapper>
     );
   };
 
   if (issues.length === 0) {
     return (
       <div className="p-2 space-y-2 max-h-[calc(100vh-220px)] overflow-y-auto">
-        <div className="text-center text-content-muted py-8 text-sm">
+        <div className="text-center text-muted-foreground py-8 text-sm">
           No issues
         </div>
       </div>
@@ -1951,12 +2140,24 @@ function ColumnContent({
             childCount={group.children.length}
             isExpanded={isExpanded}
             onToggle={() => onToggleFeature(feature.identifier)}
+            isSelected={selectedIssue === feature.identifier}
+            onSelect={() => onSelectIssue(
+              selectedIssue === feature.identifier ? null : feature.identifier
+            )}
+            onPlan={() => onPlan(feature)}
+            onViewBeads={() => onViewBeads(feature)}
+            onViewVBrief={onViewVBrief ? () => onViewVBrief(feature) : undefined}
+            planningState={planningStateById?.[feature.identifier]}
           >
             {group.children.map(child => (
               <CompactChildCard
                 key={child.id}
                 issue={child}
                 agents={agents}
+                isSelected={selectedIssue === child.identifier}
+                onSelect={() => onSelectIssue(
+                  selectedIssue === child.identifier ? null : child.identifier
+                )}
               />
             ))}
           </FeatureCard>
@@ -1966,17 +2167,20 @@ function ColumnContent({
   );
 }
 
-/* DnD components disabled pending rework
 // DroppableColumn component
-function DroppableColumn({ status, children }: { status: CanonicalState; children: React.ReactNode }) {
+export function DroppableColumn({ status, activeDragStatus, overId, issueIds, children }: { status: CanonicalState; activeDragStatus?: CanonicalState | null; overId?: string | null; issueIds?: string[]; children: React.ReactNode }) {
   const { isOver, setNodeRef } = useDroppable({
     id: status,
   });
 
+  const isOverColumn = isOver || (overId !== undefined && overId !== null && (overId === status || issueIds?.includes(overId) === true));
+  const isBlocked = isOverColumn && activeDragStatus !== undefined && activeDragStatus !== null && activeDragStatus !== status;
+
   return (
     <div
       ref={setNodeRef}
-      className={`flex-1 min-w-0 transition-all ${isOver ? 'scale-[1.02]' : ''}`}
+      data-testid={`droppable-column-${status}`}
+      className={`flex-1 min-w-0 transition-all ${isBlocked ? 'cursor-not-allowed opacity-60' : isOverColumn ? 'scale-[1.02]' : ''}`}
     >
       {children}
     </div>
@@ -1990,10 +2194,18 @@ interface DraggableCardWrapperProps {
 }
 
 function DraggableCardWrapper({ issue, children }: DraggableCardWrapperProps) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+  const { attributes, listeners, setNodeRef: setDraggableNodeRef, transform, isDragging } = useDraggable({
     id: issue.id,
     data: { issue },
   });
+  const { setNodeRef: setDroppableNodeRef } = useDroppable({
+    id: issue.id,
+    data: { issue },
+  });
+  const setNodeRef = useCallback((node: HTMLDivElement | null) => {
+    setDraggableNodeRef(node);
+    setDroppableNodeRef(node);
+  }, [setDraggableNodeRef, setDroppableNodeRef]);
 
   const style = transform
     ? {
@@ -2021,15 +2233,14 @@ interface DragOverlayCardProps {
 
 function DragOverlayCard({ issue }: DragOverlayCardProps) {
   return (
-    <div className="bg-surface-overlay rounded-lg p-3 border-l-4 border-l-blue-500 shadow-2xl rotate-2 scale-105 opacity-90">
+    <div className="bg-popover rounded-lg p-3 border-l-4 border-l-blue-500 shadow-2xl rotate-2 scale-105 opacity-90">
       <div className="flex items-center gap-2">
-        <span className="text-content-subtle text-sm">{issue.identifier}</span>
+        <span className="text-muted-foreground text-sm">{issue.identifier}</span>
       </div>
-      <p className="text-sm text-content mt-1 line-clamp-2">{issue.title}</p>
+      <p className="text-sm text-foreground mt-1 line-clamp-2">{issue.title}</p>
     </div>
   );
 }
-*/
 
 // Agent Warning Dialog
 interface AgentWarningDialogProps {
@@ -2045,26 +2256,26 @@ function AgentWarningDialog({ isOpen, onClose, onConfirm, issue }: AgentWarningD
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-surface-raised rounded-xl shadow-2xl w-full max-w-md mx-4 p-6">
+      <div className="relative bg-card rounded-xl shadow-2xl w-full max-w-md mx-4 p-6">
         <div className="flex items-start gap-4">
           <div className="p-2 badge-bg-warning rounded-lg">
             <AlertTriangle className="w-6 h-6 text-warning-foreground" />
           </div>
           <div className="flex-1">
-            <h3 className="text-lg font-semibold text-content mb-2">
+            <h3 className="text-lg font-semibold text-foreground mb-2">
               Active Agent Warning
             </h3>
-            <p className="text-content-body text-sm mb-4">
+            <p className="text-foreground text-sm mb-4">
               <strong>{issue.identifier}</strong> has an active agent working on it.
               Moving this issue may disrupt the agent's work.
             </p>
-            <p className="text-content-subtle text-xs mb-6">
+            <p className="text-muted-foreground text-xs mb-6">
               Are you sure you want to proceed?
             </p>
             <div className="flex gap-3 justify-end">
               <button
                 onClick={onClose}
-                className="px-4 py-2 text-content-subtle hover:text-content transition-colors text-sm"
+                className="px-4 py-2 text-muted-foreground hover:text-foreground transition-colors text-sm"
               >
                 Cancel
               </button>
@@ -2102,48 +2313,48 @@ function SyncPromptDialog({ isOpen, onClose, onSync, issue }: SyncPromptDialogPr
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-surface-raised rounded-xl shadow-2xl w-full max-w-md mx-4 p-6">
+      <div className="relative bg-card rounded-xl shadow-2xl w-full max-w-md mx-4 p-6">
         <div className="flex items-start gap-4">
           <div className="p-2 badge-bg-success rounded-lg">
             <Check className="w-6 h-6 text-success-foreground" />
           </div>
           <div className="flex-1">
-            <h3 className="text-lg font-semibold text-content mb-2">
+            <h3 className="text-lg font-semibold text-foreground mb-2">
               Move to Done
             </h3>
-            <p className="text-content-body text-sm mb-4">
+            <p className="text-foreground text-sm mb-4">
               You're moving <strong>{issue.identifier}</strong> to Done.
             </p>
 
             {/* Cleanup options */}
-            <div className="space-y-2 mb-4 p-3 bg-surface-overlay/50 rounded-lg">
-              <label className="flex items-center gap-2 text-sm text-content-body cursor-pointer">
+            <div className="space-y-2 mb-4 p-3 bg-popover/50 rounded-lg">
+              <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
                 <input
                   type="checkbox"
                   checked={cleanupWorkspace}
                   onChange={(e) => setCleanupWorkspace(e.target.checked)}
-                  className="rounded border-divider-strong bg-surface-overlay text-success focus:ring-ring"
+                  className="rounded border-border bg-popover text-success focus:ring-ring"
                 />
                 Clean up workspace
               </label>
-              <label className="flex items-center gap-2 text-sm text-content-body cursor-pointer">
+              <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
                 <input
                   type="checkbox"
                   checked={stopAgents}
                   onChange={(e) => setStopAgents(e.target.checked)}
-                  className="rounded border-divider-strong bg-surface-overlay text-success focus:ring-ring"
+                  className="rounded border-border bg-popover text-success focus:ring-ring"
                 />
                 Stop running agents
               </label>
             </div>
 
-            <p className="text-content-subtle text-xs mb-4">
+            <p className="text-muted-foreground text-xs mb-4">
               Sync status change to {trackerName}?
             </p>
             <div className="flex gap-3 justify-end">
               <button
                 onClick={() => onSync(false, { cleanupWorkspace, stopAgents })}
-                className="px-4 py-2 text-content-subtle hover:text-content transition-colors text-sm"
+                className="px-4 py-2 text-muted-foreground hover:text-foreground transition-colors text-sm"
               >
                 Shadow Only
               </button>
@@ -2173,8 +2384,8 @@ function UndoToast({ isVisible, onUndo, onClose }: UndoToastProps) {
 
   return (
     <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
-      <div className="bg-surface-raised border border-divider rounded-lg shadow-xl px-4 py-3 flex items-center gap-4">
-        <span className="text-sm text-content-body">Issue moved</span>
+      <div className="bg-card border border-border rounded-lg shadow-xl px-4 py-3 flex items-center gap-4">
+        <span className="text-sm text-foreground">Issue moved</span>
         <button
           onClick={onUndo}
           className="flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
@@ -2184,7 +2395,7 @@ function UndoToast({ isVisible, onUndo, onClose }: UndoToastProps) {
         </button>
         <button
           onClick={onClose}
-          className="text-content-muted hover:text-content-subtle"
+          className="text-muted-foreground hover:text-muted-foreground"
         >
           <X className="w-4 h-4" />
         </button>
@@ -2198,16 +2409,16 @@ function BeadsDialog({ issue, onClose }: { issue: Issue; onClose: () => void }) 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-surface-raised rounded-xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-hidden flex flex-col">
+      <div className="relative bg-card rounded-xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-hidden flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-divider">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div className="flex items-center gap-2">
             <List className="w-5 h-5 text-success-foreground" />
-            <h2 className="font-semibold text-content">Tasks: {issue.identifier}</h2>
+            <h2 className="font-semibold text-foreground">Tasks: {issue.identifier}</h2>
           </div>
           <button
             onClick={onClose}
-            className="p-1 text-content-subtle hover:text-content hover:bg-surface-overlay rounded transition-colors"
+            className="p-1 text-muted-foreground hover:text-foreground hover:bg-popover rounded transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -2251,7 +2462,7 @@ export function DivergedBadge({ issueIdentifier, stuckReason, stuckDetails }: { 
         <XCircle className="w-3 h-3" />
         Diverged
         <button
-          className="ml-1 underline text-red-200 hover:text-white text-xs leading-none"
+          className="ml-1 underline text-red-200 hover:text-foreground text-xs leading-none"
           onClick={async (e) => {
             e.stopPropagation();
             setUnstickError(null);
@@ -2315,11 +2526,19 @@ export function DivergedBadge({ issueIdentifier, stuckReason, stuckDetails }: { 
  * endpoint, which skips the git-safe-state check for this reason and opens a
  * fresh recovery cycle.
  */
-export function ReviewInfraStuckBadge({ issueIdentifier, retries }: { issueIdentifier: string; retries: number }) {
+export function ReviewInfraStuckBadge({ issueIdentifier, retries, recoveryStartedAt }: { issueIdentifier: string; retries: number; recoveryStartedAt?: string }) {
   const [unstickError, setUnstickError] = useState<string | null>(null);
+
+  const recoveryAge = recoveryStartedAt
+    ? Math.floor((Date.now() - new Date(recoveryStartedAt).getTime()) / 60_000)
+    : undefined;
+  const recoveryAgeLabel = recoveryAge != null
+    ? recoveryAge >= 60 ? `${Math.floor(recoveryAge / 60)}h ${recoveryAge % 60}m` : `${recoveryAge}m`
+    : undefined;
 
   const titleText =
     `Review infrastructure failed after ${retries} retries (spawn/dispatch issue). ` +
+    (recoveryAgeLabel ? `Recovery cycle running for ${recoveryAgeLabel}. ` : '') +
     `Parallel review is paused — click Retry to open a fresh recovery cycle.`;
 
   return (
@@ -2329,9 +2548,9 @@ export function ReviewInfraStuckBadge({ issueIdentifier, retries }: { issueIdent
         title={titleText}
       >
         <XCircle className="w-3 h-3" />
-        Review stuck
+        Review stuck{recoveryAgeLabel && <span className="text-amber-400/80 ml-0.5">({recoveryAgeLabel})</span>}
         <button
-          className="ml-1 underline text-amber-100 hover:text-white text-xs leading-none"
+          className="ml-1 underline text-amber-100 hover:text-foreground text-xs leading-none"
           onClick={async (e) => {
             e.stopPropagation();
             setUnstickError(null);
@@ -2450,6 +2669,7 @@ export function DeaconIgnoreButton({
           disabled={busy}
           className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold uppercase tracking-wide bg-purple-900/70 text-purple-100 border border-purple-400/60 hover:bg-purple-800/80 disabled:opacity-60"
           title={reason ? `Deacon paused: ${reason} — click to resume` : 'Deacon paused — click to resume patrol for this issue'}
+          data-testid={`card-pause-deacon-${issueIdentifier}`}
         >
           <Pause className="w-3 h-3" />
           Deacon Paused
@@ -2465,8 +2685,9 @@ export function DeaconIgnoreButton({
       <button
         onClick={toggle}
         disabled={busy}
-        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold bg-surface-overlay text-muted-foreground border border-white/10 hover:bg-purple-900/40 hover:text-purple-100 hover:border-purple-500/50 disabled:opacity-60"
+        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold bg-popover text-muted-foreground border border-white/10 hover:bg-purple-900/40 hover:text-purple-100 hover:border-purple-500/50 disabled:opacity-60"
         title="Tell Deacon to stop patrolling this issue (no re-dispatch, no pokes, no auto-completion)"
+        data-testid={`card-pause-deacon-${issueIdentifier}`}
       >
         <Pause className="w-3 h-3" />
         Pause Deacon
@@ -2479,1048 +2700,272 @@ export function DeaconIgnoreButton({
 interface PlanningState {
   hasPlan: boolean;
   hasBeads: boolean;
-  beadsCount: number;
   planningComplete: boolean;
 }
 
 interface IssueCardProps {
   issue: Issue;
   workAgent?: Agent;
+  workAgents?: Agent[];
   planningAgent?: Agent;
-  specialists?: SpecialistAgent[];
+  /** PAN-1048 — role-tagged agents (review / test / ship) for this issue. */
+  specialists?: Agent[];
   cost?: IssueCost;
   costsLoading?: boolean;
   isSelected: boolean;
   onSelect: () => void;
-  onPlan: () => void; // Lifted to parent to survive re-renders
+  onPlan: (autoStart?: boolean) => void; // Lifted to parent to survive re-renders
   onViewBeads?: (issue: Issue) => void;
   onViewVBrief?: (issue: Issue) => void;
   isBulkSelected?: boolean;
   onBulkToggle?: () => void;
   planningState?: PlanningState;
+  workspace?: WorkspaceData;
 }
 
-function IssueCard({ issue, workAgent, planningAgent, specialists = [], cost, costsLoading, isSelected, onSelect, onPlan, onViewBeads, onViewVBrief, isBulkSelected, onBulkToggle, planningState: planningStateProp }: IssueCardProps) {
-  const queryClient = useQueryClient();
-  const showAlert = useAlert();
-  const [showCostModal, setShowCostModal] = useState(false);
-  const cardRef = useRef<HTMLDivElement>(null);
-  const { prefs: _prefs } = useUIPreferences();
+const CARD_VERB_BY_PHASE: Partial<Record<PipelinePhase, 'WORK RUNNING' | 'REVIEW RUNNING' | 'SHIP RUNNING' | 'PLANNING' | 'INPUT' | 'READY TO MERGE' | 'MERGED' | 'CHANGES REQUESTED' | 'QUEUED FOR PLAN'>> = {
+  QUEUED_FOR_PLAN: 'QUEUED FOR PLAN',
+  PLANNING: 'PLANNING',
+  WORK_RUNNING: 'WORK RUNNING',
+  INPUT: 'INPUT',
+  REVIEW_RUNNING: 'REVIEW RUNNING',
+  SHIP_RUNNING: 'SHIP RUNNING',
+  CHANGES_REQUESTED: 'CHANGES REQUESTED',
+  STUCK: 'CHANGES REQUESTED',
+  READY_TO_MERGE: 'READY TO MERGE',
+  MERGED: 'MERGED',
+};
 
-  // Auto-scroll into view when selected via search
+export function IssueCard({ issue, workAgent, workAgents = [], planningAgent, specialists = [], cost, isSelected, onSelect, isBulkSelected, onBulkToggle, planningState, workspace: workspaceProp }: IssueCardProps) {
+  const [showCostModal, setShowCostModal] = useState(false);
+  const [actionOpenSignal, setActionOpenSignal] = useState(0);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const stackHealth = workspaceProp?.stackHealth;
+  const isStackUnhealthy = stackHealth?.healthy === false;
+  const issueActions = useIssueActions(issue.identifier);
+  const hasEnabledIssueAction = issueActions.all.some((view) => view.enabled);
+
   useEffect(() => {
     if (isSelected && cardRef.current) {
       cardRef.current.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
     }
   }, [isSelected]);
 
-  // Review status for merge-readiness badge
   const reviewStatus = useDashboardStore(selectReviewStatus(issue.identifier || ''));
   const isMerged = reviewStatus?.mergeStatus === 'merged' || issue.mergeStatus === 'merged' || issue.labels?.some(l => l.toLowerCase() === 'merged');
-  const isReadyToMerge = !isMerged && reviewStatus?.readyForMerge === true;
-
-  // Determine which agent is relevant based on issue status
-  const activeAgent = workAgent;
-  const isRunning = activeAgent && activeAgent.status !== 'dead' && activeAgent.status !== 'stopped';
-  // Show "Watch Planning" when planning agent is starting or has a live session
-  const isPlanningActive = planningAgent != null && (planningAgent.status === 'starting' || planningAgent.status === 'healthy' || planningAgent.status === 'warning' || planningAgent.status === 'stuck');
-
-  // For display in terminal viewer and INPUT badge, prefer work agent, fall back to planning agent
-  const agent = activeAgent || planningAgent;
-
-  // Compute agent idle duration for "inactive" badge
-  const agentIdleMinutes = (() => {
-    if (!agent?.lastActivity || !isRunning) return 0;
-    const ms = Date.now() - new Date(agent.lastActivity).getTime();
-    return Math.floor(ms / 60000);
-  })();
-  // Show inactive badge when agent hasn't acted in > 30 min (stuck threshold)
-  const isAgentIdle = agentIdleMinutes >= 30;
-
-  // Check if issue has "Review Ready" label (agent completed work)
-  // Don't show on terminal states — "ready for review" is meaningless once done/canceled
-  const canonical = STATUS_LABELS[issue.status] || 'backlog';
-  const isTerminal = isMerged || canonical === 'done' || canonical === 'canceled';
-  const isReviewReady = shouldShowReviewReadyBadge(issue, reviewStatus);
-  const hasPendingQuestion = hasActualPendingQuestion(agent);
-  const isPipelineStuck = !isTerminal && canonical === 'in_review' && isReviewPipelineStuck(reviewStatus);
-  const pipelineCallToAction = canonical === 'in_review' ? getPipelineCallToAction(reviewStatus) : null;
-  const phaseLabel =
-    canonical === 'backlog' ? 'Backlog' :
-    canonical === 'todo' ? 'Ready to start' :
-    canonical === 'in_progress' ? (isRunning ? 'Agent active' : 'Work paused') :
-    canonical === 'in_review' ? (isReadyToMerge ? 'Awaiting merge' : isPipelineStuck ? 'Needs recovery' : 'Review pipeline') :
-    canonical === 'done' ? 'Completed' :
-    'Canceled';
-  const cardTone = isPipelineStuck
-    ? 'from-destructive/12 via-destructive/5 to-transparent'
-    : isReadyToMerge
-      ? 'from-warning/20 via-warning/6 to-transparent'
-      : isRunning
-        ? 'from-primary/16 via-primary/6 to-transparent'
-        : 'from-surface-overlay/60 via-surface/40 to-transparent';
-  const actionBarClass = 'mt-3 flex items-center gap-2 flex-wrap rounded-xl border border-divider/70 bg-surface/80 px-2.5 py-2';
-
-  const priorityAccentColors: Record<number, string> = {
-    0: 'bg-border',
-    1: 'bg-destructive',
-    2: 'bg-warning',
-    3: 'bg-muted-foreground',
-    4: 'bg-border',
-  };
-
-  // Planning state — drives chip coloring + Generate Tasks affordance.
-  // Only fetched when this card has any chance of having a plan (anything past
-  // backlog where the agent could have produced one). We poll every 30s so the
-  // chip flips from red→green right after Generate Tasks runs.
-  // If parent passes planningState prop, skip the per-card fetch (avoids fan-out).
-  const planningStateQuery = useQuery({
-    queryKey: ['planning-state', issue.identifier],
-    queryFn: async () => {
-      const res = await fetch(`/api/issues/${issue.identifier}/planning-state`);
-      if (!res.ok) throw new Error('Failed to fetch planning state');
-      return res.json() as Promise<PlanningState>;
-    },
-    enabled: !!issue.identifier && !planningStateProp,
-    refetchInterval: 30000,
-    staleTime: 15000,
+  const isClosedNotMerged = reviewStatus?.mergeStatus === 'failed' || issue.mergeStatus === 'failed';
+  const isReadyToMerge = !isMerged && !isClosedNotMerged && reviewStatus?.readyForMerge === true;
+  const issueWorkAgents = workAgents.length > 0 ? workAgents : (workAgent ? [workAgent] : []);
+  const activeAgent = issueWorkAgents.find(isAgentSessionAttachable) ?? issueWorkAgents[0] ?? planningAgent;
+  const isRunning = issueWorkAgents.some(isAgentSessionAttachable);
+  const canonical = issue.state ?? STATUS_LABELS[issue.status] ?? 'backlog';
+  const issueActionPhase = deriveIssueActionPhase({
+    reviewStatus,
+    agent: activeAgent,
+    workspace: { exists: !!(workspaceProp?.path || issue.workspacePath) },
+    hasPlan: planningState?.hasPlan ?? issue.hasPlan ?? false,
+    hasBeads: planningState?.hasBeads ?? issue.hasBeads ?? false,
+    issueCanonicalState: canonical,
+    isMerged,
   });
-  const hasPlan = planningStateProp?.hasPlan ?? planningStateQuery.data?.hasPlan ?? false;
-  const beadsCount = planningStateProp?.beadsCount ?? planningStateQuery.data?.beadsCount ?? 0;
-  const planningComplete = planningStateProp?.planningComplete ?? planningStateQuery.data?.planningComplete ?? false;
-  const artifactLinks = (
-    <ArtifactLinks
-      issueId={issue.identifier || ''}
-      hasPlan={hasPlan}
-      beadsCount={beadsCount}
-      onViewBeads={() => onViewBeads && onViewBeads(issue)}
-      onViewVBrief={() => onViewVBrief && onViewVBrief(issue)}
-      variant="card"
-    />
-  );
+  const isPipelineStuck = issueActionPhase === 'STUCK';
+  const pinActionRow = isRunning || issueActionPhase === 'STUCK' || issueActionPhase === 'INPUT' || issueActionPhase === 'READY_TO_MERGE';
+  const cardVerb = CARD_VERB_BY_PHASE[issueActionPhase];
+  const cardVerbBadge =
+    canonical === 'verifying_on_main' ? <VerifyingOnMainBadge compact /> :
+    cardVerb ? <VerbBadge variant={cardVerb} /> :
+    null;
+  const beadProgressColor =
+    isReadyToMerge || isMerged || canonical === 'done' ? 'var(--success)' :
+    canonical === 'in_review' ? 'var(--warning)' :
+    canonical === 'in_progress' ? 'var(--info)' :
+    canonical === 'todo' ? 'var(--signal-review)' :
+    'var(--muted-foreground)';
+  const reviewSpecialists = specialists.filter((s) => s.role === 'review' && s.status !== 'stopped');
 
-  // Plan/See Plan chip — opens the planning dialog. Green "See Plan" when a
-  // plan already exists (clearer than "Re-plan" when the user is *continuing*
-  // an in-progress planning session, not starting over).
-  const planLabelExists = hasPlan || issue.labels?.some(l => l.toLowerCase() === 'planned');
-  const planChip = (
-    <button
-      data-testid={`action-plan-${issue.identifier}`}
-      onClick={(e) => { e.stopPropagation(); handlePlan(e); }}
-      className={`flex items-center gap-1 text-xs transition-colors ${
-        planLabelExists
-          ? 'text-success hover:text-success/80'
-          : 'text-muted-foreground hover:text-foreground'
-      }`}
-      title={planLabelExists ? 'See plan / continue planning' : 'Plan'}
-    >
-      <FileText className="w-3.5 h-3.5" />
-      {planLabelExists ? 'See Plan' : 'Plan'}
-    </button>
-  );
-
-  // Send message mutation
-  const [messageInput, setMessageInput] = useState('');
-  const [showMessageInput, setShowMessageInput] = useState(false);
-
-  const sendMessageMutation = useMutation({
-    mutationFn: async ({ agentId, message }: { agentId: string; message: string }) => {
-      const res = await fetch(`/api/agents/${agentId}/message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-      });
-      if (!res.ok) throw new Error('Failed to send message');
-      return res.json();
-    },
-    onSuccess: () => {
-      setMessageInput('');
-      setShowMessageInput(false);
-    },
-  });
-
-  const handleTell = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowMessageInput(!showMessageInput);
-  };
-
-  const handleSendMessage = (e: React.FormEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (agent && messageInput.trim()) {
-      sendMessageMutation.mutate({ agentId: agent.id, message: messageInput.trim() });
-    }
-  };
-
-  const [isStarting, setIsStarting] = useState(false);
-  const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const startAgentMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch('/api/agents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issueId: issue.identifier }),
-      });
-      if (!res.ok) {
-        // Handle non-JSON responses (e.g., Traefik 502 "Bad Gateway")
-        const text = await res.text();
-        let message = `Failed to start agent (${res.status})`;
-        try {
-          const data = JSON.parse(text);
-          message = data.error || message;
-        } catch {
-          message = text.length < 200 ? text : message;
-        }
-        throw new Error(message);
-      }
-      return res.json();
-    },
-    onSuccess: async () => {
-      setIsStarting(true);
-      if (startTimeoutRef.current) clearTimeout(startTimeoutRef.current);
-      startTimeoutRef.current = setTimeout(() => setIsStarting(false), 60000);
-      await refreshDashboardState(queryClient);
-    },
-    onError: (err: Error) => {
-      setIsStarting(false);
-      showAlert({ message: `Failed to start agent: ${err.message}`, variant: 'error' });
-    },
-  });
-
-  const [isResuming, setIsResuming] = useState(false);
-  const resumingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Clear transitional start/resume states once the agent is actually running, or after the safety valve
-  useEffect(() => {
-    if (isStarting && isRunning) {
-      setIsStarting(false);
-      if (startTimeoutRef.current) clearTimeout(startTimeoutRef.current);
-    }
-    if (isResuming && isRunning) {
-      setIsResuming(false);
-      if (resumingTimeoutRef.current) clearTimeout(resumingTimeoutRef.current);
-    }
-  }, [isStarting, isResuming, isRunning]);
-
-  const resumeSessionMutation = useMutation({
-    mutationFn: async () => {
-      const agentId = activeAgent?.id;
-      if (!agentId) throw new Error('No agent to resume');
-      const res = await fetch(`/api/agents/${agentId}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        let message = `Failed to resume session (${res.status})`;
-        try {
-          const data = JSON.parse(text);
-          message = data.error || message;
-        } catch {
-          message = text.length < 200 ? text : message;
-        }
-        throw new Error(message);
-      }
-      return res.json();
-    },
-    onSuccess: () => {
-      setIsResuming(true);
-      resumingTimeoutRef.current = setTimeout(() => setIsResuming(false), 60000);
-      refreshDashboardState(queryClient);
-    },
-    onError: (err: Error) => {
-      // If the agent is already running, the store snapshot is just stale — refresh it silently
-      if (err.message.includes('runtime=active') || err.message.includes('status=running')) {
-        setIsResuming(false);
-        refreshDashboardState(queryClient);
-        return;
-      }
-      showAlert({ message: `Failed to resume session: ${err.message}`, variant: 'error' });
-    },
-  });
-
-  const handleResumeSession = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    resumeSessionMutation.mutate();
-  };
-
-  // In Review card with stopped agent = "session lost" / needs recovery.
-  // Exclude agents that completed normally (runtimeState === 'completed') — those transitioned
-  // to in_review intentionally and don't need recovery.
-  const isSessionLost = !isRunning && !isResuming && activeAgent?.status === 'stopped'
-    && canonical === 'in_review'
-    && activeAgent?.runtimeState !== 'completed';
-
-  const startButtonRef = useRef<HTMLButtonElement | null>(null);
-
-  const handleStartAgent = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    startAgentMutation.mutate();
-  };
-
-  const handlePlan = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    onPlan();
-  };
-
-  // Deep wipe is now handled by the DeepWipeDialog component (PAN-461)
+  const agentSubText = activeAgent
+    ? (reviewSpecialists.length > 0 && activeAgent.role === 'review'
+      ? `${reviewSpecialists.length} reviewers · ${getFriendlyModelName(activeAgent.model)}`
+      : issue.beadCounts
+        ? `${getFriendlyModelName(activeAgent.model)} · bead ${issue.beadCounts.completed}/${issue.beadCounts.total}`
+        : getFriendlyModelName(activeAgent.model))
+    : '';
+  const trackerRef = issue.source === 'github'
+    ? `GitHub ${issue.identifier}`
+    : issue.source === 'linear'
+      ? `Linear ${issue.identifier}`
+      : issue.identifier;
 
   return (
-    <div
+    <IssueCardPrimitive
       ref={cardRef}
-      data-testid={`issue-card-${issue.identifier}`}
+      testId={`issue-card-${issue.identifier}`}
+      issueId={issue.identifier}
+      priority={issue.priority}
+      selected={isSelected}
+      bulkSelected={isBulkSelected}
+      stuckCard={isStackUnhealthy || isPipelineStuck}
+      mergeReadyCard={isReadyToMerge}
+      runningCard={isRunning}
+      unhealthyCard={isStackUnhealthy}
+      sessionLostCard={false}
       onClick={onSelect}
-      className={`group relative overflow-hidden rounded-2xl border cursor-pointer transition-all shadow-[0_6px_22px_rgba(0,0,0,0.08)] ${isSessionLost ? 'border-warning/50' : ''} ${
-        isSelected
-          ? 'ring-2 ring-warning/70 shadow-[0_12px_30px_rgba(245,158,11,0.18)]'
-          : isBulkSelected
-            ? 'border-primary/50 bg-primary/[0.03] shadow-[0_6px_22px_rgba(0,0,0,0.08)]'
-            : 'hover:-translate-y-0.5 border-divider/70 hover:border-divider-strong hover:shadow-[0_12px_28px_rgba(0,0,0,0.12)]'
-      } bg-[linear-gradient(145deg,var(--color-surface)_0%,rgba(255,255,255,0.03)_100%)]`}
+      onContextMenu={(event) => {
+        if (!hasEnabledIssueAction) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setActionOpenSignal((value) => value + 1);
+      }}
     >
-      <div className={`pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-br ${cardTone}`} />
-      <div
-        className={`absolute inset-y-0 left-0 w-1.5 ${
-          isPipelineStuck
-            ? 'bg-destructive'
-            : isReadyToMerge
-              ? 'bg-warning'
-              : isRunning
-                ? 'bg-primary'
-                : (priorityAccentColors[issue.priority] || 'bg-content-muted')
-        }`}
-      />
-
-      <div className="relative p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 flex-wrap">
-              {onBulkToggle && (
-                <input
-                  type="checkbox"
-                  checked={isBulkSelected || false}
-                  onChange={(e) => {
-                    e.stopPropagation();
-                    onBulkToggle();
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="w-4 h-4 rounded border-divider text-primary focus:ring-primary cursor-pointer shrink-0"
-                  aria-label={`Select ${issue.identifier}`}
-                />
-              )}
-              {issue.project && (
-                <span
-                  className="w-2 h-2 rounded-full shrink-0 shadow-[0_0_0_4px_rgba(255,255,255,0.05)]"
-                  style={{ backgroundColor: issue.project.color || '#6b7280' }}
-                  title={issue.project.name}
-                />
-              )}
-              <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-content-subtle">
-                {phaseLabel}
-              </span>
-              {issue.source === 'github' && (
-                <span title="GitHub Issue" className="inline-flex items-center">
-                  <Github className="w-3 h-3 text-content-subtle" />
-                </span>
-              )}
-              <a
-                href={issue.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => e.stopPropagation()}
-                className="inline-flex items-center gap-1 text-sm font-semibold text-content hover:text-primary"
-              >
-                <span>{issue.identifier}</span>
-                <ExternalLink className="w-3 h-3 opacity-50" />
-              </a>
-            </div>
-
-            <p className="mt-2 text-[15px] font-medium leading-5 text-content line-clamp-2">
-              {issue.title}
-            </p>
-
-            <div className="mt-3 flex items-center gap-2 flex-wrap">
-              {(issue.labels || [])
-                .filter((label) => typeof label === 'string' && !['review ready', 'needs-close-out', 'merged', 'closed-out'].includes(label.toLowerCase()))
-                .slice(0, 3)
-                .map((label) => (
-                  <span
-                    key={label}
-                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ${getLabelStyle(label)}`}
-                  >
-                    {label}
-                  </span>
-                ))}
-              {issue.assignee && (
-                <span className="inline-flex items-center gap-1 rounded-full border border-divider/70 bg-surface/80 px-2.5 py-1 text-[11px] text-content-subtle">
-                  <User className="w-3 h-3" />
-                  {issue.assignee.name.split(' ')[0]}
-                </span>
-              )}
-              {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) && (
-                <span
-                  className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ${
-                    (workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote'
-                      ? 'badge-bg-signal-cost text-signal-cost-foreground'
-                      : 'border border-divider/70 bg-surface/80 text-content-subtle'
-                  }`}
-                  title={(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? 'Running on remote VM (Fly.io)' : 'Running locally'}
-                >
-                  {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? (
-                    <Cloud className="w-3 h-3" />
-                  ) : (
-                    <Monitor className="w-3 h-3" />
-                  )}
-                  {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? 'Fly.io' : 'Local'}
-                </span>
-              )}
-            </div>
-
-            <div className="mt-3 flex items-center gap-2 flex-wrap">
-            {/* Project color indicator */}
-            {isRunning && (
-              <div className="flex gap-0.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" style={{ animationDelay: '300ms' }} />
-              </div>
-            )}
-            {(isStarting || isResuming) && (
-              <span className="inline-flex items-center gap-1 text-xs font-medium px-1.5 py-0.5 rounded badge-bg-primary text-primary-foreground">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                {isResuming ? 'Resuming…' : 'Starting…'}
-              </span>
-            )}
-            {isSessionLost && (
-              <span
-                className="inline-flex items-center gap-1 text-xs font-medium px-1.5 py-0.5 rounded badge-bg-warning text-warning-foreground"
-                title="Session lost — agent was running when the system stopped. Resume session to continue."
-              >
-                <span className="w-1.5 h-1.5 rounded-full bg-warning-foreground animate-pulse" />
-                Session lost
-              </span>
-            )}
-            {/* Agent attribution badges */}
-            {(() => {
-              const badges = [];
-              // Conflict detection: multiple agents working on same issue
-              const hasConflict = (!!workAgent && specialists.length > 0) ||
-                                  specialists.length > 1;
-
-              if (workAgent) {
-                badges.push({
-                  type: 'work' as const,
-                  name: 'work' // Don't show issue ID - it's already displayed in the card header
-                });
-              }
-              for (const spec of specialists) {
-                const specType = spec.name.replace('-agent', '') as 'review' | 'test' | 'merge';
-                badges.push({ type: specType, name: specType });
-              }
-
-              return badges.map((b, i) => (
-                <AgentBadge key={i} type={b.type} isConflict={hasConflict} />
-              ));
-            })()}
-            {/* Plan Failed badge - shown when planning agent spawn failed */}
-            {planningAgent?.status === 'failed' && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onPlan(); }}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-destructive text-destructive-foreground animate-pulse hover:bg-destructive/30 transition-colors cursor-pointer"
-                title={planningAgent.error ? `Planning failed: ${planningAgent.error}` : 'Planning agent failed to start — click to retry'}
-              >
-                <XCircle className="w-3 h-3" />
-                Plan Failed
-              </button>
-            )}
-            {/* Planning badge - clickable to watch the active planning session */}
-            {planningAgent && planningAgent.status !== 'stopped' && planningAgent.status !== 'failed' && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onPlan(); }}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-signal-review text-signal-review-foreground animate-pulse hover:bg-signal-review/30 transition-colors cursor-pointer"
-                title="Planning in progress — click to watch"
-              >
-                <Sparkles className="w-3 h-3" />
-                Planning
-              </button>
-            )}
-            {/* Planning Complete badge — planning done, waiting for user to start work agent */}
-            {planningComplete && !isRunning && !isTerminal && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-bold badge-bg-success text-success-foreground border badge-border-success uppercase tracking-wide"
-                title="Planning complete — click Start Agent to begin implementation"
-              >
-                <Sparkles className="w-3 h-3" />
-                Ready
-              </span>
-            )}
-            {/* Workspace location badge - shows for any agent with a workspace */}
-            {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) && (
-              <span
-                className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                  (workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote'
-                    ? 'badge-bg-signal-cost text-signal-cost-foreground'
-                    : 'bg-surface-raised text-muted-foreground border border-border'
-                }`}
-                title={(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? 'Running on remote VM (Fly.io)' : 'Running locally'}
-              >
-                {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? (
-                  <Cloud className="w-3 h-3" />
-                ) : (
-                  <Monitor className="w-3 h-3" />
-                )}
-                {(workAgent?.workspaceLocation || planningAgent?.workspaceLocation) === 'remote' ? 'Fly.io' : 'Local'}
-              </span>
-            )}
-            {/* Review Ready badge - prominent indicator that agent completed work */}
-            {isReviewReady && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success text-foreground animate-pulse"
-                title="Agent completed work - ready for human review"
-              >
-                <CheckCheck className="w-3 h-3" />
-                Ready
-              </span>
-            )}
-            {/* Awaiting Input badge - agent is waiting for user response */}
-            {!isTerminal && hasPendingQuestion && (
-              <span
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onPlan();
-                }}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-warning text-foreground animate-pulse cursor-pointer hover:bg-warning/90"
-                title={`Agent is waiting for user input - click to respond (${agent?.pendingQuestionCount || 1} question${(agent?.pendingQuestionCount || 1) > 1 ? 's' : ''})`}
-              >
-                <HelpCircle className="w-3 h-3" />
-                Input
-              </span>
-            )}
-            {isPipelineStuck && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-destructive text-foreground animate-pulse uppercase tracking-wide"
-                title="Pipeline is blocked by a failed review, test, rebase, or verification step. Use Recover to rerun the pipeline."
-              >
-                <AlertTriangle className="w-3 h-3" />
-                Stuck
-              </span>
-            )}
-            {pipelineCallToAction && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-warning text-warning-foreground border border-warning/40"
-                title={pipelineCallToAction.title}
-              >
-                <AlertCircle className="w-3 h-3" />
-                {pipelineCallToAction.label}
-              </span>
-            )}
-            {/* Lifecycle resolution badges (PAN-309) */}
-            {shouldShowAgentDoneBadge({
-              issueStatus: issue.status,
-              isTerminal,
-              isPipelineStuck,
-              resolution: agent?.resolution,
-              hasPendingQuestion,
-            }) && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success text-foreground"
-                title="Agent evidence shows work is complete — waiting for agent to call pan done"
-              >
-                <CheckCircle className="w-3 h-3" />
-                Done
-              </span>
-            )}
-            {!isTerminal && !isPipelineStuck && agent?.resolution === 'stuck' && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-destructive text-foreground animate-pulse"
-                title={`Agent appears stuck — no clear progress signal after ${agent.resolutionCount || 0} check(s). Consider sending a message.`}
-              >
-                <XCircle className="w-3 h-3" />
-                Stuck
-              </span>
-            )}
-            {!isTerminal && !isPipelineStuck && agent?.resolution === 'abandoned' && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-destructive text-foreground border border-yellow-500"
-                title="Deacon exhausted its poke budget — agent needs human attention"
-              >
-                <XCircle className="w-3 h-3" />
-                Abandoned
-              </span>
-            )}
-            {!isTerminal && !isPipelineStuck && agent?.resolution === 'needs_input' && !hasPendingQuestion && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-warning text-foreground animate-pulse"
-                title="Agent stopped because it needs human input or hit a blocker"
-              >
-                <AlertCircle className="w-3 h-3" />
-                Blocked
-              </span>
-            )}
-            {/* Compacting badge — shown when agent is compressing context */}
-            {isRunning && activeAgent?.runtimeState === 'compacting' && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-violet-900/60 text-violet-300 border border-violet-500/40 animate-pulse"
-                title="Agent is compressing its context window — messages sent now will be processed after compaction"
-              >
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Compacting
-              </span>
-            )}
-            {/* Idle badge — time-based health indicator. Shows when agent hasn't been active for 30+ min */}
-            {!isTerminal && isAgentIdle && agent?.resolution !== 'stuck' && agent?.resolution !== 'abandoned' && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-warning text-warning-foreground"
-                title={`Agent has not been active for ${agentIdleMinutes >= 60 ? `${Math.floor(agentIdleMinutes / 60)}h ${agentIdleMinutes % 60}m` : `${agentIdleMinutes}m`} — Deacon will poke it`}
-              >
-                <AlertTriangle className="w-3 h-3" />
-                {agentIdleMinutes >= 60 ? `${Math.floor(agentIdleMinutes / 60)}h idle` : `${agentIdleMinutes}m idle`}
-              </span>
-            )}
-            {/* Tracker vs Shadow state badges */}
-            {issue.source === 'rally' && <TrackerShadowBadges issue={issue} />}
-            {/* Difficulty badge */}
-            {(() => {
-              const difficulty = parseDifficultyLabel(issue.labels || []);
-              return difficulty ? <DifficultyBadge level={difficulty} /> : null;
-            })()}
-            {/* Ready to merge badge — yellow indicator when review+tests passed */}
-            {isReadyToMerge && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-bold bg-yellow-900/60 text-yellow-300 border border-yellow-500/40 uppercase tracking-wide"
-                title="Review and tests passed — ready for human merge approval"
-              >
-                <GitMerge className="w-3 h-3" />
-                Ready
-              </span>
-            )}
-            {/* Per-issue Deacon pause toggle — on every card, any state. */}
-            <DeaconIgnoreButton
-              issueIdentifier={issue.identifier || ''}
-              ignored={reviewStatus?.deaconIgnored === true}
-              reason={reviewStatus?.deaconIgnoredReason}
-            />
-            {/* PAN-794: review-infra breaker tripped — distinct copy/flow from DivergedBadge. */}
-            {reviewStatus?.stuck && reviewStatus.stuckReason === 'review_infrastructure_failure' && (
-              <ReviewInfraStuckBadge
-                issueIdentifier={issue.identifier || ''}
-                retries={reviewStatus.reviewRetryCount ?? 0}
-              />
-            )}
-            {/* Diverged / stuck badge — shown when gitPush threw MainDivergedError */}
-            {reviewStatus?.stuck && reviewStatus.stuckReason !== 'review_infrastructure_failure' && (
-              <DivergedBadge
-                issueIdentifier={issue.identifier || ''}
-                stuckReason={reviewStatus.stuckReason}
-                stuckDetails={reviewStatus.stuckDetails}
-              />
-            )}
-            {/* Merged badge — prominent indicator for verified merges on Done cards */}
-            {isMerged && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-success text-success-foreground uppercase tracking-wide"
-                title="Branch verified merged into main"
-              >
-                <GitMerge className="w-3 h-3" />
-                Merged
-              </span>
-            )}
-            {/* Needs close-out badge - amber indicator for reopened issues needing review */}
-            {issue.labels?.some(l => l.toLowerCase() === 'needs-close-out') && (
-              <span
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium badge-bg-warning text-warning-foreground"
-                title="Reopened for close-out review — verify this work is complete, then click Close Out"
-              >
-                <AlertTriangle className="w-3 h-3" />
-                Needs Review
-              </span>
-            )}
-            </div>
-          </div>
-
-          <div className="shrink-0">
-            {costsLoading && !cost && (
-              <span className="inline-block h-7 w-16 rounded-full bg-surface-overlay animate-pulse" />
-            )}
-            {cost && cost.totalCost > 0 && (
-              <button
-                onClick={(e) => { e.stopPropagation(); setShowCostModal(true); }}
-                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold cursor-pointer transition-all hover:ring-1 hover:ring-white/20 ${getCostColor(cost.totalCost)}`}
-                title="Click for cost breakdown"
-              >
-                <DollarSign className="w-3 h-3" />
-                {formatCost(cost.totalCost).slice(1)}
-              </button>
-            )}
-          </div>
-        </div>
-
-      {/* Action buttons for running agents */}
-      {isRunning && (
-        <div className={actionBarClass}>
-          {artifactLinks}
-          <button
-            onClick={handleTell}
-            className={`flex items-center gap-1 text-xs transition-colors ${
-              showMessageInput ? 'text-primary' : 'text-content-subtle hover:text-content'
-            }`}
-            title="Tell"
-          >
-            <MessageCircle className="w-3.5 h-3.5" />
-            Tell
-          </button>
-          {canonical === 'in_review' && !isTerminal && (
-            <RecoverButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
-          )}
-          <MergeButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
-          <ResetIssueButton issueId={issue.identifier} variant="card" issue={issue} />
-          {/* Model badge */}
-          {activeAgent && activeAgent.model && (
-            <span className="flex-1 text-center text-[10px] text-content-body font-medium">
-              {getFriendlyModelName(activeAgent.model)}
-            </span>
-          )}
-          <StopAgentButton agentId={agent?.id} variant="card" />
-        </div>
-      )}
-
-      {/* Message input for Tell */}
-      {showMessageInput && agent && (
-        <form onSubmit={handleSendMessage} className="mt-2" onClick={(e) => e.stopPropagation()}>
-          <div className="flex gap-2">
+      <div className="relative" style={{ padding: '12px 12px 10px' }}>
+        {/* Hover overlays */}
+        {onBulkToggle && (
+          <div className={`absolute top-2 left-2 transition-opacity z-10 ${isBulkSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
             <input
-              type="text"
-              value={messageInput}
-              onChange={(e) => setMessageInput(e.target.value)}
-              placeholder="Type a message..."
-              className="flex-1 bg-surface-raised text-content text-sm px-3 py-1.5 rounded border border-divider-strong focus:border-primary focus:outline-none"
-              autoFocus
+              type="checkbox"
+              checked={isBulkSelected || false}
+              onChange={(event) => {
+                event.stopPropagation();
+                onBulkToggle();
+              }}
+              onClick={(event) => event.stopPropagation()}
+              className="h-4 w-4 shrink-0 cursor-pointer rounded border-border text-primary focus:ring-primary"
+              aria-label={`Select ${issue.identifier}`}
             />
+          </div>
+        )}
+        {cost && cost.totalCost > 0 && (
+          <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
             <button
-              type="submit"
-              disabled={!messageInput.trim() || sendMessageMutation.isPending}
-              className="px-3 py-1.5 bg-primary text-foreground text-sm rounded hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+              type="button"
+              onClick={(event) => { event.stopPropagation(); setShowCostModal(true); }}
+              className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-semibold ${getCostColor(cost.totalCost)}`}
+              data-testid={`card-cost-${issue.identifier}`}
             >
-              {sendMessageMutation.isPending ? '...' : 'Send'}
+              <DollarSign className="h-3 w-3" />
+              {formatCost(cost.totalCost).slice(1)}
             </button>
           </div>
-        </form>
-      )}
+        )}
 
-      {/* Start/Plan buttons for backlog/todo items without running agent */}
-      {!isRunning && (STATUS_LABELS[issue.status] === 'backlog' || STATUS_LABELS[issue.status] === 'todo') && (
-        <div className={actionBarClass}>
-          {isPlanningActive ? (
-            <button
-              data-testid={`action-watch-planning-${issue.identifier}`}
-              onClick={handlePlan}
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors animate-pulse"
-              title="Watch Planning"
-            >
-              <Eye className="w-3.5 h-3.5" />
-            </button>
-          ) : (
-            planChip
-          )}
-          {planLabelExists && (
-            <>
-              {artifactLinks}
-              <button
-                ref={startButtonRef}
-                onClick={handleStartAgent}
-                disabled={startAgentMutation.isPending || isStarting}
-                className="flex items-center gap-1 text-xs font-semibold bg-success hover:bg-success/90 text-foreground transition-colors rounded px-2 py-1 disabled:opacity-50"
-                title={(startAgentMutation.isPending || isStarting) ? 'Starting...' : 'Start Agent'}
-              >
-                {(startAgentMutation.isPending || isStarting) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                <span>{(startAgentMutation.isPending || isStarting) ? 'Starting...' : 'Start Agent'}</span>
-              </button>
-            </>
-          )}
-          {STATUS_LABELS[issue.status] === 'todo' && <BacklogButton issue={issue} />}
-          {STATUS_LABELS[issue.status] === 'backlog' && <TodoButton issue={issue} />}
-        </div>
-      )}
-
-      {/* In Progress items without running agent */}
-      {!isRunning && STATUS_LABELS[issue.status] === 'in_progress' && (
-        <div className={actionBarClass}>
-          {isPlanningActive ? (
-            <button
-              data-testid={`action-watch-planning-${issue.identifier}`}
-              onClick={handlePlan}
-              className="flex items-center text-xs text-muted-foreground hover:text-foreground transition-colors animate-pulse"
-              title="Watch Planning"
-            >
-              <Eye className="w-3.5 h-3.5" />
-            </button>
-          ) : (
-            planChip
-          )}
-          {artifactLinks}
-          {/* Resume Session only when there's an actual prior work agent to resume.
-              For freshly-planned issues with no work agent yet, show Start Agent
-              instead (gated on beads existing). */}
-          {activeAgent?.lifecycle?.canResumeSession ? (
-            <button
-              onClick={handleResumeSession}
-              disabled={resumeSessionMutation.isPending}
-              className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors disabled:opacity-50"
-              title="Resume Session"
-            >
-              {(resumeSessionMutation.isPending || isResuming) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{(resumeSessionMutation.isPending || isResuming) ? 'Resuming...' : 'Resume Session'}</span>
-            </button>
-          ) : beadsCount > 0 ? (
-            <button
-              ref={startButtonRef}
-              onClick={handleStartAgent}
-              disabled={startAgentMutation.isPending || isStarting}
-              className="flex items-center gap-1 text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-500 transition-colors rounded px-2 py-1 disabled:opacity-50"
-              title={(startAgentMutation.isPending || isStarting) ? 'Starting...' : 'Start Agent'}
-            >
-              {(startAgentMutation.isPending || isStarting) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{(startAgentMutation.isPending || isStarting) ? 'Starting...' : 'Start Agent'}</span>
-            </button>
-          ) : null}
-          <ResetIssueButton issueId={issue.identifier} variant="card" issue={issue} />
-        </div>
-      )}
-
-      {/* In Review items - Resume Session (if lost) + Recover + Reopen */}
-      {!isRunning && STATUS_LABELS[issue.status] === 'in_review' && (
-        <>
-          {pipelineCallToAction && (
-            <div className="mt-3 rounded-xl border border-warning/40 badge-bg-warning px-3 py-2 text-xs text-warning-foreground">
-              <div className="font-medium">{pipelineCallToAction.label}</div>
-              <div className="mt-1 text-warning-foreground/80">{pipelineCallToAction.detail}</div>
+        {/* Row 1: project mark + ID + verb badge */}
+        <div className="flex items-center gap-2 mb-1.5">
+          {issue.project ? (
+            <div className="flex items-center gap-[5px]">
+              <span
+                className="block rounded-[2px]"
+                style={{ width: 8, height: 8, backgroundColor: issue.project.color }}
+              />
+              <span className="font-mono text-[10px] text-muted-foreground">{issue.identifier}</span>
             </div>
+          ) : (
+            <span className="font-mono text-[10px] text-muted-foreground">{issue.identifier}</span>
           )}
-          <div className={actionBarClass}>
-            <MergeButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
-            {((activeAgent?.lifecycle?.canResumeSession ?? false) || isSessionLost || isResuming) && (
-            <button
-              onClick={handleResumeSession}
-              disabled={resumeSessionMutation.isPending || isResuming}
-              className="flex items-center gap-1 text-xs font-medium text-warning-foreground hover:opacity-80 transition-colors disabled:opacity-50"
-              title="Resume Session"
-            >
-              {(resumeSessionMutation.isPending || isResuming) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{(resumeSessionMutation.isPending || isResuming) ? 'Resuming...' : 'Resume Session'}</span>
-            </button>
-          )}
-            <RecoverButton issueId={issue.identifier} reviewStatus={reviewStatus} variant="card" />
-            <ReopenSection issue={issue} inline />
-            <ResetIssueButton issueId={issue.identifier} variant="card" issue={issue} />
-          </div>
-        </>
-      )}
-
-      {/* Done items - Reopen + Close Out */}
-      {!isRunning && STATUS_LABELS[issue.status] === 'done' && (
-        <div className={actionBarClass}>
-          <button
-            onClick={() => onViewBeads && onViewBeads(issue)}
-            className="flex items-center text-xs text-muted-foreground hover:text-foreground transition-colors"
-            title="Tasks"
-          >
-            <List className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => onViewVBrief && onViewVBrief(issue)}
-            className="flex items-center text-xs text-muted-foreground hover:text-foreground transition-colors"
-            title="vBRIEF"
-          >
-            <ScrollText className="w-3.5 h-3.5" />
-          </button>
-          <ReopenSection issue={issue} inline />
-          <CloseOutSection issue={issue} />
+          <span className="ml-auto">{cardVerbBadge}</span>
         </div>
-      )}
 
-      {/* Cost breakdown modal */}
-      <CostBreakdownModal
-        issueId={issue.identifier}
-        isOpen={showCostModal}
-        onClose={() => setShowCostModal(false)}
-      />
+        {/* Title */}
+        <h3
+          className="text-[13px] leading-[1.35] text-foreground mb-2"
+          style={{
+            display: '-webkit-box',
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+          }}
+        >
+          {issue.title}
+        </h3>
+
+        {/* Labels */}
+        {issue.labels.length > 0 && (
+          <div className="flex flex-wrap gap-1 mb-2.5">
+            {issue.labels.map((label) => (
+              <span
+                key={label}
+                className="text-[10px] font-medium px-[6px] py-px rounded-sm"
+                style={{
+                  background: 'rgb(255 255 255 / 5%)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--muted-foreground)',
+                }}
+              >
+                {label}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Bead progress */}
+        {issue.beadCounts && (
+          <div className="flex items-center gap-2 mt-2" data-component="bead-progress" data-progress={issue.beadCounts.completed}>
+            <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground font-semibold">
+              Beads {issue.beadCounts.completed}/{issue.beadCounts.total}
+            </span>
+            <div
+              className="flex-1 h-[3px] rounded-[2px] overflow-hidden"
+              style={{ background: 'var(--accent)' }}
+            >
+              <div
+                className="h-full rounded-[2px]"
+                style={{
+                  width: `${(issue.beadCounts.completed / issue.beadCounts.total) * 100}%`,
+                  background: beadProgressColor,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Foot */}
+        <div className="flex items-center gap-2 pt-2 mt-2" style={{ borderTop: '1px solid var(--border)' }}>
+          <div className="flex flex-col min-w-0 gap-0.5 flex-1">
+            {activeAgent ? (
+              <>
+                <span className="font-mono text-[10px] text-foreground truncate">{activeAgent.id}</span>
+                <span className="font-mono text-[9px] text-muted-foreground truncate">{agentSubText}</span>
+              </>
+            ) : (
+              <>
+                <span className="text-[10px] text-muted-foreground italic" style={{ fontFamily: '"DM Sans", sans-serif' }}>
+                  no agent
+                </span>
+                <span className="font-mono text-[9px] text-muted-foreground truncate">{trackerRef}</span>
+              </>
+            )}
+          </div>
+          <span className="font-mono text-[10px] text-muted-foreground tabular-nums whitespace-nowrap">
+            {activeAgent ? formatRuntime(activeAgent.startedAt) : '—'}
+          </span>
+          <span
+            className="w-[18px] h-[18px] rounded-full grid place-items-center text-[9px] font-semibold text-white border border-border shrink-0"
+            style={{
+              background: avatarGradient(activeAgent?.id ?? issue.identifier),
+            }}
+          >
+            {cardAvatarInitials(activeAgent?.id ?? issue.identifier)}
+          </span>
+        </div>
+
+        <div
+          data-component="board-card-action-row"
+          data-visible-mode={pinActionRow ? 'pinned' : 'hover'}
+          className={cn(
+            'mt-2 flex items-center gap-1 border-t border-border pt-2 transition-opacity',
+            !pinActionRow && '[@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:group-focus-within:opacity-100',
+          )}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <IssueActionMenu issueId={issue.identifier} mode="hybrid" className="flex w-full items-center gap-1" openSignal={actionOpenSignal} />
+        </div>
+
+        <CostBreakdownModal
+          issueId={issue.identifier}
+          isOpen={showCostModal}
+          onClose={() => setShowCostModal(false)}
+        />
       </div>
-    </div>
+    </IssueCardPrimitive>
   );
 }
 
-// Move to Backlog button for Todo items
-function BacklogButton({ issue }: { issue: Issue }) {
-  const queryClient = useQueryClient();
-  const [isPending, setIsPending] = useState(false);
-
-  return (
-    <button
-      onClick={async (e) => {
-        e.stopPropagation();
-        setIsPending(true);
-        try {
-          await fetch(`/api/issues/${issue.identifier}/move-status`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status: 'backlog' }),
-          });
-          await refreshDashboardState(queryClient);
-        } catch (err) {
-          console.error('Move to backlog failed:', err);
-        } finally {
-          setIsPending(false);
-        }
-      }}
-      disabled={isPending}
-      className="flex items-center gap-1 text-xs text-content-muted hover:text-content-subtle transition-colors disabled:opacity-50"
-      title="Move to Backlog"
-    >
-      {isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ChevronDown className="w-3.5 h-3.5" />}
-      Backlog
-    </button>
-  );
-}
-
-// Move to Todo button for Backlog items
-function TodoButton({ issue }: { issue: Issue }) {
-  const queryClient = useQueryClient();
-  const [isPending, setIsPending] = useState(false);
-
-  return (
-    <button
-      onClick={async (e) => {
-        e.stopPropagation();
-        setIsPending(true);
-        try {
-          await fetch(`/api/issues/${issue.identifier}/move-status`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status: 'todo' }),
-          });
-          await refreshDashboardState(queryClient);
-        } catch (err) {
-          console.error('Move to todo failed:', err);
-        } finally {
-          setIsPending(false);
-        }
-      }}
-      disabled={isPending}
-      className="flex items-center gap-1 text-xs text-content-muted hover:text-content-subtle transition-colors disabled:opacity-50"
-      title="Move to Todo"
-    >
-      {isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ChevronRight className="w-3.5 h-3.5" />}
-      Todo
-    </button>
-  );
-}
-
-// Reopen section for Done/In Review items
-function ReopenSection({ issue, inline }: { issue: Issue; inline?: boolean }) {
-  const queryClient = useQueryClient();
-  const confirm = useConfirm();
-
-  const reopenMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(`/api/issues/${issue.identifier}/reopen`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Failed to reopen issue');
-      }
-      return res.json();
-    },
-    onSuccess: async () => {
-      await refreshDashboardState(queryClient);
-    },
-  });
-
-  const handleReopen = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (await confirm({ title: 'Reopen Issue', message: `Reopen ${issue.identifier} for re-work?\n\nThis will move it back to In Progress.`, confirmLabel: 'Reopen' })) {
-      reopenMutation.mutate();
-    }
-  };
-
-  const content = (
-    <>
-      <button
-        onClick={handleReopen}
-        disabled={reopenMutation.isPending}
-        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-      >
-        {reopenMutation.isPending ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-        ) : (
-          <RotateCcw className="w-3.5 h-3.5" />
-        )}
-        {reopenMutation.isPending ? 'Reopening...' : 'Reopen'}
-      </button>
-      {reopenMutation.isError && (
-        <span className="text-xs text-destructive-foreground">{(reopenMutation.error as Error).message}</span>
-      )}
-    </>
-  );
-
-  if (inline) return content;
-
-  return (
-    <div className="flex items-center gap-3 mt-3 pt-3 border-t border-divider-strong">
-      {content}
-    </div>
-  );
-}
-
-// Close-out section for Done items
-function CloseOutSection({ issue }: { issue: Issue }) {
-  const queryClient = useQueryClient();
-  const confirm = useConfirm();
-
-  const closeOutMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch(`/api/issues/${issue.identifier}/close-out`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Close-out failed');
-      }
-      return data;
-    },
-    onSuccess: async () => {
-      await refreshDashboardState(queryClient);
-    },
-  });
-
-  const handleCloseOut = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (await confirm({ title: 'Close Out Issue', message: `Close out ${issue.identifier}?\n\nThis will:\n• Verify branch is merged\n• Archive workspace artifacts\n• Clean up agent state\n• Close issue on tracker\n• Apply closed-out label`, variant: 'destructive', confirmLabel: 'Close Out' })) {
-      closeOutMutation.mutate();
-    }
-  };
-
-  return (
-    <>
-      <button
-        onClick={handleCloseOut}
-        disabled={closeOutMutation.isPending}
-        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-      >
-        {closeOutMutation.isPending ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-        ) : (
-          <CheckCheck className="w-3.5 h-3.5" />
-        )}
-        {closeOutMutation.isPending ? 'Closing out...' : 'Close Out'}
-      </button>
-      {closeOutMutation.isError && (
-        <span className="text-xs text-destructive-foreground">{(closeOutMutation.error as Error).message}</span>
-      )}
-    </>
-  );
-}

@@ -9,8 +9,9 @@ import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
-import { capturePaneAsync, listSessionNamesAsync, sendKeysAsync, sessionExists, sessionExistsAsync } from '../tmux.js';
-import { emitActivityEntry, emitActivityTts, emitDashboardLifecycle } from '../activity-logger.js';
+import { Effect } from 'effect';
+import { capturePane, killSession, listSessionNames, sendKeys, sessionExists } from '../tmux.js';
+import { emitActivityEntrySync, emitActivityTtsSync, emitDashboardLifecycleSync } from '../activity-logger.js';
 
 const execAsync = promisify(exec);
 
@@ -19,26 +20,18 @@ const __dirname = dirname(__filename);
 import {
   PANOPTICON_HOME,
 } from '../paths.js';
-import { resolveGitHubIssue } from '../tracker-utils.js';
+import { resolveGitHubIssueSync } from '../tracker-utils.js';
 import { setCanonicalState } from '../lifecycle/reconciler/index.js';
-import { createGitHubClient } from '../lifecycle/reconciler/github-client.js';
 
-import {
-  getSessionId,
-  recordWake,
-  getTmuxSessionName,
-  wakeSpecialist,
-  spawnEphemeralSpecialist,
-  isRunning,
-} from './specialists.js';
-import { resolveProjectFromIssue } from '../projects.js';
+import { resolveProjectFromIssueSync } from '../projects.js';
+import { restoreTrackedBeadsExport } from '../beads-restore.js';
 import { runMergeValidation, autoRevertMerge, runQualityGates } from './validation.js';
-import { loadProjectsConfig } from '../projects.js';
+import { loadProjectsConfigSync } from '../projects.js';
 import { cleanupStaleLocks } from '../git-utils.js';
-import { renderPrompt } from './prompts.js';
 import { gitPush, gitForcePush, MainDivergedError } from '../git/operations.js';
-import { markWorkspaceStuck } from '../review-status.js';
-import { appendGitOperation, type GitOperationType } from '../git-activity.js';
+import { markWorkspaceStuck, setReviewStatusSync } from '../review-status.js';
+import { appendGitOperationSync, type GitOperationType } from '../git-activity.js';
+import { buildStashMessage, createNamedStash, dropStash, listStashes } from '../stashes.js';
 
 const SPECIALISTS_DIR = join(PANOPTICON_HOME, 'specialists');
 const MERGE_HISTORY_DIR = join(SPECIALISTS_DIR, 'merge-agent');
@@ -141,8 +134,8 @@ export async function notifyTldrDaemon(projectPath: string, sourceBranch: string
     console.log(`[merge-agent] Found ${changedFiles.length} changed source files to reindex`);
 
     // Get TLDR daemon service
-    const { getTldrDaemonService } = await import('../tldr-daemon.js');
-    const tldrService = getTldrDaemonService(projectPath, venvPath);
+    const { getTldrDaemonServiceSync } = await import('../tldr-daemon.js');
+    const tldrService = getTldrDaemonServiceSync(projectPath, venvPath);
 
     // Check if daemon is running
     const status = await tldrService.getStatus();
@@ -165,11 +158,10 @@ export async function notifyTldrDaemon(projectPath: string, sourceBranch: string
 }
 
 /**
- * Post-merge cleanup: move PRD, close PR, move issue to Done, report merge, compact beads.
+ * Post-merge handoff: mark merged work as verifying on main and free runtime resources.
  *
- * Moves the issue to Done on the tracker so it appears in the Done column.
- * Does NOT tear down the workspace or apply the closed-out label — the human
- * close-out ceremony handles that separately.
+ * Leaves the issue, workspace, vBRIEF, branches, and agent state dirs intact.
+ * The explicit close-out ceremony performs final archival and destructive cleanup.
  *
  * IDEMPOTENT: Safe to call multiple times for the same issueId. Tracks completed
  * issues and returns immediately on re-entry. This is defense-in-depth against
@@ -179,281 +171,501 @@ export async function notifyTldrDaemon(projectPath: string, sourceBranch: string
 // Defense-in-depth: track issues that have completed postMergeLifecycle.
 // Prevents re-execution even if caller guards fail. Persists for server lifetime.
 const _completedPostMerge = new Set<string>();
+const _postMergeInFlight = new Map<string, Promise<void>>();
 
-// Circuit breaker for issue tracker close operations.
-// After MAX_CLOSE_RETRIES consecutive failures, stop trying to close the issue
-// on the tracker. The issue can be closed manually via the dashboard close-out ceremony.
-const _closeIssueFailures = new Map<string, number>();
-const MAX_CLOSE_RETRIES = 3;
+async function dropLingeringPreMergeStashes(issueId: string, projectPath: string): Promise<void> {
+  try {
+    const stashes = await Effect.runPromise(listStashes(projectPath));
+    const preMergeStashes = stashes.filter((entry) => entry.kind === 'pre-merge' && entry.issueId === issueId.toUpperCase());
+    for (const stash of preMergeStashes) {
+      await Effect.runPromise(dropStash(projectPath, stash.ref));
+      console.log(`[merge-agent] ✓ Dropped lingering pre-merge stash ${stash.ref}`);
+    }
+  } catch (error: any) {
+    console.warn(`[merge-agent] Could not drop lingering pre-merge stashes: ${error.message}`);
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function verifyMergedBeforeLifecycle(issueId: string, projectPath: string, sourceBranch?: string): Promise<{ merged: boolean; reason: string }> {
+  const branchName = sourceBranch?.trim() || `feature/${issueId.toLowerCase()}`;
+  const quotedBranch = shellQuote(branchName);
+
+  await execAsync('git fetch origin main --prune', { cwd: projectPath }).catch(() => undefined);
+  await execAsync(`git fetch origin ${shellQuote(`${branchName}:refs/remotes/origin/${branchName}`)}`, { cwd: projectPath }).catch(() => undefined);
+
+  // Check 1: branch tip is an ancestor of origin/main (regular merge case).
+  const refsToCheck = [branchName, `origin/${branchName}`];
+  for (const ref of refsToCheck) {
+    const quotedRef = shellQuote(ref);
+    const revParseResult = await execAsync(`git rev-parse --verify ${quotedRef} 2>/dev/null || true`, { cwd: projectPath });
+    const refSha = typeof revParseResult?.stdout === 'string' ? revParseResult.stdout : '';
+    if (!refSha.trim()) continue;
+    try {
+      await execAsync(`git merge-base --is-ancestor ${quotedRef} origin/main`, { cwd: projectPath });
+      return { merged: true, reason: `${ref} is an ancestor of origin/main` };
+    } catch {
+      // Not a regular merge ancestor — fall through to GitHub API check.
+    }
+  }
+
+  // Check 2: GitHub API truth — authoritative for squash and rebase merges
+  // where the branch tip is intentionally not an ancestor of main. Run this
+  // BEFORE the local-diff fallback so that a squash-merged PR isn't mistaken
+  // for "still has unmerged changes" just because the branch retains its
+  // own commits (PAN-1024 hit this 2026-05-09: merge succeeded on GitHub
+  // but post-merge lifecycle was refused, leaving labels + workspace stale).
+  const ghResolved = resolveGitHubIssueSync(issueId);
+  if (ghResolved.isGitHub) {
+    const { owner, repo } = ghResolved;
+    const { stdout } = await execAsync(
+      `gh pr list --repo ${shellQuote(`${owner}/${repo}`)} --state all --head ${quotedBranch} --json number,mergedAt,mergeCommit --limit 5`,
+      { cwd: projectPath },
+    ).catch(() => ({ stdout: '[]' }));
+    const prs = JSON.parse(stdout || '[]') as Array<{ number: number; mergedAt: string | null; mergeCommit: unknown | null }>;
+    const mergedPr = prs.find((pr) => pr.mergedAt || pr.mergeCommit);
+    if (mergedPr) {
+      return { merged: true, reason: `GitHub PR #${mergedPr.number} is merged` };
+    }
+  }
+
+  // Check 3: local-diff fallback — for the non-GitHub case (Linear/Rally), or
+  // GitHub edge cases where the PR API returned nothing. If the branch has
+  // no remaining code diff against main, treat as merged.
+  for (const ref of refsToCheck) {
+    const quotedRef = shellQuote(ref);
+    const revParseResult2 = await execAsync(`git rev-parse --verify ${quotedRef} 2>/dev/null || true`, { cwd: projectPath });
+    const refSha = typeof revParseResult2?.stdout === 'string' ? revParseResult2.stdout : '';
+    if (!refSha.trim()) continue;
+    const diffResult = await execAsync(
+      `git diff origin/main...${quotedRef} -- ':!.planning' ':!docs/prds' ':!.panopticon/prompts' 2>/dev/null || true`,
+      { cwd: projectPath },
+    );
+    const codeDiff = typeof diffResult?.stdout === 'string' ? diffResult.stdout : '';
+    if (!codeDiff.trim()) {
+      return { merged: true, reason: `${ref} has no remaining code diff against origin/main` };
+    }
+    return { merged: false, reason: `${ref} still has unmerged changes` };
+  }
+
+  return { merged: true, reason: `No live branch or open PR found for ${branchName}; assuming post-merge cleanup already removed the source ref` };
+}
+
+/**
+ * Detect a swarm slot branch like `feature/977-slot-3` or `feature/pan-977-slot-3`.
+ * Slot branches merge into their parent feature branch, NOT into main, so we must NOT
+ * run the full per-issue post-merge lifecycle for them. Instead we drive
+ * `onSlotMergeComplete()` so the swarm runtime advances per-item.
+ *
+ * PAN-1176: the slot branch suffix uses `-slot-N` (hyphen), not `/slot-N`
+ * (slash). Git refuses to create `feature/<parent>/slot-N` when
+ * `feature/<parent>` already exists as a leaf ref — refs cannot have both a
+ * leaf and a sub-tree at the same path. Sibling names (`feature/<parent>` and
+ * `feature/<parent>-slot-N`) avoid the collision.
+ */
+export const SLOT_BRANCH_PATTERN = /^feature\/(.+)-slot-(\d+)$/;
+export function parseSlotBranch(branch: string | undefined | null): { itemSlot: number; issueLower: string } | null {
+  if (!branch) return null;
+  const match = SLOT_BRANCH_PATTERN.exec(branch);
+  if (!match) return null;
+  const slot = Number.parseInt(match[2], 10);
+  if (!Number.isInteger(slot) || slot <= 0) return null;
+  return { itemSlot: slot, issueLower: match[1] };
+}
 
 export async function postMergeLifecycle(issueId: string, projectPath: string, sourceBranch?: string, options?: { skipDeploy?: boolean }): Promise<void> {
+  // Slot-branch merges (feature/<parent>/slot-N → feature/<parent>) drive the
+  // per-item swarm runtime, not the per-issue feature lifecycle. Route them to
+  // onSlotMergeComplete and return — the issue's overall postMergeLifecycle only
+  // fires when the parent feature branch itself merges to main.
+  const slotInfo = parseSlotBranch(sourceBranch);
+  if (slotInfo) {
+    // Loopback HTTP POST to the dashboard's /api/swarm/slot-merged endpoint.
+    // We deliberately do NOT static-import the swarm route module here — that would
+    // force the entire dashboard-server type graph into every consumer of merge-agent
+    // (lib code) and leak dashboard-only types into pure CLI builds. The HTTP edge
+    // keeps the dependency direction clean: merge-agent → REST → swarm route.
+    // We don't know itemId at the merge layer; the route resolves the canonical
+    // itemId from runtime state by matching the slot number.
+    const apiPort = process.env.API_PORT || process.env.PORT || '3011';
+    const url = `http://127.0.0.1:${apiPort}/api/swarm/slot-merged`;
+    let deliveryError: string | null = null;
+    let deliveryStatus: number | null = null;
+    try {
+      const { INTERNAL_TOKEN_HEADER, ensureInternalTokenSync } = await import('../internal-token.js');
+      const token = ensureInternalTokenSync();
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [INTERNAL_TOKEN_HEADER]: token,
+        },
+        body: JSON.stringify({ issueId, itemId: '', slotId: slotInfo.itemSlot }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        deliveryStatus = res.status;
+        deliveryError = `HTTP ${res.status}`;
+      } else {
+        console.log(`[merge-agent] Slot-merge handled for ${issueId} slot ${slotInfo.itemSlot}; skipping issue lifecycle.`);
+      }
+    } catch (err: any) {
+      deliveryError = err?.message ?? String(err);
+    }
+    if (deliveryError) {
+      // PAN-977 round-11 blocker #3: a merged slot branch with a lost dashboard
+      // callback used to vanish silently — runtime/plan state was never updated
+      // and auto-advance for the issue stalled forever. Persist a durable retry
+      // marker the swarm poller picks up on its next cycle, AND surface the
+      // failure via the activity log so an operator can see it. The slot branch
+      // is already merged at this point so we can't roll back — durable retry
+      // is the only safe answer.
+      console.warn(`[merge-agent] Slot-merge POST failed for ${issueId} slot ${slotInfo.itemSlot}: ${deliveryError}`);
+      try {
+        const retryDir = join(PANOPTICON_HOME, 'swarms', 'pending-slot-merges');
+        if (!existsSync(retryDir)) mkdirSync(retryDir, { recursive: true });
+        const retryFile = join(retryDir, `${issueId.toLowerCase()}-slot-${slotInfo.itemSlot}.json`);
+        await writeFile(retryFile, JSON.stringify({
+          issueId,
+          slotId: slotInfo.itemSlot,
+          sourceBranch,
+          status: deliveryStatus,
+          error: deliveryError,
+          queuedAt: new Date().toISOString(),
+        }, null, 2), 'utf-8');
+        try {
+          emitActivityEntrySync({
+            source: 'ship',
+            level: 'warn',
+            issueId,
+            message: `Slot ${slotInfo.itemSlot} merged but /api/swarm/slot-merged delivery failed (${deliveryError}); retry queued at ${retryFile}.`,
+          });
+        } catch { /* activity logger best-effort */ }
+      } catch (writeErr: any) {
+        // If we cannot even persist a retry marker, surface a hard error so the
+        // outer merge result captures it instead of silently losing the slot.
+        throw new Error(`[merge-agent] Slot-merge callback failed for ${issueId} slot ${slotInfo.itemSlot} (${deliveryError}) AND retry-marker write failed: ${writeErr?.message ?? writeErr}`);
+      }
+    }
+    return;
+  }
+
   // Guard 1: skip if already completed (defense-in-depth against infinite loops)
   if (_completedPostMerge.has(issueId)) {
     console.log(`[merge-agent] postMergeLifecycle already completed for ${issueId}, skipping`);
     return;
   }
 
-  // Step 0: Write pending lifecycle file and spawn detached deploy script.
-  // The deploy script rebuilds dist/, kills this server, and starts a fresh process.
-  // The fresh process reads the pending file on startup and runs the lifecycle steps
-  // with correct module chunk references (no ERR_MODULE_NOT_FOUND after merge).
-  //
-  // Skip this step when we ARE the fresh process (called from processPendingLifecycle) —
-  // dynamic imports already resolve correctly and spawning again would create an infinite loop.
-  if (!options?.skipDeploy) {
-    const pendingFile = join(PANOPTICON_HOME, 'pending-post-merge.json');
-    const repoRoot = __dirname.includes('/src/')
-      ? __dirname.replace(/\/src\/.*$/, '')
-      : __dirname.replace(/\/dist\/.*$/, '').replace(/\/lib\/.*$/, '');
-    const deployScript = join(repoRoot, 'scripts', 'post-merge-deploy.sh');
+  const inFlight = _postMergeInFlight.get(issueId);
+  if (inFlight) {
+    console.log(`[merge-agent] postMergeLifecycle already running for ${issueId}, joining in-flight run`);
+    return inFlight;
+  }
 
-    try {
-      const pendingData = JSON.stringify({
-        issueId,
-        projectPath,
-        sourceBranch: sourceBranch ?? '',
-        timestamp: Date.now(),
-        reason: 'post-merge',
-        trigger: 'merge-agent',
-      });
-      await writeFile(pendingFile, pendingData, 'utf-8');
-      console.log(`[merge-agent] Wrote pending lifecycle file: ${pendingFile}`);
-
-      // Pass 'post-merge' as the reason to the deploy script so it writes the
-      // restart marker. We spawn detached and return immediately — the deploy script
-      // kills this server. The new server reads the pending file on boot,
-      // emits lifecycle_started, and after processing emits lifecycle_complete/failed.
-      const child = spawn(deployScript, [repoRoot, issueId, projectPath, sourceBranch ?? '', 'post-merge'], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-      console.log(`[merge-agent] Spawned detached deploy script (pid ${child.pid}) — server will restart with new build`);
+  const run = (async () => {
+    const mergeVerification = await verifyMergedBeforeLifecycle(issueId, projectPath, sourceBranch);
+    if (!mergeVerification.merged) {
+      console.warn(`[merge-agent] Refusing post-merge lifecycle for ${issueId}: ${mergeVerification.reason}`);
       return;
+    }
+    console.log(`[merge-agent] Verified merge before lifecycle for ${issueId}: ${mergeVerification.reason}`);
+
+// Workflow labels are owned by the reconciler; enqueue the merged state
+    // before the verifying-on-main handoff adds the human-visible verification label.
+    try {
+      setCanonicalState(issueId, 'merged');
+      console.log(`[merge-agent] ✓ Enqueued merged label via reconciler for ${issueId}`);
+    } catch (err) {
+      console.warn(`[merge-agent] Could not enqueue merged label: ${err}`);
+    }
+
+    // Set mergeStatus='merged' after verifying the branch or PR actually landed.
+    try {
+      setReviewStatusSync(issueId, { mergeStatus: 'merged', readyForMerge: false });
+      console.log(`[merge-agent] ✓ mergeStatus set to 'merged' for ${issueId}`);
     } catch (err: any) {
-      console.warn(`[merge-agent] Failed to spawn deploy script: ${err.message}. Falling through to in-process lifecycle (may fail on stale chunks).`);
+      console.warn(`[merge-agent] Could not set mergeStatus: ${err.message}`);
     }
-  }
 
-  console.log(`[merge-agent] Running post-merge cleanup for ${issueId}`);
+    // Step 0: Write pending lifecycle file and spawn detached deploy script.
+    // The deploy script rebuilds dist/, kills this server, and starts a fresh process.
+    // The fresh process reads the pending file on startup and runs the lifecycle steps
+    // with correct module chunk references (no ERR_MODULE_NOT_FOUND after merge).
+    //
+    // Skip this step when we ARE the fresh process (called from processPendingLifecycle) —
+    // dynamic imports already resolve correctly and spawning again would create an infinite loop.
+    if (!options?.skipDeploy) {
+      const pendingFile = join(PANOPTICON_HOME, 'pending-post-merge.json');
+      let repoRoot = __dirname.includes('/src/')
+        ? __dirname.replace(/\/src\/.*$/, '')
+        : __dirname.replace(/\/dist\/.*$/, '').replace(/\/lib\/.*$/, '');
+      // If running from a workspace (workspaces/feature-*/), resolve to the main repo root.
+      // Without this, the deploy script builds and npm-links from the workspace, hijacking
+      // the global `pan` CLI to point at stale workspace code.
+      const wsMatch = repoRoot.match(/^(.+)\/workspaces\/feature-[^/]+$/);
+      if (wsMatch) {
+        repoRoot = wsMatch[1];
+        console.log(`[merge-agent] Resolved workspace repoRoot to main repo: ${repoRoot}`);
+      }
+      const deployScript = join(repoRoot, 'scripts', 'post-merge-deploy.sh');
 
-  // 1. Move PRD from active to completed (via lifecycle module)
-  try {
-    const { movePrd } = await import('../lifecycle/archive-planning.js');
-    const prdResult = await movePrd({ issueId, projectPath });
-    if (prdResult.success && !prdResult.skipped) {
-      console.log(`[merge-agent] ✓ ${prdResult.details?.join('; ')}`);
-      logActivity('prd_moved', `Moved ${issueId} PRD to completed directory`);
-    } else if (prdResult.skipped) {
-      console.log(`[merge-agent] PRD move skipped: ${prdResult.details?.join('; ')}`);
-    } else {
-      console.warn(`[merge-agent] PRD move failed: ${prdResult.error}`);
+      try {
+        const pendingData = JSON.stringify({
+          issueId,
+          projectPath,
+          sourceBranch: sourceBranch ?? '',
+          timestamp: Date.now(),
+          reason: 'post-merge',
+          trigger: 'merge-agent',
+        });
+        await writeFile(pendingFile, pendingData, 'utf-8');
+        console.log(`[merge-agent] Wrote pending lifecycle file: ${pendingFile}`);
+
+        // Pass 'post-merge' as the reason to the deploy script so it writes the
+        // restart marker. We spawn detached and return immediately — the deploy script
+        // kills this server. The new server reads the pending file on boot,
+        // emits lifecycle_started, and after processing emits lifecycle_complete/failed.
+        const child = spawn(deployScript, [repoRoot, issueId, projectPath, sourceBranch ?? '', 'post-merge'], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+        console.log(`[merge-agent] Spawned detached deploy script (pid ${child.pid}) — server will restart with new build`);
+        return;
+      } catch (err: any) {
+        console.warn(`[merge-agent] Failed to spawn deploy script: ${err.message}. Falling through to in-process lifecycle (may fail on stale chunks).`);
+      }
     }
-  } catch (err) {
-    console.warn(`[merge-agent] Could not move PRD: ${err}`);
-  }
 
-  // 2. Remove ephemeral planning artifacts from main (via lifecycle module)
-  try {
-    const { cleanPlanningArtifacts } = await import('../lifecycle/clean-planning.js');
-    const cleanResult = await cleanPlanningArtifacts({ issueId, projectPath });
-    if (cleanResult.success && !cleanResult.skipped) {
-      console.log(`[merge-agent] ✓ ${cleanResult.details?.join('; ')}`);
-      logActivity('planning_artifacts_cleaned', cleanResult.details?.join('; ') || 'Planning artifacts removed');
-    } else if (cleanResult.skipped) {
-      console.log(`[merge-agent] Planning artifact cleanup skipped: ${cleanResult.details?.join('; ')}`);
-    } else {
-      console.warn(`[merge-agent] Planning artifact cleanup failed: ${cleanResult.error}`);
+    console.log(`[merge-agent] Running post-merge verify handoff for ${issueId}`);
+
+    await dropLingeringPreMergeStashes(issueId, projectPath);
+
+    try {
+      await transitionIssueToVerifyingOnMain(issueId, projectPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[merge-agent] Could not transition issue to verifying_on_main: ${message}`);
+      try {
+        setReviewStatusSync(issueId, {
+          mergeStatus: 'failed',
+          readyForMerge: false,
+          mergeNotes: `Post-merge verifying_on_main transition failed: ${message}`,
+        });
+      } catch (statusErr: any) {
+        console.warn(`[merge-agent] Could not persist verifying_on_main transition failure: ${statusErr?.message ?? statusErr}`);
+      }
+      announceMerge('failed', issueId, `Post-merge verifying_on_main transition failed: ${message}`);
+      logActivity('merge_failed', `Post-merge verifying_on_main transition failed for ${issueId}: ${message}`);
+      throw err;
     }
-  } catch (err) {
-    console.warn(`[merge-agent] Could not clean planning artifacts: ${err}`);
-  }
 
-  // 3. Enqueue merged label via reconciler (PAN-805). Replaces direct
-  // cleanupMergedLabels call — the reconciler owns all workflow label writes.
-  try {
-    setCanonicalState(issueId, 'merged');
-    console.log(`[merge-agent] ✓ Enqueued merged label via reconciler for ${issueId}`);
-  } catch (err) {
-    console.warn(`[merge-agent] Could not enqueue merged label: ${err}`);
-  }
+    // 2. Compact old beads (via lifecycle module)
+    try {
+      const { compactBeads } = await import('../lifecycle/compact-beads.js');
+      // PAN-1249: compactBeads returns Effect<StepResult>; bridge to Promise.
+      const beadsResult = await Effect.runPromise(compactBeads({ issueId, projectPath }));
+      if (beadsResult.success && !beadsResult.skipped) {
+        console.log(`[merge-agent] ✓ ${beadsResult.details?.join('; ')}`);
+        logActivity('beads_compaction_complete', beadsResult.details?.join('; ') || 'Beads compacted');
+      }
+    } catch (err) {
+      console.warn(`[merge-agent] Beads compaction failed: ${err}`);
+    }
 
-  // 3b. Close issue on tracker (fire-and-forget with circuit breaker)
-  // PAN-805: GitHub issues are closed via explicit API (github-client with .ok +
-  // retry semantics) instead of relying on Closes #NNN in PR body.
-  const ghResolved = resolveGitHubIssue(issueId);
-  if (ghResolved.isGitHub) {
-    const token = getGitHubToken();
-    if (token) {
-      const gh = createGitHubClient({
-        githubToken: token,
-        repo: `${ghResolved.owner}/${ghResolved.repo}`,
-        intervalMs: 30000,
+    // 3. Pause work/planning agents and kill their tmux panes to free resources.
+    try {
+      const { setAgentPaused } = await import('../agents.js');
+      const { killSession, sessionExists } = await import('../tmux.js');
+      const issueLower = issueId.toLowerCase();
+      const reason = 'awaiting close-out (verify on main)';
+      for (const agentId of [`agent-${issueLower}`, `planning-${issueLower}`]) {
+        const paused = await Effect.runPromise(setAgentPaused(agentId, reason, true));
+        if (paused) {
+          console.log(`[merge-agent] ✓ Paused ${agentId}: ${reason}`);
+        }
+        if (await Effect.runPromise(sessionExists(agentId))) {
+          await Effect.runPromise(killSession(agentId));
+          console.log(`[merge-agent] ✓ Killed ${agentId} tmux session to free resources`);
+          logActivity('agent_session_killed', `Freed resources: killed tmux session for ${agentId}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[merge-agent] Could not pause or kill agent sessions: ${err}`);
+    }
+
+    // 5a. Kill canonical reviewer/synthesis sessions (PAN-915).
+    // Sessions persist across review rounds to preserve reviewer context, so the
+    // merge is the right moment to tear them down. Issue is done — context value
+    // is zero, RSS leak risk is non-zero. Resolve projectKey from the project
+    // path so we don't depend on caller-supplied config.
+    try {
+      const { killAllReviewerSessions } = await import('./review-agent.js');
+      const { resolveProjectFromIssueSync } = await import('../projects.js');
+      const resolved = resolveProjectFromIssueSync(issueId);
+      const projectKey = resolved?.projectKey;
+      if (projectKey) {
+        const { killed } = await Effect.runPromise(killAllReviewerSessions(projectKey, issueId));
+        if (killed.length > 0) {
+          console.log(`[merge-agent] ✓ Killed ${killed.length} canonical reviewer session(s) for ${issueId}`);
+          logActivity('reviewer_sessions_killed', `Killed ${killed.length} reviewer session(s) for ${issueId} on merge`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[merge-agent] Could not kill canonical reviewer sessions: ${err}`);
+    }
+
+    await killPostMergeRoleSessions(issueId);
+
+    // 3c. Create a workspace-scoped memory reset marker so old review-blocker noise stays archived but out of retrieval.
+    try {
+      const { createResetMarker } = await import('../memory/cli.js');
+      const timestamp = new Date().toISOString();
+      const marker = await createResetMarker({
+        projectId: basename(projectPath),
+        scope: 'workspace',
+        scopeId: `feature-${issueId.toLowerCase()}`,
+        reason: 'post-merge cleanup',
+        fromTimestamp: timestamp,
+        createdAt: timestamp,
       });
-      closeIssueViaApi(issueId, ghResolved.number, gh);
-    } else {
-      console.warn(`[merge-agent] GITHUB_TOKEN not available — deferring issue close to close-out ceremony`);
+      console.log(`[merge-agent] ✓ Created memory reset marker ${marker.id} for ${marker.scope}:${marker.scopeId}`);
+    } catch (err) {
+      console.warn(`[merge-agent] Memory reset marker creation failed (non-fatal): ${err}`);
     }
-  } else {
-    // Linear / Rally — keep existing closeIssueWithCircuitBreaker path
-    closeIssueWithCircuitBreaker(issueId, projectPath);
-  }
 
-  // 4. Compact old beads (via lifecycle module)
-  try {
-    const { compactBeads } = await import('../lifecycle/compact-beads.js');
-    const beadsResult = await compactBeads({ issueId, projectPath });
-    if (beadsResult.success && !beadsResult.skipped) {
-      console.log(`[merge-agent] ✓ ${beadsResult.details?.join('; ')}`);
-      logActivity('beads_compaction_complete', beadsResult.details?.join('; ') || 'Beads compacted');
-    }
-  } catch (err) {
-    console.warn(`[merge-agent] Beads compaction failed: ${err}`);
-  }
-
-  // 5. Kill work agent tmux session to free resources (non-fatal)
-  // Stopped agents with live tmux sessions leak memory (Claude + MCP processes stay resident).
-  // Kill the session unconditionally if it exists — don't require agentState to exist first
-  // (state file may have been cleaned up already, leaving an orphaned session alive).
-  try {
-    const { getAgentState, saveAgentState } = await import('../agents.js');
-    const { killSession, sessionExists } = await import('../tmux.js');
-    const agentId = `agent-${issueId.toLowerCase()}`;
-    if (sessionExists(agentId)) {
-      killSession(agentId);
-      const agentState = getAgentState(agentId);
-      if (agentState) {
-        agentState.status = 'stopped';
-        saveAgentState(agentState);
+    // 4. Stop Docker containers + networks to prevent network pool exhaustion (non-fatal)
+    // Orphaned Docker networks accumulate when workspaces are merged but containers are never
+    // torn down, eventually exhausting Docker's address pool and blocking new workspace creation.
+    try {
+      const { findWorkspacePath } = await import('../lifecycle/archive-planning.js');
+      const { stopWorkspaceDocker } = await import('../workspace-manager.js');
+      const issueLower = issueId.toLowerCase();
+      const workspacePath = findWorkspacePath(projectPath, issueLower);
+      if (workspacePath) {
+        const dockerResult = await Effect.runPromise(stopWorkspaceDocker(workspacePath, issueLower));
+        if (dockerResult.containersFound) {
+          console.log(`[merge-agent] ✓ Stopped Docker containers: ${dockerResult.steps.join('; ')}`);
+          logActivity('docker_cleanup', `Stopped Docker for ${issueId}: ${dockerResult.steps.join('; ')}`);
+        }
       }
-      console.log(`[merge-agent] ✓ Killed work agent session ${agentId} to free resources`);
-      logActivity('agent_session_killed', `Freed resources: killed tmux session for ${agentId}`);
+    } catch (err) {
+      console.warn(`[merge-agent] Docker cleanup failed (non-fatal): ${err}`);
     }
-    // Also kill planning agent if it exists
-    const planningId = `planning-${issueId.toLowerCase()}`;
-    if (sessionExists(planningId)) {
-      killSession(planningId);
-      console.log(`[merge-agent] ✓ Killed planning agent session ${planningId}`);
-    }
-  } catch (err) {
-    console.warn(`[merge-agent] Could not kill agent sessions: ${err}`);
-  }
 
-  // 6. Stop Docker containers + networks to prevent network pool exhaustion (non-fatal)
-  // Orphaned Docker networks accumulate when workspaces are merged but containers are never
-  // torn down, eventually exhausting Docker's address pool and blocking new workspace creation.
+    await notifyTldrDaemon(projectPath, sourceBranch ?? '');
+
+    try {
+      const { refreshGraphify } = await import('../graphify/refresh.js');
+      const graphifyResult = await refreshGraphify(projectPath, issueId);
+      if ('ok' in graphifyResult) {
+        if (graphifyResult.ok) {
+          console.log(`[merge-agent] ✓ Updated graphify-out and pushed commit ${graphifyResult.commit}`);
+          logActivity('graphify_refresh', `Updated graphify-out and pushed commit ${graphifyResult.commit}`);
+        } else {
+          console.warn(`[merge-agent] Graphify refresh failed: ${graphifyResult.error}`);
+          logActivity('graphify_refresh_failed', graphifyResult.error);
+        }
+      } else {
+        console.log(`[merge-agent] Graphify refresh skipped: ${graphifyResult.skipped}`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[merge-agent] Graphify refresh failed: ${message}`);
+      logActivity('graphify_refresh_failed', message);
+    }
+
+    // Mark completed BEFORE logging — prevents re-entry even if the log line triggers something
+    _completedPostMerge.add(issueId);
+
+    console.log(`[merge-agent] Post-merge handoff completed for ${issueId}. Awaiting close-out (verify on main).`);
+    announceMerge('completed', issueId);
+    logActivity('merge_complete', `Merged ${issueId}. Awaiting close-out (verify on main).`);
+  })().finally(() => {
+    _postMergeInFlight.delete(issueId);
+  });
+  _postMergeInFlight.set(issueId, run);
+  return run;
+}
+
+async function transitionIssueToVerifyingOnMain(issueId: string, projectPath: string): Promise<void> {
+  const [effectModule, issueLifecycleModule, githubModule, linearModule, rallyModule, errorsModule] = await Promise.all([
+    import('effect'),
+    import('../../dashboard/server/services/issue-lifecycle.js'),
+    import('../../dashboard/server/services/github-client.js'),
+    import('../../dashboard/server/services/linear-client.js'),
+    import('../../dashboard/server/services/rally-client.js'),
+    import('../../dashboard/server/services/typed-errors.js'),
+  ]);
+  const { Effect, Layer } = effectModule;
+  const { IssueLifecycle, IssueLifecycleLive } = issueLifecycleModule;
+  const { GitHubClient } = githubModule;
+  const { LinearClientOptionalLive } = linearModule;
+  const { RallyClientOptionalLive } = rallyModule;
+  const { IssueNotFound } = errorsModule;
+  const gitHubRepo = (owner: string, repo: string) => shellQuote(`${owner}/${repo}`);
+  const githubLayer = Layer.succeed(GitHubClient, {
+    getIssue: (_owner: string, _repo: string, number: number) => Effect.fail(new IssueNotFound({ id: String(number) })),
+    closeIssue: (owner: string, repo: string, number: number) => Effect.promise(() => execAsync(`gh issue close ${number} --repo ${gitHubRepo(owner, repo)}`, { cwd: projectPath, encoding: 'utf-8' }).then(() => undefined)),
+    reopenIssue: (owner: string, repo: string, number: number) => Effect.promise(() => execAsync(`gh issue reopen ${number} --repo ${gitHubRepo(owner, repo)} 2>/dev/null || true`, { cwd: projectPath, encoding: 'utf-8' }).then(() => undefined)),
+    addLabel: (owner: string, repo: string, number: number, label: string) => Effect.promise(async () => {
+      if (label === 'verifying-on-main') {
+        await execAsync(`gh label create ${shellQuote(label)} --repo ${gitHubRepo(owner, repo)} --color "fbca04" --description "Merged — awaiting verification on main" --force 2>/dev/null || true`, { cwd: projectPath, encoding: 'utf-8' });
+      }
+      await execAsync(`gh issue edit ${number} --repo ${gitHubRepo(owner, repo)} --add-label ${shellQuote(label)}`, { cwd: projectPath, encoding: 'utf-8' }); // PAN-805-exempt: verifying-on-main handoff owns this label.
+    }),
+    removeLabel: (owner: string, repo: string, number: number, label: string) => Effect.promise(() => execAsync(`gh issue edit ${number} --repo ${gitHubRepo(owner, repo)} --remove-label ${shellQuote(label)} 2>/dev/null || true`, { cwd: projectPath, encoding: 'utf-8' }).then(() => undefined)), // PAN-805-exempt: verifying-on-main handoff owns this label.
+    ensureLabel: (owner: string, repo: string, label: string, color = '0075ca', description = '') => Effect.promise(async () => {
+      await execAsync(`gh label create ${shellQuote(label)} --repo ${gitHubRepo(owner, repo)} --color ${shellQuote(color)} --description ${shellQuote(description)} --force 2>/dev/null || true`, { cwd: projectPath, encoding: 'utf-8' });
+      return { id: 0, name: label, color };
+    }),
+    addComment: () => Effect.void,
+    getComments: () => Effect.succeed([]),
+  });
+  const layer = IssueLifecycleLive.pipe(
+    Layer.provide(LinearClientOptionalLive),
+    Layer.provide(githubLayer),
+    Layer.provide(RallyClientOptionalLive),
+  );
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const lifecycle = yield* IssueLifecycle;
+      yield* lifecycle.transitionTo(issueId, 'verifying_on_main');
+    }).pipe(Effect.provide(layer)),
+  );
+  console.log(`[merge-agent] ✓ Transitioned ${issueId} to verifying_on_main`);
+}
+
+function isPostMergeRoleSession(sessionName: string, issueLower: string): boolean {
+  if ([`agent-${issueLower}-test`, `agent-${issueLower}-ship`, `agent-${issueLower}-merge`].includes(sessionName)) {
+    return true;
+  }
+  if (sessionName.startsWith(`agent-${issueLower}-review-`)) {
+    return true;
+  }
+  return sessionName.startsWith('specialist-')
+    && sessionName.includes(`-${issueLower}-`)
+    && /-(review|test|merge|ship)(?:-|$)/.test(sessionName);
+}
+
+async function killPostMergeRoleSessions(issueId: string): Promise<void> {
   try {
-    const { findWorkspacePath } = await import('../lifecycle/archive-planning.js');
-    const { stopWorkspaceDocker } = await import('../workspace-manager.js');
     const issueLower = issueId.toLowerCase();
-    const workspacePath = findWorkspacePath(projectPath, issueLower);
-    if (workspacePath) {
-      const projName = basename(projectPath);
-      const dockerResult = await stopWorkspaceDocker(workspacePath, projName, issueLower);
-      if (dockerResult.containersFound) {
-        console.log(`[merge-agent] ✓ Stopped Docker containers: ${dockerResult.steps.join('; ')}`);
-        logActivity('docker_cleanup', `Stopped Docker for ${issueId}: ${dockerResult.steps.join('; ')}`);
-      }
+    const sessions = await Effect.runPromise(listSessionNames());
+    const targets = sessions.filter((session) => isPostMergeRoleSession(session, issueLower));
+    for (const session of targets) {
+      await Effect.runPromise(killSession(session));
+    }
+    if (targets.length > 0) {
+      console.log(`[merge-agent] ✓ Killed ${targets.length} review/test/ship session(s) for ${issueId}`);
+      logActivity('role_sessions_killed', `Killed ${targets.length} review/test/ship session(s) for ${issueId} on merge`);
     }
   } catch (err) {
-    console.warn(`[merge-agent] Docker cleanup failed (non-fatal): ${err}`);
+    console.warn(`[merge-agent] Could not kill role sessions for ${issueId}: ${err}`);
   }
-
-  // Mark completed BEFORE logging — prevents re-entry even if the log line triggers something
-  _completedPostMerge.add(issueId);
-
-  console.log(`[merge-agent] Post-merge cleanup completed for ${issueId}. Issue moved to Done — awaiting close-out.`);
-  announceMerge('completed', issueId);
-  logActivity('merge_complete', `Merged ${issueId}. Issue moved to Done — awaiting close-out.`);
-}
-
-/**
- * Close a GitHub issue via the reconciler's github-client (PAN-805).
- * Fire-and-forget with circuit-breaker semantics.
- */
-function closeIssueViaApi(
-  issueId: string,
-  issueNumber: number,
-  gh: import('../lifecycle/reconciler/github-client.js').GitHubClient,
-): void {
-  const failures = _closeIssueFailures.get(issueId) || 0;
-  if (failures >= MAX_CLOSE_RETRIES) {
-    console.log(`[merge-agent] Circuit breaker open for ${issueId} issue close (${failures} failures). Will be closed during close-out ceremony.`);
-    return;
-  }
-
-  (async () => {
-    try {
-      const result = await gh.closeIssue(issueNumber);
-      if (result.ok) {
-        console.log(`[merge-agent] ✓ Closed GitHub issue #${issueNumber} via API`);
-        logActivity('issue_closed', `Closed GitHub issue #${issueNumber} via API`);
-        _closeIssueFailures.delete(issueId);
-      } else {
-        const newCount = (_closeIssueFailures.get(issueId) || 0) + 1;
-        _closeIssueFailures.set(issueId, newCount);
-        console.warn(`[merge-agent] ✗ GitHub close issue #${issueNumber} failed: ${result.status} (attempt ${newCount}/${MAX_CLOSE_RETRIES})`);
-        if (newCount >= MAX_CLOSE_RETRIES) {
-          console.warn(`[merge-agent] Circuit breaker tripped for ${issueId} after ${newCount} failures. Issue close deferred to close-out ceremony.`);
-        }
-      }
-    } catch (err) {
-      const newCount = (_closeIssueFailures.get(issueId) || 0) + 1;
-      _closeIssueFailures.set(issueId, newCount);
-      console.warn(`[merge-agent] Could not close GitHub issue #${issueNumber} (attempt ${newCount}/${MAX_CLOSE_RETRIES}): ${err}`);
-    }
-  })();
-}
-
-/**
- * Close issue on tracker with circuit breaker protection.
- * Fire-and-forget: runs asynchronously, never blocks the caller.
- * Stops retrying after MAX_CLOSE_RETRIES consecutive failures per issue.
- */
-function closeIssueWithCircuitBreaker(issueId: string, projectPath: string): void {
-  const failures = _closeIssueFailures.get(issueId) || 0;
-  if (failures >= MAX_CLOSE_RETRIES) {
-    console.log(`[merge-agent] Circuit breaker open for ${issueId} issue close (${failures} failures). Will be closed during close-out ceremony.`);
-    return;
-  }
-
-  // Fire-and-forget — errors are caught and logged, never propagated
-  (async () => {
-    try {
-      const { closeIssue } = await import('../lifecycle/close-issue.js');
-      const ghResolved = resolveGitHubIssue(issueId);
-      const ctx = ghResolved.isGitHub
-        ? { issueId, projectPath, github: { owner: ghResolved.owner, repo: ghResolved.repo, number: ghResolved.number } }
-        : { issueId, projectPath };
-      const results = await closeIssue(ctx, { applyLabel: false, comment: 'Merged to main via Panopticon merge-agent' });
-
-      let anyFailure = false;
-      for (const r of results) {
-        if (r.success && !r.skipped) {
-          console.log(`[merge-agent] ✓ ${r.details?.join('; ')}`);
-          logActivity(r.step, r.details?.join('; ') || r.step);
-        } else if (!r.skipped) {
-          console.warn(`[merge-agent] ✗ ${r.step} failed: ${r.error}`);
-          anyFailure = true;
-        }
-      }
-
-      if (anyFailure) {
-        const newCount = (_closeIssueFailures.get(issueId) || 0) + 1;
-        _closeIssueFailures.set(issueId, newCount);
-        if (newCount >= MAX_CLOSE_RETRIES) {
-          console.warn(`[merge-agent] Circuit breaker tripped for ${issueId} after ${newCount} failures. Issue close deferred to close-out ceremony.`);
-        }
-      } else {
-        // Success — clear failure counter
-        _closeIssueFailures.delete(issueId);
-      }
-    } catch (err) {
-      const newCount = (_closeIssueFailures.get(issueId) || 0) + 1;
-      _closeIssueFailures.set(issueId, newCount);
-      console.warn(`[merge-agent] Could not move issue to Done (attempt ${newCount}/${MAX_CLOSE_RETRIES}): ${err}`);
-    }
-  })();
 }
 
 /**
@@ -461,7 +673,7 @@ function closeIssueWithCircuitBreaker(issueId: string, projectPath: string): voi
  */
 export function resetPostMergeState(issueId: string): void {
   _completedPostMerge.delete(issueId);
-  _closeIssueFailures.delete(issueId);
+  _postMergeInFlight.delete(issueId);
 }
 
 /**
@@ -666,8 +878,8 @@ function logMergeHistory(context: MergeConflictContext, result: MergeResult, ses
  * Log activity to the dashboard activity log (event-sourced via emitActivityEntry)
  */
 function logActivity(action: string, details: string, issueId?: string): void {
-  emitActivityEntry({
-    source: 'merge-agent',
+  emitActivityEntrySync({
+    source: 'ship',
     level: action.includes('fail') || action.includes('error') ? 'error' : action.includes('warn') ? 'warn' : 'success',
     message: details,
     issueId,
@@ -693,8 +905,8 @@ function announceMerge(
       ? 'Merge completed'
       : 'Merge failed';
   const tail = extra ? `. ${extra}` : '';
-  emitActivityEntry({
-    source: 'merge-agent',
+  emitActivityEntrySync({
+    source: 'ship',
     level: status === 'failed' ? 'error' : 'success',
     message: `${prefix} for ${issueId}${tail}`,
     issueId,
@@ -705,10 +917,12 @@ function announceMerge(
     : status === 'completed'
       ? `${issueId} merged to main`
       : `Merge failed for ${issueId}`;
-  emitActivityTts({
+  emitActivityTtsSync({
     utterance: ttsUtterance,
     priority: status === 'failed' ? 0 : 1,
     issueId,
+    source: 'merge-agent',
+    eventType: `mergeStatus.${status === 'completed' ? 'merged' : status === 'started' ? 'merging' : 'failed'}`,
   });
 }
 
@@ -717,7 +931,7 @@ function announceMerge(
  */
 async function captureTmuxOutput(sessionName: string): Promise<string> {
   try {
-    return await capturePaneAsync(sessionName);
+    return await Effect.runPromise(capturePane(sessionName));
   } catch {
     return '';
   }
@@ -757,7 +971,7 @@ export function scanGitPatterns(
     for (const { re, operation, level } of GIT_PATTERNS) {
       if (re.test(trimmed)) {
         seenLineHashes.add(hash);
-        appendGitOperation({
+        appendGitOperationSync({
           operation,
           branch,
           issueId,
@@ -765,8 +979,8 @@ export function scanGitPatterns(
           error: level !== 'info' ? trimmed.slice(0, 200) : undefined,
           ts,
         });
-        emitActivityEntry({
-          source: 'merge-agent',
+        emitActivityEntrySync({
+          source: 'ship',
           level,
           message: `[git] ${trimmed.slice(0, 100)}`,
           issueId,
@@ -781,7 +995,7 @@ export function scanGitPatterns(
  * Check if specialist-merge-agent tmux session is running (async)
  */
 async function isMergeAgentRunning(): Promise<boolean> {
-  return sessionExistsAsync('specialist-merge-agent');
+  return Effect.runPromise(sessionExists('specialist-merge-agent'));
 }
 
 /**
@@ -793,13 +1007,13 @@ async function sendMessageToAgent(issueId: string, message: string): Promise<boo
 
   try {
     // Check if session exists
-    if (!sessionExists(sessionName)) {
+    if (!await Effect.runPromise(sessionExists(sessionName))) {
       console.log(`[merge-agent] Could not send message to ${sessionName} (session does not exist)`);
       return false;
     }
 
     // Send the message using centralized sendKeys
-    await sendKeysAsync(sessionName, message);
+    await Effect.runPromise(sendKeys(sessionName, message));
 
     console.log(`[merge-agent] Sent message to ${sessionName}`);
     logActivity('agent_message', `Sent to ${sessionName}: ${message.slice(0, 100)}...`);
@@ -810,13 +1024,131 @@ async function sendMessageToAgent(issueId: string, message: string): Promise<boo
   }
 }
 
+function defaultWorkspaceForIssue(issueId: string): string | undefined {
+  const project = resolveProjectFromIssueSync(issueId);
+  if (!project?.projectPath) return undefined;
+  return join(project.projectPath, 'workspaces', `feature-${issueId.toLowerCase()}`);
+}
+
+function buildShipPreparationPrompt(options: {
+  issueId: string;
+  workspacePath: string;
+  featureBranch: string;
+  targetBranch: string;
+  apiUrl: string;
+}): string {
+  return `SHIP TASK for ${options.issueId}:
+
+WORKSPACE: ${options.workspacePath}
+FEATURE BRANCH: ${options.featureBranch}
+TARGET BRANCH: ${options.targetBranch}
+
+Prepare this already-reviewed branch for the dashboard's human Merge button.
+
+Required steps:
+1. Work only in ${options.workspacePath}.
+2. Fetch the target branch: git fetch origin ${options.targetBranch}.
+3. Rebase ${options.featureBranch} onto origin/${options.targetBranch} using non-interactive rebase only.
+4. Resolve rebase conflicts if they are narrow and source-level. If conflicts are broad, abort and report SHIP BLOCKED.
+5. Run the required verification gates from the project instructions (at minimum: npm run typecheck, npm run lint, npm test when present/applicable).
+6. Push the prepared feature branch with --force-with-lease.
+7. Mark the issue ready for the human merge button:
+   curl -s -X POST ${options.apiUrl}/api/review/${options.issueId}/status \\
+     -H "Content-Type: application/json" \\
+     -d '{"readyForMerge":true}'
+8. Report SHIP READY with the pushed commit and verification summary.
+
+No-rescan rule:
+- After resolving detected conflict files, do NOT re-scan for additional conflicts.
+- If the rebase produces conflicts beyond the immediately visible set, abort and report SHIP BLOCKED for human triage.
+- Do not loop: resolve once, verify once, push once.
+
+Human-merge invariant:
+- Do NOT run gh pr merge.
+- Do NOT call any merge endpoint or destructive merge API POST.
+- Do NOT run git merge into main/master.
+- Do NOT push to main/master.
+- The existing dashboard Merge button owns the actual merge and postMergeLifecycle cleanup.`;
+}
+
+function buildShipSyncMainPrompt(options: {
+  issueId: string;
+  workspacePath: string;
+  workspaceBranch: string;
+  conflictFiles: string[];
+}): string {
+  return `SHIP SYNC-MAIN CONFLICT TASK for ${options.issueId}:
+
+WORKSPACE: ${options.workspacePath}
+WORKSPACE BRANCH: ${options.workspaceBranch}
+CONFLICT FILES:
+${options.conflictFiles.map(f => `- ${f}`).join('\n')}
+
+Resolve the in-progress sync-main conflict in the workspace branch only.
+
+Required steps:
+1. Work only in ${options.workspacePath}.
+2. Inspect the listed conflict files and resolve conflict markers by preserving the feature branch intent and current main behavior.
+3. Run the relevant verification gates from the project instructions.
+4. Commit the sync-main conflict resolution if the merge requires a commit, then push the workspace branch with --force-with-lease if needed.
+5. Report SHIP READY for the sync-main conflict resolution, or SHIP BLOCKED with exact files and reasons.
+
+Human-merge invariant:
+- Do NOT run gh pr merge.
+- Do NOT call any merge endpoint or destructive merge API POST.
+- Do NOT push to main/master.
+- Do NOT perform post-merge cleanup.`;
+}
+
+async function spawnShipRoleForTask(options: {
+  issueId: string;
+  workspacePath?: string;
+  prompt: string;
+}): Promise<{ success: boolean; message: string; tmuxSession?: string; error?: string }> {
+  const workspace = options.workspacePath ?? defaultWorkspaceForIssue(options.issueId);
+  if (!workspace) {
+    return {
+      success: false,
+      message: `Could not resolve workspace for ${options.issueId}`,
+      error: 'workspace resolution failed',
+    };
+  }
+
+  try {
+    const { spawnRun } = await import('../agents.js');
+    // Ship role delivers its rebase prompt through the work-agent's tmux session and
+    // performs git operations against the host worktree — it does not depend on the
+    // workspace's docker-compose services (server/frontend) being healthy. Pass
+    // `allowHost: true` so the stack-health pre-flight does not block ship when an
+    // ancillary container has exited (e.g. server-1 crashing on a stale init build).
+    // Blocking ship on those failures was forcing humans into a manual
+    // rebuild-and-retry loop for every merge — see PAN-1141 incident 2026-05-17.
+    const run = await spawnRun(options.issueId, 'ship', {
+      workspace,
+      prompt: options.prompt,
+      allowHost: true,
+    });
+    return {
+      success: true,
+      message: `ship role started as ${run.id}`,
+      tmuxSession: run.id,
+    };
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error?.message ?? 'Failed to start ship role',
+      error: error?.message,
+    };
+  }
+}
+
 /**
  * Attempt merge and handle result (clean merge, conflicts, or failure)
  *
  * This function:
  * 1. Attempts to merge sourceBranch into current branch
  * 2. If clean merge: commits and optionally runs tests
- * 3. If conflicts: spawns merge-agent to resolve them
+ * 3. If preparation is needed: starts the ship role to rebase/verify/push
  * 4. If failure: returns error
  *
  * @param projectPath - Project root path
@@ -832,458 +1164,84 @@ export async function spawnMergeAgentForBranches(
   issueId: string,
   options?: { skipDoneReport?: boolean }
 ): Promise<MergeResult> {
-  console.log(`[merge-agent] Waking specialist for merge of ${sourceBranch} into ${targetBranch}`);
+  console.log(`[ship-role] Starting ship preparation for ${sourceBranch} against ${targetBranch}`);
   announceMerge('started', issueId);
-  logActivity('merge_attempt', `Waking specialist for merge: ${sourceBranch} -> ${targetBranch}`);
+  logActivity('ship_start', `Starting ship role for ${sourceBranch} -> ${targetBranch}`);
 
-  // Pre-flight checks (quick validation before waking specialist)
   try {
-    // 1. Check for and clean up stale git lock files
-    console.log(`[merge-agent] Checking for stale git lock files...`);
-    const lockCleanup = await cleanupStaleLocks(projectPath);
-
-    if (lockCleanup.found.length > 0) {
-      console.log(`[merge-agent] Found ${lockCleanup.found.length} lock file(s)`);
-
-      if (lockCleanup.removed.length > 0) {
-        console.log(`[merge-agent] ✓ Cleaned up ${lockCleanup.removed.length} stale lock file(s):`);
-        lockCleanup.removed.forEach(f => console.log(`  - ${f}`));
-        logActivity('git_lock_cleanup', `Removed ${lockCleanup.removed.length} stale lock file(s)`);
-      }
-
-      if (lockCleanup.errors.length > 0) {
-        console.warn(`[merge-agent] ⚠️ Failed to clean up some locks:`, lockCleanup.errors);
-        if (lockCleanup.errors.some(e => e.error.includes('Git processes are running'))) {
-          const message = 'Git processes are still running - cannot safely start merge';
-          console.error(`[merge-agent] ${message}`);
-          logActivity('merge_blocked', message);
-          return { success: false, reason: message };
-        }
-      }
-    }
-
-    // 2. Check that source branch is pushed to remote
-    try {
-      const { stdout: remoteBranches } = await execAsync(`git ls-remote --heads origin ${sourceBranch}`, {
-        cwd: projectPath,
-        encoding: 'utf-8',
-      });
-
-      if (!remoteBranches.trim()) {
-        const message = `Branch ${sourceBranch} is not pushed to remote.`;
-        console.error(`[merge-agent] ${message}`);
-        logActivity('merge_blocked', message);
-        // Write feedback file and send short reference
-        const { writeFeedbackFile } = await import('./feedback-writer.js');
-        const blockMsg = `# Merge Blocked\n\nBranch "${sourceBranch}" is not pushed to remote.\n\n## Required Action\n\nRun: \`git push -u origin ${sourceBranch}\``;
-        const fileResult = await writeFeedbackFile({
-          issueId,
-          specialist: 'merge-agent',
-          outcome: 'blocked',
-          summary: `Branch ${sourceBranch} not pushed`,
-          markdownBody: blockMsg,
-        });
-        if (fileResult.success) {
-          await sendMessageToAgent(issueId, `SPECIALIST FEEDBACK: merge-agent reported BLOCKED for ${issueId}.\nRead and address: ${fileResult.relativePath}`);
-        } else {
-          console.error(`[merge-agent] Failed to write feedback file for ${issueId}: ${fileResult.error}`);
-        }
-        return { success: false, reason: message };
-      }
-    } catch {
-      const message = `Cannot verify remote branch ${sourceBranch}.`;
-      console.error(`[merge-agent] ${message}`);
-      logActivity('merge_blocked', message);
+    const lockCleanup = await Effect.runPromise(cleanupStaleLocks(projectPath));
+    if (lockCleanup.errors.some(e => e.error.includes('Git processes are running'))) {
+      const message = 'Git processes are still running - cannot safely start ship role';
+      console.error(`[ship-role] ${message}`);
+      logActivity('ship_blocked', message);
       return { success: false, reason: message };
     }
 
-    // NOTE: We don't check for uncommitted changes in the main repo here.
-    // The merge happens via git merge which will fail if there are conflicts.
-    // Uncommitted changes in main are the user's own work and shouldn't block
-    // merging a feature branch. The dashboard server already checks the
-    // workspace for uncommitted changes before initiating the merge.
-  } catch (error: any) {
-    return { success: false, reason: `Pre-flight check failed: ${error.message}` };
-  }
+    const { stdout: remoteBranches } = await execAsync(`git ls-remote --heads origin ${sourceBranch}`, {
+      cwd: projectPath,
+      encoding: 'utf-8',
+    });
+    if (!remoteBranches.trim()) {
+      const message = `Branch ${sourceBranch} is not pushed to remote.`;
+      console.error(`[ship-role] ${message}`);
+      logActivity('ship_blocked', message);
+      return { success: false, reason: message };
+    }
 
-  // 3. No-op check: if sourceBranch is already an ancestor of targetBranch, skip the merge
-  try {
     await execAsync(`git fetch origin ${sourceBranch} ${targetBranch}`, {
       cwd: projectPath,
       encoding: 'utf-8',
     });
-    let isAlreadyMerged = false;
     try {
       await execAsync(
         `git merge-base --is-ancestor origin/${sourceBranch} origin/${targetBranch}`,
         { cwd: projectPath, encoding: 'utf-8' }
       );
-      isAlreadyMerged = true;
+      const message = `Branch ${sourceBranch} is already integrated into ${targetBranch} — no ship run needed`;
+      console.log(`[ship-role] ${message}`);
+      logActivity('ship_skipped', message);
+      return { success: true, reason: message, validationStatus: 'NOT_RUN', testsStatus: 'SKIP' };
     } catch (e: any) {
-      // exit code 1 means not an ancestor — proceed with merge
-      // any other exit code is a real error; propagate it
-      if (e.code !== 1) {
-        throw e;
-      }
+      if (e.code !== 1) throw e;
     }
-    if (isAlreadyMerged) {
-      const message = `Branch ${sourceBranch} is already integrated into ${targetBranch} — no merge needed`;
-      console.log(`[merge-agent] ${message}`);
-      logActivity('merge_skipped', message);
-      return { success: true, reason: message };
-    }
-  } catch (ancestorErr: any) {
-    console.warn(`[merge-agent] Ancestor check failed: ${ancestorErr.message} (continuing)`);
+  } catch (error: any) {
+    return { success: false, reason: `Ship pre-flight check failed: ${error.message}` };
   }
 
-  // Record current HEAD to detect when merge happens (polling compares against this)
-  const { stdout: headBeforeRaw } = await execAsync('git rev-parse HEAD', {
-    cwd: projectPath,
-    encoding: 'utf-8',
-  });
-  const headBefore = headBeforeRaw.trim();
-
-  // Stash any uncommitted changes so the merge starts from a clean state
-  // We restore the stash after completion (success or rollback)
-  let stashCreated = false;
-  try {
-    const { stdout: statusOut } = await execAsync('git status --porcelain', {
-      cwd: projectPath,
-      encoding: 'utf-8',
-    });
-    if (statusOut.trim()) {
-      await execAsync('git stash push -u -m "Pre-merge stash for ' + issueId + '"', {
-        cwd: projectPath,
-        encoding: 'utf-8',
-      });
-      stashCreated = true;
-      console.log(`[merge-agent] Stashed uncommitted changes before merge`);
-    }
-  } catch (stashErr: any) {
-    console.warn(`[merge-agent] Failed to stash: ${stashErr.message} (continuing anyway)`);
-  }
-
-  // Build the task prompt for the merge-agent specialist
   const apiPort = process.env.API_PORT || process.env.PORT || '3011';
   const apiUrl = process.env.DASHBOARD_URL || `http://localhost:${apiPort}`;
-  const skipDoneReport = options?.skipDoneReport ?? false;
-
-  const taskPrompt = renderPrompt({
-    name: 'merge',
-    vars: {
-      ISSUE_ID: issueId,
-      SOURCE_BRANCH: sourceBranch,
-      TARGET_BRANCH: targetBranch,
-      PROJECT_PATH: projectPath,
-      DO_PUSH: true,
-      DO_BUILD: true,
-      API_URL: apiUrl,
-      SKIP_DONE_REPORT: skipDoneReport,
-    },
+  const workspacePath = defaultWorkspaceForIssue(issueId) ?? projectPath;
+  const prompt = buildShipPreparationPrompt({
+    issueId,
+    workspacePath,
+    featureBranch: sourceBranch,
+    targetBranch,
+    apiUrl,
   });
 
-  // Resolve project key for per-project ephemeral lifecycle (PAN-300)
-  const resolvedProject = resolveProjectFromIssue(issueId);
-  const mergeProjectKey = resolvedProject?.projectKey ?? null;
-  const mergeSession = getTmuxSessionName('merge-agent', mergeProjectKey ?? undefined);
-
-  if (!resolvedProject) {
-    console.warn(`[merge-agent] Could not resolve project for ${issueId} — falling back to global specialist. Check projects.yaml configuration.`);
+  const shipResult = await spawnShipRoleForTask({ issueId, workspacePath, prompt });
+  if (!shipResult.success) {
+    console.error(`[ship-role] Failed to start ship role: ${shipResult.message}`);
+    announceMerge('failed', issueId, 'Could not start ship role');
+    logActivity('ship_error', `Failed to start ship role: ${shipResult.message}`);
+    return { success: false, reason: `Failed to start ship role: ${shipResult.message}` };
   }
 
-  // Wait for the per-project merge-agent to be idle before sending a new task.
-  // Only applies to the per-project ephemeral path — the legacy wakeSpecialist
-  // path manages its own ready-wait internally via waitForReady: true.
-  // Without this, sending a task to a busy specialist causes Claude's
-  // "Interrupted" behavior — the running tool gets cancelled and the
-  // previous merge is abandoned mid-flight.
-  if (mergeProjectKey) {
-    const { getAgentRuntimeState, saveAgentRuntimeState } = await import('../agents.js');
-    const IDLE_POLL_INTERVAL = 3000; // 3 seconds
-    const IDLE_MAX_WAIT = 360000; // 6 minutes (slightly longer than specialist timeout)
-    const idleStart = Date.now();
-
-    while (Date.now() - idleStart < IDLE_MAX_WAIT) {
-      const state = getAgentRuntimeState(mergeSession);
-      if (!state || state.state === 'idle' || state.state === 'suspended') {
-        break; // Specialist is idle, safe to send
-      }
-      // Dead-session check: if runtime.json says active but tmux session is gone,
-      // the specialist died without resetting state. Reset to idle and proceed immediately.
-      const mergeSessionAlive = await sessionExistsAsync(mergeSession);
-      if (!mergeSessionAlive) {
-        // tmux has-session exits non-zero when the session does not exist
-        console.log(`[merge-agent] Specialist session ${mergeSession} is dead (state was ${state.state}), resetting to idle`);
-        saveAgentRuntimeState(mergeSession, { state: 'idle', lastActivity: new Date().toISOString() });
-        break;
-      }
-      console.log(`[merge-agent] Specialist busy (state: ${state.state}, issue: ${state.currentIssue}), waiting...`);
-      await new Promise(resolve => setTimeout(resolve, IDLE_POLL_INTERVAL));
-    }
-
-    // Final check after loop
-    const finalState = getAgentRuntimeState(mergeSession);
-    if (finalState && finalState.state !== 'idle' && finalState.state !== 'suspended') {
-      console.warn(`[merge-agent] Specialist still busy after ${IDLE_MAX_WAIT / 1000}s, proceeding anyway`);
-    }
+  if (!options?.skipDoneReport) {
+    logActivity('ship_started', shipResult.message);
   }
-
-  // Wake the merge-agent specialist using per-project ephemeral lifecycle when possible
-  let wakeResult: { success: boolean; message: string; tmuxSession?: string; error?: string };
-  if (mergeProjectKey) {
-    console.log(`[merge-agent] Using per-project ephemeral specialist for ${issueId} (${mergeProjectKey})`);
-    wakeResult = await spawnEphemeralSpecialist(mergeProjectKey, 'merge-agent', {
-      issueId,
-      branch: sourceBranch,
-      workspace: projectPath,
-      promptOverride: taskPrompt,
-    });
-  } else {
-    console.log(`[merge-agent] Project resolution failed, falling back to legacy global specialist for ${issueId}`);
-    wakeResult = await wakeSpecialist('merge-agent', taskPrompt, {
-      waitForReady: true,
-      startIfNotRunning: true,
-      issueId,
-    });
-  }
-
-  if (!wakeResult.success) {
-    console.error(`[merge-agent] Failed to wake specialist: ${wakeResult.message}`);
-    announceMerge('failed', issueId, 'Could not wake specialist');
-    logActivity('merge_error', `Failed to wake specialist: ${wakeResult.message}`);
-    return {
-      success: false,
-      reason: `Failed to wake merge-agent specialist: ${wakeResult.message}`,
-    };
-  }
-
-  console.log(`[merge-agent] Specialist woken, waiting for merge completion...`);
-  logActivity('merge_specialist_woken', `Specialist woken, task sent`);
-
-  // Poll for merge completion (check if HEAD has changed and been pushed)
-  const POLL_INTERVAL = 5000; // 5 seconds
-  const MAX_WAIT = 15 * 60 * 1000; // 15 minutes (match MERGE_TIMEOUT_MS)
-  const startTime = Date.now();
-  // Dedupe set for git pattern lines scanned from tmux output within this session
-  const seenGitLines = new Set<string>();
-
-  while (Date.now() - startTime < MAX_WAIT) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-    try {
-      // Scan tmux output for git push/fetch/rejected patterns (PAN-653 pan-1pt)
-      try {
-        const paneOutput = await captureTmuxOutput(mergeSession);
-        if (paneOutput) {
-          scanGitPatterns(paneOutput, seenGitLines, issueId, targetBranch);
-        }
-      } catch { /* non-fatal: pattern scanning is best-effort */ }
-
-      // Check if we're still on target branch
-      const { stdout: currentBranchRaw } = await execAsync('git branch --show-current', {
-        cwd: projectPath,
-        encoding: 'utf-8',
-      });
-      const currentBranch = currentBranchRaw.trim();
-
-      if (currentBranch !== targetBranch) {
-        // Specialist might still be working, continue polling
-        continue;
-      }
-
-      // Check if HEAD has changed (merge happened)
-      const { stdout: currentHeadRaw } = await execAsync('git rev-parse HEAD', {
-        cwd: projectPath,
-        encoding: 'utf-8',
-      });
-      const currentHead = currentHeadRaw.trim();
-
-      if (currentHead !== headBefore) {
-        // HEAD changed — the merge happened (could be merge commit OR fast-forward)
-        // For merge commits: message contains "merge" or branch name
-        // For fast-forward: message is the original commit message (no "merge" keyword)
-        // In BOTH cases, HEAD changing means the merge is done — verify it's pushed
-        {
-          // Verify it's pushed — fetch first to refresh stale tracking refs
-          // (the push happens in the merge-agent's tmux session, which may not
-          // update the tracking ref visible to this process)
-          try {
-            await execAsync(`git fetch origin ${targetBranch}`, {
-              cwd: projectPath,
-              encoding: 'utf-8',
-              timeout: 10000,
-            }).catch(() => {}); // Non-fatal — fall through to rev-parse
-            const { stdout: remoteHeadRaw } = await execAsync(`git rev-parse origin/${targetBranch}`, {
-              cwd: projectPath,
-              encoding: 'utf-8',
-            });
-            const remoteHead = remoteHeadRaw.trim();
-
-            if (remoteHead === currentHead) {
-              console.log(`[merge-agent] Merge completed and pushed, running validation...`);
-              logActivity('merge_validation_start', `Running post-merge validation for ${issueId}`);
-
-              // Extract baseline from specialist output if available
-              let specialistBaseline: number | undefined;
-              try {
-                const specialistOutput = await captureTmuxOutput(mergeSession);
-                const baselineMatch = specialistOutput.match(/Failed\s*│\s*(\d+)\s*│/);
-                specialistBaseline = baselineMatch ? parseInt(baselineMatch[1], 10) : undefined;
-                if (specialistBaseline !== undefined) {
-                  console.log(`[merge-agent] Extracted baseline from specialist: ${specialistBaseline}`);
-                }
-              } catch { /* ignore */ }
-
-              // Run validation
-              const validationResult = await runMergeValidation({
-                projectPath,
-                issueId,
-                baselineTestFailures: specialistBaseline,
-              });
-
-              if (validationResult.valid) {
-                // Validation passed — now run quality gates if configured
-                const skipNote = validationResult.skipped ? ' (no validation script, specialist already validated)' : '';
-                console.log(`[merge-agent] ✓ Merge validation passed${skipNote}`);
-
-                const gateResults = await runProjectQualityGates(projectPath, 'pre_push');
-                const failedRequired = gateResults.filter(g => !g.passed && g.required);
-                if (failedRequired.length > 0) {
-                  const failedNames = failedRequired.map(g => g.name).join(', ');
-                  console.log(`[merge-agent] ✗ Quality gates failed: ${failedNames}`);
-                  announceMerge('failed', issueId, 'Quality gates failed');
-                  logActivity('merge_quality_gate_fail', `Quality gates failed for ${issueId}: ${failedNames}`);
-
-                  const revertSuccess = await autoRevertMerge(projectPath);
-                  const revertNote = revertSuccess
-                    ? 'Merge auto-reverted to clean state'
-                    : 'WARNING: Auto-revert failed';
-
-                  return {
-                    success: false,
-                    validationStatus: 'FAIL',
-                    reason: `Quality gate(s) failed: ${failedNames}. ${revertNote}`,
-                  };
-                }
-
-                logActivity('merge_complete', `Merge completed by specialist${skipNote}`);
-
-                // Run post-merge cleanup (move PRD, update issue status)
-                await postMergeLifecycle(issueId, projectPath, sourceBranch);
-
-                // Restore stashed changes
-                if (stashCreated) {
-                  try {
-                    await execAsync('git stash pop', { cwd: projectPath, encoding: 'utf-8' });
-                    console.log(`[merge-agent] ✓ Restored stashed changes after successful merge`);
-                  } catch (popErr: any) {
-                    console.warn(`[merge-agent] ⚠ Failed to restore stash after merge: ${popErr.message}`);
-                  }
-                }
-
-                return {
-                  success: true,
-                  validationStatus: 'PASS',
-                  testsStatus: 'SKIP', // Specialist ran tests, we trust the result
-                  notes: 'Merge completed by merge-agent specialist and validation passed',
-                };
-              } else {
-                // Validation failed - auto-revert
-                console.log(`[merge-agent] ✗ Validation failed:`, validationResult.failures);
-                announceMerge('failed', issueId, 'Post-merge validation failed');
-                logActivity('merge_validation_fail', `Validation failed: ${validationResult.failures.map(f => f.type).join(', ')}`);
-
-                // Revert to ORIG_HEAD (set by git at merge time)
-                const revertSuccess = await autoRevertMerge(projectPath);
-
-                // Force push to revert the remote as well (--force-with-lease: no divergence guard,
-                // this is an intentional revert of a bad merge we caused)
-                if (revertSuccess) {
-                  try {
-                    await gitForcePush(projectPath, 'origin', targetBranch, {
-                      issueId,
-                      reason: 'auto-revert after post-merge validation failure',
-                    });
-                    console.log(`[merge-agent] ✓ Auto-revert pushed to remote`);
-                    logActivity('merge_auto_revert', 'Merge auto-reverted and pushed to remote');
-                  } catch (pushError: any) {
-                    console.error(`[merge-agent] ✗ Failed to push revert: ${pushError.message}`);
-                    logActivity('merge_revert_push_fail', 'Auto-revert successful but push failed');
-                  }
-                }
-
-                // Restore stashed changes after revert
-                if (stashCreated) {
-                  try {
-                    await execAsync('git stash pop', { cwd: projectPath, encoding: 'utf-8' });
-                    console.log(`[merge-agent] ✓ Restored stashed changes after revert`);
-                  } catch (popErr: any) {
-                    console.warn(`[merge-agent] ⚠ Failed to restore stash after revert: ${popErr.message}`);
-                  }
-                }
-
-                const failureReason = validationResult.failures.map(f => `${f.type}: ${f.message}`).join('; ');
-                const revertNote = revertSuccess
-                  ? 'Merge auto-reverted and force-pushed to remote'
-                  : 'WARNING: Auto-revert failed - manual cleanup required';
-
-                return {
-                  success: false,
-                  validationStatus: 'FAIL',
-                  reason: `Validation failed: ${failureReason}. ${revertNote}`,
-                  notes: 'Merge completed but validation failed, auto-reverted',
-                };
-              }
-            }
-          } catch {
-            // Remote check failed, but local merge is done
-            console.log(`[merge-agent] Merge completed locally, push status unknown`);
-          }
-
-          // Local merge done but not pushed yet - keep polling
-          console.log(`[merge-agent] Merge commit detected, waiting for push...`);
-        }
-      }
-
-      // Check if merge-agent is still running
-      if (!(await isRunning('merge-agent', mergeProjectKey ?? undefined))) {
-        console.error(`[merge-agent] Specialist stopped unexpectedly — checking for stranded merge commit`);
-        announceMerge('failed', issueId, 'Specialist stopped unexpectedly');
-        logActivity('merge_error', 'Specialist stopped unexpectedly');
-
-        // Salvage: if the specialist merged locally but died before pushing, push it ourselves
-        const salvageResult = await salvageStrandedMerge(projectPath, targetBranch, headBefore, issueId, logActivity);
-        if (salvageResult) return salvageResult;
-
-        return {
-          success: false,
-          reason: 'merge-agent specialist stopped before completing the merge',
-        };
-      }
-
-    } catch (pollError: any) {
-      console.warn(`[merge-agent] Poll error: ${pollError.message}`);
-      // Continue polling
-    }
-  }
-
-  // Timeout — same salvage check
-  console.error(`[merge-agent] Timeout waiting for merge completion — checking for stranded merge commit`);
-  announceMerge('failed', issueId, 'Specialist timed out');
-  logActivity('merge_timeout', 'Timeout waiting for specialist to complete merge');
-
-  const salvageResult = await salvageStrandedMerge(projectPath, targetBranch, headBefore, issueId, logActivity);
-  if (salvageResult) return salvageResult;
-
   return {
-    success: false,
-    reason: 'Timeout waiting for merge-agent specialist to complete merge (15 minutes)',
+    success: true,
+    validationStatus: 'NOT_RUN',
+    testsStatus: 'SKIP',
+    reason: shipResult.message,
+    notes: 'Ship role started; it will rebase, verify, push, and mark readyForMerge for the human Merge button.',
   };
 }
 
 /**
- * Rebase a feature branch onto a base branch and push, using the merge-agent
- * specialist for conflict resolution.
+ * Start the ship role to rebase a feature branch onto a base branch,
+ * verify it, push it, and mark it ready for the human Merge button.
  *
  * Used by the PR-based merge flow: triggerMerge() calls this to prepare the
  * feature branch, then calls `gh pr merge --squash` once the rebase is done.
@@ -1294,10 +1252,9 @@ export async function spawnRebaseAgentForBranch(
   baseBranch: string,
   issueId: string,
 ): Promise<MergeResult> {
-  console.log(`[merge-agent] Starting rebase of ${featureBranch} onto ${baseBranch} for ${issueId}`);
-  logActivity('rebase_start', `Rebasing ${featureBranch} onto ${baseBranch} for ${issueId}`);
+  console.log(`[ship-role] Starting ship rebase of ${featureBranch} onto ${baseBranch} for ${issueId}`);
+  logActivity('ship_rebase_start', `Starting ship role for ${featureBranch} onto ${baseBranch}`);
 
-  // Pre-flight: verify feature branch is pushed to remote
   try {
     const { stdout: remoteBranches } = await execAsync(
       `git ls-remote --heads origin ${featureBranch}`,
@@ -1305,218 +1262,41 @@ export async function spawnRebaseAgentForBranch(
     );
     if (!remoteBranches.trim()) {
       const message = `Branch ${featureBranch} is not pushed to remote`;
-      console.error(`[merge-agent] ${message}`);
+      console.error(`[ship-role] ${message}`);
       return { success: false, reason: message };
     }
   } catch {
-    const message = `Cannot verify remote branch ${featureBranch}`;
-    console.error(`[merge-agent] ${message}`);
-    return { success: false, reason: message };
+    return { success: false, reason: `Cannot verify remote branch ${featureBranch}` };
   }
 
-  // Record current remote HEAD of feature branch to detect rebase completion
-  let headBefore: string;
-  try {
-    await execAsync(`git fetch origin ${featureBranch}`, { cwd: workspacePath, encoding: 'utf-8' });
-    const { stdout } = await execAsync(`git rev-parse origin/${featureBranch}`, {
-      cwd: workspacePath,
-      encoding: 'utf-8',
-    });
-    headBefore = stdout.trim();
-  } catch (err: any) {
-    return { success: false, reason: `Failed to get remote HEAD: ${err.message}` };
-  }
-
-  // Build rebase task prompt
   const apiPort = process.env.API_PORT || process.env.PORT || '3011';
   const apiUrl = process.env.DASHBOARD_URL || `http://localhost:${apiPort}`;
+  const prompt = buildShipPreparationPrompt({
+    issueId,
+    workspacePath,
+    featureBranch,
+    targetBranch: baseBranch,
+    apiUrl,
+  });
 
-  const taskPrompt = `REBASE TASK for ${issueId}:
-
-WORKSPACE: ${workspacePath}
-FEATURE BRANCH: ${featureBranch}
-BASE BRANCH: ${baseBranch}
-
-INSTRUCTIONS:
-
-1. cd ${workspacePath}
-2. git fetch origin ${baseBranch}
-3. Check if rebase is needed:
-   \`\`\`bash
-   BEHIND=$(git rev-list --count HEAD..origin/${baseBranch})
-   echo "Commits behind origin/${baseBranch}: $BEHIND"
-   \`\`\`
-4. If BEHIND is 0: skip rebase entirely — branch is already up to date. Go to step 7.
-5. If BEHIND > 0: Remove .planning/ first (ephemeral artifacts always conflict), then rebase:
-   \`\`\`bash
-   git rm -rf .planning/ 2>/dev/null && git commit -m "chore: remove planning artifacts before rebase" 2>/dev/null
-   git rebase origin/${baseBranch}
-   \`\`\`
-6. If rebase has conflicts:
-   a. Immediately abort: git rebase --abort
-   b. Report FAILURE — do NOT attempt to resolve conflicts manually
-7. git push --force-with-lease origin ${featureBranch}
-8. Merge the PR via GitHub CLI (this is the ACTUAL merge to main):
-   \`\`\`bash
-   gh pr merge ${featureBranch} --squash
-   \`\`\`
-   Do NOT use --auto or --admin flags. Panopticon reports commit statuses via GitHub App,
-   so branch protection checks will pass automatically.
-   If this fails, report FAILURE — do NOT report success without a merged PR.
-9. Report completion by calling the Panopticon API:
-   curl -s -X POST ${apiUrl}/api/specialists/done \\
-     -H "Content-Type: application/json" \\
-     -d '{"specialist":"merge","issueId":"${issueId}","status":"passed","notes":"Rebased and merged PR via gh pr merge --squash"}'
-
-IMPORTANT:
-- Work ONLY in ${workspacePath} — do NOT modify the main repo
-- Do NOT run git merge locally — use gh pr merge --squash to merge via GitHub
-- Do NOT run build or tests — CI handles validation after PR merge
-- Use --force-with-lease (never --force) for the push
-- The PR MUST be merged via gh pr merge before reporting success
-- Report completion immediately after the PR merge
-
-IF REBASE FAILS (conflicts):
-After aborting, report failure so the work agent can fix it:
-\`\`\`bash
-curl -s -X POST ${apiUrl}/api/specialists/done \\
-  -H "Content-Type: application/json" \\
-  -d '{"specialist":"merge","issueId":"${issueId}","status":"failed","notes":"Rebase conflicts with main — work agent must run: git fetch origin main && git rebase origin/main, resolve conflicts, then resubmit"}'
-\`\`\`
-
-IF gh pr merge FAILS:
-Report failure — do NOT report success:
-\`\`\`bash
-curl -s -X POST ${apiUrl}/api/specialists/done \\
-  -H "Content-Type: application/json" \\
-  -d '{"specialist":"merge","issueId":"${issueId}","status":"failed","notes":"Rebase succeeded but gh pr merge --squash failed"}'
-\`\`\`
-
-CRITICAL: You MUST call the /api/specialists/done endpoint whether you succeed or fail.
-CRITICAL: Success means the PR is MERGED on GitHub. Rebase alone is NOT success.`;
-
-  // Resolve project for per-project ephemeral specialist
-  const resolvedProject = resolveProjectFromIssue(issueId);
-  const mergeProjectKey = resolvedProject?.projectKey ?? null;
-  const mergeSession = getTmuxSessionName('merge-agent', mergeProjectKey ?? undefined);
-
-  if (!resolvedProject) {
-    console.warn(`[merge-agent] Could not resolve project for ${issueId} — using global specialist`);
-  }
-
-  // Wait for specialist to be idle (same as spawnMergeAgentForBranches)
-  if (mergeProjectKey) {
-    const { getAgentRuntimeState, saveAgentRuntimeState } = await import('../agents.js');
-    const IDLE_POLL_INTERVAL = 3000;
-    const IDLE_MAX_WAIT = 360000;
-    const idleStart = Date.now();
-
-    while (Date.now() - idleStart < IDLE_MAX_WAIT) {
-      const state = getAgentRuntimeState(mergeSession);
-      if (!state || state.state === 'idle' || state.state === 'suspended') break;
-      const mergeSessionAlive = await sessionExistsAsync(mergeSession);
-      if (!mergeSessionAlive) {
-        saveAgentRuntimeState(mergeSession, { state: 'idle', lastActivity: new Date().toISOString() });
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, IDLE_POLL_INTERVAL));
-    }
-  }
-
-  // Wake the merge-agent specialist
-  let wakeResult: { success: boolean; message: string };
-  if (mergeProjectKey) {
-    wakeResult = await spawnEphemeralSpecialist(mergeProjectKey, 'merge-agent', {
-      issueId,
-      branch: featureBranch,
-      workspace: workspacePath,
-      promptOverride: taskPrompt,
-    });
-  } else {
-    wakeResult = await wakeSpecialist('merge-agent', taskPrompt, {
-      waitForReady: true,
-      startIfNotRunning: true,
-      issueId,
-    });
-  }
-
-  if (!wakeResult.success) {
+  const shipResult = await spawnShipRoleForTask({ issueId, workspacePath, prompt });
+  if (!shipResult.success) {
     return {
       success: false,
-      reason: `Failed to wake merge-agent specialist: ${wakeResult.message}`,
+      reason: `Failed to start ship role: ${shipResult.message}`,
     };
   }
 
-  console.log(`[merge-agent] Rebase specialist woken for ${issueId}, polling for completion...`);
-
-  // Poll for rebase completion: remote feature branch HEAD should change after rebase + push
-  const POLL_INTERVAL = 5000;
-  const MAX_WAIT = 10 * 60 * 1000; // 10 minutes
-
-  const startTime = Date.now();
-  while (Date.now() - startTime < MAX_WAIT) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-    try {
-      await execAsync(`git fetch origin ${featureBranch}`, {
-        cwd: workspacePath,
-        encoding: 'utf-8',
-        timeout: 10000,
-      }).catch(() => {});
-
-      const { stdout: remoteHeadRaw } = await execAsync(
-        `git rev-parse origin/${featureBranch}`,
-        { cwd: workspacePath, encoding: 'utf-8' },
-      );
-      const remoteHead = remoteHeadRaw.trim();
-
-      if (remoteHead !== headBefore) {
-        console.log(`[merge-agent] Rebase complete for ${issueId}, new remote HEAD: ${remoteHead}`);
-        logActivity('rebase_complete', `Rebase completed for ${issueId}`);
-        return { success: true, reason: 'Rebase completed successfully' };
-      }
-    } catch {
-      // Continue polling
-    }
-
-    // Check if specialist stopped
-    if (!(await isRunning('merge-agent', mergeProjectKey ?? undefined))) {
-      // Final check: maybe rebase succeeded just before specialist stopped
-      try {
-        await execAsync(`git fetch origin ${featureBranch}`, {
-          cwd: workspacePath,
-          encoding: 'utf-8',
-        }).catch(() => {});
-        const { stdout } = await execAsync(`git rev-parse origin/${featureBranch}`, {
-          cwd: workspacePath,
-          encoding: 'utf-8',
-        });
-        if (stdout.trim() !== headBefore) {
-          console.log(`[merge-agent] Rebase detected after specialist stopped for ${issueId}`);
-          return { success: true, reason: 'Rebase completed (detected after specialist stopped)' };
-        }
-      } catch {}
-
-      return {
-        success: false,
-        reason: 'merge-agent specialist stopped before completing rebase',
-      };
-    }
-  }
-
-  logActivity('rebase_timeout', `Rebase timed out for ${issueId}`);
+  logActivity('ship_rebase_started', shipResult.message);
   return {
-    success: false,
-    reason: 'Timeout waiting for rebase to complete (10 minutes)',
+    success: true,
+    validationStatus: 'NOT_RUN',
+    testsStatus: 'SKIP',
+    reason: shipResult.message,
+    notes: 'Ship role started for rebase/verify/push; it will mark readyForMerge after preparation succeeds.',
   };
 }
 
-/**
- * Salvage a stranded merge commit — if the specialist merged locally but died
- * before pushing, detect the unpushed merge and push it ourselves.
- *
- * Returns a success result if salvaged, or null if nothing to salvage.
- */
 async function salvageStrandedMerge(
   projectPath: string,
   targetBranch: string,
@@ -1559,7 +1339,7 @@ async function salvageStrandedMerge(
     logActivity('merge_salvage', `Pushing stranded merge commit ${currentHead.slice(0, 8)} for ${issueId}`);
 
     try {
-      await gitPush(projectPath, 'origin', targetBranch, { issueId });
+      await Effect.runPromise(gitPush(projectPath, 'origin', targetBranch, { issueId }));
     } catch (pushErr: unknown) {
       if (pushErr instanceof MainDivergedError) {
         // origin has advanced past our local ancestor — a hotfix landed.
@@ -1621,8 +1401,8 @@ export async function scanForConflictMarkers(projectPath: string): Promise<strin
  * Sync the latest main branch into a workspace's feature branch.
  *
  * This performs a `git merge origin/main` in the workspace. If the merge is clean
- * it returns immediately. If conflicts arise, the merge-agent specialist is woken
- * to resolve them. The merge is never pushed — this is a local workspace operation.
+ * it returns immediately. If conflicts arise, the ship role is started to resolve
+ * them. The merge is never pushed — this is a local workspace operation.
  *
  * Auto-commits any uncommitted changes before merging (with safety verification).
  */
@@ -1632,6 +1412,13 @@ export async function syncMainIntoWorkspace(
 ): Promise<SyncMainResult> {
   console.log(`[sync-main] Starting sync of main into workspace for ${issueId}`);
   logActivity('sync_main_start', `Starting sync for ${issueId}`);
+
+  // PAN-1158 safety net: a workspace bd dolt DB that briefly went empty can
+  // leave `.beads/issues.jsonl` reported as deleted by `git status`. The
+  // auto-commit below would then propagate that deletion onto the feature
+  // branch. Restore the tracked export first so the auto-commit only sees
+  // intentional changes.
+  await Effect.runPromise(restoreTrackedBeadsExport(projectPath));
 
   // Pre-flight: auto-commit uncommitted changes before merge
   try {
@@ -1643,7 +1430,7 @@ export async function syncMainIntoWorkspace(
       console.log(`[sync-main] Uncommitted changes detected, auto-committing...`);
       logActivity('sync_main_auto_commit', `Auto-committing uncommitted changes before sync`);
       try {
-        await execAsync('git add -A && git commit -m "WIP: auto-commit before sync with main"', {
+        await execAsync('git add -A && git commit -m "chore: auto-commit before sync with main"', {
           cwd: projectPath,
           encoding: 'utf-8',
         });
@@ -1673,7 +1460,7 @@ export async function syncMainIntoWorkspace(
 
   // Clean up stale git lock files
   try {
-    const lockCleanup = await cleanupStaleLocks(projectPath);
+    const lockCleanup = await Effect.runPromise(cleanupStaleLocks(projectPath));
     if (lockCleanup.found.length > 0) {
       console.log(`[sync-main] Found ${lockCleanup.found.length} lock file(s)`);
       if (lockCleanup.removed.length > 0) {
@@ -1742,148 +1529,39 @@ export async function syncMainIntoWorkspace(
     return { success: true, commitCount, changedFiles };
   }
 
-  // Conflict case — delegate to merge-agent specialist
+  // Conflict case — delegate to ship role
   const conflictFiles = await getConflictFiles(projectPath);
-  console.log(`[sync-main] ${conflictFiles.length} conflict(s), waking merge-agent...`);
+  console.log(`[sync-main] ${conflictFiles.length} conflict(s), starting ship role...`);
   logActivity('sync_main_conflicts', `${conflictFiles.length} conflict(s) in ${issueId}: ${conflictFiles.join(', ')}`);
 
   const workspaceBranch = await execAsync('git branch --show-current', { cwd: projectPath, encoding: 'utf-8' })
     .then(r => r.stdout.trim())
     .catch(() => `feature/${issueId.toLowerCase()}`);
 
-  let taskPrompt: string;
-  try {
-    taskPrompt = renderPrompt({
-      name: 'sync-main',
-      vars: {
-        projectPath,
-        workspaceBranch,
-        issueId,
-        conflictFiles: conflictFiles.map(f => `- ${f}`).join('\n'),
-      },
-    });
-  } catch (templateErr: any) {
-    console.error(`[sync-main] Could not render sync-main prompt: ${templateErr.message}`);
-    logActivity('sync_main_error', `Prompt render failed: ${templateErr.message}`);
-    try { await execAsync('git merge --abort', { cwd: projectPath, encoding: 'utf-8' }); } catch {}
-    return { success: false, conflictFiles, reason: 'Internal error: sync-main prompt render failed' };
-  }
+  const prompt = buildShipSyncMainPrompt({
+    issueId,
+    workspacePath: projectPath,
+    workspaceBranch,
+    conflictFiles,
+  });
 
-  // Wake the merge-agent specialist using per-project ephemeral lifecycle when possible
-  const syncResolvedProject = resolveProjectFromIssue(issueId);
-  const syncProjectKey = syncResolvedProject?.projectKey ?? null;
-  let syncWakeResult: { success: boolean; message: string; tmuxSession?: string; error?: string };
-  if (syncProjectKey) {
-    syncWakeResult = await spawnEphemeralSpecialist(syncProjectKey, 'merge-agent', {
-      issueId,
-      branch: workspaceBranch,
-      workspace: projectPath,
-      promptOverride: taskPrompt,
-    });
-  } else {
-    syncWakeResult = await wakeSpecialist('merge-agent', taskPrompt, {
-      waitForReady: true,
-      startIfNotRunning: true,
-      issueId,
-    });
-  }
-
-  if (!syncWakeResult.success) {
+  const shipResult = await spawnShipRoleForTask({ issueId, workspacePath: projectPath, prompt });
+  if (!shipResult.success) {
     try { await execAsync('git merge --abort', { cwd: projectPath, encoding: 'utf-8' }); } catch {}
-    const message = `Failed to wake merge-agent specialist: ${syncWakeResult.message}`;
+    const message = `Failed to start ship role for sync-main conflicts: ${shipResult.message}`;
     console.error(`[sync-main] ${message}`);
     logActivity('sync_main_error', message);
     return { success: false, conflictFiles, reason: message };
   }
 
-  console.log(`[sync-main] Specialist woken, waiting for conflict resolution...`);
-  logActivity('sync_main_agent_woken', `Agent resolving ${conflictFiles.length} conflict(s) for ${issueId}`);
-
-  // Poll tmux output for MERGE_RESULT markers
-  const tmuxSession = getTmuxSessionName('merge-agent', syncProjectKey ?? undefined);
-  const startTime = Date.now();
-  // Tests override via PANOPTICON_TEST_POLL_MS to avoid real 5-second waits.
-  const POLL_INTERVAL = Number(process.env.PANOPTICON_TEST_POLL_MS) || 5000;
-  const SYNC_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
-  let lastOutput = '';
-
-  while (Date.now() - startTime < SYNC_TIMEOUT_MS) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-    const output = await captureTmuxOutput(tmuxSession);
-    if (output !== lastOutput) {
-      lastOutput = output;
-      const hasStructured = output.includes('MERGE_RESULT:');
-      const lowerOutput = output.toLowerCase();
-      const hasHumanReadable =
-        lowerOutput.includes('merge task complete') ||
-        lowerOutput.includes('successfully merged') ||
-        lowerOutput.includes('merge complete') ||
-        lowerOutput.includes('merge failed') ||
-        lowerOutput.includes('merge task failed');
-
-      if (hasStructured || hasHumanReadable) {
-        const agentResult = parseAgentOutput(output);
-
-        if (agentResult.success) {
-          // Verify no leftover conflict markers
-          const remaining = await scanForConflictMarkers(projectPath);
-          if (remaining.length > 0) {
-            try { await execAsync('git merge --abort', { cwd: projectPath, encoding: 'utf-8' }); } catch {}
-            const msg = `Agent reported success but ${remaining.length} conflict marker(s) remain in: ${remaining.join(', ')}`;
-            console.error(`[sync-main] ${msg}`);
-            logActivity('sync_main_markers_remain', msg);
-            return { success: false, conflictFiles, reason: msg };
-          }
-
-          console.log(`[sync-main] ✓ Conflicts resolved by agent`);
-          logActivity('sync_main_success', `Merge agent resolved conflicts for ${issueId}`);
-
-          // Collect stats
-          let changedFiles: string[] = [];
-          let commitCount = 0;
-          try {
-            const { stdout: diffFiles } = await execAsync(
-              'git diff --name-only ORIG_HEAD HEAD',
-              { cwd: projectPath, encoding: 'utf-8' },
-            );
-            changedFiles = diffFiles.trim().split('\n').filter(f => f.length > 0);
-            const { stdout: logOut } = await execAsync(
-              'git log ORIG_HEAD..HEAD --oneline',
-              { cwd: projectPath, encoding: 'utf-8' },
-            );
-            commitCount = logOut.trim().split('\n').filter(l => l.length > 0).length;
-          } catch { /* non-fatal */ }
-
-          return { success: true, commitCount, changedFiles };
-        } else {
-          // Agent failed — ensure merge is aborted
-          try { await execAsync('git merge --abort', { cwd: projectPath, encoding: 'utf-8' }); } catch {}
-          console.log(`[sync-main] ✗ Agent could not resolve conflicts`);
-          logActivity('sync_main_agent_failed', `Agent failed to resolve conflicts for ${issueId}`);
-          return {
-            success: false,
-            conflictFiles,
-            reason: agentResult.reason || 'Merge agent could not resolve conflicts',
-          };
-        }
-      }
-    }
-
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    if (elapsed % 30 === 0) {
-      console.log(`[sync-main] Still waiting for agent... (${elapsed}s elapsed)`);
-    }
-  }
-
-  // Timeout
-  try { await execAsync('git merge --abort', { cwd: projectPath, encoding: 'utf-8' }); } catch {}
-  logActivity('sync_main_timeout', `Sync timed out for ${issueId}`);
+  console.log(`[sync-main] Ship role started for conflict resolution: ${shipResult.message}`);
+  logActivity('sync_main_ship_started', `Ship role resolving ${conflictFiles.length} conflict(s) for ${issueId}`);
   return {
-    success: false,
-    conflictFiles,
-    reason: `Timeout: merge agent did not complete within ${SYNC_TIMEOUT_MS / 60000} minutes`,
+    success: true,
+    commitCount: 0,
+    changedFiles: conflictFiles,
   };
+
 }
 
 /**
@@ -1899,7 +1577,7 @@ export async function runProjectQualityGates(
   phase: 'pre_push' | 'post_push'
 ): Promise<import('./validation.js').QualityGateResult[]> {
   try {
-    const config = loadProjectsConfig();
+    const config = loadProjectsConfigSync();
     // Find the project whose path matches
     const project = Object.values(config.projects).find(p => projectPath.startsWith(p.path));
     if (!project?.quality_gates || Object.keys(project.quality_gates).length === 0) {
@@ -1936,7 +1614,7 @@ export async function runProjectQualityGates(
     }
 
     console.log(`[merge-agent] Running ${phase} quality gates for project "${project.name}"`);
-    return await runQualityGates(gatesToRun, projectPath, phase);
+    return await Effect.runPromise(runQualityGates(gatesToRun, projectPath, phase));
   } catch (error: any) {
     console.error(`[merge-agent] Failed to load quality gates: ${error.message}`);
     return [];

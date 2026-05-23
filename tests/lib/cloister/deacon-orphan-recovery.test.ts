@@ -1,14 +1,14 @@
 /**
  * Tests for PAN-369: checkOrphanedReviewStatuses orphan recovery logic.
  *
- * Covers the dispatch paths after queue removal (PAN-722):
+ * Covers the dispatch paths after queue removal (PAN-722) and role migration (PAN-1048):
  *   (a) testStatus='testing'/'dispatch_failed' + workspace available in agent state
- *       → spawn via spawnEphemeralSpecialist, set testStatus='testing' on success
- *   (b) specialist_busy → set dispatch_failed so deacon retries next patrol
+ *       → spawn via spawnRun(issueId, 'test'), set testStatus='testing' on success
+ *   (b) spawn failure → set dispatch_failed so deacon retries next patrol
  *   (c) testStatus='testing'/'dispatch_failed' + no workspace available
  *       → reset to 'pending' (user must re-trigger manually)
  *   (d) reviewStatus='pending' + completed.processed marker + workspace + project
- *       → re-dispatch via dispatchParallelReview, set reviewStatus='reviewing'
+ *       → re-dispatch via spawnReviewRoleForIssue, set reviewStatus='reviewing'
  *
  * PAN-653: deacon now reads state via loadReviewStatuses() (SQLite-first) and
  * writes via setReviewStatus() (SQLite + JSON). These tests mock both APIs to
@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Effect } from 'effect';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -35,6 +36,7 @@ vi.mock('../../../src/lib/review-status.js', async (importOriginal) => {
     ...actual,
     loadReviewStatuses: (...args: unknown[]) => mockLoadReviewStatuses(...args as []),
     setReviewStatus: (...args: unknown[]) => mockSetReviewStatus(...args),
+  setReviewStatusSync: (...args: unknown[]) => mockSetReviewStatus(...args),
   };
 });
 
@@ -43,11 +45,16 @@ vi.mock('../../../src/lib/review-status.js', async (importOriginal) => {
 // ---------------------------------------------------------------------------
 
 const mockGetTmuxSessionName = vi.fn();
-const mockSpawnEphemeralSpecialist = vi.fn();
-const mockDispatchParallelReview = vi.fn();
+const mockSpawnRun = vi.fn();
+const mockSpawnReviewRoleForIssue = vi.fn();
 
 vi.mock('../../../src/lib/cloister/review-agent.js', () => ({
-  dispatchParallelReview: (...args: unknown[]) => mockDispatchParallelReview(...args),
+  // PAN-1048 R3/R4: deacon now spawns the review role primitive instead of
+  // dispatching the legacy `pan review run` coordinator.
+  spawnReviewRoleForIssue: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve(mockSpawnReviewRoleForIssue(...args)),
+    catch: (cause) => cause as any,
+  }),
 }));
 
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
@@ -55,10 +62,6 @@ vi.mock('../../../src/lib/cloister/specialists.js', () => ({
   getTmuxSessionName: (...args: unknown[]) => mockGetTmuxSessionName(...args),
   isRunning: vi.fn().mockResolvedValue(false),
   initializeSpecialist: vi.fn(),
-  wakeSpecialist: vi.fn(),
-  clearSessionId: vi.fn(),
-  spawnEphemeralSpecialist: (...args: unknown[]) => mockSpawnEphemeralSpecialist(...args),
-  wakeSpecialistWithTask: vi.fn(),
   getAllProjectSpecialistStatuses: vi.fn().mockResolvedValue([]),
 }));
 
@@ -66,6 +69,7 @@ const mockSessionExists = vi.fn();
 
 vi.mock('../../../src/lib/tmux.js', () => ({
   sessionExists: (...args: unknown[]) => mockSessionExists(...args),
+  sessionExistsSync: (...args: unknown[]) => mockSessionExists(...args),
   sendKeysAsync: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -74,19 +78,52 @@ const mockGetAgentState = vi.fn();
 
 vi.mock('../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: (...args: unknown[]) => mockGetAgentRuntimeState(...args),
+  getAgentRuntimeStateSync: (...args: unknown[]) => mockGetAgentRuntimeState(...args),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
   listRunningAgents: vi.fn().mockResolvedValue([]),
+  listRunningAgentsSync: vi.fn().mockResolvedValue([]),
   getAgentDir: vi.fn().mockReturnValue('/tmp'),
   getAgentState: (...args: unknown[]) => mockGetAgentState(...args),
+  getAgentStateSync: (...args: unknown[]) => mockGetAgentState(...args),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
+  spawnRun: (...args: unknown[]) => mockSpawnRun(...args),
 }));
 
 const mockResolveProjectFromIssue = vi.fn();
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: (...args: unknown[]) => mockResolveProjectFromIssue(...args),
+  resolveProjectFromIssueSync: (...args: unknown[]) => mockResolveProjectFromIssue(...args),
   findProjectByPath: vi.fn().mockReturnValue(null),
+  findProjectByPathSync: vi.fn().mockReturnValue(null),
+}));
+
+// ---------------------------------------------------------------------------
+// Mock the workspace docker-stack health + rebuild modules. The deacon's
+// orphan-test recovery now self-heals an unhealthy stack before re-dispatching
+// (PAN-1190); these mocks let the tests drive that path without touching Docker.
+// ---------------------------------------------------------------------------
+
+const mockGetWorkspaceStackHealth = vi.fn();
+const mockRebuildWorkspaceStack = vi.fn();
+
+vi.mock('../../../src/lib/workspace/stack-health.js', () => ({
+  // getWorkspaceStackHealth is Effect-returning post-PAN-1249. Mocks script
+  // via mockResolvedValue (Promise) — wrap to translate to Effect at the
+  // call site so production's `yield* getWorkspaceStackHealth(...)` works.
+  getWorkspaceStackHealth: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve().then(() => mockGetWorkspaceStackHealth(...args)),
+    catch: (cause) => cause as any,
+  }),
+}));
+
+vi.mock('../../../src/lib/workspace/rebuild-stack.js', () => ({
+  rebuildWorkspaceStack: (...args: unknown[]) => Effect.tryPromise({
+    try: () => Promise.resolve().then(() => mockRebuildWorkspaceStack(...args)),
+    catch: (cause) => cause as any,
+  }),
 }));
 
 // Import after mocks are in place
@@ -119,7 +156,15 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
     // Default: empty review status store (DB-backed via loadReviewStatuses mock)
     mockLoadReviewStatuses.mockReturnValue({});
     // Default: parallel review dispatch succeeds (review orphan re-dispatch path)
-    mockDispatchParallelReview.mockResolvedValue({ success: true, message: 'dispatched' });
+    mockSpawnReviewRoleForIssue.mockResolvedValue({ success: true, message: 'dispatched' });
+    // Default: workspace docker stack is healthy, so orphan-test recovery
+    // proceeds straight to dispatch. Unhealthy-stack tests override this.
+    mockGetWorkspaceStackHealth.mockResolvedValue({
+      healthy: true,
+      reasons: [],
+      lastObserved: new Date().toISOString(),
+    });
+    mockRebuildWorkspaceStack.mockResolvedValue({ success: true });
   });
 
   afterEach(() => {
@@ -128,10 +173,10 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Branch (a): workspace available → spawn immediately
+  // Branch (a): workspace available → spawn a test role immediately
   // -------------------------------------------------------------------------
 
-  it('(a) re-dispatches via spawnEphemeralSpecialist and sets testStatus=testing when workspace is available', async () => {
+  it('(a) re-dispatches via spawnRun test role and sets testStatus=testing when workspace is available', async () => {
     const workspace = '/workspaces/feature-pan-369-test';
 
     mockLoadReviewStatuses.mockReturnValue({
@@ -145,15 +190,14 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
-    mockSpawnEphemeralSpecialist.mockResolvedValue({ success: true, message: 'spawned' });
+    mockSpawnRun.mockResolvedValue({ id: 'test-run-1' });
 
     const actions = await checkOrphanedReviewStatuses();
 
-    expect(mockSpawnEphemeralSpecialist).toHaveBeenCalledWith('panopticon-cli', 'test-agent', {
-      issueId: ISSUE_ID,
+    expect(mockSpawnRun).toHaveBeenCalledWith(ISSUE_ID, 'test', expect.objectContaining({
       workspace,
-      branch: `feature/${ISSUE_ID.toLowerCase()}`,
-    });
+      prompt: expect.stringContaining(ISSUE_ID),
+    }));
 
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatch(/Re-dispatched orphaned test for/);
@@ -177,15 +221,14 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
-    mockSpawnEphemeralSpecialist.mockResolvedValue({ success: true, message: 'spawned' });
+    mockSpawnRun.mockResolvedValue({ id: 'test-run-1' });
 
     const actions = await checkOrphanedReviewStatuses();
 
-    expect(mockSpawnEphemeralSpecialist).toHaveBeenCalledWith('panopticon-cli', 'test-agent', {
-      issueId: ISSUE_ID,
+    expect(mockSpawnRun).toHaveBeenCalledWith(ISSUE_ID, 'test', expect.objectContaining({
       workspace,
-      branch: `feature/${ISSUE_ID.toLowerCase()}`,
-    });
+      prompt: expect.stringContaining(ISSUE_ID),
+    }));
 
     expect(actions).toHaveLength(1);
     expect(actions[0]).toContain(ISSUE_ID);
@@ -195,10 +238,10 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Branch (b): specialist busy → set dispatch_failed for next patrol
+  // Branch (b): spawn failure → set dispatch_failed for next patrol
   // -------------------------------------------------------------------------
 
-  it('(b) sets dispatch_failed when specialist is busy', async () => {
+  it('(b) sets dispatch_failed when the test role spawn fails', async () => {
     const workspace = '/workspaces/feature-pan-369-test';
 
     mockLoadReviewStatuses.mockReturnValue({
@@ -212,16 +255,91 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
-    mockSpawnEphemeralSpecialist.mockResolvedValue({ success: false, error: 'specialist_busy' });
+    mockSpawnRun.mockRejectedValue(new Error('spawn failed'));
 
     const actions = await checkOrphanedReviewStatuses();
 
-    expect(mockSpawnEphemeralSpecialist).toHaveBeenCalled();
+    expect(mockSpawnRun).toHaveBeenCalled();
     expect(actions).toHaveLength(1);
-    expect(actions[0]).toMatch(/specialist busy/i);
+    expect(actions[0]).toMatch(/test role dispatch failed/i);
 
     // DB-backed path: setReviewStatus must be called with testStatus='dispatch_failed'
     expect(mockSetReviewStatus).toHaveBeenCalledWith(ISSUE_ID, expect.objectContaining({ testStatus: 'dispatch_failed' }));
+  });
+
+  // -------------------------------------------------------------------------
+  // Branch (e): unhealthy workspace docker stack → rebuild, then re-dispatch
+  // (PAN-1190: without this the orphan-test patrol loops dispatch_failed forever)
+  // -------------------------------------------------------------------------
+
+  it('(e) rebuilds an unhealthy workspace stack before re-dispatching the test role', async () => {
+    const stackIssue = 'PAN-1190-STACK';
+    const workspace = '/workspaces/feature-pan-1190-stack';
+
+    mockLoadReviewStatuses.mockReturnValue({
+      [stackIssue]: {
+        reviewStatus: 'passed',
+        testStatus: 'dispatch_failed',
+        readyForMerge: false,
+        history: [],
+      },
+    });
+
+    mockGetAgentState.mockReturnValue({ workspace });
+    mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
+    mockGetWorkspaceStackHealth.mockResolvedValue({
+      healthy: false,
+      reasons: ['feature-pan-1190-stack-dev-1 service exited (255)'],
+      lastObserved: new Date().toISOString(),
+    });
+    mockRebuildWorkspaceStack.mockResolvedValue({ success: true });
+    mockSpawnRun.mockResolvedValue({ id: 'test-run-stack' });
+
+    const actions = await checkOrphanedReviewStatuses();
+
+    // The deacon rebuilt the stack, then dispatched the test role.
+    expect(mockRebuildWorkspaceStack).toHaveBeenCalledWith(stackIssue, expect.anything());
+    expect(mockSpawnRun).toHaveBeenCalledWith(stackIssue, 'test', expect.objectContaining({ workspace }));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatch(/Re-dispatched orphaned test for/);
+    expect(mockSetReviewStatus).toHaveBeenCalledWith(stackIssue, expect.objectContaining({ testStatus: 'testing' }));
+  });
+
+  // -------------------------------------------------------------------------
+  // Branch (f): unhealthy stack + rebuild fails → defer, do NOT spin on dispatch
+  // -------------------------------------------------------------------------
+
+  it('(f) defers re-dispatch (no spawn) when the workspace stack rebuild fails', async () => {
+    const stackIssue = 'PAN-1190-STACKFAIL';
+    const workspace = '/workspaces/feature-pan-1190-stackfail';
+
+    mockLoadReviewStatuses.mockReturnValue({
+      [stackIssue]: {
+        reviewStatus: 'passed',
+        testStatus: 'dispatch_failed',
+        readyForMerge: false,
+        history: [],
+      },
+    });
+
+    mockGetAgentState.mockReturnValue({ workspace });
+    mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
+    mockGetWorkspaceStackHealth.mockResolvedValue({
+      healthy: false,
+      reasons: ['feature-pan-1190-stackfail-server-1 service exited (0)'],
+      lastObserved: new Date().toISOString(),
+    });
+    mockRebuildWorkspaceStack.mockResolvedValue({ success: false, error: 'docker build failed' });
+
+    const actions = await checkOrphanedReviewStatuses();
+
+    // Rebuild was attempted, but the test role must NOT be dispatched onto a
+    // still-broken stack — and the patrol must not spin.
+    expect(mockRebuildWorkspaceStack).toHaveBeenCalledWith(stackIssue, expect.anything());
+    expect(mockSpawnRun).not.toHaveBeenCalled();
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatch(/deferring re-dispatch/i);
+    expect(mockSetReviewStatus).toHaveBeenCalledWith(stackIssue, expect.objectContaining({ testStatus: 'dispatch_failed' }));
   });
 
   // -------------------------------------------------------------------------
@@ -247,7 +365,7 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
     const actions = await checkOrphanedReviewStatuses();
 
     // Cannot re-dispatch without workspace — must not spawn
-    expect(mockSpawnEphemeralSpecialist).not.toHaveBeenCalled();
+    expect(mockSpawnRun).not.toHaveBeenCalled();
 
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatch(/Reset orphaned test for/);
@@ -258,10 +376,10 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Branch (d): orphaned pending review → re-dispatch via dispatchParallelReview
+  // Branch (d): orphaned pending review → re-dispatch via spawnReviewRoleForIssue
   // -------------------------------------------------------------------------
 
-  it('(d) re-dispatches pending review via dispatchParallelReview and sets reviewStatus=reviewing', async () => {
+  it('(d) re-dispatches pending review via spawnReviewRoleForIssue and sets reviewStatus=reviewing', async () => {
     const workspace = '/workspaces/feature-pan-369-test';
     const agentId = `agent-${ISSUE_ID.toLowerCase()}`;
     const agentDir = join(homedir(), '.panopticon', 'agents', agentId);
@@ -283,11 +401,11 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli', projectPath: '/workspaces' });
-    mockDispatchParallelReview.mockResolvedValue({ success: true, message: 'dispatched' });
+    mockSpawnReviewRoleForIssue.mockResolvedValue({ success: true, message: 'dispatched' });
 
     const actions = await checkOrphanedReviewStatuses();
 
-    expect(mockDispatchParallelReview).toHaveBeenCalledWith({
+    expect(mockSpawnReviewRoleForIssue).toHaveBeenCalledWith({
       issueId: ISSUE_ID,
       workspace,
       branch: `feature/${ISSUE_ID.toLowerCase()}`,
@@ -297,13 +415,13 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
     expect(actions[0]).toMatch(/Re-dispatched pending review for/);
     expect(actions[0]).toContain(ISSUE_ID);
 
-    // reviewStatus='reviewing' is set inside dispatchParallelReview (not by deacon directly).
+    // reviewStatus='reviewing' is set inside spawnReviewRoleForIssue (not by deacon directly).
     // Since the mock doesn't call setReviewStatus, we verify dispatch was called — that is
     // the deacon's responsibility. The status transition is covered by review-agent tests.
-    expect(mockDispatchParallelReview).toHaveBeenCalledTimes(1);
+    expect(mockSpawnReviewRoleForIssue).toHaveBeenCalledTimes(1);
   });
 
-  it('(d-fail) does not mark reviewing when dispatchParallelReview rejects', async () => {
+  it('(d-fail) does not mark reviewing when spawnReviewRoleForIssue rejects', async () => {
     const workspace = '/workspaces/feature-pan-369-test';
     const agentId = `agent-${ISSUE_ID.toLowerCase()}`;
     const agentDir = join(homedir(), '.panopticon', 'agents', agentId);
@@ -324,7 +442,7 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli', projectPath: '/workspaces' });
-    mockDispatchParallelReview.mockRejectedValue(new Error('spawn failed'));
+    mockSpawnReviewRoleForIssue.mockRejectedValue(new Error('spawn failed'));
 
     const actions = await checkOrphanedReviewStatuses();
 
@@ -334,7 +452,7 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
     expect(actions[0]).toContain(ISSUE_ID);
   });
 
-  it('does not re-dispatch pending review when the work agent was explicitly stopped', async () => {
+  it('re-dispatches pending review after completed handoff even when the work agent is stopped', async () => {
     const agentDir = join(homedir(), '.panopticon', 'agents', `agent-${ISSUE_ID.toLowerCase()}`);
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, 'completed.processed'), 'done\n', 'utf-8');
@@ -352,16 +470,22 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
       },
     });
 
+    const workspace = '/workspaces/feature-pan-369-test';
     mockGetAgentState.mockReturnValue({
-      workspace: '/workspaces/feature-pan-369-test',
+      workspace,
       status: 'stopped',
       stoppedByUser: true,
     });
+    mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli', projectPath: '/workspaces' });
 
     const actions = await checkOrphanedReviewStatuses();
 
-    expect(mockSpawnEphemeralSpecialist).not.toHaveBeenCalled();
-    expect(actions).toContain(`Skipped pending review for ${ISSUE_ID}: work agent was explicitly stopped`);
+    expect(mockSpawnReviewRoleForIssue).toHaveBeenCalledWith({
+      issueId: ISSUE_ID,
+      workspace,
+      branch: `feature/${ISSUE_ID.toLowerCase()}`,
+    });
+    expect(actions).toContain(`Re-dispatched pending review for ${ISSUE_ID} (deacon-orphan-recovery)`);
   });
 
   it('restores passed review/test state when top-level status is stuck in reviewing', async () => {
@@ -433,7 +557,7 @@ describe('checkOrphanedReviewStatuses — PAN-369 orphan recovery', () => {
 
     mockGetAgentState.mockReturnValue({ workspace });
     mockResolveProjectFromIssue.mockReturnValue({ projectKey: 'panopticon-cli' });
-    mockSpawnEphemeralSpecialist.mockResolvedValue({ success: true, message: 'spawned' });
+    mockSpawnRun.mockResolvedValue({ id: 'test-run-1' });
 
     await checkOrphanedReviewStatuses();
 

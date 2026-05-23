@@ -1,7 +1,11 @@
 import { defineConfig } from 'tsdown';
 
 export default defineConfig({
-  entry: { server: 'main.ts' },
+  entry: {
+    server: 'main.ts',
+    'dashboard-db-worker': 'services/dashboard-db-worker.ts',
+    'checkpoint-worker': '../../lib/memory/checkpoint-worker.ts',
+  },
   outDir: '../../../dist/dashboard',
   format: 'esm',
   platform: 'node',
@@ -10,7 +14,7 @@ export default defineConfig({
   sourcemap: true,
   outExtensions: () => ({ js: '.js' }),
   deps: {
-    alwaysBundle: [/^@panopticon\//],
+    alwaysBundle: [/^@panctl\//],
     neverBundle: [
       '@homebridge/node-pty-prebuilt-multiarch',
       'better-sqlite3',

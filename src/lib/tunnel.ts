@@ -8,7 +8,9 @@
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { homedir } from 'os';
-import { TunnelConfig, TunnelHostname, TemplatePlaceholders, replacePlaceholders } from './workspace-config.js';
+import { Effect } from 'effect';
+import { TunnelConfig, TunnelHostname, TemplatePlaceholders, replacePlaceholdersSync } from './workspace-config.js';
+import { TrackerError } from './errors.js';
 
 export interface TunnelResult {
   success: boolean;
@@ -99,17 +101,11 @@ function resolveHostnames(
   placeholders: TemplatePlaceholders,
 ): Array<{ hostname: string; httpHostHeader?: string; noTlsVerify: boolean }> {
   return hostnames.map(h => ({
-    hostname: replacePlaceholders(h.pattern, placeholders),
-    httpHostHeader: h.http_host_header ? replacePlaceholders(h.http_host_header, placeholders) : undefined,
+    hostname: replacePlaceholdersSync(h.pattern, placeholders),
+    httpHostHeader: h.http_host_header ? replacePlaceholdersSync(h.http_host_header, placeholders) : undefined,
     noTlsVerify: h.no_tls_verify !== false, // default true
   }));
-}
-
-/**
- * Add tunnel ingress rules and DNS CNAME records for a workspace.
- * Called during workspace creation.
- */
-export async function addTunnelIngress(
+}async function addTunnelIngressPromise(
   config: TunnelConfig,
   placeholders: TemplatePlaceholders,
 ): Promise<TunnelResult> {
@@ -207,13 +203,7 @@ export async function addTunnelIngress(
   }
 
   return { success: allOk, steps };
-}
-
-/**
- * Remove tunnel ingress rules and DNS CNAME records for a workspace.
- * Called during workspace removal and deep-wipe.
- */
-export async function removeTunnelIngress(
+}async function removeTunnelIngressPromise(
   config: TunnelConfig,
   placeholders: TemplatePlaceholders,
 ): Promise<TunnelResult> {
@@ -296,3 +286,43 @@ export async function removeTunnelIngress(
 
   return { success: allOk, steps };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/**
+ * Add tunnel ingress rules and DNS CNAME records for a workspace.
+ * Cloudflare API failures are surfaced as TrackerError; the per-step success
+ * map is preserved in the success channel via `TunnelResult.steps`.
+ */
+export const addTunnelIngress = (
+  config: TunnelConfig,
+  placeholders: TemplatePlaceholders,
+): Effect.Effect<TunnelResult, TrackerError> =>
+  Effect.tryPromise({
+    try: () => addTunnelIngressPromise(config, placeholders),
+    catch: (cause) =>
+      new TrackerError({
+        tracker: 'cloudflare',
+        operation: 'addTunnelIngress',
+        message: 'addTunnelIngress failed',
+        cause,
+      }),
+  });
+
+/**
+ * Remove tunnel ingress rules and DNS CNAME records for a workspace.
+ */
+export const removeTunnelIngress = (
+  config: TunnelConfig,
+  placeholders: TemplatePlaceholders,
+): Effect.Effect<TunnelResult, TrackerError> =>
+  Effect.tryPromise({
+    try: () => removeTunnelIngressPromise(config, placeholders),
+    catch: (cause) =>
+      new TrackerError({
+        tracker: 'cloudflare',
+        operation: 'removeTunnelIngress',
+        message: 'removeTunnelIngress failed',
+        cause,
+      }),
+  });

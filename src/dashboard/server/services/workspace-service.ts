@@ -9,10 +9,10 @@ import { existsSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { Effect, Layer, ServiceMap } from 'effect';
+import { Effect, Layer, Context } from 'effect';
 
 const execAsync = promisify(exec);
-import { resolveProjectFromIssue } from '../../../lib/projects.js';
+import { resolveProjectFromIssueSync } from '../../../lib/projects.js';
 import { WorkspaceNotFound, WorkspaceCreateError } from './typed-errors.js';
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ export interface WorkspaceServiceShape {
   /**
    * Clean build artifacts from a workspace.
    * preview=true returns a list of artifact paths without deleting.
-   * preview=false removes artifacts but preserves .planning directory.
+   * preview=false removes artifacts but preserves orchestration metadata directories.
    * Fails with WorkspaceNotFound if the workspace does not exist.
    */
   readonly clean: (issueId: string, preview?: boolean) => Effect.Effect<CleanResult, WorkspaceNotFound | WorkspaceCreateError>;
@@ -77,7 +77,7 @@ export interface WorkspaceServiceShape {
 
 // ─── Service tag ──────────────────────────────────────────────────────────────
 
-export class WorkspaceService extends ServiceMap.Service<
+export class WorkspaceService extends Context.Service<
   WorkspaceService,
   WorkspaceServiceShape
 >()('panopticon/dashboard/WorkspaceService') {}
@@ -89,8 +89,8 @@ export const WorkspaceServiceLive = Layer.effect(
   Effect.sync(() => {
     function getWorkspacePath(issueId: string): { projectPath: string; workspacePath: string; branch: string } {
       const issueLower = issueId.toLowerCase();
-      const project = resolveProjectFromIssue(issueId);
-      const projectPath = project?.path ?? process.cwd();
+      const project = resolveProjectFromIssueSync(issueId);
+      const projectPath = project?.projectPath ?? process.cwd();
       const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
       const branch = `feature/${issueLower}`;
       return { projectPath, workspacePath, branch };
@@ -120,10 +120,10 @@ export const WorkspaceServiceLive = Layer.effect(
             }
 
             const { createWorkspace } = await import('../../../lib/workspace-manager.js');
-            const { loadProjectsConfig } = await import('../../../lib/projects.js');
+            const { loadProjectsConfigSync } = await import('../../../lib/projects.js');
 
-            const { projects } = loadProjectsConfig();
-            const project = resolveProjectFromIssue(issueId);
+            const { projects } = loadProjectsConfigSync();
+            const project = resolveProjectFromIssueSync(issueId);
             if (!project) {
               throw new WorkspaceCreateError({
                 id: issueId,
@@ -132,13 +132,13 @@ export const WorkspaceServiceLive = Layer.effect(
             }
 
             const projectName = Object.entries(projects).find(
-              ([, p]) => p.path === project.path,
-            )?.[0] ?? 'unknown';
+              ([, p]) => p.path === project.projectPath,
+            )?.[0] ?? project.projectName;
 
-            const result = await createWorkspace({
-              projectConfig: { ...project, name: projectName },
+            const result = await Effect.runPromise(createWorkspace({
+              projectConfig: { name: projectName, path: project.projectPath },
               featureName: issueLower,
-            });
+            }));
 
             if (!result.success) {
               throw new WorkspaceCreateError({
@@ -170,15 +170,15 @@ export const WorkspaceServiceLive = Layer.effect(
             }
 
             const { removeWorkspace } = await import('../../../lib/workspace-manager.js');
-            const project = resolveProjectFromIssue(issueId);
+            const project = resolveProjectFromIssueSync(issueId);
             if (!project) {
               throw new WorkspaceCreateError({ id: issueId, message: 'No project found' });
             }
 
-            const result = await removeWorkspace({
-              projectConfig: { ...project, name: issueId },
+            const result = await Effect.runPromise(removeWorkspace({
+              projectConfig: { name: project.projectName, path: project.projectPath },
               featureName: issueLower,
-            });
+            }));
 
             if (!result.success) {
               throw new WorkspaceCreateError({
@@ -202,11 +202,8 @@ export const WorkspaceServiceLive = Layer.effect(
           try: async () => {
             const { workspacePath } = getWorkspacePath(issueId);
             const issueLower = issueId.toLowerCase();
-            const project = resolveProjectFromIssue(issueId);
-            const projectName = project?.name ?? issueId;
-
             const { stopWorkspaceDocker } = await import('../../../lib/workspace-manager.js');
-            await stopWorkspaceDocker(workspacePath, projectName, issueLower);
+            await Effect.runPromise(stopWorkspaceDocker(workspacePath, issueLower));
           },
           catch: () => undefined, // non-fatal
         }).pipe(Effect.ignore),
@@ -220,7 +217,7 @@ export const WorkspaceServiceLive = Layer.effect(
               throw new WorkspaceNotFound({ id: issueId });
             }
 
-            // Artifact directories/files to clean (preserving .planning)
+            // Artifact directories/files to clean (preserving orchestration metadata)
             const artifactPatterns = [
               'node_modules',
               'dist',
@@ -304,32 +301,20 @@ export const WorkspaceServiceLive = Layer.effect(
             const composePath = composePaths.find((p) => existsSync(p));
 
             if (!composePath) {
-              // No compose file found — generate one from project template via workspace-manager
-              const { loadProjectsConfig } = await import('../../../lib/projects.js');
-              const { projects } = loadProjectsConfig();
-              const project = resolveProjectFromIssue(issueId);
-              if (!project) {
+              // No compose file → self-heal `.devcontainer/` from the project
+              // template. This is the cheap, idempotent path; the previous
+              // implementation re-ran the full workspace-create flow (worktrees,
+              // bun install, etc.), which is the wrong granularity for
+              // "compose file is missing".
+              const { ensureDevcontainerSync } = await import(
+                '../../../lib/workspace/ensure-devcontainer.js'
+              );
+              const ensure = ensureDevcontainerSync({ workspacePath, issueId });
+              if (!ensure.step.success) {
                 throw new WorkspaceCreateError({
                   id: issueId,
-                  message: `No project configured for issue ${issueId} — cannot generate docker-compose.yml`,
-                });
-              }
-
-              const projectName = Object.entries(projects).find(
-                ([, p]) => p.path === project.path,
-              )?.[0] ?? 'unknown';
-
-              // Re-run workspace creation in dry-run=false but startDocker=false to generate compose
-              const { createWorkspace } = await import('../../../lib/workspace-manager.js');
-              const createResult = await createWorkspace({
-                projectConfig: { ...project, name: projectName },
-                featureName: issueLower,
-                startDocker: false,
-              });
-              if (!createResult.success) {
-                throw new WorkspaceCreateError({
-                  id: issueId,
-                  message: `createWorkspace failed: ${createResult.errors.join('; ')}`,
+                  message:
+                    `Could not render .devcontainer/: ${ensure.step.error ?? 'unknown error'}`,
                 });
               }
             }

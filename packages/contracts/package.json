@@ -1,15 +1,20 @@
 {
-  "name": "@panopticon/contracts",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@panctl/contracts",
+  "version": "0.10.2",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eltmon/panopticon-cli.git",
+    "directory": "packages/contracts"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
-  "types": "./src/index.ts",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
       "require": "./dist/index.cjs",
       "default": "./dist/index.mjs"
     }
@@ -17,15 +22,19 @@
   "scripts": {
     "dev": "tsdown --watch",
     "build": "tsdown",
+    "test": "vitest run --config vitest.config.ts",
+    "run": "bun run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "effect": "catalog:"
+    "effect": "4.0.0-beta.45"
   },
   "devDependencies": {
     "@effect/language-service": "catalog:",
     "tsdown": "^0.21.7",
     "typescript": "catalog:"
   },
-  "files": ["dist"]
+  "files": [
+    "dist"
+  ]
 }

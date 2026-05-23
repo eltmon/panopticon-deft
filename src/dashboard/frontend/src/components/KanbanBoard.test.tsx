@@ -1,9 +1,24 @@
+import type { ComponentProps } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { Issue, Agent } from '../types';
-import type { SpecialistAgent } from './SpecialistAgentCard';
-import { applyReviewStateToIssue, getPipelineCallToAction, groupByCanceledType, groupByLabels, groupByStatus, ListIssueRow, shouldShowAgentDoneBadge, shouldShowReviewReadyBadge, DivergedBadge } from './KanbanBoard';
+// PAN-1048 — SpecialistAgent retired; specialist-style indicators now come
+// from role-tagged AgentSnapshots passed through the `specialists` prop.
+import { applyReviewStateToIssue, getPipelineCallToAction, groupByCanceledType, groupByLabels, groupByStatus, IssueCard, KanbanBoard, ListIssueRow, shouldShowAgentDoneBadge, shouldShowReviewReadyBadge, DivergedBadge, FeatureCard, CompactChildCard, DroppableColumn } from './KanbanBoard';
 import { useDashboardStore } from '../lib/store';
+import { DialogProvider } from './DialogProvider';
+import IssueCardPrimitive from './primitives/IssueCard';
+
+const mockUseDroppable = vi.fn(() => ({ isOver: false, setNodeRef: vi.fn() }));
+
+vi.mock('@dnd-kit/core', async () => {
+  const actual = await vi.importActual<typeof import('@dnd-kit/core')>('@dnd-kit/core');
+  return {
+    ...actual,
+    useDroppable: (...args: Parameters<typeof import('@dnd-kit/core')['useDroppable']>) => mockUseDroppable(...args),
+  };
+});
 
 describe('groupByLabels', () => {
   const createMockIssue = (id: string, labels: string[]): Issue => ({
@@ -150,6 +165,26 @@ describe('applyReviewStateToIssue', () => {
     expect(result.targetCanonicalState).toBe('done');
     expect(result.labels).toContain('merged');
     expect(result.labels.map((label) => label.toLowerCase())).not.toContain('in-review');
+    expect(result.labels.map((label) => label.toLowerCase())).not.toContain('review ready');
+  });
+
+  it('preserves verifying-on-main issues after merge', () => {
+    const issue = createMockIssue({
+      status: 'Verifying On Main',
+      state: 'verifying_on_main',
+      labels: ['verifying-on-main', 'Review Ready'],
+    });
+
+    const result = applyReviewStateToIssue(issue, {
+      mergeStatus: 'merged',
+      readyForMerge: false,
+    });
+
+    expect(result.status).toBe('Verifying On Main');
+    expect(result.mergeStatus).toBe('merged');
+    expect(result.targetCanonicalState).toBe('verifying_on_main');
+    expect(result.labels).toContain('verifying-on-main');
+    expect(result.labels).toContain('merged');
     expect(result.labels.map((label) => label.toLowerCase())).not.toContain('review ready');
   });
 });
@@ -299,7 +334,7 @@ describe('ListIssueRow', () => {
   const createMockAgent = (overrides: Partial<Agent> = {}): Agent => ({
     id: 'agent-1',
     issueId: 'TEST-123',
-    runtime: 'claude',
+    runtime: 'claude-code',
     model: 'test-model',
     status: 'healthy',
     startedAt: new Date().toISOString(),
@@ -308,15 +343,18 @@ describe('ListIssueRow', () => {
     ...overrides,
   });
 
-  const createMockSpecialist = (overrides: Partial<SpecialistAgent> = {}): SpecialistAgent => ({
-    name: 'review-agent',
-    displayName: 'Review Agent',
-    description: 'Code review',
-    enabled: true,
-    autoWake: true,
-    state: 'active',
-    isRunning: true,
-    tmuxSession: 'specialist-review-agent',
+  // PAN-1048 — specialist-style agents are now role-tagged AgentSnapshots
+  // (review / test / ship) keyed off the `role` primitive.
+  const createMockRoleAgent = (overrides: Partial<Agent> = {}): Agent => ({
+    id: 'review-1',
+    issueId: 'TEST-123',
+    runtime: 'claude-code',
+    model: 'test-model',
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    consecutiveFailures: 0,
+    killCount: 0,
+    role: 'review',
     ...overrides,
   });
 
@@ -408,11 +446,11 @@ describe('ListIssueRow', () => {
     expect(screen.queryByTitle('Agent running')).toBeNull();
   });
 
-  it('should show specialist indicators', () => {
+  it('should show specialist indicators (PAN-1048 role primitive)', () => {
     const issue = createMockIssue();
     const specialists = [
-      createMockSpecialist({ name: 'review-agent', displayName: 'Review Agent', currentIssue: 'TEST-123' }),
-      createMockSpecialist({ name: 'test-agent', displayName: 'Test Agent', currentIssue: 'TEST-123' }),
+      createMockRoleAgent({ id: 'review-1', role: 'review', issueId: 'TEST-123' }),
+      createMockRoleAgent({ id: 'test-1', role: 'test', issueId: 'TEST-123' }),
     ];
     render(
       <ListIssueRow
@@ -426,8 +464,9 @@ describe('ListIssueRow', () => {
       />
     );
 
-    expect(screen.getByTitle('Review Agent specialist')).toBeDefined();
-    expect(screen.getByTitle('Test Agent specialist')).toBeDefined();
+    // Title is now `${role} agent` — derived from AgentSnapshot.role.
+    expect(screen.getByTitle('review agent')).toBeDefined();
+    expect(screen.getByTitle('test agent')).toBeDefined();
   });
 
   it('should call onSelectIssue when clicked', () => {
@@ -490,6 +529,437 @@ describe('ListIssueRow', () => {
     const trackerLink = links.find(l => l.getAttribute('href') === 'https://github.com/test/repo/issues/123');
     expect(trackerLink).toBeDefined();
     expect(trackerLink!.getAttribute('target')).toBe('_blank');
+  });
+});
+
+describe('KanbanBoard drawer wiring', () => {
+  function createBoardIssue(overrides: Partial<Issue> = {}): Issue {
+    return {
+      id: overrides.identifier ?? 'PAN-1',
+      identifier: overrides.identifier ?? 'PAN-1',
+      title: overrides.title ?? 'Board drawer issue',
+      status: overrides.status ?? 'Todo',
+      state: overrides.state ?? 'todo',
+      priority: overrides.priority ?? 3,
+      labels: overrides.labels ?? [],
+      url: `https://example.com/${overrides.identifier ?? 'PAN-1'}`,
+      createdAt: '2026-05-18T00:00:00.000Z',
+      updatedAt: '2026-05-18T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function renderBoard(props: Partial<ComponentProps<typeof KanbanBoard>> = {}) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <DialogProvider>
+          <KanbanBoard {...props} />
+        </DialogProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/board');
+    vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
+      const url = input.toString();
+      if (url === '/api/registered-projects') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve([]) } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve('{}'),
+        json: () => Promise.resolve({ issues: [], workspaces: [] }),
+      } as Response);
+    }));
+    useDashboardStore.setState({
+      drawer: { issueId: null, tab: 'overview' },
+      issuesRaw: [createBoardIssue()],
+      agentsById: {},
+      reviewStatusByIssueId: {},
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('opens the issue drawer from a single Board card click without changing selection', async () => {
+    const onSelectIssue = vi.fn();
+    renderBoard({ selectedIssue: null, onSelectIssue });
+
+    fireEvent.click(await screen.findByTestId('issue-card-PAN-1'));
+
+    expect(useDashboardStore.getState().drawer).toEqual({ issueId: 'PAN-1', tab: 'overview' });
+    expect(window.location.search).toBe('?issue=PAN-1&tab=overview');
+    expect(onSelectIssue).not.toHaveBeenCalled();
+
+    useDashboardStore.getState().closeIssue();
+
+    expect(onSelectIssue).not.toHaveBeenCalled();
+  });
+
+  it('keeps bulk selection on the checkbox affordance without opening the drawer', async () => {
+    renderBoard();
+
+    const checkbox = await screen.findByRole('checkbox', { name: 'Select PAN-1' }) as HTMLInputElement;
+    fireEvent.click(checkbox);
+
+    await waitFor(() => expect(checkbox.checked).toBe(true));
+    expect(useDashboardStore.getState().drawer).toEqual({ issueId: null, tab: 'overview' });
+  });
+});
+
+describe('IssueCard', () => {
+  const createMockIssue = (overrides: Partial<Issue> = {}): Issue => ({
+    id: 'issue-1',
+    identifier: 'TEST-123',
+    title: 'Test Issue',
+    description: '',
+    status: 'In Progress',
+    priority: 3,
+    labels: [],
+    url: 'https://test.com/TEST-123',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    project: {
+      id: 'proj-1',
+      name: 'Test Project',
+      color: '#000',
+      icon: 'test',
+    },
+    source: 'github',
+    ...overrides,
+  });
+
+  const createMockAgent = (overrides: Partial<Agent> = {}): Agent => ({
+    id: 'planning-test-123',
+    issueId: 'TEST-123',
+    runtime: 'claude-code',
+    model: 'test-model',
+    status: 'healthy',
+    startedAt: new Date().toISOString(),
+    consecutiveFailures: 0,
+    killCount: 0,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    useDashboardStore.setState({
+      issuesRaw: [],
+      agentsById: {},
+      reviewStatusByIssueId: {},
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+    vi.stubGlobal('fetch', vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === '/api/settings' && init?.method === 'PUT') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true }) } as Response);
+      }
+      if (url === '/api/settings') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ tts: { mutedIssues: [] } }) } as Response);
+      }
+      if (url === '/api/settings/available-models') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) } as Response);
+      }
+      return Promise.resolve({ ok: true, text: () => Promise.resolve('{}'), json: () => Promise.resolve({}) } as Response);
+    }) as unknown as typeof fetch);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderIssueCard(props: Partial<ComponentProps<typeof IssueCard>> = {}) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const defaultProps: ComponentProps<typeof IssueCard> = {
+      issue: createMockIssue(),
+      isSelected: false,
+      onSelect: vi.fn(),
+      onPlan: vi.fn(),
+      workspace: { exists: false, issueId: 'TEST-123' },
+      ...props,
+    };
+    const cardAgents = [
+      defaultProps.workAgent,
+      ...(defaultProps.workAgents ?? []),
+      defaultProps.planningAgent,
+      ...(defaultProps.specialists ?? []),
+    ].filter((agent): agent is Agent => !!agent);
+    const currentReviewStatusByIssueId = useDashboardStore.getState().reviewStatusByIssueId;
+    useDashboardStore.setState({
+      issuesRaw: [defaultProps.issue],
+      agentsById: Object.fromEntries(cardAgents.map((agent) => [agent.id, agent])),
+      reviewStatusByIssueId: currentReviewStatusByIssueId,
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+
+    const result = render(
+      <QueryClientProvider client={queryClient}>
+        <DialogProvider>
+          <IssueCard {...defaultProps} />
+        </DialogProvider>
+      </QueryClientProvider>,
+    );
+
+    return { ...defaultProps, ...result };
+  }
+
+  function boardActionRow() {
+    const row = screen.getByTestId('issue-card-TEST-123').querySelector('[data-component="board-card-action-row"]');
+    expect(row).toBeInTheDocument();
+    return row as HTMLElement;
+  }
+
+  function inlineBoardActionIds() {
+    return Array.from(boardActionRow().querySelectorAll('button[data-testid^="issue-action-"]'))
+      .map((button) => button.getAttribute('data-testid'))
+      .filter((testId) => testId !== 'issue-action-overflow-button');
+  }
+
+  it('renders queued board cards without legacy launch controls', () => {
+    renderIssueCard({
+      issue: createMockIssue({ status: 'Todo' }),
+    });
+
+    expect(screen.getByText('QUEUED FOR PLAN')).toBeInTheDocument();
+    expect(screen.queryByTestId('action-auto-plan-TEST-123')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('card-start-agent-TEST-123')).not.toBeInTheDocument();
+  });
+
+  it('renders a hover-revealed hybrid action row on ordinary Board cards', () => {
+    renderIssueCard({
+      issue: createMockIssue({ status: 'Todo' }),
+    });
+
+    const row = boardActionRow();
+    expect(row).toHaveAttribute('data-visible-mode', 'hover');
+    expect(row).toHaveClass('border-t', 'border-border');
+    expect(row.className).toContain('group-hover:opacity-100');
+    expect(screen.getByTestId('issue-action-overflow-button')).toBeInTheDocument();
+  });
+
+  it('pins the Board action row when the issue has a running agent or pending action state', () => {
+    const { unmount } = renderIssueCard({
+      workAgent: createMockAgent({ id: 'agent-test-123', role: 'work', status: 'running' }),
+    });
+    expect(boardActionRow()).toHaveAttribute('data-visible-mode', 'pinned');
+
+    unmount();
+    useDashboardStore.setState({
+      reviewStatusByIssueId: {
+        'TEST-123': { issueId: 'TEST-123', readyForMerge: true, mergeStatus: 'pending', prUrl: 'https://example.com/pr/1' },
+      },
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+    renderIssueCard({
+      issue: createMockIssue({ status: 'In Review', state: 'in_review' }),
+    });
+    expect(boardActionRow()).toHaveAttribute('data-visible-mode', 'pinned');
+  });
+
+  it('opens the hybrid Board action overflow menu on right-click', async () => {
+    renderIssueCard({
+      issue: createMockIssue({ status: 'Todo' }),
+    });
+
+    const card = screen.getByTestId('issue-card-TEST-123');
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    const allowedDefault = card.dispatchEvent(event);
+
+    expect(allowedDefault).toBe(false);
+    await waitFor(() => expect(screen.getByTestId('issue-action-overflow-menu')).toBeInTheDocument());
+    expect(screen.getByTestId('issue-action-plan')).toHaveTextContent('Plan');
+  });
+
+  it('snapshots inline Board action sets for representative phases', () => {
+    const actionSets: Record<string, (string | null)[]> = {};
+
+    renderIssueCard({
+      issue: createMockIssue({ status: 'Todo' }),
+    });
+    actionSets.QUEUED_FOR_PLAN = inlineBoardActionIds();
+    cleanup();
+
+    renderIssueCard({
+      workAgent: createMockAgent({ id: 'agent-test-123', role: 'work', status: 'running' }),
+    });
+    actionSets.WORK_RUNNING = inlineBoardActionIds();
+    cleanup();
+
+    useDashboardStore.setState({
+      reviewStatusByIssueId: {
+        'TEST-123': { issueId: 'TEST-123', reviewStatus: 'blocked', testStatus: 'pending', mergeStatus: 'pending', readyForMerge: false },
+      },
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+    renderIssueCard({
+      issue: createMockIssue({ status: 'In Review', state: 'in_review', workspacePath: '/tmp/test-123' }),
+    });
+    actionSets.CHANGES_REQUESTED = inlineBoardActionIds();
+    cleanup();
+
+    useDashboardStore.setState({
+      reviewStatusByIssueId: {
+        'TEST-123': { issueId: 'TEST-123', readyForMerge: true, mergeStatus: 'pending', prUrl: 'https://example.com/pr/1' },
+      },
+    } as Parameters<typeof useDashboardStore.setState>[0]);
+    renderIssueCard({
+      issue: createMockIssue({ status: 'In Review', state: 'in_review' }),
+    });
+    actionSets.READY_TO_MERGE = inlineBoardActionIds();
+
+    expect(actionSets).toMatchInlineSnapshot(`
+      {
+        "CHANGES_REQUESTED": [
+          "issue-action-open",
+          "issue-action-requestReview",
+        ],
+        "QUEUED_FOR_PLAN": [
+          "issue-action-plan",
+          "issue-action-startAgent",
+        ],
+        "READY_TO_MERGE": [
+          "issue-action-viewPr",
+        ],
+        "WORK_RUNNING": [
+          "issue-action-tell",
+          "issue-action-doneWork",
+        ],
+      }
+    `);
+  });
+
+  it('does not render Board card launch controls after planning completes', () => {
+    renderIssueCard({
+      issue: createMockIssue({ status: 'Todo', hasPlan: true, hasBeads: true }),
+      planningState: { hasPlan: true, hasBeads: true, planningComplete: true },
+    });
+
+    expect(screen.queryByTestId('card-start-agent-TEST-123')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('card-auto-start-agent-TEST-123')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agent model')).not.toBeInTheDocument();
+  });
+
+  it('selects the issue when the shared board card is clicked', () => {
+    const onSelect = vi.fn();
+    renderIssueCard({ onSelect });
+
+    expect(screen.queryByTestId('card-tts-mute-TEST-123')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('issue-card-TEST-123'));
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks unhealthy workspace stack state on the shared card primitive', () => {
+    renderIssueCard({
+      workspace: {
+        exists: true,
+        issueId: 'TEST-123',
+        stackHealth: {
+          healthy: false,
+          reasons: ['test-stack-server stuck Created for 120s'],
+          lastObserved: new Date().toISOString(),
+        },
+      },
+    });
+
+    const card = screen.getByTestId('issue-card-TEST-123');
+    expect(card).toHaveAttribute('data-stuck-card', 'true');
+    expect(card).toHaveClass('border-destructive/60', 'bg-destructive/10');
+  });
+
+  it('opens the drawer from the shared card instead of legacy planning input controls', () => {
+    const onSelect = vi.fn();
+    const onPlan = vi.fn();
+    renderIssueCard({
+      onSelect,
+      onPlan,
+      planningAgent: createMockAgent({
+        hasPendingQuestion: true,
+        pendingQuestionCount: 1,
+        pendingQuestionPrompt: 'Planning finalized — click Done in the dashboard',
+        pendingQuestionReason: 'planning_done',
+        agentPhase: 'planning',
+      }),
+    });
+
+    expect(screen.queryByTestId('card-input-TEST-123')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('issue-card-TEST-123'));
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onPlan).not.toHaveBeenCalled();
+  });
+
+  it('renders Beads N/M progress row when beadCounts is present', () => {
+    renderIssueCard({
+      issue: createMockIssue({ beadCounts: { completed: 7, total: 12 } }),
+    });
+
+    expect(screen.getByText('Beads 7/12')).toBeInTheDocument();
+    const beadProgress = screen.getByTestId('issue-card-TEST-123').querySelector('[data-component="bead-progress"]');
+    expect(beadProgress).toBeInTheDocument();
+    expect(beadProgress).toHaveAttribute('data-progress', '7');
+  });
+
+  it('hides bead progress row when beadCounts is null', () => {
+    renderIssueCard({
+      issue: createMockIssue({ beadCounts: null }),
+    });
+
+    expect(screen.queryByText(/Beads \d+\/\d+/)).not.toBeInTheDocument();
+  });
+
+  it('renders agent foot with name, sub, runtime and avatar for active agent', () => {
+    renderIssueCard({
+      workAgent: createMockAgent({ id: 'agent-test-123', model: 'claude-sonnet-4-6' }),
+    });
+
+    const card = screen.getByTestId('issue-card-TEST-123');
+    expect(card).toHaveTextContent('agent-test-123');
+    expect(card).toHaveTextContent('Sonnet 4.6');
+    expect(card.querySelector('[class*="rounded-full"][class*="grid"]')).toBeInTheDocument();
+  });
+
+  it('renders empty agent foot with no agent and tracker ref when no agent is active', () => {
+    renderIssueCard({
+      issue: createMockIssue({ source: 'github' }),
+      workAgent: undefined,
+    });
+
+    expect(screen.getByText('no agent')).toBeInTheDocument();
+    expect(screen.getByText('GitHub TEST-123')).toBeInTheDocument();
+  });
+
+  it('renders cost overlay when totalCost is greater than 0', () => {
+    renderIssueCard({
+      cost: { issueId: 'TEST-123', totalCost: 5.5, tokenCount: 1000, sessionCount: 1 },
+    });
+
+    expect(screen.getByTestId('card-cost-TEST-123')).toBeInTheDocument();
+  });
+
+  it('uses success tokens for merge-ready cards', () => {
+    renderIssueCard({
+      issue: createMockIssue({ status: 'In Review' }),
+      // Simulate merge-ready state via review status injection would require
+      // more setup; instead test the primitive directly through the board card
+      // by leveraging the fact that KanbanBoard computes mergeReadyCard from
+      // reviewStatus. We render the primitive directly for a focused assertion.
+    });
+
+    // Render the primitive directly for a focused styling test
+    const { container } = render(
+      <IssueCardPrimitive issueId="TEST-123" priority={3} mergeReadyCard={true}>
+        <div>content</div>
+      </IssueCardPrimitive>,
+    );
+
+    const card = container.querySelector('[data-merge-ready-card="true"]');
+    expect(card).toHaveClass('badge-border-success', 'bg-success/10');
+    expect(card).not.toHaveClass('border-warning/60', 'bg-warning/10');
   });
 });
 
@@ -743,5 +1213,374 @@ describe('DivergedBadge', () => {
 
   afterEach(() => {
     useDashboardStore.setState({ reviewStatusByIssueId: {} } as Parameters<typeof useDashboardStore.setState>[0]);
+  });
+});
+
+// ─── FeatureCard ──────────────────────────────────────────────────────────────
+
+describe('FeatureCard', () => {
+  const createMockFeature = (overrides: Partial<Issue> = {}): Issue => ({
+    id: 'feature-1',
+    identifier: 'F123',
+    title: 'Test Feature',
+    description: 'A test feature',
+    status: 'In Progress',
+    priority: 3,
+    labels: [],
+    url: 'https://rally.com/F123',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    project: {
+      id: 'proj-1',
+      name: 'Test Project',
+      color: '#000',
+      icon: 'test',
+    },
+    source: 'rally',
+    ...overrides,
+  });
+
+  it('renders Plan button when feature is not done', () => {
+    const feature = createMockFeature();
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onPlan={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId('action-plan-F123')).toBeDefined();
+    expect(screen.getByText('Plan')).toBeDefined();
+  });
+
+  it('renders See Plan button when planned label exists', () => {
+    const feature = createMockFeature({ labels: ['planned'] });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onPlan={vi.fn()}
+      />
+    );
+    expect(screen.getByText('See Plan')).toBeDefined();
+  });
+
+  it('renders See Plan button when hasPlan is true', () => {
+    const feature = createMockFeature({ hasPlan: true });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onPlan={vi.fn()}
+      />
+    );
+    expect(screen.getByText('See Plan')).toBeDefined();
+  });
+
+  it('renders Tasks button when feature has beads', () => {
+    const feature = createMockFeature({ hasBeads: true });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onViewBeads={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId('action-tasks-F123')).toBeDefined();
+    expect(screen.getByText('Tasks')).toBeDefined();
+  });
+
+  it('renders vBRIEF button when feature has a plan', () => {
+    const feature = createMockFeature({ hasPlan: true });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onViewVBrief={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId('action-vbrief-F123')).toBeDefined();
+    expect(screen.getByText('vBRIEF')).toBeDefined();
+  });
+
+  it('hides Plan button when feature is done', () => {
+    const feature = createMockFeature({ status: 'Done' });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+      />
+    );
+    expect(screen.queryByTestId('action-plan-F123')).toBeNull();
+  });
+
+  it('calls onPlan when Plan button is clicked', () => {
+    const onPlan = vi.fn();
+    const feature = createMockFeature();
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onPlan={onPlan}
+      />
+    );
+    fireEvent.click(screen.getByTestId('action-plan-F123'));
+    expect(onPlan).toHaveBeenCalled();
+  });
+
+  it('calls onViewBeads when Tasks button is clicked', () => {
+    const onViewBeads = vi.fn();
+    const feature = createMockFeature({ hasBeads: true });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onViewBeads={onViewBeads}
+      />
+    );
+    fireEvent.click(screen.getByTestId('action-tasks-F123'));
+    expect(onViewBeads).toHaveBeenCalled();
+  });
+
+  it('applies selection ring when isSelected is true', () => {
+    const feature = createMockFeature();
+    const { container } = render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        isSelected={true}
+      />
+    );
+    const card = container.querySelector('.ring-2');
+    expect(card).toBeTruthy();
+  });
+
+  it('does not apply selection ring when isSelected is false', () => {
+    const feature = createMockFeature();
+    const { container } = render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        isSelected={false}
+      />
+    );
+    const card = container.querySelector('.ring-2');
+    expect(card).toBeFalsy();
+  });
+
+  it('calls onSelect when clicking the title/content area', () => {
+    const onSelect = vi.fn();
+    const onToggle = vi.fn();
+    const feature = createMockFeature();
+    const { container } = render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={onToggle}
+        onSelect={onSelect}
+      />
+    );
+    // Click on the content div (title area)
+    const contentDiv = container.querySelector('.flex-1.min-w-0');
+    expect(contentDiv).toBeTruthy();
+    fireEvent.click(contentDiv!);
+    expect(onSelect).toHaveBeenCalled();
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it('calls onToggle but not onSelect when clicking the chevron', () => {
+    const onSelect = vi.fn();
+    const onToggle = vi.fn();
+    const feature = createMockFeature();
+    const { container } = render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={onToggle}
+        onSelect={onSelect}
+      />
+    );
+    const chevronDiv = container.querySelector('[class*="shrink-0"]');
+    expect(chevronDiv).toBeTruthy();
+    fireEvent.click(chevronDiv!);
+    expect(onToggle).toHaveBeenCalled();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('does NOT render Start Agent button', () => {
+    const feature = createMockFeature();
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+      />
+    );
+    expect(screen.queryByText(/Start Agent/i)).toBeNull();
+  });
+
+  it('shows Plan button when derivedStatus is in_progress but status is Todo', () => {
+    const feature = createMockFeature({ status: 'Todo', derivedStatus: 'in_progress' });
+    render(
+      <FeatureCard
+        feature={feature}
+        childCount={2}
+        isExpanded={false}
+        onToggle={vi.fn()}
+        onPlan={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId('action-plan-F123')).toBeDefined();
+  });
+});
+
+// ─── CompactChildCard ─────────────────────────────────────────────────────────
+
+describe('CompactChildCard', () => {
+  const createMockChild = (overrides: Partial<Issue> = {}): Issue => ({
+    id: 'child-1',
+    identifier: 'US100',
+    title: 'Child Story',
+    description: '',
+    status: 'In Progress',
+    priority: 3,
+    labels: [],
+    url: 'https://rally.com/US100',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    project: {
+      id: 'proj-1',
+      name: 'Test Project',
+      color: '#000',
+      icon: 'test',
+    },
+    source: 'rally',
+    ...overrides,
+  });
+
+  it('renders child identifier and title', () => {
+    const child = createMockChild();
+    render(<CompactChildCard issue={child} agents={[]} />);
+    expect(screen.getByText('US100')).toBeDefined();
+    expect(screen.getByText('Child Story')).toBeDefined();
+  });
+
+  it('calls onSelect when clicked', () => {
+    const onSelect = vi.fn();
+    const child = createMockChild();
+    const { container } = render(<CompactChildCard issue={child} agents={[]} onSelect={onSelect} />);
+    fireEvent.click(container.firstChild!);
+    expect(onSelect).toHaveBeenCalled();
+  });
+
+  it('does not call onSelect when clicking the identifier link', () => {
+    const onSelect = vi.fn();
+    const child = createMockChild();
+    render(<CompactChildCard issue={child} agents={[]} onSelect={onSelect} />);
+    const link = screen.getByText('US100');
+    fireEvent.click(link);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('applies selected primitive state when isSelected is true', () => {
+    const child = createMockChild();
+    const { container } = render(<CompactChildCard issue={child} agents={[]} isSelected={true} />);
+    const el = container.querySelector('[data-component="issue-card"]');
+    expect(el).toHaveClass('ring-2', 'ring-warning/70');
+  });
+
+  it('does not apply selected primitive state when isSelected is false', () => {
+    const child = createMockChild();
+    const { container } = render(<CompactChildCard issue={child} agents={[]} isSelected={false} />);
+    const el = container.querySelector('[data-component="issue-card"]');
+    expect(el).not.toHaveClass('ring-2', 'ring-warning/70');
+  });
+
+  it('shows agent pulse dot when agent is running', () => {
+    const child = createMockChild();
+    const agents: Agent[] = [{
+      id: 'agent-1',
+      issueId: 'US100',
+      runtime: 'claude-code',
+      model: 'test',
+      status: 'healthy',
+      startedAt: new Date().toISOString(),
+      consecutiveFailures: 0,
+      killCount: 0,
+    }];
+    render(<CompactChildCard issue={child} agents={agents} />);
+    expect(screen.getByTitle('Agent running')).toBeDefined();
+  });
+});
+
+describe('DroppableColumn', () => {
+  beforeEach(() => {
+    mockUseDroppable.mockReturnValue({ isOver: false, setNodeRef: vi.fn() });
+  });
+
+  afterEach(() => {
+    mockUseDroppable.mockClear();
+  });
+
+  it('applies blocked styles when dragging over a different column', () => {
+    mockUseDroppable.mockReturnValue({ isOver: true, setNodeRef: vi.fn() });
+    const { container } = render(
+      <DroppableColumn status="in_progress" activeDragStatus="done">
+        <div>content</div>
+      </DroppableColumn>,
+    );
+    const el = container.firstChild as HTMLElement;
+    expect(el.className).toContain('cursor-not-allowed');
+    expect(el.className).toContain('opacity-60');
+    expect(el.className).not.toContain('scale-[1.02]');
+  });
+
+  it('applies scale when dragging over the same column', () => {
+    mockUseDroppable.mockReturnValue({ isOver: true, setNodeRef: vi.fn() });
+    const { container } = render(
+      <DroppableColumn status="in_progress" activeDragStatus="in_progress">
+        <div>content</div>
+      </DroppableColumn>,
+    );
+    const el = container.firstChild as HTMLElement;
+    expect(el.className).toContain('scale-[1.02]');
+    expect(el.className).not.toContain('cursor-not-allowed');
+    expect(el.className).not.toContain('opacity-60');
+  });
+
+  it('applies no hover styles when not dragging over', () => {
+    mockUseDroppable.mockReturnValue({ isOver: false, setNodeRef: vi.fn() });
+    const { container } = render(
+      <DroppableColumn status="in_progress" activeDragStatus="done">
+        <div>content</div>
+      </DroppableColumn>,
+    );
+    const el = container.firstChild as HTMLElement;
+    expect(el.className).not.toContain('scale-[1.02]');
+    expect(el.className).not.toContain('cursor-not-allowed');
+    expect(el.className).not.toContain('opacity-60');
   });
 });

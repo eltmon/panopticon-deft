@@ -21,6 +21,7 @@ import { promisify } from 'node:util';
 
 import { Effect, Layer } from 'effect';
 import { HttpRouter } from 'effect/unstable/http';
+import { layer as nodeServicesLayer } from '@effect/platform-node/NodeServices';
 
 import { DockerStatsCollector } from '../../../lib/docker-stats.js';
 import { EventStoreService } from '../services/domain-services.js';
@@ -35,9 +36,9 @@ let dockerStatsCollector: DockerStatsCollector | null = null;
 export function getDockerStatsCollector(): DockerStatsCollector {
   if (!dockerStatsCollector) {
     dockerStatsCollector = new DockerStatsCollector();
-    dockerStatsCollector.start().catch((err: unknown) => {
-      console.error('[resources-route] DockerStatsCollector.start() failed:', err);
-    });
+    Effect.runFork(
+      dockerStatsCollector.start().pipe(Effect.provide(nodeServicesLayer)),
+    );
   }
   return dockerStatsCollector;
 }
@@ -67,23 +68,28 @@ const getResourcesRoute = HttpRouter.add(
     const agentsDir = join(homedir(), '.panopticon', 'agents');
     const agents: Record<string, unknown>[] = [];
 
-    const agentsDirExists = yield* Effect.tryPromise({
-      try: () => access(agentsDir).then(() => true, () => false),
-      catch: () => false as false,
-    });
+    // Wrap I/O so its fallback lives in the SUCCESS channel — using
+    // `Effect.tryPromise({ catch: () => fallback })` instead routes `fallback`
+    // through the FAILURE channel, so `yield*` re-raises and the surrounding
+    // `if (!stateText) continue;` is dead code. That bug fired on every poll
+    // where any agent's state.json was missing or briefly being rewritten, and
+    // since this route is polled every 5s, it manufactured a steady stream of
+    // `Effect.fail(null)` defects that hit `httpHandler`'s catchCause and spammed
+    // the dashboard log + stole event-loop time formatting Cause.pretty.
+    const agentsDirExists = yield* Effect.promise(() =>
+      access(agentsDir).then(() => true, () => false),
+    );
 
     if (agentsDirExists) {
-      const names = yield* Effect.tryPromise({
-        try: () => readdir(agentsDir),
-        catch: () => [] as string[],
-      });
+      const names = yield* Effect.promise(() =>
+        readdir(agentsDir).catch(() => [] as string[]),
+      );
 
       for (const name of names) {
         const stateFile = join(agentsDir, name, 'state.json');
-        const stateText = yield* Effect.tryPromise({
-          try: () => readFile(stateFile, 'utf-8'),
-          catch: () => null as null | string,
-        });
+        const stateText = yield* Effect.promise(() =>
+          readFile(stateFile, 'utf-8').catch(() => null as string | null),
+        );
         if (!stateText) continue;
         try {
           const state = JSON.parse(stateText) as Record<string, unknown>;
@@ -295,6 +301,73 @@ const postPruneVolumesRoute = HttpRouter.add(
   })),
 );
 
+// ─── Route: POST /api/resources/docker/container/:id/restart ─────────────────
+
+const postRestartContainerRoute = HttpRouter.add(
+  'POST',
+  '/api/resources/docker/container/:id/restart',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    const eventStore = yield* EventStoreService;
+
+    if (!id) {
+      return jsonResponse({ error: 'Container ID required' }, { status: 400 });
+    }
+
+    const { stdout } = yield* Effect.tryPromise({
+      try: () => execAsync(`docker restart "${id}"`, { encoding: 'utf-8', timeout: 30000 }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    yield* eventStore.append({ type: 'resources.updated', timestamp: new Date().toISOString(), payload: { resources: { containers: 0, networks: 0 } } });
+    return jsonResponse({ ok: true, container: id, output: stdout.trim() });
+  })),
+);
+
+// ─── Route: POST /api/resources/docker/container/:id/start ───────────────────
+
+const postStartContainerRoute = HttpRouter.add(
+  'POST',
+  '/api/resources/docker/container/:id/start',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+    const eventStore = yield* EventStoreService;
+
+    if (!id) {
+      return jsonResponse({ error: 'Container ID required' }, { status: 400 });
+    }
+
+    const { stdout } = yield* Effect.tryPromise({
+      try: () => execAsync(`docker start "${id}"`, { encoding: 'utf-8', timeout: 30000 }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    yield* eventStore.append({ type: 'resources.updated', timestamp: new Date().toISOString(), payload: { resources: { containers: 0, networks: 0 } } });
+    return jsonResponse({ ok: true, container: id, output: stdout.trim() });
+  })),
+);
+
+// ─── Route: GET /api/resources/docker/container/:id/logs ─────────────────────
+
+const getContainerLogsRoute = HttpRouter.add(
+  'GET',
+  '/api/resources/docker/container/:id/logs',
+  httpHandler(Effect.gen(function* () {
+    const params = yield* HttpRouter.params;
+    const id = params['id'] ?? '';
+
+    if (!id) {
+      return jsonResponse({ error: 'Container ID required' }, { status: 400 });
+    }
+
+    const { stdout } = yield* Effect.tryPromise({
+      try: () => execAsync(`docker logs --tail 200 --timestamps "${id}"`, { encoding: 'utf-8', timeout: 10000 }),
+      catch: (err) => new Error(err instanceof Error ? err.message : String(err)),
+    });
+    return jsonResponse({ logs: stdout });
+  })),
+);
+
 // ─── Compose all routes into a single Layer ───────────────────────────────────
 
 export const resourcesRouteLayer = Layer.mergeAll(
@@ -306,6 +379,9 @@ export const resourcesRouteLayer = Layer.mergeAll(
   deleteDockerNetworkRoute,
   deleteDockerVolumeRoute,
   postPruneVolumesRoute,
+  postRestartContainerRoute,
+  postStartContainerRoute,
+  getContainerLogsRoute,
 );
 
 export default resourcesRouteLayer;

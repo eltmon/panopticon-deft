@@ -4,6 +4,7 @@
  *   2. isRunning called with await and mergeProjectKey
  */
 
+import { Effect } from 'effect';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── child_process mock (must be hoisted) ──────────────────────────────────────
@@ -19,6 +20,7 @@ const execMock = vi.hoisted(() =>
     return { stdout: '' };
   })
 );
+const spawnRunMock = vi.hoisted(() => vi.fn().mockResolvedValue({ id: 'agent-pan-333-ship' }));
 
 vi.mock('child_process', () => {
   const kCustom = Symbol.for('nodejs.util.promisify.custom');
@@ -48,34 +50,43 @@ vi.mock('child_process', () => {
 
 // ── Other dependency mocks ────────────────────────────────────────────────────
 vi.mock('../../../../src/lib/git-utils.js', () => ({
-  cleanupStaleLocks: vi.fn().mockResolvedValue({ found: [], removed: [], errors: [] }),
+  cleanupStaleLocks: vi.fn().mockReturnValue(Effect.succeed({ found: [], removed: [], errors: [] })),
 }));
 
 vi.mock('../../../../src/lib/tmux.js', () => ({
   sendKeysAsync: vi.fn().mockResolvedValue(undefined),
   sessionExists: vi.fn().mockReturnValue(false),
+  sessionExistsSync: vi.fn().mockReturnValue(false),
+  sessionExistsAsync: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock('../../../../src/lib/paths.js', () => ({
   PANOPTICON_HOME: '/tmp/panopticon-test',
+  AGENTS_DIR: '/tmp/panopticon-test/agents',
+  getPanopticonHome: vi.fn(() => '/tmp/panopticon-test'),
 }));
 
 vi.mock('../../../../src/lib/tracker-utils.js', () => ({
   resolveGitHubIssue: vi.fn(),
+  resolveGitHubIssueSync: vi.fn(),
+}));
+
+vi.mock('../../../../src/lib/agents.js', () => ({
+  spawnRun: (...args: unknown[]) => spawnRunMock(...args),
 }));
 
 vi.mock('../../../../src/lib/cloister/specialists.js', () => ({
-  getSessionId: vi.fn().mockReturnValue(null),
   recordWake: vi.fn(),
   getTmuxSessionName: vi.fn().mockReturnValue('specialist-merge-agent'),
-  wakeSpecialist: vi.fn().mockResolvedValue({ success: false, reason: 'test-stop' }),
   spawnEphemeralSpecialist: vi.fn().mockResolvedValue({ success: false, reason: 'test-stop' }),
   isRunning: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock('../../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: vi.fn().mockReturnValue(null),
+  resolveProjectFromIssueSync: vi.fn().mockReturnValue(null),
   loadProjectsConfig: vi.fn().mockReturnValue({ projects: {} }),
+  loadProjectsConfigSync: vi.fn().mockReturnValue({ projects: {} }),
 }));
 
 vi.mock('../../../../src/lib/cloister/validation.js', () => ({
@@ -163,7 +174,7 @@ describe('spawnMergeAgentForBranches — no-op merge detection', () => {
     // git merge-base --is-ancestor exits 1 → not an ancestor, proceed with merge
     setExecError('git merge-base --is-ancestor', 1, 'not an ancestor');
 
-    // The function continues and ultimately fails trying to spawn/wake specialist
+    // The function continues and delegates the remaining conflict work to the ship role
     const result = await spawnMergeAgentForBranches(PROJECT_PATH, SOURCE, TARGET, ISSUE_ID);
 
     // Should NOT short-circuit with the "already integrated" message
@@ -202,8 +213,8 @@ describe('spawnMergeAgentForBranches — isRunning called correctly', () => {
   });
 
   it('isRunning receives mergeProjectKey from resolveProjectFromIssue', async () => {
-    const { resolveProjectFromIssue } = await import('../../../../src/lib/projects.js');
-    const mockResolve = vi.mocked(resolveProjectFromIssue);
+    const { resolveProjectFromIssueSync } = await import('../../../../src/lib/projects.js');
+    const mockResolve = vi.mocked(resolveProjectFromIssueSync);
 
     // When resolveProjectFromIssue returns a project, mergeProjectKey should be passed
     mockResolve.mockReturnValueOnce({ projectKey: 'myproject', path: PROJECT_PATH } as any);

@@ -7,18 +7,23 @@
  * Data sources:
  *   - agent output → DashboardStore.agentOutputById (from agent.output_received events)
  *   - agent status → DashboardStore.agentsById (from agent.status_changed events)
- *   - activity → DashboardStore.recentActivity (from activity.updated events)
+ *   - activity → DashboardStore.recentActivity (from activity.entry / activity.updated events)
  *   - system health → REST polling /api/godview/system-health (unchanged)
  */
 
 import { useEffect } from 'react';
 import { create } from 'zustand';
+import type { MemoryObservation } from '@panctl/contracts';
 
 export interface GodViewActivityEvent {
-  agentId: string;
+  id: string;
+  agentId?: string | null;
   timestamp: string;
-  type: string;
+  source: string;
+  level: 'info' | 'warn' | 'error' | 'success';
   message: string;
+  details?: string | null;
+  issueId?: string | null;
 }
 
 export interface GodViewStore {
@@ -39,6 +44,11 @@ export const useGodViewStore = create<GodViewStore>((set) => ({
   setFocusedAgentId: (id) => set({ focusedAgentId: id }),
 }));
 
+interface ActivityFeedState {
+  recentActivity: unknown[];
+  observationsByIssueId?: Record<string, MemoryObservation[]>;
+}
+
 // Derived selectors from DashboardStore (replaces duplicate GodView state)
 export const selectGodViewAgentOutput = (s: { agentOutputById: Record<string, string[]> }) =>
   s.agentOutputById;
@@ -58,8 +68,24 @@ export const selectGodViewAgentStatuses = (s: { agentsById: Record<string, { sta
   return statuses;
 };
 
-export const selectGodViewActivityFeed = (s: { recentActivity: unknown[] }) =>
-  s.recentActivity as GodViewActivityEvent[];
+export const selectGodViewActivityFeed = (s: ActivityFeedState): GodViewActivityEvent[] => {
+  const activity = s.recentActivity as GodViewActivityEvent[];
+  const observations: GodViewActivityEvent[] = Object.values(s.observationsByIssueId ?? {})
+    .flat()
+    .filter((observation) => observation.actionStatus !== null)
+    .map((observation) => ({
+      id: `memory-${observation.id}`,
+      agentId: observation.workspaceId,
+      issueId: observation.issueId,
+      timestamp: observation.timestamp,
+      source: 'memory',
+      level: 'success',
+      message: observation.actionStatus ?? observation.summary,
+    }));
+
+  return [...observations, ...activity]
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+};
 
 export function useGodViewSocket(): void {
   const store = useGodViewStore();

@@ -4,15 +4,19 @@
  * Opens on Cmd+K (macOS) / Ctrl+K (Linux/Windows).
  * Also opened from the desktop app via panopticonBridge.onMenuAction.
  *
- * Sections:
- *   - Actions: Start/Stop Cloister, Emergency Stop, Open Settings, Plan Issue
- *   - Workspaces: active workspaces (navigates to kanban + selects issue)
- *   - Agents: running agents (shows agent status)
- *   - Settings: jumps to settings subsections
+ * Sections (in display order):
+ *   - Actions / Orchestration / Navigation  — built-in dashboard actions
+ *   - Commands                              — curated `pan <verb>` catalog (click to copy)
+ *   - Active Workspaces / Issues / Running Agents
+ *   - Memory / Observations                 — FTS over ~/.panopticon/memory
+ *
+ * Phase 2 (tracked separately) will add semantic conversation search with
+ * excerpts that point to the relevant message inside a JSONL session.
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Command } from 'cmdk';
+import { toast } from 'sonner';
 import {
   Play,
   Square,
@@ -24,8 +28,13 @@ import {
   Zap,
   Bot,
   RefreshCw,
+  ChevronRight,
+  Brain,
+  Sparkles,
+  Eye,
 } from 'lucide-react';
-import { useDashboardStore, selectAgentList, selectIssues } from '../lib/store';
+import { isAgentRunningStatus } from '../lib/pipeline-state';
+import { useDashboardStore, selectAgents, selectIssues } from '../lib/store';
 import type { Issue, Agent } from '../types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -39,6 +48,10 @@ interface PaletteAction {
   keywords?: string[];
   onSelect: () => void;
   destructive?: boolean;
+  // Optional rich excerpt rendering (memory/observation results).
+  excerptSegments?: ExcerptSegment[];
+  // Sort hint within group: lower = earlier.
+  rank?: number;
 }
 
 interface CommandPaletteProps {
@@ -46,6 +59,40 @@ interface CommandPaletteProps {
   onClose: () => void;
   onNavigate: (tab: string, issueId?: string) => void;
 }
+
+interface PanCommandEntry {
+  name: string;
+  description: string;
+  group: string;
+  keywords?: string[];
+}
+
+type ExcerptSegment = { kind: 'text' | 'match'; value: string };
+
+interface PaletteSearchHit {
+  kind: 'memory' | 'observation' | 'summary';
+  id: string;
+  projectId: string;
+  workspaceId: string;
+  issueId: string;
+  timestamp: string;
+  displayContent: string;
+  excerpt: string;
+  excerptSegments: ExcerptSegment[];
+  tags: string[];
+  docType: string;
+  rank: number;
+}
+
+interface PaletteSearchResponse {
+  memory: PaletteSearchHit[];
+  observations: PaletteSearchHit[];
+  summaries: PaletteSearchHit[];
+}
+
+const EMPTY_AGENTS: Agent[] = [];
+const EMPTY_ISSUES: Issue[] = [];
+const EMPTY_SEARCH: PaletteSearchResponse = { memory: [], observations: [], summaries: [] };
 
 // ─── Server API ───────────────────────────────────────────────────────────────
 
@@ -57,17 +104,147 @@ async function callApi(path: string, method = 'POST'): Promise<void> {
   }
 }
 
+async function fetchPanCommands(): Promise<PanCommandEntry[]> {
+  try {
+    const res = await fetch('/api/palette/commands');
+    if (!res.ok) return [];
+    const data = await res.json() as { commands?: PanCommandEntry[] };
+    return Array.isArray(data.commands) ? data.commands : [];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPaletteSearch(query: string, signal: AbortSignal): Promise<PaletteSearchResponse> {
+  try {
+    const res = await fetch(`/api/palette/search?q=${encodeURIComponent(query)}&limit=15`, { signal });
+    if (!res.ok) return EMPTY_SEARCH;
+    const data = await res.json() as PaletteSearchResponse;
+    return {
+      memory: data.memory ?? [],
+      observations: data.observations ?? [],
+      summaries: data.summaries ?? [],
+    };
+  } catch (err) {
+    if ((err as { name?: string }).name === 'AbortError') return EMPTY_SEARCH;
+    return EMPTY_SEARCH;
+  }
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Highlighted text ─────────────────────────────────────────────────────────
+//
+// Wraps every case-insensitive occurrence of any query term in `text` with a
+// <mark>. Used for label + description on every palette row so the matched
+// substring is visually obvious. Memory excerpts keep their server-driven
+// FTS5 snippet highlighting (which understands stemming).
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractHighlightTerms(query: string): string[] {
+  const matches = query.match(/[\p{L}\p{N}_-]+/gu) ?? [];
+  const dedup = new Set<string>();
+  for (const term of matches) {
+    if (term.length === 0) continue;
+    dedup.add(term);
+  }
+  // Match longer terms first so a query like "pan plan" highlights "plan"
+  // inside "planning" before "pan" greedily consumes part of "planning".
+  return [...dedup].sort((a, b) => b.length - a.length);
+}
+
+interface HighlightedProps {
+  text: string;
+  terms: string[];
+}
+
+// Spans (not <mark>) avoid the browser's bright-yellow default style.
+// Background-only highlight: the parent's text color carries through, and
+// only the backdrop signals "this matched". GitHub-search style — quieter
+// than swapping the text color, and the same single rule reads well in
+// both light and dark themes.
+const HIGHLIGHT_CLASS = 'rounded-sm px-px text-inherit bg-amber-300/40 dark:bg-amber-400/20';
+
+function Highlighted({ text, terms }: HighlightedProps) {
+  if (!text) return null;
+  if (terms.length === 0) return <>{text}</>;
+  const pattern = new RegExp(`(${terms.map(escapeRegex).join('|')})`, 'gi');
+  const parts = text.split(pattern);
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className={HIGHLIGHT_CLASS}>{part}</span>
+        ) : (
+          <span key={i}>{part}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+// ─── Hooks ────────────────────────────────────────────────────────────────────
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const handle = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(handle);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
-  const agents = useDashboardStore(selectAgentList) as unknown as Agent[];
-  const issues = useDashboardStore(selectIssues) as Issue[];
+  const debouncedQuery = useDebouncedValue(query, 120);
+  const agents = useDashboardStore((state) => isOpen ? selectAgents(state) : EMPTY_AGENTS) as unknown as Agent[];
+  const issues = useDashboardStore((state) => isOpen ? selectIssues(state) : EMPTY_ISSUES) as Issue[];
+  const openIssue = useDashboardStore((state) => state.openIssue);
 
-  // Reset query when opened
+  const [panCommands, setPanCommands] = useState<PanCommandEntry[]>([]);
+  const [searchResults, setSearchResults] = useState<PaletteSearchResponse>(EMPTY_SEARCH);
+  const [isSearchLoading, setIsSearchLoading] = useState(false);
+
+  // Reset query when opened, and lazy-load the pan command catalog the first
+  // time the palette is shown.
   useEffect(() => {
-    if (isOpen) setQuery('');
-  }, [isOpen]);
+    if (!isOpen) return;
+    setQuery('');
+    setSearchResults(EMPTY_SEARCH);
+    if (panCommands.length === 0) {
+      void fetchPanCommands().then(setPanCommands);
+    }
+  }, [isOpen, panCommands.length]);
+
+  // Fan out to the unified search endpoint as the user types.
+  useEffect(() => {
+    if (!isOpen) return;
+    const trimmed = debouncedQuery.trim();
+    if (trimmed.length < 2) {
+      setSearchResults(EMPTY_SEARCH);
+      setIsSearchLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setIsSearchLoading(true);
+    void fetchPaletteSearch(trimmed, controller.signal)
+      .then((data) => setSearchResults(data))
+      .finally(() => setIsSearchLoading(false));
+    return () => controller.abort();
+  }, [isOpen, debouncedQuery]);
 
   // Keyboard: Escape to close
   useEffect(() => {
@@ -88,9 +265,18 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
     setTimeout(action, 50);
   }, [onClose]);
 
-  // ─── Static actions ─────────────────────────────────────────────────────────
+  // ─── Action builders (stable wrt query — filtered later) ────────────────────
 
-  const staticActions: PaletteAction[] = [
+  const staticActions = useMemo<PaletteAction[]>(() => [
+    {
+      id: 'pan-flywheel',
+      label: 'Run flywheel',
+      description: 'Start the autonomous pipeline run on all In Progress / In Review issues',
+      icon: Zap,
+      group: 'Actions',
+      keywords: ['flywheel', 'all-up', 'orchestrator', 'fixall', 'autonomous'],
+      onSelect: () => onNavigate('flywheel'),
+    },
     {
       id: 'start-cloister',
       label: 'Start Cloister',
@@ -162,7 +348,7 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
       icon: Terminal,
       group: 'Navigation',
       keywords: ['shell', 'console'],
-      onSelect: () => onNavigate('terminal'),
+      onSelect: () => onNavigate('command-deck'),
     },
     {
       id: 'open-agents',
@@ -173,59 +359,152 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
       keywords: ['agents', 'workers'],
       onSelect: () => onNavigate('agents'),
     },
-  ];
+  ], [onNavigate]);
 
-  // ─── Dynamic: active workspaces ─────────────────────────────────────────────
+  // ─── Dynamic: issues + agents ─────────────────────────────────────────────
 
-  const activeAgents = agents.filter((a) => a.status !== 'dead');
-  const activeIssueIds = new Set(activeAgents.map((a) => a.issueId?.toLowerCase()).filter(Boolean));
+  const { issueActions, agentActions } = useMemo(() => {
+    const activeAgents = agents.filter((agent) => isAgentRunningStatus(agent.status));
+    const activeIssueIds = new Set(activeAgents.map((a) => a.issueId?.toLowerCase()).filter(Boolean));
+    const branchByIssueId = new Map(
+      activeAgents
+        .filter((agent) => agent.issueId && agent.git?.branch)
+        .map((agent) => [agent.issueId!.toLowerCase(), agent.git!.branch]),
+    );
 
-  const workspaceActions: PaletteAction[] = issues
-    .filter((issue) => activeIssueIds.has(issue.identifier.toLowerCase()))
-    .map((issue) => ({
-      id: `workspace-${issue.identifier}`,
-      label: issue.identifier,
-      description: issue.title,
-      icon: FolderOpen,
-      group: 'Active Workspaces',
-      keywords: [issue.identifier.toLowerCase(), issue.title.toLowerCase()],
+    const issueActs: PaletteAction[] = issues.map((issue) => {
+      const issueKey = issue.identifier.toLowerCase();
+      const branch = branchByIssueId.get(issueKey);
+      const active = activeIssueIds.has(issueKey);
+      return {
+        id: `issue-${issue.identifier}`,
+        label: issue.identifier,
+        description: branch ? `${issue.title} · ${branch}` : issue.title,
+        icon: FolderOpen,
+        group: active ? 'Active Workspaces' : 'Issues',
+        keywords: [issue.id, issue.identifier, issue.title, branch ?? '', issue.workspacePath ?? ''].filter(Boolean),
+        onSelect: () => {
+          openIssue(issue.identifier);
+        },
+      };
+    });
+
+    const agentActs: PaletteAction[] = activeAgents.map((agent) => ({
+      id: `agent-${agent.id}`,
+      label: agent.issueId ?? agent.id,
+      description: agent.issueId ? `Working on ${agent.issueId}` : agent.status,
+      icon: User,
+      group: 'Running Agents',
+      keywords: [agent.id, agent.issueId ?? '', agent.git?.branch ?? '', agent.status],
       onSelect: () => {
-        onNavigate('kanban', issue.identifier);
+        if (agent.issueId) openIssue(agent.issueId);
+        else onNavigate('agents');
       },
     }));
 
-  // ─── Dynamic: running agents ─────────────────────────────────────────────────
+    return { issueActions: issueActs, agentActions: agentActs };
+  }, [agents, issues, openIssue, onNavigate]);
 
-  const agentActions: PaletteAction[] = activeAgents.map((agent) => ({
-    id: `agent-${agent.id}`,
-    label: agent.issueId ?? agent.id,
-    description: agent.issueId ? `Working on ${agent.issueId}` : agent.status,
-    icon: User,
-    group: 'Running Agents',
-    keywords: [agent.id, agent.issueId ?? '', agent.status],
+  // ─── Dynamic: pan commands ────────────────────────────────────────────────
+
+  const commandActions = useMemo<PaletteAction[]>(() => panCommands.map((cmd, index) => ({
+    id: `cmd-${index}-${cmd.name}`,
+    label: cmd.name,
+    description: cmd.description,
+    icon: ChevronRight,
+    group: `Commands · ${cmd.group}`,
+    keywords: ['pan', cmd.group, ...(cmd.keywords ?? [])],
     onSelect: () => {
-      if (agent.issueId) onNavigate('kanban', agent.issueId);
-      else onNavigate('agents');
-    },
-  }));
-
-  // ─── Filter ─────────────────────────────────────────────────────────────────
-
-  const allActions = [...staticActions, ...workspaceActions, ...agentActions];
-
-  const filtered = query.trim().length === 0
-    ? allActions
-    : allActions.filter((action) => {
-        const q = query.toLowerCase();
-        return (
-          action.label.toLowerCase().includes(q) ||
-          action.description?.toLowerCase().includes(q) ||
-          action.keywords?.some((k) => k.toLowerCase().includes(q))
-        );
+      void copyToClipboard(cmd.name).then((ok) => {
+        if (ok) toast.success(`Copied: ${cmd.name}`);
+        else toast.error('Clipboard unavailable — copy manually');
       });
+    },
+  })), [panCommands]);
 
-  // Group
-  const groups = [...new Set(filtered.map((a) => a.group))];
+  // ─── Dynamic: memory + observations + summaries ───────────────────────────
+
+  const memoryActions = useMemo<PaletteAction[]>(() => {
+    const out: PaletteAction[] = [];
+    const push = (hits: PaletteSearchHit[], group: string, icon: React.ElementType) => {
+      for (const hit of hits) {
+        const label = hit.displayContent || hit.docType || hit.id;
+        const issueOrProject = hit.issueId || hit.projectId || '';
+        const when = hit.timestamp ? hit.timestamp.slice(0, 16).replace('T', ' ') : '';
+        const meta = [issueOrProject, when].filter(Boolean).join(' · ');
+        out.push({
+          id: `mem-${hit.kind}-${hit.id}`,
+          label: label.length > 80 ? `${label.slice(0, 77)}…` : label,
+          description: meta,
+          icon,
+          group,
+          rank: hit.rank,
+          excerptSegments: hit.excerptSegments,
+          keywords: [hit.kind, hit.docType, hit.projectId, hit.issueId, ...hit.tags],
+          onSelect: () => {
+            if (hit.issueId && /^[A-Z]+-\d+$/i.test(hit.issueId)) {
+              openIssue(hit.issueId);
+            } else {
+              toast.message(label, { description: hit.excerpt || meta || undefined });
+            }
+          },
+        });
+      }
+    };
+    push(searchResults.observations, 'Observations', Eye);
+    push(searchResults.memory, 'Memory', Brain);
+    push(searchResults.summaries, 'Memory · Summaries', Sparkles);
+    return out;
+  }, [searchResults, openIssue]);
+
+  // ─── Filter + group ───────────────────────────────────────────────────────
+
+  const allActions = useMemo(() => [
+    ...staticActions,
+    ...commandActions,
+    ...issueActions,
+    ...agentActions,
+    ...memoryActions,
+  ], [staticActions, commandActions, issueActions, agentActions, memoryActions]);
+
+  const filtered = useMemo(() => {
+    const trimmed = query.trim();
+    if (trimmed.length === 0) {
+      // Default view: only show built-in actions + issues + agents. Don't
+      // dump the entire pan command catalog or empty memory section.
+      return allActions.filter((a) => !a.group.startsWith('Commands · '));
+    }
+    const q = trimmed.toLowerCase();
+    return allActions.filter((action) => {
+      // Server-side memory results are pre-matched against the query, so
+      // include them unconditionally (sort handles ranking).
+      if (action.group === 'Memory' || action.group === 'Observations' || action.group === 'Memory · Summaries') {
+        return true;
+      }
+      return (
+        action.label.toLowerCase().includes(q) ||
+        (action.description?.toLowerCase().includes(q) ?? false) ||
+        (action.keywords?.some((k) => k.toLowerCase().includes(q)) ?? false)
+      );
+    });
+  }, [query, allActions]);
+
+  // Terms used to highlight every matched substring in label + description.
+  const highlightTerms = useMemo(() => extractHighlightTerms(query), [query]);
+
+  // Display group ordering: Actions/Orchestration/Navigation first, then
+  // Active Workspaces, Issues, Running Agents, Commands, Memory/Observations.
+  const groupOrder = useMemo(() => {
+    const seen = new Set(filtered.map((a) => a.group));
+    const ordered: string[] = [];
+    const preferred = ['Actions', 'Orchestration', 'Navigation', 'Active Workspaces', 'Issues', 'Running Agents'];
+    for (const g of preferred) if (seen.has(g)) { ordered.push(g); seen.delete(g); }
+    const commandGroups = [...seen].filter((g) => g.startsWith('Commands · ')).sort();
+    for (const g of commandGroups) { ordered.push(g); seen.delete(g); }
+    for (const g of ['Observations', 'Memory', 'Memory · Summaries']) if (seen.has(g)) { ordered.push(g); seen.delete(g); }
+    ordered.push(...seen);
+    return ordered;
+  }, [filtered]);
 
   if (!isOpen) return null;
 
@@ -239,60 +518,77 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
 
       {/* Palette */}
       <div
-        className="relative w-full max-w-xl bg-surface border border-divider-strong rounded-xl shadow-2xl overflow-hidden"
+        className="relative w-full max-w-xl bg-card border border-border rounded-xl shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <Command shouldFilter={false} className="[&_[cmdk-input-wrapper]]:border-b [&_[cmdk-input-wrapper]]:border-divider">
+        <Command shouldFilter={false} className="[&_[cmdk-input-wrapper]]:border-b [&_[cmdk-input-wrapper]]:border-border">
           {/* Search input */}
-          <div className="flex items-center gap-3 px-4 py-3 border-b border-divider">
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
             <Zap className="w-4 h-4 text-primary shrink-0" />
             <Command.Input
               value={query}
               onValueChange={setQuery}
-              placeholder="Search actions, workspaces, agents…"
-              className="flex-1 bg-transparent text-sm text-content-body placeholder:text-content-muted outline-none"
+              placeholder="Search commands, issues, memory, observations…"
+              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none"
               autoFocus
             />
-            <kbd className="text-[10px] text-content-muted bg-surface-emphasis px-1.5 py-0.5 rounded border border-divider">ESC</kbd>
+            {isSearchLoading && (
+              <span className="text-[10px] text-muted-foreground">searching…</span>
+            )}
+            <kbd className="text-[10px] text-muted-foreground bg-card px-1.5 py-0.5 rounded border border-border">ESC</kbd>
           </div>
 
           {/* Results */}
-          <Command.List className="max-h-[400px] overflow-y-auto py-2">
+          <Command.List className="max-h-[480px] overflow-y-auto py-2">
             {filtered.length === 0 ? (
-              <Command.Empty className="py-6 text-center text-sm text-content-muted">
-                No results for "{query}"
+              <Command.Empty className="py-6 text-center text-sm text-muted-foreground">
+                {query.trim().length === 0 ? 'Start typing…' : `No results for "${query}"`}
               </Command.Empty>
             ) : (
-              groups.map((group) => (
+              groupOrder.map((group) => (
                 <Command.Group
                   key={group}
                   heading={group}
-                  className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-content-muted"
+                  className="[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-muted-foreground"
                 >
                   {filtered
                     .filter((a) => a.group === group)
+                    .sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0))
                     .map((action) => (
                       <Command.Item
                         key={action.id}
                         value={action.id}
                         onSelect={() => handleSelect(action.onSelect)}
-                        className="flex items-center gap-3 px-3 py-2 mx-1 rounded-lg cursor-pointer data-[selected=true]:bg-surface-overlay transition-colors group"
+                        className="flex items-start gap-3 px-3 py-2 mx-1 rounded-lg cursor-pointer data-[selected=true]:bg-popover transition-colors group"
                       >
-                        <div className={`size-7 rounded-md flex items-center justify-center shrink-0 ${
+                        <div className={`size-7 rounded-md flex items-center justify-center shrink-0 mt-0.5 ${
                           action.destructive
                             ? 'bg-destructive/10 text-destructive'
-                            : 'bg-surface-emphasis text-content-subtle group-data-[selected=true]:text-primary'
+                            : 'bg-card text-muted-foreground group-data-[selected=true]:text-primary'
                         }`}>
                           <action.icon className="w-3.5 h-3.5" />
                         </div>
                         <div className="flex-1 min-w-0">
                           <p className={`text-sm font-medium truncate ${
-                            action.destructive ? 'text-destructive' : 'text-content-body'
+                            action.destructive ? 'text-destructive' : 'text-foreground'
                           }`}>
-                            {action.label}
+                            <Highlighted text={action.label} terms={highlightTerms} />
                           </p>
                           {action.description && (
-                            <p className="text-xs text-content-muted truncate">{action.description}</p>
+                            <p className="text-xs text-muted-foreground truncate">
+                              <Highlighted text={action.description} terms={highlightTerms} />
+                            </p>
+                          )}
+                          {action.excerptSegments && action.excerptSegments.length > 0 && (
+                            <p className="text-[11px] text-muted-foreground mt-1 line-clamp-2 leading-snug">
+                              {action.excerptSegments.map((seg, i) =>
+                                seg.kind === 'match' ? (
+                                  <span key={i} className={HIGHLIGHT_CLASS}>{seg.value}</span>
+                                ) : (
+                                  <span key={i}>{seg.value}</span>
+                                ),
+                              )}
+                            </p>
                           )}
                         </div>
                       </Command.Item>
@@ -303,17 +599,17 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
           </Command.List>
 
           {/* Footer */}
-          <div className="flex items-center gap-4 px-4 py-2 border-t border-divider bg-surface-raised">
-            <span className="text-[10px] text-content-muted flex items-center gap-1">
-              <kbd className="px-1 py-0.5 bg-surface-emphasis border border-divider rounded text-[9px]">↑↓</kbd>
+          <div className="flex items-center gap-4 px-4 py-2 border-t border-border bg-card">
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              <kbd className="px-1 py-0.5 bg-card border border-border rounded text-[9px]">↑↓</kbd>
               navigate
             </span>
-            <span className="text-[10px] text-content-muted flex items-center gap-1">
-              <kbd className="px-1 py-0.5 bg-surface-emphasis border border-divider rounded text-[9px]">↵</kbd>
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              <kbd className="px-1 py-0.5 bg-card border border-border rounded text-[9px]">↵</kbd>
               select
             </span>
-            <span className="text-[10px] text-content-muted flex items-center gap-1">
-              <kbd className="px-1.5 py-0.5 bg-surface-emphasis border border-divider rounded text-[9px]">Esc</kbd>
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-card border border-border rounded text-[9px]">Esc</kbd>
               close
             </span>
           </div>

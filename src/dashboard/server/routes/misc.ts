@@ -8,11 +8,13 @@ import { jsonResponse } from "../http-helpers.js";
  *   GET  /api/project-mappings
  *   PUT  /api/project-mappings
  *   POST /api/project-mappings
+ *   GET  /api/system/health
  *   GET  /api/godview/system-health
  *   GET  /api/health/agents
  *   POST /api/health/agents/:id/ping
  *   GET  /api/tracker-status
  *   POST /api/rally/validate
+ *   GET  /api/no-resume-mode
  *   GET  /api/deacon/status
  *   GET  /api/deacon/logs
  *   POST /api/deacon/patrol
@@ -33,9 +35,10 @@ import { jsonResponse } from "../http-helpers.js";
  *   POST /api/shadow/:issueId/monitor
  *   POST /api/shadow/:issueId/observe
  *   POST /api/dev/rebuild
+ *   POST /api/system/restart-dashboard
  */
 
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { access, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -46,26 +49,32 @@ import { promisify } from 'node:util';
 import { Effect, Layer } from 'effect';
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/unstable/http';
 
-import { cpus as osCpus, freemem, totalmem } from 'node:os';
 
 import { getCloisterService } from '../../../lib/cloister/service.js';
-import { createSessionAsync, killSessionAsync, resizeWindowAsync, sendKeysAsync, sessionExistsAsync } from '../../../lib/tmux.js';
-import { listProjects, resolveProjectFromIssue, findProjectByTeam, extractTeamPrefix, getIssuePrefix } from '../../../lib/projects.js';
+import { getNoResumeMode } from '../../../lib/cloister/no-resume-mode.js';
+import { createSession, killSession, listSessionNames, resizeWindow, sendKeys, sessionExists } from '../../../lib/tmux.js';
+import { generateLauncherScriptSync } from '../../../lib/launcher-generator.js';
+import { getClaudePermissionFlagsStringSync } from '../../../lib/claude-permissions.js';
+import { listProjectsSync, resolveProjectFromIssueSync, findProjectByTeamSync, extractTeamPrefix, getIssuePrefix } from '../../../lib/projects.js';
 import { getLinearApiKey, getGitHubConfig, getRallyConfig } from '../services/tracker-config.js';
 import {
   getLinearApiKey as getLinearApiKeyShared,
   getGitHubConfig as getGitHubConfigShared,
   getRallyConfig as getRallyConfigShared,
 } from '../services/tracker-config.js';
-import { loadConfig as loadYamlConfig } from '../../../lib/config-yaml.js';
-import { loadConfig as loadPanConfig } from '../../../lib/config.js';
-import { checkAgentHealthAsync, determineHealthStatusAsync } from '../../lib/health-filtering.js';
-import { resolveGitHubIssue as resolveGitHubIssueShared } from '../../../lib/tracker-utils.js';
-import { extractPrefix } from '../../../lib/issue-id.js';
+import { loadConfigSync as loadYamlConfig } from '../../../lib/config-yaml.js';
+import { loadConfigSync as loadPanConfig } from '../../../lib/config.js';
+import { checkAgentHealth, determineHealthStatus } from '../../lib/health-filtering.js';
+import { resolveGitHubIssueSync as resolveGitHubIssueShared } from '../../../lib/tracker-utils.js';
+import { extractPrefixSync } from '../../../lib/issue-id.js';
+import { findPlan, readPlan } from '../../../lib/vbrief/io.js';
 import { IssueDataService } from '../services/issue-data-service.js';
 import { EventStoreService } from '../services/domain-services.js';
+import { ReadModelService } from '../read-model.js';
+import { getSystemHealthSnapshot } from '../services/system-health-service.js';
 import { httpHandler } from './http-handler.js';
 import { isDeaconGloballyPaused, setDeaconGloballyPaused } from '../../../lib/database/app-settings.js';
+import { PAN_CONTINUE_FILENAME, PAN_DIRNAME } from '../../../lib/pan-dir/types.js';
 
 const execAsync = promisify(exec);
 
@@ -149,7 +158,7 @@ async function saveProjectMappings(mappings: ProjectMapping[]): Promise<void> {
 async function getProjectPath(issuePrefix?: string): Promise<string> {
   if (issuePrefix) {
     const issueId = `${issuePrefix}-1`;
-    const resolved = resolveProjectFromIssue(issueId);
+    const resolved = resolveProjectFromIssueSync(issueId);
     if (resolved) return resolved.projectPath;
     const mappings = await getProjectMappings();
     const mapping = mappings.find(m => m.linearPrefix === issuePrefix);
@@ -178,49 +187,13 @@ function getGitHubLocalPaths(): Record<string, string> {
   if (!ghConfig) return {};
   const out: Record<string, string> = {};
   for (const r of ghConfig.repos) {
-    if (r.localPath) {
-      out[`${r.owner}/${r.repo}`] = r.localPath;
+    const localPath = (r as { localPath?: unknown }).localPath;
+    if (typeof localPath === 'string') {
+      out[`${r.owner}/${r.repo}`] = localPath;
     }
   }
   return out;
 }
-
-// ─── System health cache (godview) ───────────────────────────────────────────
-
-let godViewSystemHealthCache: {
-  cpu: number;
-  memPercent: number;
-  memUsed: number;
-  memTotal: number;
-  updatedAt: string;
-} | null = null;
-
-async function refreshGodViewSystemHealth() {
-  try {
-    const cpuList = osCpus();
-    const cpuUsage =
-      cpuList.reduce((acc: number, cpu) => {
-        const total = Object.values(cpu.times).reduce((s, t) => s + t, 0);
-        const idle = cpu.times.idle;
-        return acc + ((total - idle) / total) * 100;
-      }, 0) / cpuList.length;
-    const memTotal = totalmem();
-    const memFree = freemem();
-    godViewSystemHealthCache = {
-      cpu: Math.round(cpuUsage * 10) / 10,
-      memPercent: Math.round(((memTotal - memFree) / memTotal) * 1000) / 10,
-      memUsed: memTotal - memFree,
-      memTotal,
-      updatedAt: new Date().toISOString(),
-    };
-  } catch (err) {
-    console.error('[godview] system health refresh error:', err);
-  }
-  setTimeout(refreshGodViewSystemHealth, 10000);
-}
-
-// Start background refresh (non-blocking)
-refreshGodViewSystemHealth().catch(() => {});
 
 // ─── Pending confirmations store ─────────────────────────────────────────────
 
@@ -234,6 +207,21 @@ interface ConfirmationRequest {
 }
 
 const pendingConfirmations = new Map<string, ConfirmationRequest>();
+
+const PLANNING_FINISHED_STATUSES = new Set(['proposed', 'approved', 'pending', 'running', 'completed', 'blocked']);
+
+const checkPlanStatus = (
+  workspacePath: string,
+  matchStatus: (status: string) => boolean,
+): Effect.Effect<boolean, unknown> => Effect.gen(function* () {
+  const planPath = yield* findPlan(workspacePath);
+  if (!planPath) return false;
+  const status = yield* readPlan(planPath).pipe(
+    Effect.map(doc => doc.plan?.status),
+    Effect.catch(() => Effect.succeed(undefined)),
+  );
+  return Boolean(status && matchStatus(status));
+});
 
 // ─── Runtime metrics helpers ──────────────────────────────────────────────────
 
@@ -416,23 +404,38 @@ const postProjectMappingsRoute = HttpRouter.add(
   }),
 );
 
+// ─── Route: GET /api/system/health ───────────────────────────────────────────
+
+const getSystemHealthRoute = HttpRouter.add(
+  'GET',
+  '/api/system/health',
+  httpHandler(Effect.gen(function* () {
+    const readModel = yield* ReadModelService;
+    const health = yield* readModel.getSnapshot.pipe(
+      Effect.flatMap((snapshot) => Effect.promise(() => getSystemHealthSnapshot(snapshot))),
+    );
+    return jsonResponse(health);
+  })),
+);
+
 // ─── Route: GET /api/godview/system-health ───────────────────────────────────
 
 const getGodviewSystemHealthRoute = HttpRouter.add(
   'GET',
   '/api/godview/system-health',
-  Effect.sync(() => {
-    if (godViewSystemHealthCache) {
-      return jsonResponse(godViewSystemHealthCache);
-    }
+  httpHandler(Effect.gen(function* () {
+    const readModel = yield* ReadModelService;
+    const health = yield* readModel.getSnapshot.pipe(
+      Effect.flatMap((snapshot) => Effect.promise(() => getSystemHealthSnapshot(snapshot))),
+    );
     return jsonResponse({
-      cpu: 0,
-      memPercent: 0,
-      memUsed: 0,
-      memTotal: 0,
-      updatedAt: new Date().toISOString(),
+      cpu: health.summary.cpuPercent,
+      memPercent: health.summary.memoryUsedPercent,
+      memUsed: health.summary.usedMemoryBytes,
+      memTotal: health.summary.totalMemoryBytes,
+      updatedAt: health.updatedAt,
     });
-  }),
+  })),
 );
 
 // ─── Route: GET /api/health/agents ───────────────────────────────────────────
@@ -454,20 +457,25 @@ const getHealthAgentsRoute = HttpRouter.add(
           name.startsWith('specialist-'),
       );
 
+      // Fetch the live tmux session set ONCE for the whole request — per-agent
+      // liveness checks used to fork once per agent dir (~150 forks per poll).
+      const liveSessions = new Set(await Effect.runPromise(listSessionNames()));
+
       const agents = await Promise.all(
         agentNames.map(async name => {
           const stateFile = join(agentsDir, name, 'state.json');
           const healthFile = join(agentsDir, name, 'health.json');
 
+          const healthStatus = await Effect.runPromise(determineHealthStatus(name, stateFile, liveSessions));
+          if (!healthStatus) return null;
+
+          // Only read health.json for agents that survive the status filter —
+          // most agent dirs are stopped/completed and bail out above.
           let storedHealth = { consecutiveFailures: 0, killCount: 0 };
           try {
             const healthContent = await readFile(healthFile, 'utf-8');
             storedHealth = { ...storedHealth, ...JSON.parse(healthContent) };
           } catch {}
-
-          const healthStatus = await determineHealthStatusAsync(name, stateFile);
-
-          if (!healthStatus) return null;
 
           let contextPercent: number | null = null;
           try {
@@ -511,7 +519,7 @@ const postHealthAgentPingRoute = HttpRouter.add(
 
     return yield* Effect.promise(async () => {
     try {
-        const health = await checkAgentHealthAsync(id);
+        const health = await Effect.runPromise(checkAgentHealth(id));
 
         if (!health.alive) {
           return jsonResponse({ success: false, status: 'dead' });
@@ -574,8 +582,8 @@ const getTrackerStatusRoute = HttpRouter.add(
       }> = [];
 
       // Only report trackers that have at least one project using them
-      const projects = listProjects();
-      const cfgs = projects.map(p => p.config as Record<string, unknown>);
+      const projects = listProjectsSync();
+      const cfgs = projects.map(p => p.config as unknown as Record<string, unknown>);
       const trackerHasProjects: Record<string, boolean> = {
         linear: cfgs.some(c => !!c.linear_project),
         github: cfgs.some(c => !!c.github_repo),
@@ -590,7 +598,7 @@ const getTrackerStatusRoute = HttpRouter.add(
 
         const envVar = trackerEnvVars[trackerType] || `${trackerType.toUpperCase()}_API_KEY`;
         const hasEnvKey = !!process.env[envVar];
-        const hasConfigKey = !!((yamlConfig.trackerKeys || {}) as Record<string, string | undefined>)[trackerType];
+        const hasConfigKey = !!(((yamlConfig as { trackerKeys?: Record<string, string | undefined> }).trackerKeys || {}) as Record<string, string | undefined>)[trackerType];
 
         let hasEnvFileKey = false;
         if (trackerType === 'linear') hasEnvFileKey = !!getLinearApiKeyShared();
@@ -640,14 +648,14 @@ const postRallyValidateRoute = HttpRouter.add(
           server: server || 'https://rally1.rallydev.com',
         });
 
-        const result = await api.query({
+        const result = await Effect.runPromise(api.query({
           type: 'artifact',
           fetch: ['FormattedID'],
           query: '((State = "Open"))',
           limit: 1,
           workspace,
           project,
-        });
+        }));
 
         return jsonResponse({
           valid: true,
@@ -669,6 +677,14 @@ const postRallyValidateRoute = HttpRouter.add(
         );
         }})
   }),
+);
+
+// ─── Route: GET /api/no-resume-mode ─────────────────────────────────────────
+
+const getNoResumeModeRoute = HttpRouter.add(
+  'GET',
+  '/api/no-resume-mode',
+  Effect.sync(() => jsonResponse(getNoResumeMode())),
 );
 
 // ─── Route: GET /api/deacon/status ───────────────────────────────────────────
@@ -796,7 +812,19 @@ const postDeaconPauseRoute = HttpRouter.add(
 const getVersionRoute = HttpRouter.add(
   'GET',
   '/api/version',
-  Effect.promise(() => getPanopticonVersion().then(version => jsonResponse({ version, isDev: panopticonDevMode }))),
+  Effect.promise(async () => {
+    const version = await getPanopticonVersion();
+    // Expose supervisor URL so the frontend can cache it while the dashboard
+    // is healthy, then use it as a fallback when the dashboard is dead.
+    let supervisorUrl: string | null = null;
+    try {
+      const { getSupervisorUrlSync } = await import('../../../lib/supervisor.js');
+      supervisorUrl = getSupervisorUrlSync();
+    } catch {
+      // supervisor module not available in this build — benign
+    }
+    return jsonResponse({ version, isDev: panopticonDevMode, supervisorUrl });
+  }),
 );
 
 // ─── Route: GET /api/registered-projects ─────────────────────────────────────
@@ -806,7 +834,7 @@ const getRegisteredProjectsRoute = HttpRouter.add(
   '/api/registered-projects',
   Effect.try({
     try: () => {
-      const projects = listProjects();
+      const projects = listProjectsSync();
       return jsonResponse(
         projects.map(p => ({
           key: p.key,
@@ -814,7 +842,7 @@ const getRegisteredProjectsRoute = HttpRouter.add(
           path: p.config.path,
           linearTeam: getIssuePrefix(p.config) || null,
           githubRepo: p.config.github_repo || null,
-          linearProject: p.config.linear_project || null,
+          linearProject: (p.config as { linear_project?: string }).linear_project || null,
         })),
       );
     },
@@ -862,7 +890,7 @@ const postConfirmationRespondRoute = HttpRouter.add(
     return yield* Effect.promise(async () => {
     try {
         const response = confirmed ? 'y' : 'n';
-        await sendKeysAsync(confirmationRequest.sessionName, response);
+        await Effect.runPromise(sendKeys(confirmationRequest.sessionName, response));
         pendingConfirmations.delete(id);
         return jsonResponse({ success: true, confirmed });
       }    catch (error: unknown) {
@@ -943,7 +971,7 @@ const getPlanningStatusRoute = HttpRouter.add(
     const issueId = parts[3] || '';
     const sessionName = `planning-${issueId.toLowerCase()}`;
     const issueLower = issueId.toLowerCase();
-    const issuePrefix = extractPrefix(issueId) ?? issueId.split('-')[0];
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
 
     return yield* Effect.promise(async () => {
       try {
@@ -972,33 +1000,32 @@ const getPlanningStatusRoute = HttpRouter.add(
         let sessionExists = false;
         if (!isRemote) {
           try {
-            sessionExists = await sessionExistsAsync(sessionName);
+            sessionExists = await Effect.runPromise(sessionExists(sessionName));
           } catch {}
         }
 
-        const planningDirInWorkspace = join(workspacePath, '.planning');
-        const legacyPlanningDir = join(projectPath, '.planning', issueLower);
-        const planningDir = existsSync(planningDirInWorkspace)
-          ? planningDirInWorkspace
-          : existsSync(legacyPlanningDir)
-            ? legacyPlanningDir
-            : null;
-
-        const hasStateFile = planningDir ? existsSync(join(planningDir, 'STATE.md')) : false;
-        const hasPromptFile = planningDir
-          ? existsSync(join(planningDir, 'PLANNING_PROMPT.md'))
+        const panDir = join(workspacePath, PAN_DIRNAME);
+        const panContinueFile = join(panDir, PAN_CONTINUE_FILENAME);
+        const hasContinueFile = existsSync(panContinueFile);
+        const hasPlanningState = hasContinueFile || await Effect.runPromise(findPlan(workspacePath)) !== null;
+        const hasPromptFile = hasPlanningState;
+        // hasCompletionMarker means `plan.status === 'proposed'` (gates the
+        // dashboard Done button which should hide once the user has approved).
+        // planningCompleted means `plan.status` indicates planning has finished
+        // (any of proposed/approved/pending/running/completed/blocked).
+        const hasCompletionMarker = existsSync(panDir)
+          ? await Effect.runPromise(checkPlanStatus(workspacePath, status => status === 'proposed'))
           : false;
-        const hasCompletionMarker = planningDir
-          ? existsSync(join(planningDir, '.planning-complete'))
+        const planningCompleted = existsSync(panDir)
+          ? await Effect.runPromise(checkPlanStatus(workspacePath, status => PLANNING_FINISHED_STATUSES.has(status)))
           : false;
-        const planningCompleted = hasCompletionMarker;
 
         return jsonResponse({
           active: sessionExists || agentStarting,
           sessionName,
           workspacePath: existsSync(workspacePath) ? workspacePath : undefined,
           planningCompleted,
-          hasStateFile,
+          hasStateFile: hasPlanningState,
           hasPromptFile,
           hasCompletionMarker,
           isRemote,
@@ -1051,7 +1078,7 @@ const postPlanningMessageRoute = HttpRouter.add(
         }
         if (!projectPath) {
           const teamPrefix = extractTeamPrefix(issueId);
-          const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+          const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
           projectPath = projectConfig?.path || '';
         }
 
@@ -1063,15 +1090,8 @@ const postPlanningMessageRoute = HttpRouter.add(
         }
 
         const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
-        const workspacePlanningDir = join(workspacePath, '.planning');
-        const legacyPlanningDir = join(projectPath, '.planning', issueLower);
-
-        let planningDir: string;
-        if (existsSync(workspacePlanningDir)) {
-          planningDir = workspacePlanningDir;
-        } else if (existsSync(legacyPlanningDir)) {
-          planningDir = legacyPlanningDir;
-        } else {
+        const planningDir = join(workspacePath, PAN_DIRNAME);
+        if (!existsSync(planningDir)) {
           return jsonResponse(
             { error: 'Planning directory not found', sessionEnded: true },
             { status: 404 },
@@ -1096,12 +1116,12 @@ const postPlanningMessageRoute = HttpRouter.add(
         let sessionExists = false;
         if (!isRemote) {
           try {
-            sessionExists = await sessionExistsAsync(sessionName);
+            sessionExists = await Effect.runPromise(sessionExists(sessionName));
           } catch {}
         }
 
         if (sessionExists) {
-          await sendKeysAsync(sessionName, message, 'planning user message');
+          await Effect.runPromise(sendKeys(sessionName, message, 'planning user message'));
           await Effect.runPromise(eventStore.append({
             type: 'planning.sync',
             timestamp: new Date().toISOString(),
@@ -1150,7 +1170,7 @@ const postPlanningMessageRoute = HttpRouter.add(
 **YOU SHOULD ONLY:**
 - Ask clarifying questions
 - Explore the codebase to understand context
-- Generate planning artifacts (STATE.md, vBRIEF plan at \`.planning/plan.vbrief.json\`, implementation plan at \`docs/prds/active/{issue-id-lowercase}/STATE.md\` — directory MUST be lowercase)
+- Generate planning artifacts (\`.pan/continue.json\`, \`.pan/spec.vbrief.json\`)
 - Present options and tradeoffs
 
 ---
@@ -1181,31 +1201,37 @@ Continue the PLANNING session. Do NOT implement anything.
           await rename(outputFile, backupPath);
         }
 
-        const { getAgentCommand } = await import('../../../lib/settings.js');
+        const { getAgentCommandSync } = await import('../../../lib/settings.js');
         let msgPlanningModel = 'claude-sonnet-4-6';
         try {
-          const { getModelId } = await import('../../../lib/work-type-router.js');
-          msgPlanningModel = getModelId('planning-agent');
+          const { loadConfigSync, resolveModel } = await import('../../../lib/config-yaml.js');
+          msgPlanningModel = resolveModel('plan', undefined, loadConfigSync().config);
         } catch { /* fall back to default */ }
-        const msgAgentCmd = getAgentCommand(msgPlanningModel);
+        const msgAgentCmd = getAgentCommandSync(msgPlanningModel);
+        const msgPermissionFlags = getClaudePermissionFlagsStringSync();
         const msgCmdWithArgs =
           msgAgentCmd.args.length > 0
-            ? `${msgAgentCmd.command} ${msgAgentCmd.args.join(' ')} --dangerously-skip-permissions --permission-mode bypassPermissions`
-            : `${msgAgentCmd.command} --dangerously-skip-permissions --permission-mode bypassPermissions`;
+            ? `${msgAgentCmd.command} ${msgAgentCmd.args.join(' ')} ${msgPermissionFlags}`
+            : `${msgAgentCmd.command} ${msgPermissionFlags}`;
 
         const launcherScript = join(agentStateDir, 'continuation-launcher.sh');
         await mkdir(agentStateDir, { recursive: true });
 
         await writeFile(
           launcherScript,
-          `#!/bin/bash\ncd "${agentCwd}"\nexec ${msgCmdWithArgs} "Please read the continuation prompt at ${continuationPromptPath} and continue the planning session."\n`,
+          generateLauncherScriptSync({
+            role: 'plan',
+            workingDir: agentCwd,
+            baseCommand: msgCmdWithArgs,
+            promptInline: `Please read the continuation prompt at ${continuationPromptPath} and continue the planning session.`,
+          }),
           { mode: 0o755 },
         );
 
-        await createSessionAsync(sessionName, agentCwd, `bash '${launcherScript}'`);
+        await Effect.runPromise(createSession(sessionName, agentCwd, `bash '${launcherScript}'`));
 
         try {
-          await resizeWindowAsync(sessionName, 200, 50);
+          await Effect.runPromise(resizeWindow(sessionName, 200, 50));
         } catch {}
 
         await Effect.runPromise(eventStore.append({
@@ -1246,7 +1272,7 @@ const deletePlanningSessionRoute = HttpRouter.add(
 
     return yield* Effect.promise(async () => {
       try {
-        await killSessionAsync(sessionName);
+        await Effect.runPromise(killSession(sessionName));
         return jsonResponse({ success: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -1271,7 +1297,7 @@ const getTldrStatusRoute = HttpRouter.add(
   '/api/services/tldr/status',
   Effect.promise(async () => {
     try {
-      const { getTldrDaemonService } = await import('../../../lib/tldr-daemon.js');
+      const { getTldrDaemonServiceSync } = await import('../../../lib/tldr-daemon.js');
       const projectRoot = process.cwd();
       const venvPath = join(projectRoot, '.venv');
 
@@ -1287,7 +1313,7 @@ const getTldrStatusRoute = HttpRouter.add(
       }> = [];
 
       if (existsSync(venvPath)) {
-        const service = getTldrDaemonService(projectRoot, venvPath);
+        const service = getTldrDaemonServiceSync(projectRoot, venvPath);
         const status = await service.getStatus();
         const indexStats = getIndexStats(projectRoot, true);
 
@@ -1312,7 +1338,7 @@ const getTldrStatusRoute = HttpRouter.add(
           const wsVenvPath = join(wsPath, '.venv');
 
           if (existsSync(wsVenvPath)) {
-            const service = getTldrDaemonService(wsPath, wsVenvPath);
+            const service = getTldrDaemonServiceSync(wsPath, wsVenvPath);
             const status = await service.getStatus();
             const indexStats = getIndexStats(wsPath, false);
 
@@ -1343,7 +1369,7 @@ const postTldrStartRoute = HttpRouter.add(
   '/api/services/tldr/start',
   Effect.promise(async () => {
     try {
-      const { getTldrDaemonService } = await import('../../../lib/tldr-daemon.js');
+      const { getTldrDaemonServiceSync } = await import('../../../lib/tldr-daemon.js');
       const projectRoot = process.cwd();
       const venvPath = join(projectRoot, '.venv');
 
@@ -1354,7 +1380,7 @@ const postTldrStartRoute = HttpRouter.add(
         );
       }
 
-      const service = getTldrDaemonService(projectRoot, venvPath);
+      const service = getTldrDaemonServiceSync(projectRoot, venvPath);
       await service.start();
       return jsonResponse({ success: true, message: 'TLDR daemon started' });
     }    catch (error: unknown) {
@@ -1371,7 +1397,7 @@ const postTldrStopRoute = HttpRouter.add(
   '/api/services/tldr/stop',
   Effect.promise(async () => {
     try {
-      const { getTldrDaemonService } = await import('../../../lib/tldr-daemon.js');
+      const { getTldrDaemonServiceSync } = await import('../../../lib/tldr-daemon.js');
       const projectRoot = process.cwd();
       const venvPath = join(projectRoot, '.venv');
 
@@ -1382,7 +1408,7 @@ const postTldrStopRoute = HttpRouter.add(
         );
       }
 
-      const service = getTldrDaemonService(projectRoot, venvPath);
+      const service = getTldrDaemonServiceSync(projectRoot, venvPath);
       await service.stop();
       return jsonResponse({ success: true, message: 'TLDR daemon stopped' });
     }    catch (error: unknown) {
@@ -1519,7 +1545,7 @@ const postShadowMonitorRoute = HttpRouter.add(
     // /api/shadow/:issueId/monitor → parts[3] = issueId
     const issueId = parts[3] || '';
     const issueLower = issueId.toLowerCase();
-    const issuePrefix = extractPrefix(issueId) ?? issueId.split('-')[0];
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
 
     return yield* Effect.promise(async () => {
       try {
@@ -1533,13 +1559,13 @@ const postShadowMonitorRoute = HttpRouter.add(
         const {
           gatherArtifacts,
           generateBasicInference,
-          updateInferenceDocument,
+          updateInferenceDocumentSync,
         } = await import('../../../lib/shadow-engineering/index.js');
 
         const config = { issueId, workspacePath, projectPath };
-        const artifacts = await gatherArtifacts(config);
+        const artifacts = await Effect.runPromise(gatherArtifacts(config));
         const inference = generateBasicInference(config, artifacts);
-        updateInferenceDocument(workspacePath, inference);
+        updateInferenceDocumentSync(workspacePath, inference);
 
         return jsonResponse({ success: true, inference });
       } catch (error: unknown) {
@@ -1565,7 +1591,7 @@ const postShadowObserveRoute = HttpRouter.add(
     // /api/shadow/:issueId/observe → parts[3] = issueId
     const issueId = parts[3] || '';
     const issueLower = issueId.toLowerCase();
-    const issuePrefix = extractPrefix(issueId) ?? issueId.split('-')[0];
+    const issuePrefix = extractPrefixSync(issueId) ?? issueId.split('-')[0];
 
     const body = yield* readJsonBody;
     const { mode } = body as { mode?: string };
@@ -1598,7 +1624,7 @@ const postShadowObserveRoute = HttpRouter.add(
           mode: ((mode || 'watch') as 'watch' | 'propose'),
         };
 
-        const commentsPosted = await runObserverCycle(config);
+        const commentsPosted = await Effect.runPromise(runObserverCycle(config));
         return jsonResponse({ success: true, commentsPosted });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -1656,16 +1682,43 @@ const postDevRebuildRoute = HttpRouter.add(
   }),
 );
 
+// POST /api/system/restart-dashboard — fire-and-forget restart of the dashboard
+// server. Spawns a detached `pan restart --dashboard` so the new process
+// outlives the SIGTERM that kills this server. Used by the browser fallback
+// path in App.tsx when window.panopticonBridge is not available.
+const postRestartDashboardRoute = HttpRouter.add(
+  'POST',
+  '/api/system/restart-dashboard',
+  Effect.sync(() => {
+    try {
+      const child = spawn('pan', ['restart', '--dashboard'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.on('error', (err) => {
+        console.error('[restart-dashboard] pan restart spawn failed:', err);
+      });
+      child.unref();
+      return jsonResponse({ ok: true, pid: child.pid ?? null }, { status: 202 });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return jsonResponse({ error: 'Restart failed: ' + msg }, { status: 500 });
+    }
+  }),
+);
+
 export const miscRouteLayer = Layer.mergeAll(
   postTrackersRefreshRoute,
   getProjectMappingsRoute,
   putProjectMappingsRoute,
   postProjectMappingsRoute,
+  getSystemHealthRoute,
   getGodviewSystemHealthRoute,
   getHealthAgentsRoute,
   postHealthAgentPingRoute,
   getTrackerStatusRoute,
   postRallyValidateRoute,
+  getNoResumeModeRoute,
   getDeaconStatusRoute,
   getDeaconLogsRoute,
   postDeaconPatrolRoute,
@@ -1689,6 +1742,7 @@ export const miscRouteLayer = Layer.mergeAll(
   postShadowMonitorRoute,
   postShadowObserveRoute,
   postDevRebuildRoute,
+  postRestartDashboardRoute,
 );
 
 export default miscRouteLayer;

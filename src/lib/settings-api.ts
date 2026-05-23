@@ -5,87 +5,115 @@
  * Converts between YAML config format and frontend API format.
  */
 
-import { writeFile } from 'fs/promises';
-import yaml from 'js-yaml';
-import { loadConfig, getGlobalConfigPath, YamlConfig } from './config-yaml.js';
-import { WorkTypeId } from './work-types.js';
+import { readFile, writeFile } from 'fs/promises';
+import { parseDocument } from 'yaml';
+import { Data, Effect } from 'effect';
+import {
+  DEFAULT_ROLES,
+  DEFAULT_WORKHORSES,
+  PARENT_MODEL_REF,
+  loadConfigSync,
+  getGlobalConfigPath,
+  clearConfigCache,
+  mergeConfigs,
+  type YamlConfig,
+  type ModelRef,
+  type RoleConfig,
+  type RolesConfig,
+  type WorkhorsesConfig,
+  type WorkhorseSlot,
+  type TtsDaemonConfig,
+} from './config-yaml.js';
 import { ModelId } from './settings.js';
-import { MODEL_CAPABILITIES, getModelCapability, MODEL_DEPRECATIONS, resolveModelId } from './model-capabilities.js';
-import { reloadGlobalRouter } from './work-type-router.js';
-
-/**
- * Optimal model defaults — multi-provider distribution (see docs/research/)
- * - Kimi K2.6: Exploration, testing, docs, UAT, general-purpose subagent
- * - GLM-5.1: Implementation, review-response (SWE-Bench Pro #1)
- * - GPT-5.4: Specialist review agent (high-stakes code review)
- * - MiniMax M2.7: Procedural specialists — test, merge, inspect
- * - Claude Opus/Sonnet: All parallel review agents (security, correctness, etc.)
- * - GPT-5.4 Nano/Mini: Subagents and CLI (fastest, cheapest, strong tool use)
- *
- * NOTE: All model IDs are automatically resolved through deprecation mapping
- * to ensure this function never returns deprecated models.
- */
-export function getOptimalModelDefaults(): Partial<Record<WorkTypeId, ModelId>> {
-  const rawDefaults: Partial<Record<WorkTypeId, string>> = {
-    // Planning & high-stakes review — GPT-5.4
-    'issue-agent:exploration': 'kimi-k2.6',
-
-    // Implementation — GLM-5.1 (SWE-Bench Pro #1, 8-hour autonomous sessions)
-    'issue-agent:implementation': 'glm-5.1',
-    'issue-agent:testing': 'kimi-k2.6',
-    'issue-agent:documentation': 'kimi-k2.6',
-    'issue-agent:review-response': 'glm-5.1',
-
-    // Specialist agents
-    'specialist-review-agent': 'gpt-5.4',
-    'specialist-test-agent': 'minimax-m2.7',
-    'specialist-merge-agent': 'minimax-m2.7',
-    'specialist-inspect-agent': 'minimax-m2.7-highspeed',
-    'specialist-uat-agent': 'kimi-k2.6',
-
-    // Review agents - mixed based on criticality
-    'review:security': 'claude-opus-4-6', // SAFETY CRITICAL
-    'review:performance': 'claude-sonnet-4-6',
-    'review:correctness': 'claude-sonnet-4-6',
-    'review:requirements': 'claude-sonnet-4-6',
-    'review:synthesis': 'claude-sonnet-4-6',
-
-    // Subagents — GPT-5.4 Nano (155 tok/s, Tau2-Bench 92.5% tool use)
-    'subagent:explore': 'gpt-5.4-nano',
-    'subagent:plan': 'gpt-5.4-nano',
-    'subagent:bash': 'gpt-5.4-nano',
-    'subagent:general-purpose': 'kimi-k2.6',
-
-    // Workflow jobs
-    'status-review': 'gpt-5.4-nano',
-
-    // CLI modes
-    'cli:interactive': 'gpt-5.4-mini',
-    'cli:quick-command': 'gpt-5.4-nano',
-  };
-
-  // Apply deprecation resolution to all model IDs
-  const resolved: Partial<Record<WorkTypeId, ModelId>> = {};
-  for (const [workType, modelId] of Object.entries(rawDefaults)) {
-    resolved[workType as WorkTypeId] = resolveModelId(modelId);
-  }
-
-  return resolved;
-}
+import type { Role } from './agents.js';
+import type { RuntimeName } from './runtimes/types.js';
+import { MODEL_CAPABILITIES, hasModelCapabilitySync, MODEL_DEPRECATIONS, resolveModelIdSync } from './model-capabilities.js';
 
 /**
  * Deprecation warning in API format
  */
 export interface ApiDeprecationWarning {
-  workType: WorkTypeId;
+  workType: string;
   from: string;
   to: string;
+}
+
+export type ApiTtsConfig = Omit<TtsDaemonConfig, 'daemonPort' | 'daemonHost'>;
+
+const API_TTS_KEYS = [
+  'enabled',
+  'voice',
+  'statusVoice',
+  'volume',
+  'rate',
+  'maxChars',
+  'dropInfoWhenFull',
+  'voiceMap',
+  'mutedSources',
+  'utteranceTemplates',
+  'mutedIssues',
+] as const satisfies readonly (keyof ApiTtsConfig)[];
+
+const API_TTS_KEY_SET = new Set<string>(API_TTS_KEYS);
+
+function unknownApiTtsKeys(tts: Record<string, unknown>): string[] {
+  return Object.keys(tts).filter((key) => !API_TTS_KEY_SET.has(key));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === 'string');
+}
+
+function validateApiTtsConfigFields(tts: Record<string, unknown>, errors: string[]): void {
+  const unknownKeys = unknownApiTtsKeys(tts);
+  if (unknownKeys.length > 0) {
+    errors.push(`Unknown tts setting(s): ${unknownKeys.join(', ')}`);
+  }
+
+  if (tts.enabled !== undefined && typeof tts.enabled !== 'boolean') errors.push('tts.enabled must be a boolean');
+  if (tts.dropInfoWhenFull !== undefined && typeof tts.dropInfoWhenFull !== 'boolean') errors.push('tts.dropInfoWhenFull must be a boolean');
+  if (tts.voice !== undefined && typeof tts.voice !== 'string') errors.push('tts.voice must be a string');
+  if (tts.statusVoice !== undefined && typeof tts.statusVoice !== 'string') errors.push('tts.statusVoice must be a string');
+  if (tts.volume !== undefined && (typeof tts.volume !== 'number' || tts.volume < 0 || tts.volume > 1)) {
+    errors.push('tts.volume must be between 0 and 1');
+  }
+  if (tts.rate !== undefined && (typeof tts.rate !== 'number' || tts.rate <= 0)) {
+    errors.push('tts.rate must be greater than 0');
+  }
+  if (tts.maxChars !== undefined && (typeof tts.maxChars !== 'number' || tts.maxChars <= 0)) {
+    errors.push('tts.maxChars must be greater than 0');
+  }
+  if (tts.voiceMap !== undefined && !isStringRecord(tts.voiceMap)) errors.push('tts.voiceMap must be a string record');
+  if (tts.utteranceTemplates !== undefined && !isStringRecord(tts.utteranceTemplates)) errors.push('tts.utteranceTemplates must be a string record');
+  if (tts.mutedSources !== undefined && !isStringArray(tts.mutedSources)) errors.push('tts.mutedSources must be an array of strings');
+  if (tts.mutedIssues !== undefined && !isStringArray(tts.mutedIssues)) errors.push('tts.mutedIssues must be an array of strings');
+}
+
+function sanitizeApiTtsConfig(tts: ApiTtsConfig | undefined): ApiTtsConfig | undefined {
+  if (tts === undefined) return undefined;
+  if (!isRecord(tts)) throw new Error('tts must be an object');
+
+  const errors: string[] = [];
+  validateApiTtsConfigFields(tts, errors);
+  if (errors.length > 0) throw new Error(errors.join('; '));
+
+  return Object.fromEntries(
+    API_TTS_KEYS
+      .filter((key) => tts[key] !== undefined)
+      .map((key) => [key, tts[key]]),
+  ) as ApiTtsConfig;
 }
 
 // API format matches frontend SettingsConfig interface
 // Note: No cost_sensitivity - we're opinionated and always pick the best model
 // for each task. Users control cost by which providers they enable.
 export interface ApiSettingsConfig {
+  workhorses?: WorkhorsesConfig;
+  roles?: RolesConfig;
   models: {
     providers: {
       anthropic: boolean;
@@ -94,9 +122,13 @@ export interface ApiSettingsConfig {
       minimax: boolean;
       zai: boolean;
       kimi: boolean;
+      mimo: boolean;
       openrouter: boolean;
+      nous: boolean;
+      dashscope: boolean;
     };
-    overrides: Partial<Record<WorkTypeId, ModelId>>;
+    /** Legacy model-route overrides are no longer surfaced by GET /api/settings. */
+    overrides?: Partial<Record<string, ModelId>>;
     gemini_thinking_level?: number;
     default_conversation_model?: ModelId;
   };
@@ -104,15 +136,51 @@ export interface ApiSettingsConfig {
     compaction_model?: ModelId;
     manual_compact_mode?: 'claude-code' | 'panopticon-native';
     rich_compaction?: boolean;
+    title_model?: ModelId;
+    watch_dirs?: string[];
+    scan_max_parallel?: number | null;
+    embeddings?: boolean;
+    embedding_provider?: 'openai' | 'voyage' | 'ollama';
+    embedding_model?: string;
+    embedding_auto_on_deep?: boolean;
+    enrichment?: {
+      quick_model?: string | null;
+      deep_model?: string | null;
+      max_parallel?: number;
+      cost_confirm_threshold?: number;
+    };
+  };
+  memory?: {
+    provider?: 'anthropic' | 'cliproxy';
+    model?: string;
+    per_day_cost_cap_usd?: number;
+    fallback_provider?: 'anthropic' | 'cliproxy' | '';
+    fallback_model?: string;
+    fallback_chain?: Array<{ provider: 'anthropic' | 'cliproxy'; model: string }>;
+    observations_enabled?: boolean;
+    prompt_time_injection_enabled?: boolean;
+    rollup_pending_threshold?: number;
+    sidebar_refresh_interval_ms?: number;
+    worker_concurrency?: number;
   };
   api_keys: {
     openai?: string;
+    voyage?: string;
     google?: string;
     minimax?: string;
     zai?: string;
     kimi?: string;
+    mimo?: string;
     openrouter?: string;
+    nous?: string;
+    dashscope?: string;
   };
+  agents?: {
+    rtk?: {
+      enabled?: boolean;
+    };
+  };
+  tts?: ApiTtsConfig;
   openrouter?: {
     favorites?: string[];
   };
@@ -125,6 +193,24 @@ export interface ApiSettingsConfig {
     gitlab?: string;
     rally?: string;
   };
+  experimental?: {
+    /** Use Claude Code Channels delivery for conversations/messages. */
+    claudeCodeChannels?: boolean;
+    /** Enable legacy Claude Code Channels MCP wiring for new eligible work agents. */
+    claudeCodeChannelsMcp?: boolean;
+  };
+  /**
+   * Permission mode for spawned Claude Code agents.
+   *
+   * 'auto' (default) → --permission-mode auto (classifier blocks destructive ops)
+   * 'bypass'         → --dangerously-skip-permissions --permission-mode bypassPermissions
+   *
+   * Persisted under `claude.permissionMode` in `~/.panopticon/config.yaml`.
+   * Override per-invocation with `--yolo` / `--no-yolo` / `PAN_YOLO`.
+   */
+  claude?: {
+    permissionMode?: 'auto' | 'bypass';
+  };
   deprecation_warnings?: ApiDeprecationWarning[];
 }
 
@@ -134,65 +220,303 @@ export interface ApiSettingsConfig {
  * Also detects deprecated model IDs in current overrides and returns warnings.
  */
 export function getDefaultConversationModelApi(): ModelId {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
-  if (config.defaultConversationModel) return resolveModelId(config.defaultConversationModel);
+  if (config.defaultConversationModel) return resolveModelIdSync(config.defaultConversationModel);
 
-  if (config.enabledProviders.has('openai')) return resolveModelId('gpt-5.4');
-  if (config.enabledProviders.has('minimax')) return resolveModelId('minimax-m2.7-highspeed');
-  if (config.enabledProviders.has('google')) return resolveModelId('gemini-3.1-pro-preview');
-  if (config.enabledProviders.has('kimi')) return resolveModelId('kimi-k2.5');
-  if (config.enabledProviders.has('zai')) return resolveModelId('glm-5.1');
+  if (config.enabledProviders.has('openai')) return resolveModelIdSync('gpt-5.5');
+  if (config.enabledProviders.has('minimax')) return resolveModelIdSync('minimax-m2.7-highspeed');
+  if (config.enabledProviders.has('google')) return resolveModelIdSync('gemini-3.1-pro-preview');
+  if (config.enabledProviders.has('kimi')) return resolveModelIdSync('kimi-k2.5');
+  if (config.enabledProviders.has('zai')) return resolveModelIdSync('glm-5.1');
+  if (config.enabledProviders.has('mimo')) return resolveModelIdSync('mimo-v2.5-pro');
+  if (config.enabledProviders.has('nous')) return resolveModelIdSync('qwen/qwen3.6-plus');
+  if (config.enabledProviders.has('dashscope')) return resolveModelIdSync('qwen3-coder-plus');
   if (config.enabledProviders.has('openrouter')) {
     const fav = config.openrouterFavorites[0];
-    if (fav) return resolveModelId(fav);
+    if (fav) return resolveModelIdSync(fav);
   }
-  return resolveModelId('claude-sonnet-4-6');
+  return resolveModelIdSync('claude-sonnet-4-6');
 }
 
-/** convoy:* override keys → review:* equivalents (translated on every read) */
-const CONVOY_TO_REVIEW_MIGRATION: Partial<Record<string, WorkTypeId>> = {
-  'convoy:security-reviewer': 'review:security',
-  'convoy:performance-reviewer': 'review:performance',
-  'convoy:correctness-reviewer': 'review:correctness',
-  'convoy:requirements-reviewer': 'review:requirements',
-  'convoy:synthesis-agent': 'review:synthesis',
+const ROLE_NAMES: readonly Role[] = ['plan', 'work', 'review', 'test', 'ship', 'flywheel'];
+const WORKHORSE_SLOTS: readonly WorkhorseSlot[] = ['expensive', 'mid', 'cheap'];
+const ALLOWED_SUB_ROLES: Partial<Record<Role, readonly string[]>> = {
+  work: ['inspect', 'inspect-deep'],
+  review: ['security', 'performance', 'correctness', 'requirements', 'synthesis'],
 };
+function seededWorkhorses(config: Pick<ReturnType<typeof loadConfigSync>['config'], 'workhorses'>): WorkhorsesConfig {
+  return { ...DEFAULT_WORKHORSES, ...(config.workhorses ?? {}) };
+}
 
-export function loadSettingsApi(): ApiSettingsConfig {
-  const { config } = loadConfig();
+function seededRoles(config: Pick<ReturnType<typeof loadConfigSync>['config'], 'roles'>): RolesConfig {
+  const roles: RolesConfig = {};
+  for (const role of ROLE_NAMES) {
+    const defaultRole = DEFAULT_ROLES[role];
+    const configuredRole = config.roles?.[role];
+    const sub = {
+      ...(defaultRole.sub ?? {}),
+      ...(configuredRole?.sub ?? {}),
+    };
+    roles[role] = {
+      ...defaultRole,
+      ...(configuredRole ?? {}),
+      sub: Object.keys(sub).length > 0 ? sub : undefined,
+    };
+  }
+  return roles;
+}
 
-  // Translate persisted convoy:* override keys to review:* equivalents on every read.
-  // The rename is applied in-memory; it persists to disk only when the user calls saveSettingsApi.
-  const migratedOverrides: Partial<Record<WorkTypeId, ModelId>> = {};
-  let migrationNeeded = false;
-  for (const [workType, modelId] of Object.entries(config.overrides)) {
-    const newKey = CONVOY_TO_REVIEW_MIGRATION[workType];
-    if (newKey) {
-      migratedOverrides[newKey] = modelId as ModelId;
-      migrationNeeded = true;
+function toApiTtsConfig(config: ReturnType<typeof loadConfigSync>['config']['tts']): ApiTtsConfig {
+  return {
+    enabled: config.enabled,
+    voice: config.voice,
+    statusVoice: config.statusVoice,
+    volume: config.volume,
+    rate: config.rate,
+    maxChars: config.maxChars,
+    dropInfoWhenFull: config.dropInfoWhenFull,
+    voiceMap: { ...config.voiceMap },
+    mutedSources: [...config.mutedSources],
+    utteranceTemplates: { ...config.utteranceTemplates },
+    mutedIssues: [...config.mutedIssues],
+  };
+}
+
+function pruneUndefined<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((item) => pruneUndefined(item)) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, pruneUndefined(entry)]),
+    ) as T;
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isWorkhorseRef(ref: string): boolean {
+  return ref.startsWith('workhorse:');
+}
+
+function workhorseSlotFromRef(ref: string): string {
+  return ref.slice('workhorse:'.length);
+}
+
+function mergeRoles(current?: RolesConfig, updates?: RolesConfig): RolesConfig | undefined {
+  if (!current && !updates) return undefined;
+  const merged: RolesConfig = { ...(current ?? {}) };
+  for (const [role, roleConfig] of Object.entries(updates ?? {}) as Array<[Role, RoleConfig]>) {
+    merged[role] = {
+      ...(merged[role] ?? {}),
+      ...roleConfig,
+      sub: roleConfig.sub
+        ? {
+            ...(merged[role]?.sub ?? {}),
+            ...roleConfig.sub,
+          }
+        : merged[role]?.sub,
+    };
+  }
+  return merged;
+}
+
+function validateModelRef(
+  fieldPath: string,
+  ref: unknown,
+  effectiveWorkhorses: WorkhorsesConfig,
+  errors: string[],
+  warnings: string[],
+  allowWorkhorseRef: boolean,
+  allowParentRef = false,
+): void {
+  if (typeof ref !== 'string' || ref.trim() === '') {
+    errors.push(`${fieldPath} must be a non-empty model reference`);
+    return;
+  }
+
+  if (ref === PARENT_MODEL_REF) {
+    if (!allowParentRef) {
+      errors.push(`${fieldPath} cannot be ${PARENT_MODEL_REF}; ${PARENT_MODEL_REF} is valid only for sub-role models`);
+    }
+    return;
+  }
+
+  if (isWorkhorseRef(ref)) {
+    if (!allowWorkhorseRef) {
+      errors.push(`${fieldPath} cannot reference another workhorse`);
+      return;
+    }
+    const slot = workhorseSlotFromRef(ref);
+    if (!WORKHORSE_SLOTS.includes(slot as WorkhorseSlot)) {
+      errors.push(`${fieldPath} references unknown workhorse slot "${slot}"`);
+      return;
+    }
+    if (!effectiveWorkhorses[slot as WorkhorseSlot]) {
+      errors.push(`${fieldPath} references ${ref} but workhorses.${slot} is not defined`);
+    }
+    return;
+  }
+
+  if (MODEL_DEPRECATIONS[ref]) {
+    warnings.push(`${fieldPath}: "${ref}" is deprecated, use "${MODEL_DEPRECATIONS[ref]}" instead`);
+    return;
+  }
+
+  const resolved = resolveModelIdSync(ref);
+  if (!hasModelCapabilitySync(resolved)) {
+    errors.push(`Invalid model reference "${ref}" at ${fieldPath}`);
+  }
+}
+
+function validateRoleFields(fieldPath: string, roleConfig: Record<string, unknown>, errors: string[]): void {
+  const harness = roleConfig.harness;
+  if (harness !== undefined && harness !== 'claude-code' && harness !== 'pi') {
+    errors.push(`${fieldPath}.harness must be claude-code or pi`);
+  }
+
+  const effort = roleConfig.effort;
+  if (effort !== undefined && effort !== 'low' && effort !== 'medium' && effort !== 'high') {
+    errors.push(`${fieldPath}.effort must be low, medium, or high`);
+  }
+
+  const maxAgents = roleConfig.maxAgents;
+  if (maxAgents !== undefined && (typeof maxAgents !== 'number' || !Number.isInteger(maxAgents) || maxAgents < 1)) {
+    errors.push(`${fieldPath}.maxAgents must be a positive integer`);
+  }
+
+  const scope = roleConfig.scope;
+  if (scope !== undefined && scope !== 'pan-only' && scope !== 'all-tracked-projects') {
+    errors.push(`${fieldPath}.scope must be pan-only or all-tracked-projects`);
+  }
+}
+
+function validateWorkhorsesAndRoles(settings: ApiSettingsConfig, errors: string[], warnings: string[]): void {
+  const effectiveWorkhorses: WorkhorsesConfig = { ...DEFAULT_WORKHORSES };
+
+  if (settings.workhorses !== undefined) {
+    if (!isRecord(settings.workhorses)) {
+      errors.push('workhorses must be an object');
     } else {
-      migratedOverrides[workType as WorkTypeId] = modelId as ModelId;
+      for (const [slot, ref] of Object.entries(settings.workhorses)) {
+        if (!WORKHORSE_SLOTS.includes(slot as WorkhorseSlot)) {
+          errors.push(`Unknown workhorse slot "${slot}"`);
+          continue;
+        }
+        effectiveWorkhorses[slot as WorkhorseSlot] = ref as ModelRef;
+        validateModelRef(`workhorses.${slot}`, ref, effectiveWorkhorses, errors, warnings, false);
+      }
     }
   }
-  // Use migratedOverrides for the response without mutating the loaded config object.
-  const effectiveOverrides = migrationNeeded
-    ? (migratedOverrides as Record<WorkTypeId, ModelId>)
-    : config.overrides;
 
-  // Detect deprecated models in current overrides
+  if (settings.roles !== undefined) {
+    if (!isRecord(settings.roles)) {
+      errors.push('roles must be an object');
+    } else {
+      for (const [roleName, rawRoleConfig] of Object.entries(settings.roles)) {
+        if (!ROLE_NAMES.includes(roleName as Role)) {
+          errors.push(`Unknown role "${roleName}"`);
+          continue;
+        }
+        const role = roleName as Role;
+        if (!isRecord(rawRoleConfig)) {
+          errors.push(`roles.${role}.model must be a non-empty model reference`);
+          continue;
+        }
+
+        validateModelRef(`roles.${role}.model`, rawRoleConfig.model, effectiveWorkhorses, errors, warnings, true);
+        validateRoleFields(`roles.${role}`, rawRoleConfig, errors);
+
+        if (rawRoleConfig.sub !== undefined) {
+          if (!isRecord(rawRoleConfig.sub)) {
+            errors.push(`roles.${role}.sub must be an object`);
+          } else {
+            const allowedSubRoles = ALLOWED_SUB_ROLES[role] ?? [];
+            for (const [subRole, rawSubConfig] of Object.entries(rawRoleConfig.sub)) {
+              if (!allowedSubRoles.includes(subRole)) {
+                errors.push(`Unknown sub-role "${subRole}" for role "${role}"`);
+                continue;
+              }
+              if (!isRecord(rawSubConfig)) {
+                errors.push(`roles.${role}.sub.${subRole}.model must be a non-empty model reference`);
+                continue;
+              }
+              validateModelRef(
+                `roles.${role}.sub.${subRole}.model`,
+                rawSubConfig.model,
+                effectiveWorkhorses,
+                errors,
+                warnings,
+                true,
+                true,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (errors.length === 0) {
+    try {
+      mergeConfigs({ workhorses: effectiveWorkhorses, roles: settings.roles });
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+
+export function loadSettingsApi(): ApiSettingsConfig {
+  const { config } = loadConfigSync();
+
+  // Detect deprecated models in current overrides. Overrides are no longer
+  // surfaced by GET /api/settings, but warnings help users clean stale config.
   const deprecationWarnings: ApiDeprecationWarning[] = [];
-  for (const [workType, modelId] of Object.entries(effectiveOverrides)) {
+  for (const [workType, modelId] of Object.entries(config.overrides)) {
     if (modelId && MODEL_DEPRECATIONS[modelId]) {
       deprecationWarnings.push({
-        workType: workType as WorkTypeId,
+        workType,
         from: modelId,
         to: MODEL_DEPRECATIONS[modelId],
       });
     }
   }
 
+  const conversationSettings = pruneUndefined({
+    compaction_model: config.conversations?.compactionModel,
+    manual_compact_mode: config.conversations?.manualCompactMode,
+    rich_compaction: config.conversations?.richCompaction,
+    title_model: config.conversations?.titleModel,
+    watch_dirs: config.conversations?.watchDirs,
+    scan_max_parallel: config.conversations?.scanMaxParallel,
+    embeddings: config.conversations?.embeddings,
+    embedding_provider: config.conversations?.embeddingProvider,
+    embedding_model: config.conversations?.embeddingModel,
+    embedding_auto_on_deep: config.conversations?.embeddingAutoOnDeep,
+    enrichment: config.conversations?.enrichment ? pruneUndefined({
+      quick_model: config.conversations.enrichment.quickModel,
+      deep_model: config.conversations.enrichment.deepModel,
+      max_parallel: config.conversations.enrichment.maxParallel,
+      cost_confirm_threshold: config.conversations.enrichment.costConfirmThreshold,
+    }) : undefined,
+  });
+
+  const memory = config.memory ?? {
+    extraction: { fallbackChain: [] },
+    observationsEnabled: true,
+    promptTimeInjectionEnabled: true,
+    rollupPendingThreshold: 4,
+    sidebarRefreshIntervalMs: 10_000,
+    workerConcurrency: 4,
+  };
+
   return {
+    workhorses: seededWorkhorses(config),
+    roles: seededRoles(config),
     models: {
       providers: {
         anthropic: config.enabledProviders.has('anthropic'),
@@ -201,39 +525,131 @@ export function loadSettingsApi(): ApiSettingsConfig {
         minimax: config.enabledProviders.has('minimax'),
         zai: config.enabledProviders.has('zai'),
         kimi: config.enabledProviders.has('kimi'),
+        mimo: config.enabledProviders.has('mimo'),
         openrouter: config.enabledProviders.has('openrouter'),
+        nous: config.enabledProviders.has('nous'),
+        dashscope: config.enabledProviders.has('dashscope'),
       },
-      overrides: effectiveOverrides,
       gemini_thinking_level: config.geminiThinkingLevel,
       default_conversation_model: getDefaultConversationModelApi(),
     },
     api_keys: config.apiKeys,
+    agents: {
+      rtk: {
+        enabled: config.rtk?.enabled ?? false,
+      },
+    },
+    tts: toApiTtsConfig(config.tts),
     openrouter: {
       favorites: config.openrouterFavorites,
     },
     tmux: {
       config_mode: config.tmux.configMode,
     },
-    conversations: {
-      compaction_model: config.conversations.compactionModel,
-      manual_compact_mode: config.conversations.manualCompactMode,
-      rich_compaction: config.conversations.richCompaction,
+    conversations: conversationSettings,
+    memory: {
+      provider: memory.extraction.provider,
+      model: memory.extraction.model,
+      per_day_cost_cap_usd: memory.extraction.perDayCostCapUsd,
+      fallback_provider: memory.extraction.fallbackChain[0]?.provider ?? '',
+      fallback_model: memory.extraction.fallbackChain[0]?.model,
+      fallback_chain: memory.extraction.fallbackChain,
+      observations_enabled: memory.observationsEnabled,
+      prompt_time_injection_enabled: memory.promptTimeInjectionEnabled,
+      rollup_pending_threshold: memory.rollupPendingThreshold,
+      sidebar_refresh_interval_ms: memory.sidebarRefreshIntervalMs,
+      worker_concurrency: memory.workerConcurrency,
     },
     tracker_keys: config.trackerKeys,
+    experimental: {
+      claudeCodeChannels: config.experimental?.claudeCodeChannels ?? false,
+      claudeCodeChannelsMcp: config.experimental?.claudeCodeChannelsMcp ?? false,
+    },
+    claude: {
+      // Defensive — older test mocks of loadConfig may not include `claude`;
+      // production loader always populates it via DEFAULT_CONFIG.
+      permissionMode: config.claude?.permissionMode ?? 'auto',
+    },
     deprecation_warnings: deprecationWarnings.length > 0 ? deprecationWarnings : undefined,
   };
 }
 
-/**
- * Save settings from API format (for PUT /api/settings)
- */
-export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void> {
-  const { config: currentConfig } = loadConfig();
+async function writeYamlConfigPreservingComments(yamlConfig: YamlConfig): Promise<void> {
+  const configPath = getGlobalConfigPath();
+  let existingContent = '{}\n';
+  try {
+    const content = await readFile(configPath, 'utf-8');
+    existingContent = content.trim().length > 0 ? content : '{}\n';
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  const doc = parseDocument(existingContent);
+  if (doc.contents === null) {
+    doc.contents = parseDocument('{}\n').contents;
+  }
+  const config = pruneUndefined(yamlConfig);
+
+  doc.setIn(['workhorses'], config.workhorses ?? {});
+  doc.setIn(['roles'], config.roles ?? {});
+  doc.setIn(['models', 'providers'], config.models?.providers ?? {});
+  doc.deleteIn(['models', 'overrides']);
+
+  if (config.models?.gemini_thinking_level !== undefined) {
+    doc.setIn(['models', 'gemini_thinking_level'], config.models.gemini_thinking_level);
+  } else {
+    doc.deleteIn(['models', 'gemini_thinking_level']);
+  }
+
+  if (config.models?.default_conversation_model !== undefined) {
+    doc.setIn(['models', 'default_conversation_model'], config.models.default_conversation_model);
+  } else {
+    doc.deleteIn(['models', 'default_conversation_model']);
+  }
+
+  const topLevelSections: Array<[keyof YamlConfig, unknown]> = [
+    ['api_keys', config.api_keys],
+    ['openrouter', config.openrouter],
+    ['tmux', config.tmux],
+    ['conversations', config.conversations],
+    ['memory', config.memory],
+    ['tracker_keys', config.tracker_keys],
+    ['experimental', config.experimental],
+    ['claude', config.claude],
+  ];
+
+  for (const [key, value] of topLevelSections) {
+    if (value === undefined) {
+      doc.deleteIn([key]);
+    } else {
+      doc.setIn([key], value);
+    }
+  }
+
+  if (config.agents?.rtk !== undefined) {
+    doc.setIn(['agents', 'rtk'], config.agents.rtk);
+  }
+
+  if (config.tts !== undefined) {
+    for (const [key, value] of Object.entries(config.tts)) {
+      doc.setIn(['tts', key], value);
+    }
+  }
+
+  await writeFile(configPath, doc.toString({ lineWidth: 120 }), 'utf-8');
+}
+
+async function saveSettingsApiPromise(settings: ApiSettingsConfig): Promise<void> {
+  const { config: currentConfig } = loadConfigSync();
   const providerAuth = currentConfig.providerAuth ?? {};
   const providerPlan = currentConfig.providerPlan ?? {};
 
   // Convert API format to YAML format
   const yamlConfig: YamlConfig = {
+    workhorses: settings.workhorses,
+    roles: settings.roles,
     models: {
       providers: {
         anthropic: settings.models.providers.anthropic,
@@ -254,51 +670,81 @@ export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void
         minimax: settings.models.providers.minimax,
         zai: settings.models.providers.zai,
         kimi: settings.models.providers.kimi,
+        mimo: settings.models.providers.mimo,
         openrouter: settings.models.providers.openrouter,
+        nous: settings.models.providers.nous,
+        dashscope: settings.models.providers.dashscope,
       },
-      overrides: settings.models.overrides,
       gemini_thinking_level: settings.models.gemini_thinking_level as 1 | 2 | 3 | 4,
       default_conversation_model: settings.models.default_conversation_model,
     },
     api_keys: {
       openai: settings.api_keys.openai,
+      voyage: settings.api_keys.voyage,
       google: settings.api_keys.google,
       minimax: settings.api_keys.minimax,
       zai: settings.api_keys.zai,
       kimi: settings.api_keys.kimi,
+      mimo: settings.api_keys.mimo,
       openrouter: settings.api_keys.openrouter,
+      nous: settings.api_keys.nous,
+      dashscope: settings.api_keys.dashscope,
     },
+    agents: settings.agents?.rtk !== undefined
+      ? { rtk: { enabled: settings.agents.rtk.enabled ?? false } }
+      : undefined,
+    tts: sanitizeApiTtsConfig(settings.tts),
     openrouter: settings.openrouter,
     tmux: settings.tmux,
     conversations: settings.conversations,
+    memory: settings.memory
+      ? {
+          extraction: {
+            provider: settings.memory.provider || undefined,
+            model: settings.memory.model || undefined,
+            per_day_cost_cap_usd: settings.memory.per_day_cost_cap_usd,
+            fallback_chain: settings.memory.fallback_chain ?? (settings.memory.fallback_provider && settings.memory.fallback_model
+              ? [{ provider: settings.memory.fallback_provider, model: settings.memory.fallback_model }]
+              : undefined),
+          },
+          features: {
+            observations: settings.memory.observations_enabled,
+            prompt_time_injection: settings.memory.prompt_time_injection_enabled,
+          },
+          rollup_pending_threshold: settings.memory.rollup_pending_threshold,
+          sidebar_refresh_interval_ms: settings.memory.sidebar_refresh_interval_ms,
+          worker_concurrency: settings.memory.worker_concurrency,
+        }
+      : undefined,
     tracker_keys: settings.tracker_keys,
+    experimental: settings.experimental
+      ? {
+          claudeCodeChannels: settings.experimental.claudeCodeChannels,
+          claudeCodeChannelsMcp: settings.experimental.claudeCodeChannelsMcp,
+        }
+      : undefined,
+    claude: settings.claude?.permissionMode
+      ? { permissionMode: settings.claude.permissionMode }
+      : undefined,
   };
 
-  // Write to YAML file
-  const yamlContent = yaml.dump(yamlConfig, {
-    indent: 2,
-    lineWidth: 120,
-    noRefs: true,
-  });
+  await writeYamlConfigPreservingComments(yamlConfig);
 
-  await writeFile(getGlobalConfigPath(), yamlContent, 'utf-8');
-
-  // Reload the global work-type router so in-memory overrides reflect the
-  // freshly-written config. Without this, planning-agent / specialist overrides
-  // saved via PUT /api/settings don't take effect until the dashboard restarts,
-  // and smart-model-selector fallback can pick an unexpected model (e.g. a
-  // non-Anthropic top scorer that the runtime can't resolve).
-  reloadGlobalRouter();
+  // Clear the config-yaml cache because mtime-based invalidation can miss rapid
+  // writes (same-millisecond) or coarse filesystem mtime resolution.
+  clearConfigCache();
 }
 
-/**
- * Update specific settings (partial update)
- */
-export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Promise<ApiSettingsConfig> {
+async function updateSettingsApiPromise(updates: Partial<ApiSettingsConfig>): Promise<ApiSettingsConfig> {
   const current = loadSettingsApi();
 
   // Merge updates
   const merged: ApiSettingsConfig = {
+    workhorses: {
+      ...current.workhorses,
+      ...updates.workhorses,
+    },
+    roles: mergeRoles(current.roles, updates.roles),
     models: {
       ...current.models,
       ...updates.models,
@@ -306,14 +752,23 @@ export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Pr
         ...current.models.providers,
         ...updates.models?.providers,
       },
-      overrides: {
-        ...current.models.overrides,
-        ...updates.models?.overrides,
-      },
+      overrides: undefined,
     },
     api_keys: {
       ...current.api_keys,
       ...updates.api_keys,
+    },
+    agents: {
+      ...current.agents,
+      ...updates.agents,
+      rtk: {
+        ...current.agents?.rtk,
+        ...updates.agents?.rtk,
+      },
+    },
+    tts: {
+      ...current.tts,
+      ...sanitizeApiTtsConfig(updates.tts),
     },
     openrouter: {
       ...current.openrouter,
@@ -327,26 +782,46 @@ export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Pr
       ...current.conversations,
       ...updates.conversations,
     },
+    memory: {
+      ...current.memory,
+      ...updates.memory,
+    },
     tracker_keys: {
       ...current.tracker_keys,
       ...updates.tracker_keys,
     },
+    experimental: {
+      ...current.experimental,
+      ...updates.experimental,
+    },
+    claude: {
+      ...current.claude,
+      ...updates.claude,
+    },
   };
 
   // Save and return
-  await saveSettingsApi(merged);
+  await Effect.runPromise(saveSettingsApi(merged));
   return merged;
 }
 
-export async function updateProviderApiKey(
-  provider: 'openai' | 'google' | 'minimax' | 'zai' | 'kimi' | 'openrouter',
+export function getRoleConfig(role: Role): RoleConfig | undefined {
+  return loadSettingsApi().roles?.[role];
+}
+
+async function setRoleConfigPromise(role: Role, roleConfig: RoleConfig): Promise<ApiSettingsConfig> {
+  return Effect.runPromise(updateSettingsApi({ roles: { [role]: roleConfig } }));
+}
+
+async function updateProviderApiKeyPromise(
+  provider: 'openai' | 'voyage' | 'google' | 'minimax' | 'zai' | 'kimi' | 'mimo' | 'openrouter' | 'nous' | 'dashscope',
   apiKey?: string
 ): Promise<ApiSettingsConfig> {
-  return updateSettingsApi({
+  return Effect.runPromise(updateSettingsApi({
     api_keys: {
       [provider]: apiKey,
     },
-  });
+  }));
 }
 
 /**
@@ -397,11 +872,63 @@ export function validateSettingsApi(settings: ApiSettingsConfig): ValidationResu
     }
   }
 
+  validateWorkhorsesAndRoles(settings, errors, warnings);
+
   // Validate gemini thinking level
   if (settings.models?.gemini_thinking_level !== undefined) {
     const level = settings.models.gemini_thinking_level;
     if (level < 1 || level > 4) {
       errors.push('Gemini thinking level must be between 1 and 4');
+    }
+  }
+
+  if (settings.agents !== undefined) {
+    if (!isRecord(settings.agents)) {
+      errors.push('agents must be an object');
+    } else if (settings.agents.rtk !== undefined) {
+      if (!isRecord(settings.agents.rtk)) {
+        errors.push('agents.rtk must be an object');
+      } else if (settings.agents.rtk.enabled !== undefined && typeof settings.agents.rtk.enabled !== 'boolean') {
+        errors.push('agents.rtk.enabled must be a boolean');
+      }
+    }
+  }
+
+  if (settings.memory !== undefined) {
+    if (settings.memory.per_day_cost_cap_usd !== undefined && settings.memory.per_day_cost_cap_usd < 0) {
+      errors.push('memory.per_day_cost_cap_usd must be greater than or equal to 0');
+    }
+    if (settings.memory.rollup_pending_threshold !== undefined && (!Number.isInteger(settings.memory.rollup_pending_threshold) || settings.memory.rollup_pending_threshold < 1)) {
+      errors.push('memory.rollup_pending_threshold must be a positive integer');
+    }
+    if (settings.memory.sidebar_refresh_interval_ms !== undefined && (!Number.isInteger(settings.memory.sidebar_refresh_interval_ms) || settings.memory.sidebar_refresh_interval_ms < 1)) {
+      errors.push('memory.sidebar_refresh_interval_ms must be a positive integer');
+    }
+    if (settings.memory.worker_concurrency !== undefined && (!Number.isInteger(settings.memory.worker_concurrency) || settings.memory.worker_concurrency < 1)) {
+      errors.push('memory.worker_concurrency must be a positive integer');
+    }
+  }
+
+  // Validate experimental flags — every flag must be a boolean if present.
+  if (settings.experimental !== undefined) {
+    if (typeof settings.experimental !== 'object' || settings.experimental === null) {
+      errors.push('experimental must be an object');
+    } else {
+      const experimental = settings.experimental as { claudeCodeChannels?: unknown; claudeCodeChannelsMcp?: unknown };
+      if (experimental.claudeCodeChannels !== undefined && typeof experimental.claudeCodeChannels !== 'boolean') {
+        errors.push('experimental.claudeCodeChannels must be a boolean');
+      }
+      if (experimental.claudeCodeChannelsMcp !== undefined && typeof experimental.claudeCodeChannelsMcp !== 'boolean') {
+        errors.push('experimental.claudeCodeChannelsMcp must be a boolean');
+      }
+    }
+  }
+
+  if (settings.tts !== undefined) {
+    if (!isRecord(settings.tts)) {
+      errors.push('tts must be an object');
+    } else {
+      validateApiTtsConfigFields(settings.tts, errors);
     }
   }
 
@@ -422,7 +949,10 @@ export function getAvailableModelsApi(): {
   minimax: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   zai: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   kimi: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+  mimo: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   openrouter: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+  nous: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+  dashscope: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
 } {
   const result: {
     anthropic: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
@@ -431,7 +961,10 @@ export function getAvailableModelsApi(): {
     minimax: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
     zai: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
     kimi: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+    mimo: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
     openrouter: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+    nous: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+    dashscope: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   } = {
     anthropic: [],
     openai: [],
@@ -439,10 +972,15 @@ export function getAvailableModelsApi(): {
     minimax: [],
     zai: [],
     kimi: [],
+    mimo: [],
     openrouter: [],
+    nous: [],
+    dashscope: [],
   };
 
   for (const [modelId, capability] of Object.entries(MODEL_CAPABILITIES)) {
+    // Skip deprecated models — they should not appear in user-facing pickers.
+    if (capability.displayName.includes('(deprecated)')) continue;
     const entry = { id: modelId as ModelId, name: capability.displayName, costPer1MTokens: capability.costPer1MTokens };
     switch (capability.provider) {
       case 'anthropic':
@@ -463,11 +1001,31 @@ export function getAvailableModelsApi(): {
       case 'zai':
         result.zai.push(entry);
         break;
+      case 'mimo':
+        result.mimo.push(entry);
+        break;
       case 'openrouter':
         result.openrouter.push(entry);
         break;
+      case 'nous':
+        result.nous.push(entry);
+        break;
+      case 'dashscope':
+        result.dashscope.push(entry);
+        break;
     }
   }
+
+  // Order OpenAI models with latest family first: 5.5 (current default) → 5.4 → 5.3-codex → 5.2 → o-series → gpt-4o legacy.
+  const openaiOrder: Record<string, number> = {
+    'gpt-5.5': 0, 'gpt-5.5-pro': 1,
+    'gpt-5.4': 10, 'gpt-5.4-pro': 11, 'gpt-5.4-mini': 12,
+    'gpt-5.3-codex': 20,
+    'gpt-5.2': 30,
+    'o3': 40, 'o4-mini': 41,
+    'gpt-4o': 50, 'gpt-4o-mini': 51,
+  };
+  result.openai.sort((a, b) => (openaiOrder[a.id] ?? 99) - (openaiOrder[b.id] ?? 99));
 
   return result;
 }
@@ -477,6 +1035,8 @@ export function getAvailableModelsApi(): {
  */
 export function getOptimalDefaultsApi(): ApiSettingsConfig {
   return {
+    workhorses: { ...DEFAULT_WORKHORSES },
+    roles: seededRoles({ roles: undefined }),
     models: {
       providers: {
         anthropic: true,
@@ -485,9 +1045,11 @@ export function getOptimalDefaultsApi(): ApiSettingsConfig {
         minimax: false,
         zai: false,
         kimi: true, // Kimi K2.6 (K2.6-code-preview) used for exploration, testing, and documentation
+        mimo: false,
         openrouter: false,
+        nous: false,
+        dashscope: false,
       },
-      overrides: getOptimalModelDefaults(),
       gemini_thinking_level: 3,
     },
     api_keys: {},
@@ -500,6 +1062,12 @@ export function getOptimalDefaultsApi(): ApiSettingsConfig {
  */
 export function getMiniMaxDefaultsApi(): ApiSettingsConfig {
   return {
+    workhorses: {
+      expensive: 'minimax-m2.7-highspeed',
+      mid: 'minimax-m2.7-highspeed',
+      cheap: 'minimax-m2.7-highspeed',
+    },
+    roles: seededRoles({ roles: undefined }),
     models: {
       providers: {
         anthropic: false,
@@ -508,9 +1076,11 @@ export function getMiniMaxDefaultsApi(): ApiSettingsConfig {
         zai: false,
         kimi: false,
         minimax: true,
+        mimo: false,
         openrouter: false,
+        nous: false,
+        dashscope: false,
       },
-      overrides: getMiniMaxModelDefaults(),
       gemini_thinking_level: 3,
     },
     api_keys: {},
@@ -518,42 +1088,12 @@ export function getMiniMaxDefaultsApi(): ApiSettingsConfig {
   };
 }
 
-function getMiniMaxModelDefaults(): Partial<Record<WorkTypeId, ModelId>> {
-  return {
-    'issue-agent:exploration': 'minimax-m2.7-highspeed',
-    'issue-agent:implementation': 'minimax-m2.7-highspeed',
-    'issue-agent:testing': 'minimax-m2.7-highspeed',
-    'issue-agent:documentation': 'minimax-m2.7-highspeed',
-    'issue-agent:review-response': 'minimax-m2.7-highspeed',
-    'specialist-review-agent': 'minimax-m2.7-highspeed',
-    'specialist-test-agent': 'minimax-m2.7-highspeed',
-    'specialist-merge-agent': 'minimax-m2.7-highspeed',
-    'specialist-inspect-agent': 'minimax-m2.7-highspeed',
-    'specialist-uat-agent': 'minimax-m2.7-highspeed',
-    'review:security': 'minimax-m2.7-highspeed',
-    'review:performance': 'minimax-m2.7-highspeed',
-    'review:correctness': 'minimax-m2.7-highspeed',
-    'review:requirements': 'minimax-m2.7-highspeed',
-    'review:synthesis': 'minimax-m2.7-highspeed',
-    'subagent:explore': 'minimax-m2.7-highspeed',
-    'subagent:plan': 'minimax-m2.7-highspeed',
-    'subagent:bash': 'minimax-m2.7-highspeed',
-    'subagent:general-purpose': 'minimax-m2.7-highspeed',
-    'planning-agent': 'minimax-m2.7-highspeed',
-    'cli:interactive': 'minimax-m2.7-highspeed',
-    'cli:quick-command': 'minimax-m2.7-highspeed',
-  };
-}
-
-/**
- * Save OpenRouter favorites to config.yaml
- */
-export async function saveOpenRouterFavorites(favorites: string[]): Promise<void> {
+async function saveOpenRouterFavoritesPromise(favorites: string[]): Promise<void> {
   const current = loadSettingsApi();
-  await saveSettingsApi({
+  await Effect.runPromise(saveSettingsApi({
     ...current,
     openrouter: { ...current.openrouter, favorites },
-  });
+  }));
 }
 
 /**
@@ -563,3 +1103,88 @@ export function getOpenRouterFavorites(): string[] {
   const settings = loadSettingsApi();
   return settings.openrouter?.favorites ?? [];
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// Additive Effect-channel variants for the genuinely-async settings-api
+// surfaces. Sync helpers (`loadSettingsApi`, `getRoleConfig`, validation,
+// defaults) remain unwrapped — they're pure reads of an in-memory parsed
+// config. Only the disk-writing helpers receive Effect variants.
+
+/** Tagged error for settings-api Effect variants. */
+export class SettingsApiError extends Data.TaggedError('SettingsApiError')<{
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `saveSettingsApi`. */
+export const saveSettingsApi = (
+  settings: ApiSettingsConfig,
+): Effect.Effect<void, SettingsApiError> =>
+  Effect.tryPromise({
+    try: () => saveSettingsApiPromise(settings),
+    catch: (cause) =>
+      new SettingsApiError({
+        operation: 'saveSettingsApi',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `updateSettingsApi`. */
+export const updateSettingsApi = (
+  updates: Partial<ApiSettingsConfig>,
+): Effect.Effect<ApiSettingsConfig, SettingsApiError> =>
+  Effect.tryPromise({
+    try: () => updateSettingsApiPromise(updates),
+    catch: (cause) =>
+      new SettingsApiError({
+        operation: 'updateSettingsApi',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `setRoleConfig`. */
+export const setRoleConfig = (
+  role: Role,
+  roleConfig: RoleConfig,
+): Effect.Effect<ApiSettingsConfig, SettingsApiError> =>
+  Effect.tryPromise({
+    try: () => setRoleConfigPromise(role, roleConfig),
+    catch: (cause) =>
+      new SettingsApiError({
+        operation: 'setRoleConfig',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `updateProviderApiKey`. */
+export const updateProviderApiKey = (
+  ...args: Parameters<typeof updateProviderApiKeyPromise>
+): Effect.Effect<Awaited<ReturnType<typeof updateProviderApiKeyPromise>>, SettingsApiError> =>
+  Effect.tryPromise({
+    try: () => updateProviderApiKeyPromise(...args),
+    catch: (cause) =>
+      new SettingsApiError({
+        operation: 'updateProviderApiKey',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `saveOpenRouterFavorites`. */
+export const saveOpenRouterFavorites = (
+  favorites: string[],
+): Effect.Effect<void, SettingsApiError> =>
+  Effect.tryPromise({
+    try: () => saveOpenRouterFavoritesPromise(favorites),
+    catch: (cause) =>
+      new SettingsApiError({
+        operation: 'saveOpenRouterFavorites',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });

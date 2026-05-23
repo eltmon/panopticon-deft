@@ -1,5 +1,5 @@
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { existsSync } from 'fs';
 
 // Panopticon home directory (can be overridden for testing)
@@ -21,6 +21,11 @@ export const COSTS_DIR = join(PANOPTICON_HOME, 'costs');
 export const HEARTBEATS_DIR = join(PANOPTICON_HOME, 'heartbeats');
 export const ARCHIVES_DIR = join(PANOPTICON_HOME, 'archives');
 export const LOGS_DIR = join(PANOPTICON_HOME, 'logs');
+export const HANDOFFS_DIR = join(PANOPTICON_HOME, 'handoffs');
+
+export function getHandoffsDir(): string {
+  return join(getPanopticonHome(), 'handoffs');
+}
 
 // Traefik directories
 export const TRAEFIK_DIR = join(PANOPTICON_HOME, 'traefik');
@@ -64,27 +69,53 @@ import { dirname } from 'path';
 const currentFile = fileURLToPath(import.meta.url);
 const currentDir = dirname(currentFile);
 
-// Handle both development (src/lib/) and production (dist/) modes
-// In dev: /path/to/panopticon/src/lib/paths.ts -> /path/to/panopticon
-// In prod: /path/to/panopticon/dist/lib/paths.js -> /path/to/panopticon
-export let packageRoot: string;
-if (currentDir.includes('/src/')) {
-  // Development mode - go up from src/lib to package root
-  packageRoot = dirname(dirname(currentDir));
-} else {
-  // Production mode - go up from dist (or dist/lib) to package root
-  packageRoot = currentDir.endsWith('/lib')
-    ? dirname(dirname(currentDir))
-    : dirname(currentDir);
+export function resolvePackageRootForDir(dir: string): string {
+  const srcSegment = `${sep}src${sep}`;
+  const distSegment = `${sep}dist`;
+  const nestedDistSegment = `${distSegment}${sep}`;
+
+  if (dir.includes(srcSegment)) {
+    return dir.slice(0, dir.indexOf(srcSegment));
+  }
+  if (dir.endsWith(distSegment)) {
+    return dirname(dir);
+  }
+  if (dir.includes(nestedDistSegment)) {
+    return dir.slice(0, dir.indexOf(nestedDistSegment));
+  }
+  return dir.endsWith(`${sep}lib`) ? dirname(dirname(dir)) : dirname(dir);
 }
 
-export const SOURCE_TEMPLATES_DIR = join(packageRoot, 'templates');
-export const SOURCE_TRAEFIK_TEMPLATES = join(SOURCE_TEMPLATES_DIR, 'traefik');
-export const SOURCE_SCRIPTS_DIR = join(packageRoot, 'scripts');
-export const SOURCE_SKILLS_DIR = join(packageRoot, 'skills');
-export const SOURCE_DEV_SKILLS_DIR = join(packageRoot, 'dev-skills');
-export const SOURCE_AGENTS_DIR = join(packageRoot, 'agents');
-export const SOURCE_RULES_DIR = join(packageRoot, 'rules');
+export const packageRoot = resolvePackageRootForDir(currentDir);
+
+/**
+ * Root of Panopticon's own bundled sync sources (PAN-1201).
+ *
+ * Everything `pan sync` distributes from the package itself lives under this
+ * single explicit top-level directory — skills, dev-skills, agents, rules,
+ * hook scripts, and workspace templates. A glance at the repo root shows
+ * exactly what sync distributes.
+ *
+ * This replaces the scattered SOURCE_*_DIR constants that previously pointed
+ * at sprawled top-level dirs. That sprawl let the stale top-level `rules/`
+ * silently rot while the maintained rules accumulated elsewhere (#1359):
+ * nothing in the repo layout signalled which dirs were sync sources.
+ */
+export const SYNC_SOURCES_ROOT = join(packageRoot, 'sync-sources');
+
+/** Resolved sub-paths under {@link SYNC_SOURCES_ROOT}. */
+export const SYNC_SOURCES = {
+  root: SYNC_SOURCES_ROOT,
+  skills: join(SYNC_SOURCES_ROOT, 'skills'),
+  devSkills: join(SYNC_SOURCES_ROOT, 'dev-skills'),
+  agents: join(SYNC_SOURCES_ROOT, 'agents'),
+  rules: join(SYNC_SOURCES_ROOT, 'rules'),
+  hooks: join(SYNC_SOURCES_ROOT, 'hooks'),
+  gitHooks: join(SYNC_SOURCES_ROOT, 'hooks', 'git-hooks'),
+  templates: join(SYNC_SOURCES_ROOT, 'templates'),
+  traefikTemplates: join(SYNC_SOURCES_ROOT, 'templates', 'traefik'),
+  claudeMdSections: join(SYNC_SOURCES_ROOT, 'templates', 'claude-md', 'sections'),
+} as const;
 
 // Cache directories (where Panopticon keeps its copy of distributed content)
 export const CACHE_SKILLS_DIR = SKILLS_DIR;   // ~/.panopticon/skills/
@@ -106,19 +137,18 @@ export const PROJECT_PRDS_PLANNED_SUBDIR = 'planned';
 export const PROJECT_PRDS_COMPLETED_SUBDIR = 'completed';
 
 /**
- * Detect if running in development mode (from npm link or panopticon repo)
+ * Detect if running from a panopticon-cli checkout (vs an installed package).
  *
- * Dev mode is detected if:
- * 1. Running from the panopticon source directory (npm link)
- * 2. The SOURCE_DEV_SKILLS_DIR exists (only present in repo, not in npm package)
+ * The npm package ships only `dist/` plus the dirs in package.json's `files`
+ * array — never `src/`. So the presence of a `src/` directory next to the
+ * resolved package root is a reliable dev-mode signal.
+ *
+ * (PAN-1201: previously keyed off the bundled `dev-skills/` dir. That broke
+ * once dev-skills moved under the shipped `sync-sources/` tree — the package
+ * now ships dev-skills, so their presence no longer implies a checkout.)
  */
 export function isDevMode(): boolean {
-  try {
-    // Check if dev-skills directory exists - this is only in the repo, not npm package
-    return existsSync(SOURCE_DEV_SKILLS_DIR);
-  } catch {
-    return false;
-  }
+  return existsSync(join(packageRoot, 'src'));
 }
 
 /**
@@ -137,6 +167,23 @@ export function isDevMode(): boolean {
  */
 export function encodeClaudeProjectDir(cwdPath: string): string {
   return cwdPath.replace(/[^a-zA-Z0-9-]/g, '-');
+}
+
+/**
+ * Compute the deterministic JSONL session file path from cwd + session UUID.
+ *
+ * Claude Code stores session files at:
+ *   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+ */
+export function sessionFilePath(cwd: string, sessionId: string): string {
+  const encodedCwd = encodeClaudeProjectDir(cwd);
+  return join(homedir(), '.claude', 'projects', encodedCwd, `${sessionId}.jsonl`);
+}
+
+/** Extract the session UUID from a full JSONL file path. */
+export function sessionIdFromFile(sessionFile: string | null | undefined): string | undefined {
+  if (!sessionFile) return undefined;
+  return sessionFile.split('/').pop()?.replace('.jsonl', '') ?? undefined;
 }
 
 // All directories to create on init

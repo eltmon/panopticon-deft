@@ -73,6 +73,18 @@ describe('conversations-db', () => {
     expect(list[1].name).toBe('a');
   });
 
+  it('listConversations excludes agent orchestrator conversations', async () => {
+    const { createConversation, listConversations } = await import('../conversations-db.js');
+    createConversation({ name: 'user-chat', tmuxSession: 'conv-user', cwd: '/cwd' });
+    createConversation({ name: 'agent-pan-123-ship', tmuxSession: 'agent-pan-123-ship', cwd: '/cwd' });
+    createConversation({ name: 'agent-pan-123-review-correctness', tmuxSession: 'agent-pan-123-review-correctness', cwd: '/cwd' });
+    createConversation({ name: 'planning-pan-456', tmuxSession: 'planning-pan-456', cwd: '/cwd' });
+    createConversation({ name: 'specialist-pan-789-review-security', tmuxSession: 'specialist-pan-789-review-security', cwd: '/cwd' });
+    const list = listConversations();
+    expect(list).toHaveLength(1);
+    expect(list[0].name).toBe('user-chat');
+  });
+
   it('getConversationByName returns the matching row', async () => {
     const { createConversation, getConversationByName } = await import('../conversations-db.js');
     createConversation({ name: 'lookup-me', tmuxSession: 'conv-lookup-me', cwd: '/cwd' });
@@ -136,10 +148,13 @@ describe('conversations-db', () => {
     expect(list.every(c => c.status === 'ended')).toBe(true);
   });
 
-  it('name has UNIQUE constraint — duplicate throws', async () => {
-    const { createConversation } = await import('../conversations-db.js');
+  it('name collision replaces stale row instead of throwing', async () => {
+    const { createConversation, getConversationByName } = await import('../conversations-db.js');
     createConversation({ name: 'unique-name', tmuxSession: 'conv-unique-name', cwd: '/cwd' });
-    expect(() => createConversation({ name: 'unique-name', tmuxSession: 'conv-unique-name-2', cwd: '/cwd' })).toThrow();
+    createConversation({ name: 'unique-name', tmuxSession: 'conv-unique-name-2', cwd: '/cwd' });
+    const conv = getConversationByName('unique-name');
+    expect(conv).not.toBeNull();
+    expect(conv!.tmuxSession).toBe('conv-unique-name-2');
   });
 
   it('canReplaceTitle returns true only for auto titles', async () => {

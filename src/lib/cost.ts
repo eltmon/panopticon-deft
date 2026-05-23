@@ -5,9 +5,11 @@
  * Supports multiple AI providers with configurable pricing.
  */
 
+import { Effect } from 'effect';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { COSTS_DIR } from './paths.js';
+import { FsError } from './errors.js';
 
 // ============== Types ==============
 
@@ -94,20 +96,19 @@ export const DEFAULT_PRICING: ModelPricing[] = [
   { provider: 'anthropic', model: 'claude-sonnet-4', inputPer1k: 0.003, outputPer1k: 0.015, cacheReadPer1k: 0.0003, cacheWrite5mPer1k: 0.00375, cacheWrite1hPer1k: 0.006, currency: 'USD' },
   // Anthropic - Legacy
   { provider: 'anthropic', model: 'claude-haiku-3', inputPer1k: 0.00025, outputPer1k: 0.00125, cacheReadPer1k: 0.00003, cacheWrite5mPer1k: 0.0003, cacheWrite1hPer1k: 0.0005, currency: 'USD' },
-  // OpenAI
-  { provider: 'openai', model: 'gpt-5.5', inputPer1k: 0.003, outputPer1k: 0.018, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.5-mini', inputPer1k: 0.0005, outputPer1k: 0.002, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.5-nano', inputPer1k: 0.00025, outputPer1k: 0.0015, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.5-pro', inputPer1k: 0.018, outputPer1k: 0.22, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.4', inputPer1k: 0.0025, outputPer1k: 0.015, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.4-mini', inputPer1k: 0.0004, outputPer1k: 0.0016, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.4-nano', inputPer1k: 0.0002, outputPer1k: 0.00125, currency: 'USD' },
-  { provider: 'openai', model: 'gpt-5.4-pro', inputPer1k: 0.015, outputPer1k: 0.195, currency: 'USD' },
+  // OpenAI — prices per developers.openai.com/api/docs/pricing (May 2026)
+  { provider: 'openai', model: 'gpt-5.5', inputPer1k: 0.005, outputPer1k: 0.030, cacheReadPer1k: 0.0005, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.5-pro', inputPer1k: 0.030, outputPer1k: 0.180, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.4', inputPer1k: 0.0025, outputPer1k: 0.015, cacheReadPer1k: 0.00025, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.4-mini', inputPer1k: 0.00075, outputPer1k: 0.0045, cacheReadPer1k: 0.000075, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.4-pro', inputPer1k: 0.030, outputPer1k: 0.180, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.3-codex', inputPer1k: 0.00175, outputPer1k: 0.014, cacheReadPer1k: 0.000175, currency: 'USD' },
+  { provider: 'openai', model: 'gpt-5.2', inputPer1k: 0.00125, outputPer1k: 0.010, currency: 'USD' },
   { provider: 'openai', model: 'o3', inputPer1k: 0.002, outputPer1k: 0.008, currency: 'USD' },
-  { provider: 'openai', model: 'o4-mini', inputPer1k: 0.0011, outputPer1k: 0.0044, currency: 'USD' },
+  { provider: 'openai', model: 'o4-mini', inputPer1k: 0.004, outputPer1k: 0.016, cacheReadPer1k: 0.001, currency: 'USD' },
   // Google
   { provider: 'google', model: 'gemini-3.1-pro-preview', inputPer1k: 0.002, outputPer1k: 0.012, currency: 'USD' },
-  { provider: 'google', model: 'gemini-3-flash', inputPer1k: 0.00015, outputPer1k: 0.0006, currency: 'USD' },
+  { provider: 'google', model: 'gemini-3-flash-preview', inputPer1k: 0.00015, outputPer1k: 0.0006, currency: 'USD' },
   { provider: 'google', model: 'gemini-3.1-flash-lite-preview', inputPer1k: 0.00025, outputPer1k: 0.0015, currency: 'USD' },
   // Moonshot AI (Kimi)
   { provider: 'custom', model: 'kimi-for-coding', inputPer1k: 0.0006, outputPer1k: 0.002, cacheReadPer1k: 0.00006, cacheWrite5mPer1k: 0.00075, currency: 'USD' },
@@ -124,7 +125,7 @@ export const DEFAULT_PRICING: ModelPricing[] = [
 /**
  * Calculate cost for token usage
  */
-export function calculateCost(usage: TokenUsage, pricing: ModelPricing): number {
+export function calculateCostSync(usage: TokenUsage, pricing: ModelPricing): number {
   let cost = 0;
   let inputMultiplier = 1;
   let outputMultiplier = 1;
@@ -169,7 +170,7 @@ export function calculateCost(usage: TokenUsage, pricing: ModelPricing): number 
 /**
  * Get pricing for a model
  */
-export function getPricing(provider: AIProvider, model: string): ModelPricing | null {
+export function getPricingSync(provider: AIProvider, model: string): ModelPricing | null {
   // Try exact match first
   let pricing = DEFAULT_PRICING.find(
     p => p.provider === provider && p.model === model
@@ -198,7 +199,7 @@ function getCurrentDateString(): string {
 /**
  * Log a cost entry
  */
-export function logCost(entry: Omit<CostEntry, 'id' | 'timestamp'>): CostEntry {
+export function logCostSync(entry: Omit<CostEntry, 'id' | 'timestamp'>): CostEntry {
   mkdirSync(COSTS_DIR, { recursive: true });
 
   const fullEntry: CostEntry = {
@@ -216,7 +217,7 @@ export function logCost(entry: Omit<CostEntry, 'id' | 'timestamp'>): CostEntry {
 /**
  * Log cost from token usage
  */
-export function logUsage(
+export function logUsageSync(
   provider: AIProvider,
   model: string,
   usage: TokenUsage,
@@ -228,15 +229,15 @@ export function logUsage(
     metadata?: Record<string, any>;
   } = {}
 ): CostEntry | null {
-  const pricing = getPricing(provider, model);
+  const pricing = getPricingSync(provider, model);
   if (!pricing) {
     console.warn(`No pricing found for ${provider}/${model}`);
     return null;
   }
 
-  const cost = calculateCost(usage, pricing);
+  const cost = calculateCostSync(usage, pricing);
 
-  return logCost({
+  return logCostSync({
     provider,
     model,
     usage,
@@ -255,7 +256,7 @@ export function logUsage(
 /**
  * Read cost entries for a date range
  */
-export function readCosts(startDate: string, endDate: string): CostEntry[] {
+export function readCostsSync(startDate: string, endDate: string): CostEntry[] {
   const entries: CostEntry[] = [];
 
   const start = new Date(startDate);
@@ -285,20 +286,20 @@ export function readCosts(startDate: string, endDate: string): CostEntry[] {
 /**
  * Read costs for today
  */
-export function readTodayCosts(): CostEntry[] {
+export function readTodayCostsSync(): CostEntry[] {
   const today = getCurrentDateString();
-  return readCosts(today, today);
+  return readCostsSync(today, today);
 }
 
 /**
  * Read costs for an issue
  */
-export function readIssueCosts(issueId: string, days: number = 30): CostEntry[] {
+export function readIssueCostsSync(issueId: string, days: number = 30): CostEntry[] {
   const end = new Date();
   const start = new Date();
   start.setDate(start.getDate() - days);
 
-  const allCosts = readCosts(
+  const allCosts = readCostsSync(
     start.toISOString().split('T')[0],
     end.toISOString().split('T')[0]
   );
@@ -311,7 +312,7 @@ export function readIssueCosts(issueId: string, days: number = 30): CostEntry[] 
 /**
  * Calculate cost summary for a set of entries
  */
-export function summarizeCosts(entries: CostEntry[]): CostSummary {
+export function summarizeCostsSync(entries: CostEntry[]): CostSummary {
   const summary: CostSummary = {
     totalCost: 0,
     currency: 'USD',
@@ -376,42 +377,42 @@ export function summarizeCosts(entries: CostEntry[]): CostSummary {
 /**
  * Get daily cost summary
  */
-export function getDailySummary(date?: string): CostSummary {
+export function getDailySummarySync(date?: string): CostSummary {
   const targetDate = date || getCurrentDateString();
-  const entries = readCosts(targetDate, targetDate);
-  return summarizeCosts(entries);
+  const entries = readCostsSync(targetDate, targetDate);
+  return summarizeCostsSync(entries);
 }
 
 /**
  * Get weekly cost summary
  */
-export function getWeeklySummary(): CostSummary {
+export function getWeeklySummarySync(): CostSummary {
   const end = new Date();
   const start = new Date();
   start.setDate(start.getDate() - 7);
 
-  const entries = readCosts(
+  const entries = readCostsSync(
     start.toISOString().split('T')[0],
     end.toISOString().split('T')[0]
   );
 
-  return summarizeCosts(entries);
+  return summarizeCostsSync(entries);
 }
 
 /**
  * Get monthly cost summary
  */
-export function getMonthlySummary(): CostSummary {
+export function getMonthlySummarySync(): CostSummary {
   const end = new Date();
   const start = new Date();
   start.setDate(start.getDate() - 30);
 
-  const entries = readCosts(
+  const entries = readCostsSync(
     start.toISOString().split('T')[0],
     end.toISOString().split('T')[0]
   );
 
-  return summarizeCosts(entries);
+  return summarizeCostsSync(entries);
 }
 
 // ============== Cost Budgets ==============
@@ -439,7 +440,7 @@ function saveBudgets(budgets: CostBudget[]): void {
 /**
  * Create a cost budget
  */
-export function createBudget(budget: Omit<CostBudget, 'id' | 'spent'>): CostBudget {
+export function createBudgetSync(budget: Omit<CostBudget, 'id' | 'spent'>): CostBudget {
   const budgets = loadBudgets();
 
   const newBudget: CostBudget = {
@@ -457,7 +458,7 @@ export function createBudget(budget: Omit<CostBudget, 'id' | 'spent'>): CostBudg
 /**
  * Get a budget by ID
  */
-export function getBudget(id: string): CostBudget | null {
+export function getBudgetSync(id: string): CostBudget | null {
   const budgets = loadBudgets();
   return budgets.find(b => b.id === id) || null;
 }
@@ -465,14 +466,14 @@ export function getBudget(id: string): CostBudget | null {
 /**
  * Get all budgets
  */
-export function getAllBudgets(): CostBudget[] {
+export function getAllBudgetsSync(): CostBudget[] {
   return loadBudgets();
 }
 
 /**
  * Update budget spent amount
  */
-export function updateBudgetSpent(id: string, spent: number): boolean {
+export function updateBudgetSpentSync(id: string, spent: number): boolean {
   const budgets = loadBudgets();
   const budget = budgets.find(b => b.id === id);
 
@@ -487,14 +488,14 @@ export function updateBudgetSpent(id: string, spent: number): boolean {
 /**
  * Check budget status
  */
-export function checkBudget(id: string): {
+export function checkBudgetSync(id: string): {
   budget: CostBudget | null;
   remaining: number;
   percentUsed: number;
   exceeded: boolean;
   alert: boolean;
 } {
-  const budget = getBudget(id);
+  const budget = getBudgetSync(id);
 
   if (!budget) {
     return {
@@ -521,7 +522,7 @@ export function checkBudget(id: string): {
 /**
  * Delete a budget
  */
-export function deleteBudget(id: string): boolean {
+export function deleteBudgetSync(id: string): boolean {
   const budgets = loadBudgets();
   const index = budgets.findIndex(b => b.id === id);
 
@@ -538,9 +539,9 @@ export function deleteBudget(id: string): boolean {
 /**
  * Generate a cost report
  */
-export function generateReport(startDate: string, endDate: string): string {
-  const entries = readCosts(startDate, endDate);
-  const summary = summarizeCosts(entries);
+export function generateReportSync(startDate: string, endDate: string): string {
+  const entries = readCostsSync(startDate, endDate);
+  const summary = summarizeCostsSync(entries);
 
   const lines: string[] = [
     '# Cost Report',
@@ -590,9 +591,116 @@ export function generateReport(startDate: string, endDate: string): string {
 /**
  * Format cost for display
  */
-export function formatCost(cost: number, currency: string = 'USD'): string {
+export function formatCostSync(cost: number, currency: string = 'USD'): string {
   if (currency === 'USD') {
     return `$${cost.toFixed(4)}`;
   }
   return `${cost.toFixed(4)} ${currency}`;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// Cost-tracking helpers — sync FS by design (CLI / cron scripts). Read paths
+// are Effect.sync; write paths surface FsError via Effect.try.
+
+/** Compute the cost of one token-usage record at given pricing. Pure. */
+export const calculateCost = (
+  usage: TokenUsage,
+  pricing: ModelPricing,
+): Effect.Effect<number> => Effect.sync(() => calculateCostSync(usage, pricing));
+
+/** Look up pricing for a (provider, model) pair. Pure. */
+export const getPricing = (
+  provider: AIProvider,
+  model: string,
+): Effect.Effect<ModelPricing | null> => Effect.sync(() => getPricingSync(provider, model));
+
+/** Append a single cost entry to the cost log. */
+export const logCost = (
+  entry: Omit<CostEntry, 'id' | 'timestamp'>,
+): Effect.Effect<CostEntry, FsError> =>
+  Effect.try({
+    try: () => logCostSync(entry),
+    catch: (cause) => new FsError({ path: COSTS_DIR, operation: 'log-cost', cause }),
+  });
+
+/** Convenience wrapper: compute cost then log. */
+export const logUsage = (
+  ...args: Parameters<typeof logUsageSync>
+): Effect.Effect<ReturnType<typeof logUsageSync>, FsError> =>
+  Effect.try({
+    try: () => logUsageSync(...args),
+    catch: (cause) => new FsError({ path: COSTS_DIR, operation: 'log-usage', cause }),
+  });
+
+/** Read entries across an inclusive date range. Pure-ish. */
+export const readCosts = (
+  startDate: string,
+  endDate: string,
+): Effect.Effect<CostEntry[]> => Effect.sync(() => readCostsSync(startDate, endDate));
+
+/** Read today's cost entries. Pure-ish. */
+export const readTodayCosts = (): Effect.Effect<CostEntry[]> =>
+  Effect.sync(() => readTodayCostsSync());
+
+/** Read recent cost entries scoped to an issue. Pure-ish. */
+export const readIssueCosts = (
+  issueId: string,
+  days: number = 30,
+): Effect.Effect<CostEntry[]> => Effect.sync(() => readIssueCostsSync(issueId, days));
+
+/** Summarize a flat list of cost entries. Pure. */
+export const summarizeCosts = (
+  entries: CostEntry[],
+): Effect.Effect<CostSummary> => Effect.sync(() => summarizeCostsSync(entries));
+
+/** Daily / weekly / monthly rollups. Pure-ish. */
+export const getDailySummary = (date?: string): Effect.Effect<CostSummary> =>
+  Effect.sync(() => getDailySummarySync(date));
+export const getWeeklySummary = (): Effect.Effect<CostSummary> =>
+  Effect.sync(() => getWeeklySummarySync());
+export const getMonthlySummary = (): Effect.Effect<CostSummary> =>
+  Effect.sync(() => getMonthlySummarySync());
+
+/** Budget CRUD. */
+export const createBudget = (
+  budget: Omit<CostBudget, 'id' | 'spent'>,
+): Effect.Effect<CostBudget, FsError> =>
+  Effect.try({
+    try: () => createBudgetSync(budget),
+    catch: (cause) =>
+      new FsError({ path: COSTS_DIR, operation: 'create-budget', cause }),
+  });
+export const getBudget = (id: string): Effect.Effect<CostBudget | null> =>
+  Effect.sync(() => getBudgetSync(id));
+export const getAllBudgets = (): Effect.Effect<CostBudget[]> =>
+  Effect.sync(() => getAllBudgetsSync());
+export const updateBudgetSpent = (
+  id: string,
+  spent: number,
+): Effect.Effect<boolean, FsError> =>
+  Effect.try({
+    try: () => updateBudgetSpentSync(id, spent),
+    catch: (cause) =>
+      new FsError({ path: COSTS_DIR, operation: 'update-budget-spent', cause }),
+  });
+export const checkBudget = (
+  id: string,
+): Effect.Effect<ReturnType<typeof checkBudgetSync>> => Effect.sync(() => checkBudgetSync(id));
+export const deleteBudget = (id: string): Effect.Effect<boolean, FsError> =>
+  Effect.try({
+    try: () => deleteBudgetSync(id),
+    catch: (cause) =>
+      new FsError({ path: COSTS_DIR, operation: 'delete-budget', cause }),
+  });
+
+/** Render a human-readable cost report. Pure-ish. */
+export const generateReport = (
+  startDate: string,
+  endDate: string,
+): Effect.Effect<string> => Effect.sync(() => generateReportSync(startDate, endDate));
+
+/** Format a cost number for display. Pure. */
+export const formatCost = (
+  cost: number,
+  currency: string = 'USD',
+): Effect.Effect<string> => Effect.sync(() => formatCostSync(cost, currency));

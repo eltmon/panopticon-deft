@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * `pan restart` — scoped restart with explicit dependency isolation.
  *
@@ -22,9 +23,12 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync } from 'fs';
 
+import { acquireRestartLock, readRestartLockHolder, type RestartLockHandle } from '../../lib/restart-lock.js';
+import { writeRestartStatus } from '../../lib/restart-status.js';
+
 import {
   openDashboardLogStdio,
-  readPlatformConfig,
+  readPlatformConfigSync,
   restartDashboard,
   restartCliproxy,
   restartTraefik,
@@ -41,7 +45,9 @@ export interface RestartOptions {
   cliproxy?: boolean;
   traefik?: boolean;
   full?: boolean;
+  force?: boolean;
   healthTimeout?: string;
+  deacon?: boolean;
 }
 
 function resolveScope(options: RestartOptions): 'dashboard' | 'cliproxy' | 'traefik' | 'full' {
@@ -64,22 +70,55 @@ function resolveNode22(): string {
   return 'node';
 }
 
-function resolveBundledServerPath(): string {
-  // After tsdown bundles the CLI, this code runs inside `dist/cli/index.js`,
-  // so `__dirname` is `dist/cli` and the sibling dashboard bundle sits at
-  // `dist/dashboard/server.js` — one `..` up, not two. The old two-up form
-  // was written assuming the unbundled `dist/cli/commands/restart.js` layout
-  // and resolved to `<project>/dashboard/server.js`, which never exists.
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-  return join(__dirname, '..', 'dashboard', 'server.js');
+type DashboardBundleCandidate = {
+  path: string;
+  preferred: boolean;
+};
+
+function dashboardBundleCandidates(): DashboardBundleCandidate[] {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  return [
+    {
+      path: join(currentDir, '..', 'dashboard', 'server.js'),
+      preferred: currentDir.endsWith(join('dist', 'cli')),
+    },
+    {
+      path: join(currentDir, '..', '..', '..', 'dist', 'dashboard', 'server.js'),
+      preferred: currentDir.endsWith(join('src', 'cli', 'commands')),
+    },
+    {
+      path: join(currentDir, '..', '..', 'dashboard', 'server.js'),
+      preferred: currentDir.endsWith(join('dist', 'cli', 'commands')),
+    },
+  ];
 }
 
-function spawnDashboardDetached(config: PlatformConfig): void {
+function uniqueBundleCandidates(): DashboardBundleCandidate[] {
+  const seen = new Set<string>();
+  return dashboardBundleCandidates().filter((candidate) => {
+    if (seen.has(candidate.path)) return false;
+    seen.add(candidate.path);
+    return true;
+  });
+}
+
+export function resolveBundledServerPath(): string {
+  const candidates = uniqueBundleCandidates();
+  return candidates.find(candidate => existsSync(candidate.path))?.path
+    ?? candidates.find(candidate => candidate.preferred)?.path
+    ?? candidates[0].path;
+}
+
+function searchedBundlePaths(): string[] {
+  return uniqueBundleCandidates().map(candidate => candidate.path);
+}
+
+export function spawnDashboardDetached(config: PlatformConfig, opts?: { disableDeacon?: boolean }): void {
   const serverPath = resolveBundledServerPath();
   if (!existsSync(serverPath)) {
     throw new StageError({
       stage: 'dashboard',
-      reason: `Dashboard bundle not found at ${serverPath}. Run \`npm run build\`.`,
+      reason: `Dashboard bundle not found. Run \`npm run build\`. Searched: ${searchedBundlePaths().join(', ')}`,
     });
   }
   const child = spawn(resolveNode22(), [serverPath], {
@@ -88,52 +127,116 @@ function spawnDashboardDetached(config: PlatformConfig): void {
     env: {
       ...process.env,
       DASHBOARD_PORT: String(config.dashboardPort),
+      API_PORT: String(config.dashboardApiPort),
+      PORT: String(config.dashboardApiPort),
       PANOPTICON_MODE: 'production',
+      ...(opts?.disableDeacon ? { PANOPTICON_DISABLE_DEACON: '1' } : {}),
     },
   });
   child.unref();
 }
 
+async function recordRestartStatus(startedAt: number, success: boolean, error?: string): Promise<void> {
+  await Effect.runPromise(writeRestartStatus({
+    ts: new Date().toISOString(),
+    trigger: 'pan restart',
+    success,
+    error,
+    durationMs: Date.now() - startedAt,
+    attempts: 1,
+  }));
+}
+
+async function reportHeldRestartLock(startedAt: number): Promise<void> {
+  const holder = await Effect.runPromise(readRestartLockHolder());
+  const heldBy = holder ? `held by PID ${holder.pid} (${holder.caller})` : 'held by another process';
+  const error = `restart in progress (${heldBy})`;
+  console.error(chalk.yellow(error));
+  await recordRestartStatus(startedAt, false, error);
+  process.exitCode = 2;
+}
+
 export async function restartCommand(options: RestartOptions): Promise<void> {
+  const startedAt = Date.now();
   const scope = resolveScope(options);
-  const config = readPlatformConfig();
+  const config = readPlatformConfigSync();
   const healthTimeoutMs = options.healthTimeout
     ? parseInt(options.healthTimeout, 10)
     : undefined;
 
+  const disableDeacon = options.deacon === false;
+  if (disableDeacon) {
+    console.log(chalk.yellow('  Deacon auto-start disabled for this restart (--no-deacon)'));
+  }
+
   console.log(chalk.bold(`Restarting Panopticon (${scope})...\n`));
+
+  const lockInherited = process.env.PANOPTICON_RESTART_LOCK_HELD === '1';
+  const needsRestartLock = (scope === 'dashboard' || scope === 'full') && !lockInherited;
+  let restartLock: RestartLockHandle | null = null;
+  if (needsRestartLock) {
+    restartLock = await Effect.runPromise(acquireRestartLock('pan restart'));
+    if (!restartLock) {
+      await reportHeldRestartLock(startedAt);
+      return;
+    }
+  }
 
   try {
     switch (scope) {
       case 'dashboard': {
-        await restartDashboard(config, () => spawnDashboardDetached(config), {
+        if (process.env.PANOPTICON_SKIP_SUPERVISOR_CYCLE !== '1') {
+          try {
+            const { stopSupervisorProcessSync, startSupervisorProcessSync } = await import('../../lib/supervisor.js');
+            stopSupervisorProcessSync();
+            startSupervisorProcessSync();
+          } catch { /* non-fatal */ }
+        }
+
+        await Effect.runPromise(restartDashboard(config, () => spawnDashboardDetached(config, { disableDeacon }), {
           healthTimeoutMs,
-        });
+        }));
+        await recordRestartStatus(startedAt, true);
         console.log(chalk.green('✓ Dashboard restarted and healthy'));
         console.log(chalk.dim('  CLIProxy, Traefik, and TLDR were left running.'));
         break;
       }
       case 'cliproxy': {
         const cliproxy = await import('../../lib/cliproxy.js');
-        await restartCliproxy(cliproxy);
-        console.log(chalk.green('✓ CLIProxy restarted'));
+        await Effect.runPromise(restartCliproxy({
+          stopCliproxy: cliproxy.stopCliproxySync,
+          startCliproxy: cliproxy.startCliproxySync,
+          isCliproxyRunning: cliproxy.isCliproxyRunningSync,
+          installCliproxy: cliproxy.installCliproxySync,
+        }, { force: options.force === true }));
+        if (options.force) {
+          console.log(chalk.green('✓ CLIProxy reinstalled at pinned version and restarted'));
+        } else {
+          console.log(chalk.green('✓ CLIProxy restarted'));
+        }
         console.log(chalk.dim('  Dashboard and Traefik were left running.'));
         break;
       }
       case 'traefik': {
-        await restartTraefik(config);
+        await Effect.runPromise(restartTraefik(config));
         console.log(chalk.green('✓ Traefik restarted'));
         console.log(chalk.dim('  Dashboard and CLIProxy were left running.'));
         break;
       }
       case 'full': {
-        await runFullRestart(config, { healthTimeoutMs });
+        await runFullRestart(config, { healthTimeoutMs, disableDeacon });
         break;
       }
     }
   } catch (err) {
+    const message = err instanceof StageError
+      ? `[${err.failure.stage}] ${err.failure.reason}`
+      : (err as Error)?.message || String(err);
+    if (scope === 'dashboard') {
+      await recordRestartStatus(startedAt, false, message);
+    }
     if (err instanceof StageError) {
-      console.error(chalk.red(`✗ [${err.failure.stage}] ${err.failure.reason}`));
+      console.error(chalk.red(`✗ ${message}`));
       console.error(
         chalk.dim(
           '  Other components were left in their prior state. ' +
@@ -141,9 +244,11 @@ export async function restartCommand(options: RestartOptions): Promise<void> {
         ),
       );
     } else {
-      console.error(chalk.red('✗ Restart failed:'), (err as Error)?.message || err);
+      console.error(chalk.red('✗ Restart failed:'), message);
     }
-    process.exit(1);
+    process.exitCode = 1;
+  } finally {
+    await restartLock?.release();
   }
 }
 
@@ -156,7 +261,7 @@ export async function restartCommand(options: RestartOptions): Promise<void> {
  */
 async function runFullRestart(
   config: PlatformConfig,
-  opts: { healthTimeoutMs?: number },
+  opts: { healthTimeoutMs?: number; disableDeacon?: boolean },
 ): Promise<void> {
   const projectRoot = process.cwd();
   const venvPath = join(projectRoot, '.venv');
@@ -164,19 +269,26 @@ async function runFullRestart(
 
   // ── Stop phase ──
   // Dashboard first so it doesn't spam errors while sidecars die.
-  await stopDashboard(config);
+  await Effect.runPromise(stopDashboard(config));
+
+  try {
+    const { stopSupervisorProcessSync } = await import('../../lib/supervisor.js');
+    stopSupervisorProcessSync();
+  } catch {
+    // non-fatal
+  }
 
   if (tldrAvailable) {
     try {
-      const { getTldrDaemonService } = await import('../../lib/tldr-daemon.js');
-      await getTldrDaemonService(projectRoot, venvPath).stop();
+      const { getTldrDaemonServiceSync } = await import('../../lib/tldr-daemon.js');
+      await getTldrDaemonServiceSync(projectRoot, venvPath).stop();
     } catch {
       // non-fatal — daemon may already be down
     }
   }
 
   if (config.traefikEnabled) {
-    await stopTraefik(config);
+    await Effect.runPromise(stopTraefik(config));
   }
 
   // ── Start phase ──
@@ -184,22 +296,34 @@ async function runFullRestart(
   // dashboard so GPT-backed agents have their router from t=0; TLDR last
   // because it's non-critical and shouldn't block the dashboard coming up.
   if (config.traefikEnabled) {
-    await startTraefik(config);
+    await Effect.runPromise(startTraefik(config));
   }
 
   // restartCliproxy handles stop-sleep-start-verify in one shot.
   const cliproxy = await import('../../lib/cliproxy.js');
-  await restartCliproxy(cliproxy);
+  await Effect.runPromise(restartCliproxy({
+    stopCliproxy: cliproxy.stopCliproxySync,
+    startCliproxy: cliproxy.startCliproxySync,
+    isCliproxyRunning: cliproxy.isCliproxyRunningSync,
+    installCliproxy: cliproxy.installCliproxySync,
+  }));
 
-  spawnDashboardDetached(config);
-  await waitForDashboardHealth(config.dashboardApiPort, {
+  spawnDashboardDetached(config, { disableDeacon: opts.disableDeacon });
+  await Effect.runPromise(waitForDashboardHealth(config.dashboardApiPort, {
     timeoutMs: opts.healthTimeoutMs,
-  });
+  }));
+
+  try {
+    const { startSupervisorProcessSync } = await import('../../lib/supervisor.js');
+    startSupervisorProcessSync();
+  } catch {
+    // non-fatal
+  }
 
   if (tldrAvailable) {
     try {
-      const { getTldrDaemonService } = await import('../../lib/tldr-daemon.js');
-      await getTldrDaemonService(projectRoot, venvPath).start(true);
+      const { getTldrDaemonServiceSync } = await import('../../lib/tldr-daemon.js');
+      await getTldrDaemonServiceSync(projectRoot, venvPath).start(true);
     } catch {
       // non-fatal — dashboard is already healthy; TLDR just won't be available
     }

@@ -3,25 +3,18 @@
  *
  * Orchestrates model handoffs for running agents using two methods:
  * 1. Kill & Spawn: For general agents (clean handoff with context preservation)
- * 2. Specialist Wake: For permanent specialists (resume with preserved context)
+ * 2. Legacy specialist wake has been removed; all handoffs use role-based respawn.
  */
 
 import { existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { Data, Effect } from 'effect';
 import type { AgentState } from '../agents.js';
-import { getAgentState, saveAgentState, stopAgent, spawnAgent, getAgentDir } from '../agents.js';
+import { getAgentStateSync, saveAgentStateSync, stopAgentSync, spawnAgent, spawnRun, getAgentDir } from '../agents.js';
 import type { HandoffContext } from './handoff-context.js';
 import { captureHandoffContext, buildHandoffPrompt } from './handoff-context.js';
-import { sessionExists } from '../tmux.js';
-import {
-  wakeSpecialist,
-  wakeSpecialistOrQueue,
-  getSessionId,
-  getTmuxSessionName,
-  isRunning,
-  recordWake,
-  type SpecialistType,
-} from './specialists.js';
+import { sessionExistsSync } from '../tmux.js';
+import { requireModelOverrideSync } from '../model-validation.js';
 
 /**
  * Handoff method type
@@ -50,25 +43,12 @@ export interface HandoffOptions {
   waitForIdle?: boolean; // Wait for agent to be idle before killing (default: true)
   idleTimeoutMs?: number; // How long to wait for idle (default: 30000)
   additionalInstructions?: string; // Extra instructions for new agent
-}
-
-/**
- * Perform a model handoff for an agent
- *
- * Auto-selects handoff method based on agent type:
- * - Specialists (merge-agent, test-agent, etc.): Use specialist-wake
- * - General agents: Use kill-spawn
- *
- * @param agentId - Agent to hand off
- * @param options - Handoff options
- * @returns Handoff result
- */
-export async function performHandoff(
+}async function performHandoffPromise(
   agentId: string,
   options: HandoffOptions
 ): Promise<HandoffResult> {
   // Get current agent state
-  const state = getAgentState(agentId);
+  const state = getAgentStateSync(agentId);
   if (!state) {
     return {
       success: false,
@@ -77,15 +57,21 @@ export async function performHandoff(
     };
   }
 
-  // Auto-detect method if not specified
-  const method = options.method || detectHandoffMethod(agentId);
-
-  // Execute appropriate handoff method
-  if (method === 'specialist-wake') {
-    return await performSpecialistWake(state, options);
-  } else {
-    return await performKillAndSpawn(state, options);
+  let targetModel: string;
+  try {
+    targetModel = requireModelOverrideSync(options.targetModel);
+  } catch (error) {
+    return {
+      success: false,
+      method: 'kill-spawn',
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
+
+  // Legacy specialist wake has been deleted; normalize all handoffs to role respawn.
+  const method = options.method === 'specialist-wake' ? 'kill-spawn' : (options.method || detectHandoffMethod(agentId));
+
+  return await performKillAndSpawn(state, { ...options, targetModel, method });
 }
 
 /**
@@ -94,14 +80,7 @@ export async function performHandoff(
  * @param agentId - Agent ID
  * @returns Handoff method
  */
-function detectHandoffMethod(agentId: string): HandoffMethod {
-  // Specialists use specialist-wake (context-preserving resume)
-  const specialists = ['merge-agent', 'review-agent', 'test-agent', 'inspect-agent', 'uat-agent'];
-  if (specialists.some(s => agentId.includes(s))) {
-    return 'specialist-wake';
-  }
-
-  // General agents use kill-spawn
+function detectHandoffMethod(_agentId: string): HandoffMethod {
   return 'kill-spawn';
 }
 
@@ -109,7 +88,7 @@ function detectHandoffMethod(agentId: string): HandoffMethod {
  * Kill & Spawn handoff method
  *
  * Process:
- * 1. Signal agent to save state (update STATE.md)
+ * 1. Signal agent to save state (update continue file)
  * 2. Wait for idle (check for activity)
  * 3. Capture handoff context
  * 4. Kill current agent
@@ -126,7 +105,7 @@ async function performKillAndSpawn(
 ): Promise<HandoffResult> {
   try {
     // Step 1: Signal agent to save state
-    // TODO: Send message to agent asking to update STATE.md
+    // TODO: Send message to agent asking to update the continue file
     // For now, we'll capture what's there
 
     // Step 2: Wait for idle if requested
@@ -139,10 +118,10 @@ async function performKillAndSpawn(
     }
 
     // Step 3: Capture handoff context
-    const context = await captureHandoffContext(state, options.targetModel, options.reason);
+    const context = await Effect.runPromise(captureHandoffContext(state, options.targetModel, options.reason));
 
     // Step 4: Kill current agent
-    stopAgent(state.id);
+    stopAgentSync(state.id);
 
     // Step 5: Build handoff prompt
     const prompt = buildHandoffPrompt(context, options.additionalInstructions);
@@ -158,17 +137,16 @@ async function performKillAndSpawn(
     const newState = await spawnAgent({
       issueId: state.issueId,
       workspace: state.workspace,
-      runtime: state.runtime,
+      harness: state.harness,
       model: options.targetModel,
-      phase: 'implementation',
+      role: 'work',
       prompt,
+      allowHost: state.hostOverride === true,
     });
 
-    // Update handoff metrics
-    newState.handoffCount = (state.handoffCount || 0) + 1;
+    // Preserve accumulated cost without reintroducing legacy phase/complexity routing fields.
     newState.costSoFar = state.costSoFar || 0;
-    newState.complexity = state.complexity;
-    saveAgentState(newState);
+    saveAgentStateSync(newState);
 
     return {
       success: true,
@@ -186,97 +164,6 @@ async function performKillAndSpawn(
 }
 
 /**
- * Specialist Wake handoff method
- *
- * Process:
- * 1. Capture handoff context
- * 2. Use `claude --resume {sessionId}` to wake specialist
- * 3. Pass task-specific prompt
- * 4. Faster context loading, specialist expertise retained
- *
- * NOTE: This requires the specialist to have been initialized first.
- * Specialists are persistent sessions that can be resumed.
- *
- * @param state - Current agent state
- * @param options - Handoff options
- * @returns Handoff result
- */
-async function performSpecialistWake(
-  state: AgentState,
-  options: HandoffOptions
-): Promise<HandoffResult> {
-  try {
-    // Step 1: Capture handoff context
-    const context = await captureHandoffContext(state, options.targetModel, options.reason);
-
-    // Step 2: Build task prompt for specialist
-    const prompt = buildHandoffPrompt(context, options.additionalInstructions);
-
-    // Step 3: Wake specialist using --resume
-    // Determine specialist type from agent ID or options
-    const specialistName = extractSpecialistName(state.id) as SpecialistType | null;
-    if (!specialistName) {
-      return {
-        success: false,
-        method: 'specialist-wake',
-        error: 'Could not determine specialist name from agent ID',
-      };
-    }
-
-    // Check if specialist session exists
-    const sessionId = getSessionId(specialistName);
-    const tmuxSession = getTmuxSessionName(specialistName);
-
-    console.log(`[handoff] Waking specialist ${specialistName} (session: ${sessionId || 'none'})`);
-
-    // Build task details for wakeSpecialistOrQueue
-    const taskDetails = {
-      issueId: state.issueId || 'unknown',
-      branch: context.gitBranch || state.branch,
-      workspace: state.workspace,
-      prUrl: (context as any).prUrl,  // Optional field may not exist
-      context: {
-        reason: options.reason,
-        targetModel: options.targetModel,
-        additionalInstructions: options.additionalInstructions,
-      },
-    };
-
-    // Use wakeSpecialistOrQueue to handle busy specialists (PAN-74)
-    const wakeResult = await wakeSpecialistOrQueue(specialistName, taskDetails, {
-      priority: 'normal',
-      source: 'handoff',
-    });
-
-    if (!wakeResult.success) {
-      console.error(`[handoff] Failed to wake or queue specialist: ${wakeResult.error}`);
-      // Fall back to kill-spawn if specialist wake fails
-      console.warn(`[handoff] Falling back to kill-spawn`);
-      return await performKillAndSpawn(state, options);
-    }
-
-    if (wakeResult.queued) {
-      console.log(`[handoff] Specialist ${specialistName} was busy, task queued`);
-    } else {
-      console.log(`[handoff] Successfully woke specialist ${specialistName}`);
-    }
-
-    return {
-      success: true,
-      method: 'specialist-wake',
-      newSessionId: sessionId || undefined,
-      context,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      method: 'specialist-wake',
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-/**
  * Wait for agent to become idle
  *
  * @param agentId - Agent ID
@@ -288,7 +175,7 @@ async function waitForIdle(agentId: string, timeoutMs: number): Promise<boolean>
 
   while (Date.now() - startTime < timeoutMs) {
     // Check if agent session still exists
-    if (!sessionExists(agentId)) {
+    if (!sessionExistsSync(agentId)) {
       return true; // Agent is gone, consider it idle
     }
 
@@ -299,22 +186,6 @@ async function waitForIdle(agentId: string, timeoutMs: number): Promise<boolean>
   }
 
   return false; // Timeout
-}
-
-/**
- * Extract specialist name from agent ID
- *
- * @param agentId - Agent ID (e.g., "agent-merge-pan-18")
- * @returns Specialist name or null
- */
-function extractSpecialistName(agentId: string): string | null {
-  const specialists = ['merge-agent', 'review-agent', 'test-agent', 'inspect-agent', 'uat-agent'];
-  for (const specialist of specialists) {
-    if (agentId.includes(specialist.replace('-agent', ''))) {
-      return specialist;
-    }
-  }
-  return null;
 }
 
 /**
@@ -337,3 +208,39 @@ export function shouldHandoff(agentId: string): boolean {
   // TODO: Implement trigger logic in Phase C
   return false;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+//
+// The handoff orchestration touches multiple subsystems (model validation,
+// agent state, tmux session detection, prompt persistence) — failures from any
+// of them surface here. The Effect variant collapses these into a single typed
+// error channel so callers can `Effect.catchTag` the relevant case.
+
+/** Tagged error for `performHandoffProgram` failures. */
+export class HandoffError extends Data.TaggedError('HandoffError')<{
+  readonly agentId: string;
+  readonly stage: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/**
+ * Effect variant of `performHandoff`. Wraps the Promise-based implementation
+ * and maps any thrown error into a typed `HandoffError`. The success result is
+ * the same `HandoffResult` shape as the sync variant — including `success:
+ * false` results when the agent isn't found or the model override is invalid.
+ */
+export const performHandoff = (
+  agentId: string,
+  options: HandoffOptions,
+): Effect.Effect<HandoffResult, HandoffError> =>
+  Effect.tryPromise({
+    try: () => performHandoffPromise(agentId, options),
+    catch: (cause) =>
+      new HandoffError({
+        agentId,
+        stage: 'performHandoff',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });

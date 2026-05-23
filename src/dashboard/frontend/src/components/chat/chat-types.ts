@@ -28,6 +28,50 @@ export interface WorkLogEntry {
   sequence?: number;
 }
 
+export interface ProposedPlan {
+  id: string;
+  plan: string;
+  planFilePath?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+export interface CompactBoundary {
+  id: string;
+  timestamp: string;
+  trigger?: string;
+  preTokens?: number;
+  model?: string;
+}
+
+export interface ContextUsage {
+  activeBytes: number;
+  estimatedTokens: number;
+  contextWindow: number;
+  percentUsed: number;
+}
+
 export type ConversationEvent =
-  | { kind: 'messages'; messages: ChatMessage[]; workLog: WorkLogEntry[]; streaming: boolean }
+  | { kind: 'messages'; messages: ChatMessage[]; workLog: WorkLogEntry[]; streaming: boolean; proposedPlan?: ProposedPlan; compactBoundaries?: CompactBoundary[]; contextUsage?: ContextUsage | null }
   | { kind: 'discovering' };
+
+// ─── Turn Diff Types ─────────────────────────────────────────────────────────
+// Mirror T3Code's types from apps/web/src/types.ts
+
+export interface TurnDiffFileChange {
+  path: string;
+  kind?: string;
+  additions?: number;
+  deletions?: number;
+}
+
+export interface TurnDiffSummary {
+  turnId: string;
+  completedAt: string;
+  status?: string;
+  files: TurnDiffFileChange[];
+  checkpointRef?: string;
+  assistantMessageId?: string;
+  checkpointTurnCount?: number;
+}

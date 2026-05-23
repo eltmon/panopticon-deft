@@ -6,13 +6,13 @@
  */
 
 import { getDatabase } from '../../database/index.js';
-import { parseGitHubRepos } from '../../tracker-utils.js';
+import { parseGitHubReposSync } from '../../tracker-utils.js';
 import { setCanonicalState } from './index.js';
 import type { GitHubClient } from './github-client.js';
 import type { ReconcilerConfig } from './types.js';
 
 function resolvePrefix(config: ReconcilerConfig): string | null {
-  const repos = parseGitHubRepos();
+  const repos = parseGitHubReposSync();
   const [owner, repo] = config.repo.split('/');
   const match = repos.find((r) => r.owner === owner && r.repo === repo);
   return match ? match.prefix : null;

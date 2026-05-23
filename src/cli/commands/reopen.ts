@@ -6,9 +6,11 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { LinearClient } from '@linear/sdk';
 import { reopenWorkspaceState } from '../../lib/reopen.js';
+import { Effect } from 'effect';
 import { getLinearApiKey } from '../../lib/shadow-utils.js';
 import { getTrackerContext } from '../../lib/cloister/work-agent-prompt.js';
-import { resolveProjectFromIssue } from '../../lib/projects.js';
+import { resolveProjectFromIssueSync } from '../../lib/projects.js';
+import { resolveTrackerTypeSync, isGitHubIssueSync, resolveGitHubIssueSync } from '../../lib/tracker-utils.js';
 
 interface ReopenOptions {
   json?: boolean;
@@ -114,6 +116,122 @@ async function transitionToInProgress(client: LinearClient, issueId: string): Pr
   await client.updateIssue(linearIssue.id, { stateId: inProgressState.id });
 }
 
+interface GitHubIssueResult {
+  number: number;
+  title: string;
+  state: string;
+  body: string | null | undefined;
+  html_url: string;
+  comments: number;
+}
+
+/**
+ * Fetch a GitHub issue by its full identifier (e.g., "PAN-457")
+ */
+async function fetchGitHubIssue(issueId: string): Promise<GitHubIssueResult> {
+  const gh = resolveGitHubIssueSync(issueId);
+  if (!gh.isGitHub) {
+    throw new Error(`Issue ${issueId} is not a GitHub issue`);
+  }
+
+  const token = await getGitHubToken();
+  const { Octokit } = await import('@octokit/rest');
+  const octokit = new Octokit({ auth: token });
+
+  const { data } = await octokit.issues.get({
+    owner: gh.owner,
+    repo: gh.repo,
+    issue_number: gh.number,
+  });
+
+  return {
+    number: data.number,
+    title: data.title,
+    state: data.state,
+    body: data.body,
+    html_url: data.html_url,
+    comments: data.comments,
+  };
+}
+
+/**
+ * Transition a GitHub issue to "open" state (reopen) and add in-progress label
+ */
+async function reopenGitHubIssue(issueId: string): Promise<void> {
+  const gh = resolveGitHubIssueSync(issueId);
+  if (!gh.isGitHub) {
+    throw new Error(`Issue ${issueId} is not a GitHub issue`);
+  }
+
+  const token = await getGitHubToken();
+  const { Octokit } = await import('@octokit/rest');
+  const octokit = new Octokit({ auth: token });
+
+  // Reopen the issue
+  await octokit.issues.update({
+    owner: gh.owner,
+    repo: gh.repo,
+    issue_number: gh.number,
+    state: 'open',
+  });
+
+  // Add in-progress label (best-effort — warn if label is missing, don't abort reopen)
+  try {
+    await octokit.issues.addLabels({
+      owner: gh.owner,
+      repo: gh.repo,
+      issue_number: gh.number,
+      labels: ['in-progress'],
+    });
+  } catch (err) {
+    console.warn(chalk.yellow(`Warning: could not add in-progress label (may already exist): ${err instanceof Error ? err.message : String(err)}`));
+  }
+}
+
+/**
+ * Add a comment to a GitHub issue
+ */
+async function addGitHubComment(issueId: string, body: string): Promise<void> {
+  const gh = resolveGitHubIssueSync(issueId);
+  if (!gh.isGitHub) {
+    throw new Error(`Issue ${issueId} is not a GitHub issue`);
+  }
+
+  const token = await getGitHubToken();
+  const { Octokit } = await import('@octokit/rest');
+  const octokit = new Octokit({ auth: token });
+
+  await octokit.issues.createComment({
+    owner: gh.owner,
+    repo: gh.repo,
+    issue_number: gh.number,
+    body,
+  });
+}
+
+/**
+ * Get GitHub token from config-yaml or environment
+ */
+async function getGitHubToken(): Promise<string> {
+  const { loadConfigSync: loadYamlConfig } = await import('../../lib/config-yaml.js');
+  const yamlConfig = loadYamlConfig();
+  const token = yamlConfig.config.trackerKeys?.github || process.env.GITHUB_TOKEN;
+  if (!token) {
+    throw new Error('GITHUB_TOKEN not found in config or environment');
+  }
+  return token;
+}
+
+/**
+ * Strip ANSI escape codes and terminal control characters from user-provided text
+ * before rendering to prevent terminal escape sequence injection.
+ */
+function sanitizeForTerminal(text: string | null | undefined): string {
+  if (!text) return '';
+  // Remove ANSI escape codes (colors, cursor movement, etc.)
+  return text.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B[a-zA-Z]/g, '');
+}
+
 /**
  * Format comments for display
  */
@@ -142,7 +260,7 @@ export function findLocalWorkspace(issueId: string, startDir?: string): string |
   const normalizedId = issueId.toLowerCase();
 
   // Try project registry first
-  const resolved = resolveProjectFromIssue(issueId, []);
+  const resolved = resolveProjectFromIssueSync(issueId, []);
   if (resolved) {
     const workspacePath = join(resolved.projectPath, 'workspaces', `feature-${normalizedId}`);
     if (existsSync(workspacePath)) return workspacePath;
@@ -165,10 +283,133 @@ export function findLocalWorkspace(issueId: string, startDir?: string): string |
 }
 
 export async function reopenCommand(id: string, options: ReopenOptions = {}): Promise<void> {
+  // Resolve tracker type using the same logic as `pan start` so GitHub issues
+  // (e.g. pan-457) don't misroute to Linear (MIN-848).
+  const trackerType = resolveTrackerTypeSync(id);
+
+  if (trackerType === 'github') {
+    await reopenGitHubIssueCommand(id, options);
+  } else if (trackerType === 'linear') {
+    await reopenLinearIssueCommand(id, options);
+  } else {
+    // rally and gitlab are not yet supported — fail fast rather than silently
+    // falling through to the Linear SDK which could misroute the issue.
+    console.log(chalk.red(`\nError: \`pan reopen\` does not support ${trackerType} tracker.`));
+    console.log(`  Issue ${id} is tracked as ${trackerType} in your projects.yaml.`);
+    console.log(`  Currently supported trackers: github, linear.`);
+    process.exit(1);
+  }
+}
+
+async function reopenGitHubIssueCommand(id: string, options: ReopenOptions): Promise<void> {
   const spinner = ora(`Fetching issue ${id}...`).start();
 
   try {
-    const apiKey = getLinearApiKey();
+    // Fetch issue from GitHub
+    spinner.text = 'Fetching issue from GitHub...';
+    const issue = await fetchGitHubIssue(id);
+    spinner.stop();
+
+    // Display issue info
+    console.log('');
+    console.log(chalk.bold('═══════════════════════════════════════════════════════════'));
+    console.log(chalk.bold(`  Reopen: ${id.toUpperCase()}`));
+    console.log(chalk.bold('═══════════════════════════════════════════════════════════'));
+    console.log('');
+    console.log(chalk.bold('Title:'), sanitizeForTerminal(issue.title));
+    console.log(chalk.bold('Current State:'), issue.state);
+    console.log(chalk.bold('URL:'), issue.html_url);
+    console.log('');
+
+    // Show description preview
+    if (issue.body) {
+      console.log(chalk.bold('Description:'));
+      const descPreview = issue.body.length > 300 ? issue.body.slice(0, 300) + '...' : issue.body;
+      console.log(chalk.dim(sanitizeForTerminal(descPreview)));
+      console.log('');
+    }
+
+    // Show comments count
+    console.log(chalk.bold(`Comments:`), issue.comments);
+    console.log('');
+
+    // Guard: if the issue is already open, `pan reopen` is almost never the right verb.
+    // The user probably wants `pan review restart` (or `pan review reset`) — both leave
+    // the workspace, branch, and PR untouched and only re-trigger the specialist pipeline.
+    // `pan reopen` is meant for issues that have been closed/completed and need to
+    // re-enter the pipeline.
+    if (issue.state === 'open' && !options.force) {
+      console.log(chalk.yellow(`Heads up: ${id.toUpperCase()} is already open.`));
+      console.log('');
+      console.log(`\`pan reopen\` is for re-entering the pipeline after an issue was`);
+      console.log(`closed/completed/cancelled. For an issue that is already open, you`);
+      console.log(`probably want one of:`);
+      console.log('');
+      console.log(`  ${chalk.cyan(`pan review restart ${id}`)}   kill stuck reviewers and dispatch a fresh review`);
+      console.log(`  ${chalk.cyan(`pan review reset   ${id}`)}   reset review/test/merge cycles (human override)`);
+      console.log(`  ${chalk.cyan(`pan review abort   ${id}`)}   kill running reviewers, leave the worker idle`);
+      console.log('');
+      console.log(`If you really want to reset specialist state via reopen anyway, re-run with ${chalk.bold('--force')}.`);
+      return;
+    }
+
+    // JSON output
+    if (options.json) {
+      console.log(JSON.stringify({ issue }, null, 2));
+      return;
+    }
+
+    // Confirm reopen
+    if (!options.force) {
+      const confirm = await inquirer.prompt([
+        {
+          type: 'confirm',
+          name: 'proceed',
+          message: `Reopen ${id.toUpperCase()} and reset workspace state?`,
+          default: true,
+        },
+      ]);
+
+      if (!confirm.proceed) {
+        console.log(chalk.yellow('Cancelled'));
+        return;
+      }
+    }
+
+    // Transition the issue to open and add in-progress label
+    const transitionSpinner = ora('Reopening issue and adding in-progress label...').start();
+    await reopenGitHubIssue(id);
+    transitionSpinner.succeed(`Issue ${id.toUpperCase()} reopened`);
+
+    // Add a comment about reopening
+    const commentSpinner = ora('Adding reopen comment...').start();
+    const reasonText = options.reason ? ` Reason: ${options.reason}.` : '';
+    await addGitHubComment(
+      id,
+      `Issue reopened for re-work via Panopticon.${reasonText}\n\nPrevious state: ${issue.state}`
+    );
+    commentSpinner.succeed('Added reopen comment');
+
+    // Workspace state reset (same as Linear — uses resolveProjectFromIssue internally)
+    await resetWorkspaceState(id, options);
+
+    console.log('');
+    console.log(chalk.green(`✓ ${id.toUpperCase()} reopened and ready for re-work`));
+    console.log('');
+    await printNextSteps(id);
+  } catch (error: unknown) {
+    if (spinner.isSpinning) spinner.fail();
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red(`Error: ${message}`));
+    process.exit(1);
+  }
+}
+
+async function reopenLinearIssueCommand(id: string, options: ReopenOptions): Promise<void> {
+  const spinner = ora(`Fetching issue ${id}...`).start();
+
+  try {
+    const apiKey = await Effect.runPromise(getLinearApiKey());
     if (!apiKey) {
       spinner.fail('LINEAR_API_KEY not found');
       console.log('');
@@ -191,7 +432,7 @@ export async function reopenCommand(id: string, options: ReopenOptions = {}): Pr
     console.log(chalk.bold(`  Reopen: ${issue.identifier}`));
     console.log(chalk.bold('═══════════════════════════════════════════════════════════'));
     console.log('');
-    console.log(chalk.bold('Title:'), issue.title);
+    console.log(chalk.bold('Title:'), sanitizeForTerminal(issue.title));
     console.log(chalk.bold('Current State:'), issue.state);
     console.log(chalk.bold('URL:'), issue.url);
     console.log('');
@@ -201,7 +442,7 @@ export async function reopenCommand(id: string, options: ReopenOptions = {}): Pr
       console.log(chalk.bold('Description:'));
       const descPreview =
         issue.description.length > 300 ? issue.description.slice(0, 300) + '...' : issue.description;
-      console.log(chalk.dim(descPreview));
+      console.log(chalk.dim(sanitizeForTerminal(descPreview)));
       console.log('');
     }
 
@@ -226,6 +467,35 @@ export async function reopenCommand(id: string, options: ReopenOptions = {}): Pr
           2
         )
       );
+      return;
+    }
+
+    // Guard: if the issue is already in an in-progress / open state, `pan reopen`
+    // is almost never the right verb. The user probably wants `pan review restart`
+    // (or `pan review reset`) — both leave the workspace, branch, and PR untouched
+    // and only re-trigger the specialist pipeline. `pan reopen` is meant for issues
+    // that have been closed/completed/cancelled and need to re-enter the pipeline.
+    const stateLower = issue.state.toLowerCase();
+    const inProgressLike =
+      stateLower === 'in progress' ||
+      stateLower === 'in review' ||
+      stateLower === 'todo' ||
+      stateLower === 'backlog' ||
+      stateLower === 'open' ||
+      stateLower.startsWith('in '); // catches "In Test", "In Verification", etc.
+
+    if (inProgressLike && !options.force) {
+      console.log(chalk.yellow(`Heads up: ${issue.identifier} is already in state "${issue.state}".`));
+      console.log('');
+      console.log(`\`pan reopen\` is for re-entering the pipeline after an issue was`);
+      console.log(`closed/completed/cancelled. For an issue that is already open, you`);
+      console.log(`probably want one of:`);
+      console.log('');
+      console.log(`  ${chalk.cyan(`pan review restart ${issue.identifier}`)}   kill stuck reviewers and dispatch a fresh review`);
+      console.log(`  ${chalk.cyan(`pan review reset   ${issue.identifier}`)}   reset review/test/merge cycles (human override)`);
+      console.log(`  ${chalk.cyan(`pan review abort   ${issue.identifier}`)}   kill running reviewers, leave the worker idle`);
+      console.log('');
+      console.log(`If you really want to reset specialist state via reopen anyway, re-run with ${chalk.bold('--force')}.`);
       return;
     }
 
@@ -260,82 +530,93 @@ export async function reopenCommand(id: string, options: ReopenOptions = {}): Pr
     });
     commentSpinner.succeed('Added reopen comment');
 
-    // Find workspace and reset state
-    const workspacePath = findLocalWorkspace(id);
-    let trackerContext: string | undefined;
-
-    if (workspacePath) {
-      // Fetch tracker context for STATE.md (reuse PAN-253 pattern)
-      try {
-        trackerContext = await getTrackerContext(id, workspacePath);
-      } catch {
-        // Non-fatal: tracker context is best-effort
-      }
-
-      const resetSpinner = ora('Resetting workspace state...').start();
-      const result = await reopenWorkspaceState(id, workspacePath, {
-        reason: options.reason,
-        trackerContext,
-      });
-      resetSpinner.succeed('Workspace state reset');
-
-      console.log('');
-      console.log(chalk.bold('Reset summary:'));
-      if (result.previousReviewStatus) {
-        console.log(`  Review: ${chalk.yellow(result.previousReviewStatus)} → ${chalk.green('pending')}`);
-      }
-      if (result.previousTestStatus) {
-        console.log(`  Test:   ${chalk.yellow(result.previousTestStatus)} → ${chalk.green('pending')}`);
-      }
-      if (result.previousMergeStatus) {
-        console.log(`  Merge:  ${chalk.yellow(result.previousMergeStatus)} → ${chalk.green('pending')}`);
-      }
-
-      const queueEntries = Object.entries(result.queueItemsRemoved);
-      if (queueEntries.length > 0) {
-        console.log(`  Queue items removed:`);
-        for (const [specialist, count] of queueEntries) {
-          console.log(`    ${specialist}: ${count} item(s)`);
-        }
-      }
-
-      if (result.stateMdUpdated) {
-        console.log(`  STATE.md updated with Reopened section`);
-      }
-    } else {
-      console.log('');
-      console.log(chalk.yellow(`  No local workspace found for ${id} — skipping workspace state reset`));
-      console.log(chalk.dim('  Specialist states were not modified.'));
-    }
+    // Workspace state reset
+    await resetWorkspaceState(id, options);
 
     console.log('');
     console.log(chalk.green(`✓ ${issue.identifier} reopened and ready for re-work`));
     console.log('');
-
-    // Check if agent is currently running and suggest appropriate next step
-    try {
-      const { getAgentState } = await import('../../lib/agents.js');
-      const agentId = `agent-${id.toLowerCase()}`;
-      const agentState = getAgentState(agentId);
-      const agentRunning = agentState?.status === 'running' || agentState?.status === 'starting';
-
-      if (agentRunning) {
-        console.log(chalk.dim('Agent is still running. Send it context about the re-work:'));
-        console.log(`  pan tell ${id} "Issue reopened. <describe what needs to change>"`);
-      } else {
-        console.log(chalk.dim('Start the agent to resume implementation:'));
-        console.log(`  pan start ${id}`);
-      }
-    } catch {
-      // Fallback if agent state check fails
-      console.log(chalk.dim('Start the agent to resume implementation:'));
-      console.log(`  pan start ${id}`);
-    }
-    console.log('');
+    await printNextSteps(id);
   } catch (error: unknown) {
     if (spinner.isSpinning) spinner.fail();
     const message = error instanceof Error ? error.message : String(error);
     console.error(chalk.red(`Error: ${message}`));
     process.exit(1);
   }
+}
+
+/**
+ * Shared workspace state reset logic for both GitHub and Linear reopen paths.
+ * Uses resolveProjectFromIssue internally so it works for any tracker.
+ */
+async function resetWorkspaceState(id: string, options: ReopenOptions): Promise<void> {
+  const workspacePath = findLocalWorkspace(id);
+  let trackerContext: string | undefined;
+
+  if (workspacePath) {
+    // Fetch tracker context to attach to the continue file (reuse PAN-253 pattern)
+    try {
+      trackerContext = await getTrackerContext(id, workspacePath);
+    } catch {
+      // Non-fatal: tracker context is best-effort
+    }
+
+    const resetSpinner = ora('Resetting workspace state...').start();
+    const result = await Effect.runPromise(reopenWorkspaceState(id, workspacePath, {
+      reason: options.reason,
+      trackerContext,
+    }));
+    resetSpinner.succeed('Workspace state reset');
+
+    console.log('');
+    console.log(chalk.bold('Reset summary:'));
+    if (result.previousReviewStatus) {
+      console.log(`  Review: ${chalk.yellow(result.previousReviewStatus)} → ${chalk.green('pending')}`);
+    }
+    if (result.previousTestStatus) {
+      console.log(`  Test:   ${chalk.yellow(result.previousTestStatus)} → ${chalk.green('pending')}`);
+    }
+    if (result.previousMergeStatus) {
+      console.log(`  Merge:  ${chalk.yellow(result.previousMergeStatus)} → ${chalk.green('pending')}`);
+    }
+
+    const queueEntries = Object.entries(result.queueItemsRemoved);
+    if (queueEntries.length > 0) {
+      console.log(`  Queue items removed:`);
+      for (const [specialist, count] of queueEntries) {
+        console.log(`    ${specialist}: ${count} item(s)`);
+      }
+    }
+
+    if (result.continueFileUpdated) {
+      console.log(`  Continue file updated with reopen breadcrumb`);
+    }
+  } else {
+    console.log('');
+    console.log(chalk.yellow(`  No local workspace found for ${id} — skipping workspace state reset`));
+    console.log(chalk.dim('  Specialist states were not modified.'));
+  }
+}
+
+async function printNextSteps(id: string): Promise<void> {
+  // Check if agent is currently running and suggest appropriate next step
+  try {
+    const { getAgentStateSync } = await import('../../lib/agents.js');
+    const agentId = `agent-${id.toLowerCase()}`;
+    const agentState = getAgentStateSync(agentId);
+    const agentRunning = agentState?.status === 'running' || agentState?.status === 'starting';
+
+    if (agentRunning) {
+      console.log(chalk.dim('Agent is still running. Send it context about the re-work:'));
+      console.log(`  pan tell ${id} "Issue reopened. <describe what needs to change>"`);
+    } else {
+      console.log(chalk.dim('Start the agent to resume implementation:'));
+      console.log(`  pan start ${id}`);
+    }
+  } catch {
+    // Fallback if agent state check fails
+    console.log(chalk.dim('Start the agent to resume implementation:'));
+    console.log(`  pan start ${id}`);
+  }
+  console.log('');
 }

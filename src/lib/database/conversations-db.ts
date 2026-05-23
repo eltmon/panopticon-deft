@@ -3,13 +3,20 @@
  *
  * CRUD operations for the conversations table — session metadata for
  * user-driven Claude conversations spawned from Mission Control.
+ *
+ * PAN-1249: Effect migration pass — public API remains synchronous to keep
+ * the existing call sites unchanged. The DatabaseError tagged error is
+ * re-exported from ./index.js so future SQLite-failure-aware refactors can
+ * use it. Full conversion to @effect/sql-sqlite-bun is deferred to PAN-447.
  */
 
-import { getDatabase } from './index.js';
+import { getDatabase, DatabaseError } from './index.js';
+import type { ConversationFilter } from './discovered-sessions-db.js';
+export { DatabaseError };
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type TitleSource = 'auto' | 'ai' | 'manual';
+export type TitleSource = 'auto' | 'ai' | 'manual' | 'default';
 
 export interface Conversation {
   id: number;
@@ -21,8 +28,8 @@ export interface Conversation {
   createdAt: string;
   endedAt: string | null;
   lastAttachedAt: string | null;
-  /** Absolute path to the Claude Code JSONL session file. Null until discovered (PAN-451). */
-  sessionFile: string | null;
+  /** Claude Code session UUID. Immutable for the lifetime of the conversation. */
+  claudeSessionId: string | null;
   /** Human-readable title, auto-set from first message content. Null until first message sent. */
   title: string | null;
   /** How the title was set: 'auto' (truncated message), 'ai' (Claude-generated), 'manual' (user renamed). */
@@ -41,7 +48,49 @@ export interface Conversation {
   forkStatus: string | null;
   /** Error message when forkStatus='failed'. */
   forkError: string | null;
+  /** Coding harness used to spawn this conversation. */
+  harness: 'claude-code' | 'pi' | null;
+  /** Delivery method for messages: 'auto' tries channels then tmux, 'channels' is strict, 'tmux' bypasses channels. */
+  deliveryMethod: 'auto' | 'channels' | 'tmux' | null;
+  /** Error message when background spawn failed (e.g. quota exhausted, auth error). Null = spawned OK or not yet known. */
+  spawnError: string | null;
+  /** Agent-authored handoff document path for target conversations. */
+  handoffDocPath: string | null;
+  /** Target conversation id created from this source handoff. */
+  handoffTargetConvId: number | null;
+  /** Reason a requested fork mode fell back to summary fork. */
+  forkFallbackReason: string | null;
 }
+
+export interface ArchivedConversationWithEnrichment {
+  id: number;
+  name: string;
+  cwd: string;
+  issueId: string | null;
+  createdAt: string;
+  claudeSessionId: string | null;
+  title: string | null;
+  totalCost: number;
+  archivedAt: string;
+  model: string | null;
+  discoveredJsonlPath: string | null;
+  discoveredWorkspacePath: string | null;
+  messageCount: number | null;
+  firstTs: string | null;
+  lastTs: string | null;
+  primaryModel: string | null;
+  tokenInput: number | null;
+  tokenOutput: number | null;
+  estimatedCost: number | null;
+  toolsUsed: string | null;
+  filesTouched: string | null;
+  tags: string | null;
+  summary: string | null;
+  enrichmentLevel: number | null;
+  enrichmentFailed: number | null;
+}
+
+export type ArchivedConversationListOptions = ConversationFilter;
 
 // ─── Row mapper ───────────────────────────────────────────────────────────────
 
@@ -56,7 +105,7 @@ function rowToConversation(row: Record<string, unknown>): Conversation {
     createdAt: row['created_at'] as string,
     endedAt: (row['ended_at'] as string | null) ?? null,
     lastAttachedAt: (row['last_attached_at'] as string | null) ?? null,
-    sessionFile: (row['session_file'] as string | null) ?? null,
+    claudeSessionId: (row['claude_session_id'] as string | null) ?? null,
     title: (row['title'] as string | null) ?? null,
     titleSource: (row['title_source'] as TitleSource | null) ?? null,
     titleSeed: (row['title_seed'] as string | null) ?? null,
@@ -66,21 +115,64 @@ function rowToConversation(row: Record<string, unknown>): Conversation {
     effort: (row['effort'] as string | null) ?? null,
     forkStatus: (row['fork_status'] as string | null) ?? null,
     forkError: (row['fork_error'] as string | null) ?? null,
+    harness: (row['harness'] === 'pi' || row['harness'] === 'claude-code') ? row['harness'] : null,
+    deliveryMethod: (row['delivery_method'] === 'auto' || row['delivery_method'] === 'channels' || row['delivery_method'] === 'tmux')
+      ? row['delivery_method'] as 'auto' | 'channels' | 'tmux'
+      : null,
+    spawnError: (row['spawn_error'] as string | null) ?? null,
+    handoffDocPath: (row['handoff_doc_path'] as string | null) ?? null,
+    handoffTargetConvId: (row['handoff_target_conv_id'] as number | null) ?? null,
+    forkFallbackReason: (row['fork_fallback_reason'] as string | null) ?? null,
   };
+}
+
+/** Agent-managed conversation names that should not appear in the user conversation list. */
+const AGENT_CONVERSATION_PREFIXES = ['agent-', 'planning-', 'specialist-'];
+
+/** True if the conversation name belongs to an orchestrator-managed agent session. */
+export function isAgentConversationName(name: string): boolean {
+  return AGENT_CONVERSATION_PREFIXES.some((p) => name.startsWith(p));
 }
 
 // ─── Read operations ──────────────────────────────────────────────────────────
 
-export function listConversations(): Conversation[] {
+export function listConversations(options?: { limit?: number; offset?: number }): Conversation[] {
+  const db = getDatabase();
+  let sql = `SELECT id, name, tmux_session, status, cwd, issue_id,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
+              title_source, title_seed, total_cost, archived_at, model, effort,
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
+       FROM conversations
+       WHERE archived_at IS NULL
+         AND name NOT LIKE 'agent-%'
+         AND name NOT LIKE 'planning-%'
+         AND name NOT LIKE 'specialist-%'
+       ORDER BY created_at DESC`;
+  const params: number[] = [];
+  if (options?.limit !== undefined) {
+    sql += ' LIMIT ?';
+    params.push(options.limit);
+  }
+  if (options?.offset !== undefined) {
+    sql += ' OFFSET ?';
+    params.push(options.offset);
+  }
+  const rows = db.prepare(sql).all(...params) as Record<string, unknown>[];
+  return rows.map(rowToConversation);
+}
+
+export function listActiveConversations(): Conversation[] {
   const db = getDatabase();
   const rows = db
     .prepare(
       `SELECT id, name, tmux_session, status, cwd, issue_id,
-              created_at, ended_at, last_attached_at, session_file, title,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
               title_source, title_seed, total_cost, archived_at, model, effort,
-              fork_status, fork_error
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
        FROM conversations
-       WHERE archived_at IS NULL
+       WHERE archived_at IS NULL AND status = 'active'
        ORDER BY created_at DESC`,
     )
     .all() as Record<string, unknown>[];
@@ -92,9 +184,10 @@ export function getConversationByName(name: string): Conversation | null {
   const row = db
     .prepare(
       `SELECT id, name, tmux_session, status, cwd, issue_id,
-              created_at, ended_at, last_attached_at, session_file, title,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
               title_source, title_seed, total_cost, archived_at, model, effort,
-              fork_status, fork_error
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
        FROM conversations
        WHERE name = ?`,
     )
@@ -107,13 +200,30 @@ export function getConversationById(id: number): Conversation | null {
   const row = db
     .prepare(
       `SELECT id, name, tmux_session, status, cwd, issue_id,
-              created_at, ended_at, last_attached_at, session_file, title,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
               title_source, title_seed, total_cost, archived_at, model, effort,
-              fork_status, fork_error
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
        FROM conversations
        WHERE id = ?`,
     )
     .get(id) as Record<string, unknown> | undefined;
+  return row ? rowToConversation(row) : null;
+}
+
+export function getConversationByClaudeSessionId(claudeSessionId: string): Conversation | null {
+  const db = getDatabase();
+  const row = db
+    .prepare(
+      `SELECT id, name, tmux_session, status, cwd, issue_id,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
+              title_source, title_seed, total_cost, archived_at, model, effort,
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
+       FROM conversations
+       WHERE claude_session_id = ?`,
+    )
+    .get(claudeSessionId) as Record<string, unknown> | undefined;
   return row ? rowToConversation(row) : null;
 }
 
@@ -122,15 +232,170 @@ export function listArchivedConversations(): Conversation[] {
   const rows = db
     .prepare(
       `SELECT id, name, tmux_session, status, cwd, issue_id,
-              created_at, ended_at, last_attached_at, session_file, title,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
               title_source, title_seed, total_cost, archived_at, model, effort,
-              fork_status, fork_error
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
        FROM conversations
        WHERE archived_at IS NOT NULL
        ORDER BY archived_at DESC, created_at DESC`,
     )
     .all() as Record<string, unknown>[];
   return rows.map(rowToConversation);
+}
+
+function archivedArrayIndexCondition(
+  target: { table: 'discovered_session_tags'; column: 'tag' } | { table: 'discovered_session_tools'; column: 'tool' } | { table: 'discovered_session_files'; column: 'file_path' },
+  values: string[],
+): { sql: string; params: string[] } | null {
+  const filtered = [...new Set(values.filter((value) => value.length > 0))];
+  if (filtered.length === 0) return null;
+  return {
+    sql: `EXISTS (SELECT 1 FROM ${target.table} idx WHERE idx.session_id = ds.id AND idx.${target.column} IN (${filtered.map(() => '?').join(',')}))`,
+    params: filtered,
+  };
+}
+
+function buildArchivedConversationFilterSql(options: ArchivedConversationListOptions): { where: string; params: unknown[] } {
+  const conditions = ['c.archived_at IS NOT NULL'];
+  const params: unknown[] = [];
+  const lastTs = 'COALESCE(ds.last_ts, c.archived_at)';
+  const firstTs = 'COALESCE(ds.first_ts, c.created_at)';
+  const primaryModel = 'COALESCE(ds.primary_model, c.model)';
+  const estimatedCost = 'COALESCE(ds.estimated_cost, c.total_cost)';
+  const messageCount = 'COALESCE(ds.message_count, 0)';
+  const enrichmentLevel = 'COALESCE(ds.enrichment_level, 0)';
+
+  if (options.workspacePath !== undefined) {
+    conditions.push('c.cwd = ?');
+    params.push(options.workspacePath);
+  }
+  if (options.primaryModel !== undefined) {
+    conditions.push(`${primaryModel} = ?`);
+    params.push(options.primaryModel);
+  }
+  if (options.unmanaged === true) {
+    conditions.push('0 = 1');
+  }
+  if (options.since !== undefined) {
+    conditions.push(`${lastTs} >= ?`);
+    params.push(options.since);
+  }
+  if (options.before !== undefined) {
+    conditions.push(`${lastTs} < ?`);
+    params.push(options.before);
+  }
+  if (options.after !== undefined) {
+    conditions.push(`${firstTs} >= ?`);
+    params.push(options.after);
+  }
+  if (options.minCost !== undefined) {
+    conditions.push(`${estimatedCost} >= ?`);
+    params.push(options.minCost);
+  }
+  if (options.maxCost !== undefined) {
+    conditions.push(`${estimatedCost} <= ?`);
+    params.push(options.maxCost);
+  }
+  if (options.minMessages !== undefined) {
+    conditions.push(`${messageCount} >= ?`);
+    params.push(options.minMessages);
+  }
+  if (options.issueId !== undefined) {
+    conditions.push('c.issue_id = ?');
+    params.push(options.issueId);
+  }
+  if (options.enriched === true) {
+    conditions.push(`${enrichmentLevel} > 0`);
+  }
+  if (options.notEnriched === true) {
+    conditions.push(`${enrichmentLevel} = 0`);
+  }
+  if (options.enrichmentLevel !== undefined) {
+    conditions.push(`${enrichmentLevel} = ?`);
+    params.push(options.enrichmentLevel);
+  }
+  if (options.enrichmentLevelLessThan !== undefined) {
+    conditions.push(`${enrichmentLevel} < ?`);
+    params.push(options.enrichmentLevelLessThan);
+  }
+
+  const tagCondition = options.tags ? archivedArrayIndexCondition({ table: 'discovered_session_tags', column: 'tag' }, options.tags) : null;
+  if (tagCondition) {
+    conditions.push(tagCondition.sql);
+    params.push(...tagCondition.params);
+  }
+  const toolCondition = options.tools ? archivedArrayIndexCondition({ table: 'discovered_session_tools', column: 'tool' }, options.tools) : null;
+  if (toolCondition) {
+    conditions.push(toolCondition.sql);
+    params.push(...toolCondition.params);
+  }
+  const fileCondition = options.files ? archivedArrayIndexCondition({ table: 'discovered_session_files', column: 'file_path' }, options.files) : null;
+  if (fileCondition) {
+    conditions.push(fileCondition.sql);
+    params.push(...fileCondition.params);
+  }
+
+  return { where: `WHERE ${conditions.join(' AND ')}`, params };
+}
+
+export function listArchivedConversationsWithEnrichment(options: ArchivedConversationListOptions = {}): ArchivedConversationWithEnrichment[] {
+  const db = getDatabase();
+  const { where, params } = buildArchivedConversationFilterSql(options);
+  const safeLimit = Number.isFinite(options.limit) && options.limit! >= 0 ? options.limit! : undefined;
+  const safeOffset = Number.isFinite(options.offset) && options.offset! >= 0 ? options.offset! : undefined;
+  const limit = safeLimit !== undefined ? 'LIMIT ?' : safeOffset !== undefined ? 'LIMIT -1' : '';
+  const offset = safeOffset !== undefined ? 'OFFSET ?' : '';
+  const paginationParams = [
+    ...(safeLimit !== undefined ? [safeLimit] : []),
+    ...(safeOffset !== undefined ? [safeOffset] : []),
+  ];
+
+  return db
+    .prepare(
+      `SELECT
+         c.id AS id,
+         c.name AS name,
+         c.cwd AS cwd,
+         c.issue_id AS issueId,
+         c.created_at AS createdAt,
+         c.claude_session_id AS claudeSessionId,
+         c.title AS title,
+         c.total_cost AS totalCost,
+         c.archived_at AS archivedAt,
+         c.model AS model,
+         ds.jsonl_path AS discoveredJsonlPath,
+         ds.workspace_path AS discoveredWorkspacePath,
+         ds.message_count AS messageCount,
+         ds.first_ts AS firstTs,
+         ds.last_ts AS lastTs,
+         ds.primary_model AS primaryModel,
+         ds.token_input AS tokenInput,
+         ds.token_output AS tokenOutput,
+         ds.estimated_cost AS estimatedCost,
+         ds.tools_used AS toolsUsed,
+         ds.files_touched AS filesTouched,
+         ds.tags AS tags,
+         ds.summary AS summary,
+         ds.enrichment_level AS enrichmentLevel,
+         ds.enrichment_failed AS enrichmentFailed
+       FROM conversations c
+       LEFT JOIN discovered_sessions ds ON ds.session_id = c.claude_session_id
+       ${where}
+       ORDER BY c.archived_at DESC, c.created_at DESC
+       ${limit} ${offset}`,
+    )
+    .all(...params, ...paginationParams) as ArchivedConversationWithEnrichment[];
+}
+
+export function listArchivedConversationNames(): string[] {
+  const db = getDatabase();
+  const rows = db
+    .prepare(
+      `SELECT name FROM conversations WHERE archived_at IS NOT NULL`,
+    )
+    .all() as Array<{ name: string }>;
+  return rows.map((row) => row.name);
 }
 
 // ─── Write operations ─────────────────────────────────────────────────────────
@@ -140,42 +405,76 @@ export function createConversation(opts: {
   tmuxSession: string;
   cwd: string;
   issueId?: string;
-  sessionFile?: string;
+  claudeSessionId?: string;
   title?: string;
   titleSource?: TitleSource;
   titleSeed?: string;
   model?: string;
   effort?: string;
   forkStatus?: string;
+  harness?: 'claude-code' | 'pi';
+  deliveryMethod?: 'auto' | 'channels' | 'tmux';
 }): Conversation {
   const db = getDatabase();
   const now = new Date().toISOString();
-  const result = db
-    .prepare(
-      `INSERT INTO conversations (name, tmux_session, status, cwd, issue_id, created_at, session_file, title, title_source, title_seed, model, effort, fork_status)
-       VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
+
+  // Remove any stale row with the same name so respawned specialist roles
+  // (e.g. review convoy sub-roles re-running on a new review cycle) do not
+  // hit UNIQUE constraint failures. The old JSONL session file is left
+  // intact per the sacred-JSONL rule; only the DB record is replaced.
+  db.prepare(`DELETE FROM conversations WHERE name = ?`).run(opts.name);
+
+  // title_source is NOT NULL but has a DB-side default of 'auto'. Omit from
+  // INSERT column list when not provided so the default applies.
+  let sql: string;
+  let params: unknown[];
+  if (opts.titleSource !== undefined) {
+    sql = `INSERT INTO conversations (name, tmux_session, status, cwd, issue_id, created_at, claude_session_id, title, title_source, title_seed, model, effort, fork_status, harness, delivery_method)
+           VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    params = [
       opts.name,
       opts.tmuxSession,
       opts.cwd,
       opts.issueId ?? null,
       now,
-      opts.sessionFile ?? null,
+      opts.claudeSessionId ?? null,
       opts.title ?? null,
-      opts.titleSource ?? null,
+      opts.titleSource,
       opts.titleSeed ?? null,
       opts.model ?? null,
       opts.effort ?? null,
       opts.forkStatus ?? null,
-    );
+      opts.harness ?? null,
+      opts.deliveryMethod ?? null,
+    ];
+  } else {
+    sql = `INSERT INTO conversations (name, tmux_session, status, cwd, issue_id, created_at, claude_session_id, title, title_seed, model, effort, fork_status, harness, delivery_method)
+           VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    params = [
+      opts.name,
+      opts.tmuxSession,
+      opts.cwd,
+      opts.issueId ?? null,
+      now,
+      opts.claudeSessionId ?? null,
+      opts.title ?? null,
+      opts.titleSeed ?? null,
+      opts.model ?? null,
+      opts.effort ?? null,
+      opts.forkStatus ?? null,
+      opts.harness ?? null,
+      opts.deliveryMethod ?? null,
+    ];
+  }
+
+  const result = db.prepare(sql).run(...params);
   const conv = db
     .prepare(
       `SELECT id, name, tmux_session, status, cwd, issue_id,
-              created_at, ended_at, last_attached_at, session_file, title,
+              created_at, ended_at, last_attached_at, claude_session_id, title,
               title_source, title_seed, total_cost, archived_at, model, effort,
-              fork_status, fork_error,
-              fork_status, fork_error
+              fork_status, fork_error, harness, delivery_method, spawn_error,
+              handoff_doc_path, handoff_target_conv_id, fork_fallback_reason
        FROM conversations WHERE id = ?`,
     )
     .get(result.lastInsertRowid) as Record<string, unknown>;
@@ -196,6 +495,33 @@ export function markConversationActive(name: string): void {
   ).run(new Date().toISOString(), name);
 }
 
+export function reactivateConversationForSpawn(opts: {
+  name: string;
+  tmuxSession: string;
+  cwd: string;
+  issueId?: string;
+  claudeSessionId?: string;
+  model?: string;
+  harness?: 'claude-code' | 'pi';
+}): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations
+     SET tmux_session = ?, status = 'active', cwd = ?, issue_id = ?, last_attached_at = ?,
+         claude_session_id = ?, model = ?, harness = ?, archived_at = NULL
+     WHERE name = ?`,
+  ).run(
+    opts.tmuxSession,
+    opts.cwd,
+    opts.issueId ?? null,
+    new Date().toISOString(),
+    opts.claudeSessionId ?? null,
+    opts.model ?? null,
+    opts.harness ?? null,
+    opts.name,
+  );
+}
+
 export function updateLastAttached(name: string): void {
   const db = getDatabase();
   db.prepare(
@@ -209,14 +535,6 @@ export function markAllEndedOnStartup(): void {
   db.prepare(
     `UPDATE conversations SET status = 'ended', ended_at = ? WHERE status = 'active'`,
   ).run(new Date().toISOString());
-}
-
-/** Store the discovered JSONL session file path for a conversation (PAN-451). */
-export function updateSessionFile(name: string, sessionFilePath: string): void {
-  const db = getDatabase();
-  db.prepare(
-    `UPDATE conversations SET session_file = ? WHERE name = ?`,
-  ).run(sessionFilePath, name);
 }
 
 /** Set the human-readable title for a conversation. */
@@ -257,8 +575,42 @@ export function updateConversationCost(name: string, totalCost: number): void {
   ).run(totalCost, name);
 }
 
-/** Update the model for a conversation (used by backfill). */
-export function updateConversationModel(name: string, model: string): void {
+/** Set the model for a conversation unconditionally. */
+export function setConversationModel(name: string, model: string): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET model = ? WHERE name = ?`,
+  ).run(model, name);
+}
+
+export function setConversationHarness(name: string, harness: 'claude-code' | 'pi'): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET harness = ? WHERE name = ?`,
+  ).run(harness, name);
+}
+
+/**
+ * Point a conversation at a new session UUID. Used when a harness change
+ * converts the transcript into a new format/file — the DB must track the
+ * converted session, not the orphaned original (P0, 2026-05-14).
+ */
+export function setConversationClaudeSessionId(name: string, claudeSessionId: string): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET claude_session_id = ? WHERE name = ?`,
+  ).run(claudeSessionId, name);
+}
+
+export function updateConversationDeliveryMethod(name: string, method: 'auto' | 'channels' | 'tmux' | null): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET delivery_method = ? WHERE name = ?`,
+  ).run(method, name);
+}
+
+/** Backfill the model for a conversation only when currently NULL. */
+export function backfillConversationModel(name: string, model: string): void {
   const db = getDatabase();
   db.prepare(
     `UPDATE conversations SET model = ? WHERE name = ? AND model IS NULL`,
@@ -270,6 +622,35 @@ export function updateForkStatus(name: string, status: string | null, error?: st
   db.prepare(
     `UPDATE conversations SET fork_status = ?, fork_error = ? WHERE name = ?`,
   ).run(status, error ?? null, name);
+}
+
+export function updateConversationForkFallbackReason(name: string, reason: string | null): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET fork_fallback_reason = ? WHERE name = ?`,
+  ).run(reason, name);
+}
+
+export function recordConversationHandoff(sourceName: string, targetName: string, docPath: string): Conversation {
+  const db = getDatabase();
+  const target = getConversationByName(targetName);
+  if (!target) throw new Error(`Handoff target conversation ${targetName} not found`);
+
+  db.prepare(
+    `UPDATE conversations SET handoff_doc_path = ? WHERE name = ?`,
+  ).run(docPath, targetName);
+  db.prepare(
+    `UPDATE conversations SET handoff_target_conv_id = ? WHERE name = ?`,
+  ).run(target.id, sourceName);
+
+  return getConversationByName(targetName) ?? target;
+}
+
+export function updateSpawnError(name: string, error: string | null): void {
+  const db = getDatabase();
+  db.prepare(
+    `UPDATE conversations SET spawn_error = ? WHERE name = ?`,
+  ).run(error, name);
 }
 
 export function clearStuckForks(): number {
@@ -290,8 +671,8 @@ export function clearStuckForks(): number {
  */
 export function canReplaceTitle(conv: Conversation): boolean {
   if (conv.titleSource === 'manual') return false;
-  if (conv.titleSource === 'auto') return true;
-  // If AI already set it, don't replace again
+  // Allow AI title generation for default (instant-start) and auto (message at creation) titles
+  if (conv.titleSource === 'default' || conv.titleSource === 'auto') return true;
   return false;
 }
 

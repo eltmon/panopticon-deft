@@ -287,7 +287,7 @@ export interface TemplatePlaceholders {
 /**
  * Replace template placeholders in a string
  */
-export function replacePlaceholders(template: string, placeholders: TemplatePlaceholders): string {
+export function replacePlaceholdersSync(template: string, placeholders: TemplatePlaceholders): string {
   let result = template;
   for (const [key, value] of Object.entries(placeholders)) {
     result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
@@ -298,7 +298,7 @@ export function replacePlaceholders(template: string, placeholders: TemplatePlac
 /**
  * Get default workspace config for a monorepo project
  */
-export function getDefaultWorkspaceConfig(): WorkspaceConfig {
+export function getDefaultWorkspaceConfigSync(): WorkspaceConfig {
   return {
     type: 'monorepo',
     workspaces_dir: 'workspaces',
@@ -388,7 +388,7 @@ export const SERVICE_TEMPLATES: Record<string, Partial<ServiceConfig>> = {
 /**
  * Get service config from template with overrides
  */
-export function getServiceFromTemplate(
+export function getServiceFromTemplateSync(
   templateName: string,
   overrides: Partial<ServiceConfig>
 ): ServiceConfig {
@@ -402,3 +402,25 @@ export function getServiceFromTemplate(
     port: overrides.port || template.port,
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// Pure helpers; Effect wrappers exist solely so consumers can stay in Effect.
+
+import { Effect } from 'effect';
+
+/** Substitute {{KEY}} placeholders. Pure. */
+export const replacePlaceholders = (
+  template: string,
+  placeholders: TemplatePlaceholders,
+): Effect.Effect<string> => Effect.sync(() => replacePlaceholdersSync(template, placeholders));
+
+/** Workspace defaults (ports, services, DNS). Pure. */
+export const getDefaultWorkspaceConfig = (): Effect.Effect<WorkspaceConfig> =>
+  Effect.sync(() => getDefaultWorkspaceConfigSync());
+
+/** Merge a service template with overrides. Pure. */
+export const getServiceFromTemplate = (
+  templateName: string,
+  overrides: Partial<ServiceConfig>,
+): Effect.Effect<ServiceConfig> =>
+  Effect.sync(() => getServiceFromTemplateSync(templateName, overrides));

@@ -1,23 +1,19 @@
 /**
- * Provider Configuration and Compatibility
+ * Provider Configuration
  *
- * Defines which LLM providers are compatible with Claude Code's API format.
- * - Direct providers: Implement Anthropic-compatible API (no router needed)
- * - Claudish providers: Route through claudish for provider-prefixed model selection
+ * Defines LLM providers that Panopticon launches through Claude Code directly
+ * or through local Anthropic-compatible sidecars such as CLIProxyAPI.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
-import type { ModelId, AnthropicModel, OpenAIModel, GoogleModel, KimiModel } from './settings.js';
+import { Effect } from 'effect';
+import type { ModelId, AnthropicModel, OpenAIModel, GoogleModel, KimiModel, MimoModel } from './settings.js';
+import { FsError } from './errors.js';
+import { getOpenAICompatibleProxyBaseUrl } from './openai-compatible-proxy.js';
 
-export type ProviderName = 'anthropic' | 'kimi' | 'openai' | 'google' | 'minimax' | 'zai' | 'openrouter';
-
-/**
- * Provider compatibility types
- * - direct: Anthropic-compatible API, use ANTHROPIC_BASE_URL directly
- * - claudish: Route via claudish (provider@model syntax, supports OAuth subscriptions)
- */
-export type ProviderCompatibility = 'direct' | 'claudish';
+export type ProviderName = 'anthropic' | 'kimi' | 'openai' | 'google' | 'minimax' | 'zai' | 'mimo' | 'openrouter' | 'nous' | 'dashscope';
 
 /**
  * Provider configuration
@@ -33,12 +29,18 @@ export type ProviderAuthType = 'static' | 'credential-file';
 export interface ProviderConfig {
   name: ProviderName;
   displayName: string;
-  compatibility: ProviderCompatibility;
+  compatibility: 'direct';
   baseUrl?: string; // For direct providers
   authType?: ProviderAuthType; // Defaults to 'static'
   credentialFile?: string; // Path to credential file (for 'credential-file' auth)
   credentialHelper?: string; // Script that reads credential file and prints token
   models: (ModelId | string)[];
+  haikuModel?: string; // Model to use as haiku substitute (for non-Anthropic providers)
+  tierModels?: {
+    opus?: string;
+    sonnet?: string;
+    haiku?: string;
+  };
   tested: boolean; // Whether compatibility has been verified
   description: string;
 }
@@ -46,6 +48,15 @@ export interface ProviderConfig {
 /**
  * All provider configurations
  */
+export const KIMI_CODING_BASE_URL = 'https://api.kimi.com/coding';
+export const KIMI_PLATFORM_BASE_URL = 'https://api.moonshot.ai/anthropic';
+
+export function getKimiAnthropicBaseUrl(apiKey: string): string {
+  return apiKey.trim().startsWith('sk-kimi-')
+    ? KIMI_CODING_BASE_URL
+    : KIMI_PLATFORM_BASE_URL;
+}
+
 export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
   anthropic: {
     name: 'anthropic',
@@ -60,29 +71,30 @@ export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
     name: 'kimi',
     displayName: 'Kimi (Moonshot AI)',
     compatibility: 'direct',
-    baseUrl: 'https://api.kimi.com/coding/',
-    authType: 'static',
     models: ['kimi-k2.6', 'kimi-k2.5', 'kimi-k2', 'K2.6-code-preview'],
+    tierModels: { opus: 'kimi-k2.6', sonnet: 'kimi-k2.5', haiku: 'kimi-k2' },
     tested: true,
-    description: 'Anthropic-compatible API via Kimi subscription API key',
+    description: 'Route directly to Kimi Anthropic-compatible endpoints; sk-kimi-* keys use the coding endpoint, platform keys use Moonshot.',
   },
 
   openai: {
     name: 'openai',
     displayName: 'OpenAI',
-    compatibility: 'claudish',
-    models: ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-nano', 'gpt-5.5-pro', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5.4-pro', 'o3', 'o4-mini'],
+    compatibility: 'direct',
+    models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
+    tierModels: { opus: 'gpt-5.5', sonnet: 'gpt-5.4', haiku: 'gpt-5.4-mini' },
     tested: true,
-    description: 'Route via claudish: oai@model (API key) or cx@model (ChatGPT OAuth subscription)',
+    description: 'Route through the local CLIProxyAPI Anthropic-compatible sidecar using Codex/ChatGPT subscription auth.',
   },
 
   google: {
     name: 'google',
     displayName: 'Google (Gemini)',
-    compatibility: 'claudish',
-    models: ['gemini-3.1-pro-preview', 'gemini-3-flash', 'gemini-3.1-flash-lite-preview'],
+    compatibility: 'direct',
+    models: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview'],
+    tierModels: { opus: 'gemini-3.1-pro-preview', sonnet: 'gemini-3-flash-preview', haiku: 'gemini-3.1-flash-lite-preview' },
     tested: true,
-    description: 'Route via claudish: go@model (Google CodeAssist OAuth) or API key',
+    description: 'Route via local CLIProxyAPI Gemini backend using GOOGLE_API_KEY',
   },
 
   minimax: {
@@ -90,9 +102,12 @@ export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
     displayName: 'MiniMax',
     compatibility: 'direct',
     baseUrl: 'https://api.minimax.io/anthropic',
+    authType: 'static',
     models: ['minimax-m2.7', 'minimax-m2.7-highspeed'],
+    haikuModel: 'minimax-m2.7-highspeed',
+    tierModels: { opus: 'minimax-m2.7', sonnet: 'minimax-m2.7', haiku: 'minimax-m2.7-highspeed' },
     tested: true,
-    description: 'Anthropic-compatible API via MiniMax API',
+    description: 'Route directly to MiniMax Anthropic-compatible endpoint using MINIMAX_API_KEY.',
   },
 
   zai: {
@@ -100,27 +115,77 @@ export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
     displayName: 'Z.AI',
     compatibility: 'direct',
     baseUrl: 'https://api.z.ai/api/anthropic',
+    authType: 'static',
     models: ['glm-5.1', 'glm-4.7', 'glm-4.7-flash'],
+    haikuModel: 'glm-4.7-flash',
+    tierModels: { opus: 'glm-5.1', sonnet: 'glm-4.7', haiku: 'glm-4.7-flash' },
     tested: true,
-    description: 'Anthropic-compatible API via Z.AI GLM models',
+    description: 'Route directly to Z.AI Anthropic-compatible endpoint using ZHIPU_API_KEY.',
+  },
+
+  mimo: {
+    name: 'mimo',
+    displayName: 'Xiaomi MiMo',
+    compatibility: 'direct',
+    baseUrl: 'https://token-plan-sgp.xiaomimimo.com/anthropic',
+    authType: 'static',
+    models: ['mimo-v2.5-pro', 'mimo-v2.5'],
+    haikuModel: 'mimo-v2.5',
+    tierModels: { opus: 'mimo-v2.5-pro', sonnet: 'mimo-v2.5-pro', haiku: 'mimo-v2.5' },
+    tested: true,
+    description: 'Route directly to Xiaomi MiMo Anthropic-compatible endpoint using MIMO_API_KEY.',
   },
 
   openrouter: {
     name: 'openrouter',
     displayName: 'OpenRouter',
     compatibility: 'direct',
-    baseUrl: 'https://openrouter.ai/api',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    authType: 'static',
     models: [], // Dynamic models fetched from OpenRouter API; IDs contain '/'
     tested: true,
-    description: 'Anthropic-compatible API aggregator. Model IDs contain \'/\' (e.g. qwen/qwen3.6-plus:free)',
+    description: 'Route directly to OpenRouter Anthropic-compatible endpoint; slash-containing model IDs pass through unchanged.',
+  },
+
+  nous: {
+    name: 'nous',
+    displayName: 'Nous Portal',
+    compatibility: 'direct',
+    baseUrl: getOpenAICompatibleProxyBaseUrl('nous'),
+    authType: 'static',
+    models: ['qwen/qwen3.6-plus'],
+    haikuModel: 'qwen/qwen3.6-plus',
+    tierModels: { opus: 'qwen/qwen3.6-plus', sonnet: 'qwen/qwen3.6-plus', haiku: 'qwen/qwen3.6-plus' },
+    tested: true,
+    description: 'Route Nous Portal OpenAI-compatible models through Panopticon’s local Anthropic-compatible adapter using NOUS_API_KEY.',
+  },
+
+  dashscope: {
+    name: 'dashscope',
+    displayName: 'Alibaba DashScope',
+    compatibility: 'direct',
+    baseUrl: getOpenAICompatibleProxyBaseUrl('dashscope'),
+    authType: 'static',
+    models: ['qwen3-max', 'qwen3-coder-plus', 'qwen3-plus', 'qwen3.7-max'],
+    haikuModel: 'qwen3-plus',
+    tierModels: { opus: 'qwen3-max', sonnet: 'qwen3-coder-plus', haiku: 'qwen3-plus' },
+    tested: false,
+    description: 'Route Alibaba DashScope Qwen models through Panopticon’s local Anthropic-compatible adapter using DASHSCOPE_API_KEY against the Singapore intl endpoint (ap-southeast-1).',
   },
 };
 
 /**
  * Get provider for a given model ID
  */
-export function getProviderForModel(modelId: ModelId | string): ProviderConfig {
-  // OpenRouter model IDs always contain '/' (e.g. 'qwen/qwen3.6-plus:free')
+export function getProviderForModelSync(modelId: ModelId | string): ProviderConfig {
+  // OpenRouter model IDs always contain '/' (e.g. 'qwen/qwen3.6-plus:free'),
+  // except for explicitly supported slash-delimited providers such as Nous Portal.
+  if (['qwen/qwen3.6-plus'].includes(modelId)) {
+    return PROVIDERS.nous;
+  }
+  if (['qwen3-max', 'qwen3-coder-plus', 'qwen3-plus', 'qwen3.7-max'].includes(modelId)) {
+    return PROVIDERS.dashscope;
+  }
   if (modelId.includes('/')) {
     return PROVIDERS.openrouter;
   }
@@ -130,13 +195,14 @@ export function getProviderForModel(modelId: ModelId | string): ProviderConfig {
     return PROVIDERS.anthropic;
   }
 
-  // Check OpenAI models
-  if (['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-nano', 'gpt-5.5-pro', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5.4-pro', 'o3', 'o4-mini', 'gpt-5.2-codex', 'o3-deep-research', 'gpt-4o', 'gpt-4o-mini'].includes(modelId)) {
+  // Check OpenAI models — supported set + retired IDs (still routed so the
+  // deprecation-migration path can fire warnings before remap).
+  if (['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2', 'gpt-5.5-pro', 'gpt-5.4-pro', 'o3', 'o4-mini', 'o3-deep-research', 'gpt-4o', 'gpt-4o-mini'].includes(modelId)) {
     return PROVIDERS.openai;
   }
 
   // Check Google models
-  if (['gemini-3.1-pro-preview', 'gemini-3-flash', 'gemini-3.1-flash-lite-preview', 'gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'].includes(modelId)) {
+  if (['gemini-3.1-pro-preview', 'gemini-3.1-flash-lite-preview', 'gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'].includes(modelId)) {
     return PROVIDERS.google;
   }
 
@@ -155,92 +221,87 @@ export function getProviderForModel(modelId: ModelId | string): ProviderConfig {
     return PROVIDERS.zai;
   }
 
+  // Check MiMo models
+  if (['mimo-v2.5-pro', 'mimo-v2.5'].includes(modelId)) {
+    return PROVIDERS.mimo;
+  }
+
   // Default to Anthropic if unknown
   return PROVIDERS.anthropic;
-}
-
-/**
- * Check if a provider requires claudish routing
- */
-export function requiresClaudish(provider: ProviderName): boolean {
-  return PROVIDERS[provider].compatibility === 'claudish';
-}
-
-/**
- * Get all providers that require claudish routing
- */
-export function getClaudishProviders(): ProviderConfig[] {
-  return Object.values(PROVIDERS).filter(p => p.compatibility === 'claudish');
 }
 
 /**
  * Get all direct-compatible providers
  */
 export function getDirectProviders(): ProviderConfig[] {
-  return Object.values(PROVIDERS).filter(p => p.compatibility === 'direct');
-}
-
-/**
- * Check if any configured providers need claudish installed.
- */
-export function needsClaudish(apiKeys: { openai?: string; google?: string }): boolean {
-  return !!(apiKeys.openai || apiKeys.google);
+  return Object.values(PROVIDERS);
 }
 
 /**
  * Get environment variables for spawning agent with specific provider
  */
-export function getProviderEnv(
+export function getProviderEnvSync(
   provider: ProviderConfig,
   apiKey: string
 ): Record<string, string> {
-  if (provider.compatibility === 'direct') {
-    // Direct providers use ANTHROPIC_BASE_URL
-    const env: Record<string, string> = {};
-
-    if (provider.baseUrl) {
-      env.ANTHROPIC_BASE_URL = provider.baseUrl;
-    }
-
-    if (provider.name !== 'anthropic') {
-      if (provider.authType === 'credential-file') {
-        // Credential-file providers use apiKeyHelper for dynamic token refresh.
-        // We still need an initial ANTHROPIC_AUTH_TOKEN for the first request,
-        // but apiKeyHelper (configured via setupCredentialFileAuth) will keep it fresh.
-        env.ANTHROPIC_AUTH_TOKEN = apiKey;
-        // Refresh token every 60 seconds (kimi-cli refreshes credential file automatically)
-        env.CLAUDE_CODE_API_KEY_HELPER_TTL_MS = '60000';
-      } else {
-        // Static providers use a long-lived API key
-        env.ANTHROPIC_AUTH_TOKEN = apiKey;
-      }
-    }
-
-    // MiniMax and Z.AI recommend longer timeouts
-    if (provider.name === 'minimax' || provider.name === 'zai') {
-      env.API_TIMEOUT_MS = '300000';
-    }
-
-    return env;
-  } else {
-    // Claudish-backed providers are launched via the `claudish` wrapper, not
-    // through a long-lived localhost proxy. For subscription/OAuth-backed
-    // models no extra env is required; for direct API-key mode, pass the
-    // provider-native key env that claudish expects.
-    if (apiKey === 'subscription-oauth') {
-      return {};
-    }
-
-    if (provider.name === 'openai') {
-      return { OPENAI_API_KEY: apiKey };
-    }
-
-    if (provider.name === 'google') {
-      return { GEMINI_API_KEY: apiKey };
-    }
-
+  if (provider.name === 'openai') {
+    // OpenAI never receives provider-native or Anthropic token env here.
+    // getProviderEnvForModel routes subscription launches through CLIProxy and
+    // rejects API-key launches before env construction.
     return {};
   }
+
+  const env: Record<string, string> = {};
+
+  if (provider.name === 'kimi') {
+    env.ANTHROPIC_BASE_URL = getKimiAnthropicBaseUrl(apiKey);
+  } else if (provider.baseUrl) {
+    env.ANTHROPIC_BASE_URL = provider.baseUrl;
+  }
+
+  if (provider.name !== 'anthropic') {
+    if (provider.authType === 'credential-file') {
+      // Credential-file providers use apiKeyHelper for dynamic token refresh.
+      // We still need an initial ANTHROPIC_AUTH_TOKEN for the first request,
+      // but apiKeyHelper (configured via setupCredentialFileAuth) will keep it fresh.
+      env.ANTHROPIC_AUTH_TOKEN = apiKey;
+      // Refresh token every 60 seconds (kimi-cli refreshes credential file automatically)
+      env.CLAUDE_CODE_API_KEY_HELPER_TTL_MS = '60000';
+    } else {
+      // Static providers use a long-lived API key
+      env.ANTHROPIC_AUTH_TOKEN = apiKey;
+    }
+  }
+
+  // MiniMax, Z.AI, and MiMo recommend longer timeouts
+  if (provider.name === 'minimax' || provider.name === 'zai' || provider.name === 'mimo') {
+    env.API_TIMEOUT_MS = '300000';
+  }
+
+  // Non-Anthropic providers don't support claude-haiku-4-5-20251001.
+  // Tell Claude Code to use the provider's small/fast model instead
+  // for Explore agents and other haiku-dependent features.
+  if (provider.haikuModel) {
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = provider.haikuModel;
+  }
+
+  // Inject subagent model env vars so Claude Code spawns subagents
+  // (Explorer, Plan, general-purpose) with model IDs the provider knows.
+  if (provider.tierModels) {
+    if (provider.tierModels.opus) {
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = provider.tierModels.opus;
+    }
+    if (provider.tierModels.sonnet) {
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = provider.tierModels.sonnet;
+    }
+    if (provider.tierModels.haiku) {
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = provider.tierModels.haiku;
+      env.ANTHROPIC_SMALL_FAST_MODEL = provider.tierModels.haiku;
+      env.CLAUDE_CODE_SUBAGENT_MODEL = provider.tierModels.haiku;
+    }
+  }
+
+  return env;
 }
 
 /**
@@ -250,7 +311,7 @@ export function getProviderEnv(
  * This writes to .claude/settings.local.json in the workspace directory.
  * Must be called before spawning the agent.
  */
-export function setupCredentialFileAuth(provider: ProviderConfig, workspacePath: string): void {
+export function setupCredentialFileAuthSync(provider: ProviderConfig, workspacePath: string): void {
   if (provider.authType !== 'credential-file' || !provider.credentialHelper) return;
 
   const helperPath = provider.credentialHelper.replace('~', process.env.HOME || '');
@@ -283,7 +344,7 @@ export function setupCredentialFileAuth(provider: ProviderConfig, workspacePath:
  * .claude/settings.local.json. Otherwise Claude Code will keep using the stale
  * token helper and fail with "Invalid API key".
  */
-export function clearCredentialFileAuth(workspacePath: string): void {
+export function clearCredentialFileAuthSync(workspacePath: string): void {
   const settingsPath = join(workspacePath, '.claude', 'settings.local.json');
   if (!existsSync(settingsPath)) return;
 
@@ -295,3 +356,60 @@ export function clearCredentialFileAuth(workspacePath: string): void {
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   } catch { /* non-fatal */ }
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Effect variant of {@link getProviderForModelSync}. Pure lookup; cannot fail. */
+export const getProviderForModel = (modelId: ModelId | string): Effect.Effect<ProviderConfig, never> =>
+  Effect.sync(() => getProviderForModelSync(modelId));
+
+/** Effect variant of {@link getProviderEnvSync}. Pure transform; cannot fail. */
+export const getProviderEnv = (
+  provider: ProviderConfig,
+  apiKey: string,
+): Effect.Effect<Record<string, string>, never> =>
+  Effect.sync(() => getProviderEnvSync(provider, apiKey));
+
+/** Effect variant of {@link setupCredentialFileAuthSync}. */
+export const setupCredentialFileAuth = (
+  provider: ProviderConfig,
+  workspacePath: string,
+): Effect.Effect<void, FsError> =>
+  Effect.tryPromise({
+    try: async () => {
+      if (provider.authType !== 'credential-file' || !provider.credentialHelper) return;
+
+      const helperPath = provider.credentialHelper.replace('~', process.env.HOME || '');
+      const claudeDir = join(workspacePath, '.claude');
+      const settingsPath = join(claudeDir, 'settings.local.json');
+
+      if (!existsSync(claudeDir)) {
+        await mkdir(claudeDir, { recursive: true });
+      }
+
+      let settings: Record<string, unknown> = {};
+      if (existsSync(settingsPath)) {
+        try {
+          settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
+        } catch { /* start fresh */ }
+      }
+
+      settings.apiKeyHelper = helperPath;
+      await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    },
+    catch: (cause) =>
+      new FsError({ path: workspacePath, operation: 'setupCredentialFileAuth', cause }),
+  });
+
+/** Effect variant of {@link clearCredentialFileAuthSync}. Swallows all errors (non-fatal). */
+export const clearCredentialFileAuth = (workspacePath: string): Effect.Effect<void, never> =>
+  Effect.promise(async () => {
+    const settingsPath = join(workspacePath, '.claude', 'settings.local.json');
+    if (!existsSync(settingsPath)) return;
+    try {
+      const settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
+      if (!settings.apiKeyHelper) return;
+      delete settings.apiKeyHelper;
+      await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    } catch { /* non-fatal */ }
+  });

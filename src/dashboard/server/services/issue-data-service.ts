@@ -12,11 +12,28 @@
  */
 
 import { Octokit } from '@octokit/rest';
+import { Effect } from 'effect';
+import { existsSync } from 'fs';
+import { stat } from 'fs/promises';
+import { join } from 'path';
 import { mapGitHubStateToCanonical } from '../../../core/state-mapping.js';
 import { CacheService, DEFAULT_TTLS } from './cache-service.js';
 import { getGitHubConfig, getLinearApiKey, getRallyConfig, validateRallyConfig } from './tracker-config.js';
 import type { GitHubConfig, RallyConfig } from './tracker-config.js';
-import { loadReviewStatuses } from '../../../lib/review-status.js';
+import { loadReviewStatusesForIssues, type ReviewStatus } from '../../../lib/review-status.js';
+import { resolveProjectFromIssueSync } from '../../../lib/projects.js';
+import { findPlan, readWorkspacePlan } from '../../../lib/vbrief/io.js';
+import type { VBriefDocument } from '../../../lib/vbrief/types.js';
+
+/**
+ * Compute bead progress counts from a cached plan document.
+ * Exported for testing.
+ */
+export function computeBeadCounts(doc: VBriefDocument | null): { completed: number; total: number } | null {
+  const items = doc?.plan?.items ?? [];
+  if (items.length === 0) return null;
+  return { completed: items.filter((i) => i.status === 'completed').length, total: items.length };
+}
 
 /**
  * Map a raw status string to its canonical state.
@@ -33,11 +50,14 @@ export function getCanonicalStatus(status: string | undefined, stateType?: strin
   if (normalized === 'todo' || normalized === 'to do' || normalized === 'ready' || normalized === 'unstarted') {
     return 'todo';
   }
-  if (normalized === 'in progress' || normalized === 'started' || normalized === 'active' || normalized === 'in planning') {
+  if (normalized === 'in progress' || normalized === 'in_progress' || normalized === 'started' || normalized === 'active' || normalized === 'in planning') {
     return 'in_progress';
   }
-  if (normalized === 'in review' || normalized === 'review' || normalized === 'qa' || normalized === 'testing') {
+  if (normalized === 'in review' || normalized === 'in_review' || normalized === 'review' || normalized === 'qa' || normalized === 'testing') {
     return 'in_review';
+  }
+  if (normalized === 'verifying' || normalized === 'verifying on main' || normalized === 'verifying_on_main') {
+    return 'verifying_on_main';
   }
   if (normalized === 'done' || normalized === 'completed' || normalized === 'closed') {
     return 'done';
@@ -79,6 +99,28 @@ interface TrackerState {
 }
 
 /**
+ * Cheap change detection for issue arrays.
+ * Compares length + the most recent updatedAt timestamp instead of
+ * serializing the entire array with JSON.stringify (which caused
+ * 600-900ms event loop stalls on large issue sets).
+ */
+function issuesChanged(newIssues: any[], oldIssues: any[]): boolean {
+  if (newIssues.length !== oldIssues.length) return true;
+  if (newIssues.length === 0) return false;
+
+  // Find the most recent updatedAt in each set
+  let newMax = '';
+  let oldMax = '';
+  for (const issue of newIssues) {
+    if (issue.updatedAt && issue.updatedAt > newMax) newMax = issue.updatedAt;
+  }
+  for (const issue of oldIssues) {
+    if (issue.updatedAt && issue.updatedAt > oldMax) oldMax = issue.updatedAt;
+  }
+  return newMax !== oldMax;
+}
+
+/**
  * Map normalized IssueState (open/in_progress/closed) to canonical dashboard status.
  * The Rally tracker already normalizes raw Rally states to IssueState in rally.ts.
  */
@@ -91,6 +133,129 @@ function mapRallyStateToCanonical(issueState: string): string {
   return 'todo';
 }
 
+/**
+ * Compute planning-state for an issue via cheap filesystem checks.
+ *
+ * `isPlanningComplete()` reads and JSON-parses the workspace's plan.vbrief.json
+ * file. Calling it for every issue on every getSnapshot — which happens once
+ * per WS-RPC bootstrap and then every emitted snapshot — would do 870+ sync
+ * disk reads per call and starve the dashboard event loop until WS clients
+ * timeout. Cache by plan-file mtime so the read happens at most once per file
+ * change.
+ */
+interface PlanningStateCacheEntry {
+  result: {
+    hasPlan: boolean;
+    hasBeads: boolean;
+    planningComplete: boolean;
+    workspacePath: string;
+    beadCounts: { completed: number; total: number } | null;
+  };
+  planMtimeMs: number; // -1 when no plan file existed at compute time
+  continueMtimeMs: number; // -1 when no continue.json existed at compute time
+}
+const planningStateCache = new Map<string, PlanningStateCacheEntry>();
+
+const planningStateRefreshInFlight = new Set<string>();
+const PLANNING_REFRESH_CONCURRENCY = 4;
+const PLANNING_FINISHED_STATUSES = new Set(['proposed', 'approved', 'pending', 'running', 'completed', 'blocked']);
+
+function getCachedPlanningState(identifier: string): {
+  hasPlan: boolean;
+  hasBeads: boolean;
+  planningComplete: boolean;
+  workspacePath: string;
+  beadCounts: { completed: number; total: number } | null;
+} {
+  try {
+    const resolved = resolveProjectFromIssueSync(identifier);
+    const projectPath = resolved?.projectPath ?? '';
+    if (!projectPath) {
+      return { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath: '', beadCounts: null };
+    }
+    const issueLower = identifier.toLowerCase();
+    const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+    return planningStateCache.get(identifier)?.result
+      ?? { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath, beadCounts: null };
+  } catch {
+    return { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath: '', beadCounts: null };
+  }
+}
+
+async function refreshPlanningState(identifier: string): Promise<boolean> {
+  if (planningStateRefreshInFlight.has(identifier)) return false;
+  planningStateRefreshInFlight.add(identifier);
+  try {
+    const resolved = resolveProjectFromIssueSync(identifier);
+    const projectPath = resolved?.projectPath ?? '';
+    if (!projectPath) return updatePlanningStateCache(identifier, {
+      result: { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath: '', beadCounts: null },
+      planMtimeMs: -1,
+      continueMtimeMs: -1,
+    });
+
+    const issueLower = identifier.toLowerCase();
+    const workspacePath = join(projectPath, 'workspaces', `feature-${issueLower}`);
+    if (!existsSync(workspacePath)) {
+      return updatePlanningStateCache(identifier, {
+        result: { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath, beadCounts: null },
+        planMtimeMs: -1,
+        continueMtimeMs: -1,
+      });
+    }
+
+    const planPath = await Effect.runPromise(findPlan(workspacePath));
+    let planMtimeMs = -1;
+    if (planPath) {
+      try {
+        planMtimeMs = (await stat(planPath)).mtimeMs;
+      } catch {
+        planMtimeMs = -1;
+      }
+    }
+
+    const continuePath = join(workspacePath, '.pan', 'continue.json');
+    let continueMtimeMs = -1;
+    try {
+      continueMtimeMs = (await stat(continuePath)).mtimeMs;
+    } catch {
+      continueMtimeMs = -1;
+    }
+
+    const cached = planningStateCache.get(identifier);
+    if (cached && cached.planMtimeMs === planMtimeMs && cached.continueMtimeMs === continueMtimeMs && cached.result.workspacePath === workspacePath) {
+      return false;
+    }
+
+    const doc = planPath ? await Effect.runPromise(readWorkspacePlan(workspacePath)) : null;
+    const planningComplete = doc?.plan?.status ? PLANNING_FINISHED_STATUSES.has(doc.plan.status) : false;
+    const beadCounts = computeBeadCounts(doc);
+    return updatePlanningStateCache(identifier, {
+      result: { hasPlan: planPath !== null, hasBeads: planningComplete, planningComplete, workspacePath, beadCounts },
+      planMtimeMs,
+      continueMtimeMs,
+    });
+  } catch {
+    return updatePlanningStateCache(identifier, {
+      result: { hasPlan: false, hasBeads: false, planningComplete: false, workspacePath: '', beadCounts: null },
+      planMtimeMs: -1,
+      continueMtimeMs: -1,
+    });
+  } finally {
+    planningStateRefreshInFlight.delete(identifier);
+  }
+}
+
+function updatePlanningStateCache(identifier: string, entry: PlanningStateCacheEntry): boolean {
+  const prev = planningStateCache.get(identifier);
+  const changed = !prev
+    || prev.planMtimeMs !== entry.planMtimeMs
+    || prev.continueMtimeMs !== entry.continueMtimeMs
+    || JSON.stringify(prev.result) !== JSON.stringify(entry.result);
+  planningStateCache.set(identifier, entry);
+  return changed;
+}
+
 export class IssueDataService {
   private cache: CacheService;
   private trackers: Record<string, TrackerState> = {};
@@ -100,7 +265,14 @@ export class IssueDataService {
   /** In-memory snapshot of shadow states, refreshed asynchronously. The hot
    * path (`getIssues`) reads from this map — no disk I/O on every request. */
   private shadowStatesCache: Map<string, any> = new Map();
+  private reviewStatusesCache: Record<string, ReviewStatus> = {};
   private _onIssuesChanged: ((issues: unknown[]) => void) | null = null;
+  private planningSnapshotQueued = false;
+  private planningRefreshQueue: string[] = [];
+  private planningRefreshQueued = new Set<string>();
+  private planningRefreshActive = 0;
+  private reviewStatusRefreshQueued = false;
+  private reviewStatusRefreshIssueIds = new Set<string>();
 
   /** Register a callback invoked whenever issue data changes (PAN-433). */
   onIssuesChanged(fn: (issues: unknown[]) => void): void {
@@ -262,20 +434,40 @@ export class IssueDataService {
     }
     // cycle === 'all': no additional filtering, show everything
 
-    // Augment with mergeStatus from review-status (used for MERGED badge)
-    try {
-      const reviewStatuses = loadReviewStatuses();
-      allIssues = allIssues.map(issue => {
-        const key = issue.identifier?.toUpperCase();
-        const rs = key ? reviewStatuses[key] : null;
-        if (rs?.mergeStatus) {
-          return { ...issue, mergeStatus: rs.mergeStatus };
+    // Augment with mergeStatus from the asynchronous review-status cache.
+    allIssues = allIssues.map(issue => {
+      const key = issue.identifier?.toUpperCase();
+      const rs = key ? this.reviewStatusesCache[key] : null;
+      if (rs?.mergeStatus) {
+        const issueWithMerge = { ...issue, mergeStatus: rs.mergeStatus };
+        if (rs.mergeStatus === 'merged') {
+          const canonical = getCanonicalStatus(issue.state ?? issue.canonicalStatus ?? issue.status, issue.stateType);
+          if (canonical !== 'done' && canonical !== 'canceled') {
+            return {
+              ...issueWithMerge,
+              status: 'Verifying',
+              canonicalStatus: 'verifying_on_main',
+              state: 'verifying_on_main',
+            };
+          }
         }
-        return issue;
-      });
-    } catch {
-      // review-status.json may not exist yet
-    }
+        return issueWithMerge;
+      }
+      return issue;
+    });
+
+    // Enrich with cached planning-state only. Refresh work is scheduled by tracker updates.
+    allIssues = allIssues.map(issue => {
+      const ps = getCachedPlanningState(issue.identifier);
+      return {
+        ...issue,
+        hasPlan: ps.hasPlan,
+        hasBeads: ps.hasBeads,
+        planningComplete: ps.planningComplete,
+        workspacePath: ps.workspacePath || undefined,
+        beadCounts: ps.beadCounts,
+      };
+    });
 
     // Sort by updatedAt
     allIssues.sort((a, b) =>
@@ -477,6 +669,9 @@ export class IssueDataService {
         this.trackers[tracker].lastFetchedAt = cached.lastFetchedAt;
       }
     }
+    const cachedIssues = this.getCachedTrackerIssues();
+    this.schedulePlanningRefreshForIssues(cachedIssues);
+    this.scheduleReviewStatusRefreshForIssues(cachedIssues);
   }
 
   private pushSnapshot(): void {
@@ -484,7 +679,74 @@ export class IssueDataService {
   }
 
   private pushUpdated(): void {
+    const cachedIssues = this.getCachedTrackerIssues();
+    this.schedulePlanningRefreshForIssues(cachedIssues);
+    this.scheduleReviewStatusRefreshForIssues(cachedIssues);
     this._onIssuesChanged?.(this.getIssues());
+  }
+
+  private getCachedTrackerIssues(): any[] {
+    return [
+      ...this.trackers.github.lastFetchedIssues,
+      ...this.trackers.linear.lastFetchedIssues,
+      ...this.trackers.rally.lastFetchedIssues,
+    ];
+  }
+
+  private schedulePlanningRefreshForIssues(issues: any[]): void {
+    for (const issue of issues) {
+      const identifier = typeof issue?.identifier === 'string' ? issue.identifier : '';
+      if (!identifier || this.planningRefreshQueued.has(identifier) || planningStateRefreshInFlight.has(identifier)) continue;
+      this.planningRefreshQueued.add(identifier);
+      this.planningRefreshQueue.push(identifier);
+    }
+    this.drainPlanningRefreshQueue();
+  }
+
+  private drainPlanningRefreshQueue(): void {
+    while (this.planningRefreshActive < PLANNING_REFRESH_CONCURRENCY && this.planningRefreshQueue.length > 0) {
+      const identifier = this.planningRefreshQueue.shift()!;
+      this.planningRefreshQueued.delete(identifier);
+      this.planningRefreshActive++;
+      void refreshPlanningState(identifier).then((changed) => {
+        if (changed) this.queuePlanningSnapshot();
+      }).finally(() => {
+        this.planningRefreshActive--;
+        this.drainPlanningRefreshQueue();
+      });
+    }
+  }
+
+  private queuePlanningSnapshot(): void {
+    if (this.planningSnapshotQueued) return;
+    this.planningSnapshotQueued = true;
+    setTimeout(() => {
+      this.planningSnapshotQueued = false;
+      if (this.started) this.pushSnapshot();
+    }, 50);
+  }
+
+  private scheduleReviewStatusRefreshForIssues(issues: any[]): void {
+    for (const issue of issues) {
+      const identifier = typeof issue?.identifier === 'string' ? issue.identifier : '';
+      if (identifier) this.reviewStatusRefreshIssueIds.add(identifier);
+    }
+    if (this.reviewStatusRefreshQueued || this.reviewStatusRefreshIssueIds.size === 0) return;
+    this.reviewStatusRefreshQueued = true;
+    setImmediate(() => {
+      this.reviewStatusRefreshQueued = false;
+      const issueIds = [...this.reviewStatusRefreshIssueIds];
+      this.reviewStatusRefreshIssueIds.clear();
+      try {
+        this.reviewStatusesCache = {
+          ...this.reviewStatusesCache,
+          ...loadReviewStatusesForIssues(issueIds),
+        };
+        if (this.started) this.pushSnapshot();
+      } catch {
+        // review-status store may not exist yet
+      }
+    });
   }
 
   private pushMeta(): void {
@@ -526,9 +788,9 @@ export class IssueDataService {
       }
     }
 
-    // Check if data actually changed
+    // Check if data actually changed (cheap length + updatedAt check)
     const oldData = this.trackers.github.lastFetchedIssues;
-    const changed = JSON.stringify(allIssues) !== JSON.stringify(oldData);
+    const changed = issuesChanged(allIssues, oldData);
 
     this.trackers.github.lastFetchedIssues = allIssues;
     this.trackers.github.lastFetchedAt = new Date().toISOString();
@@ -614,6 +876,7 @@ export class IssueDataService {
           status: canonicalStatus === 'todo' ? 'Todo' :
                   canonicalStatus === 'in_progress' ? 'In Progress' :
                   canonicalStatus === 'in_review' ? 'In Review' :
+                  canonicalStatus === 'verifying_on_main' ? 'Verifying' :
                   canonicalStatus === 'done' ? 'Done' :
                   canonicalStatus === 'backlog' ? 'Backlog' : 'Todo',
           canonicalStatus,
@@ -713,7 +976,7 @@ export class IssueDataService {
       }
 
       const oldData = this.trackers.linear.lastFetchedIssues;
-      const changed = JSON.stringify(allIssues) !== JSON.stringify(oldData);
+      const changed = issuesChanged(allIssues, oldData);
 
       this.trackers.linear.lastFetchedIssues = allIssues;
       this.trackers.linear.lastFetchedAt = new Date().toISOString();
@@ -1022,10 +1285,10 @@ export class IssueDataService {
               project: projConfig.rally_project,
             });
 
-            const issues = await tracker.listIssues({
+            const issues = await Effect.runPromise(tracker.listIssues({
               includeClosed: false,
               limit: 100,
-            });
+            }));
 
             const projectInfo = {
               id: `rally-${key}`,
@@ -1052,10 +1315,10 @@ export class IssueDataService {
           project: globalConfig.project,
         });
 
-        const issues = await tracker.listIssues({
+        const issues = await Effect.runPromise(tracker.listIssues({
           includeClosed: false,
           limit: 100,
-        });
+        }));
 
         const projectInfo = {
           id: 'rally-project',
@@ -1071,7 +1334,7 @@ export class IssueDataService {
       allFormatted = this.computeDerivedFeatureStatus(allFormatted);
 
       const oldData = this.trackers.rally.lastFetchedIssues;
-      const changed = JSON.stringify(allFormatted) !== JSON.stringify(oldData);
+      const changed = issuesChanged(allFormatted, oldData);
 
       this.trackers.rally.lastFetchedIssues = allFormatted;
       this.trackers.rally.lastFetchedAt = new Date().toISOString();

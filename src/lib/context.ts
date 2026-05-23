@@ -2,28 +2,19 @@
  * Context Engineering System
  *
  * Implements GSD-Plus patterns for structured context management:
- * - STATE.md: Agent state that survives compaction
  * - WORKSPACE.md: Project context
  * - SUMMARY.md: Work artifacts
  * - Queryable history files
+ *
+ * Workspace-level orchestration state lives in `<workspace>/.pan/continue.json`,
+ * not here.
  */
 
+import { Effect } from 'effect';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from 'fs';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { AGENTS_DIR } from './paths.js';
-
-export interface AgentStateContext {
-  issueId: string;
-  status: string;
-  lastActivity: string;
-  lastCheckpoint?: string;
-  resumePoint?: string;
-  contextRefs: {
-    workspace?: string;
-    prd?: string;
-    beads?: string;
-  };
-}
+import { FsError } from './errors.js';
 
 export interface SummaryEntry {
   title: string;
@@ -32,135 +23,6 @@ export interface SummaryEntry {
   whatWasDone: string[];
   keyInsights?: string[];
   filesModified?: string[];
-}
-
-// ============== STATE.md ==============
-
-function getStateFile(agentId: string): string {
-  return join(AGENTS_DIR, agentId, 'STATE.md');
-}
-
-/**
- * Read current STATE.md for an agent
- */
-export function readAgentState(agentId: string): AgentStateContext | null {
-  const stateFile = getStateFile(agentId);
-  if (!existsSync(stateFile)) return null;
-
-  try {
-    const content = readFileSync(stateFile, 'utf-8');
-    return parseStateMd(content);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Write STATE.md for an agent
- */
-export function writeAgentState(agentId: string, state: AgentStateContext): void {
-  const dir = join(AGENTS_DIR, agentId);
-  mkdirSync(dir, { recursive: true });
-
-  const content = generateStateMd(state);
-  writeFileSync(getStateFile(agentId), content);
-}
-
-/**
- * Update checkpoint in STATE.md
- */
-export function updateCheckpoint(agentId: string, checkpoint: string, resumePoint?: string): void {
-  const state = readAgentState(agentId);
-  if (!state) return;
-
-  state.lastActivity = new Date().toISOString();
-  state.lastCheckpoint = checkpoint;
-  if (resumePoint) {
-    state.resumePoint = resumePoint;
-  }
-
-  writeAgentState(agentId, state);
-}
-
-function generateStateMd(state: AgentStateContext): string {
-  const lines: string[] = [
-    `# Agent State: ${state.issueId}`,
-    '',
-    '## Current Position',
-    '',
-    `Issue: ${state.issueId}`,
-    `Status: ${state.status}`,
-    `Last activity: ${state.lastActivity}`,
-    '',
-  ];
-
-  if (state.lastCheckpoint) {
-    lines.push('## Session Continuity');
-    lines.push('');
-    lines.push(`Last checkpoint: "${state.lastCheckpoint}"`);
-    if (state.resumePoint) {
-      lines.push(`Resume point: "${state.resumePoint}"`);
-    }
-    lines.push('');
-  }
-
-  if (state.contextRefs.workspace || state.contextRefs.prd || state.contextRefs.beads) {
-    lines.push('## Context References');
-    lines.push('');
-    if (state.contextRefs.workspace) {
-      lines.push(`- Workspace: ${state.contextRefs.workspace}`);
-    }
-    if (state.contextRefs.prd) {
-      lines.push(`- PRD: ${state.contextRefs.prd}`);
-    }
-    if (state.contextRefs.beads) {
-      lines.push(`- Beads: ${state.contextRefs.beads}`);
-    }
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-function parseStateMd(content: string): AgentStateContext {
-  const state: AgentStateContext = {
-    issueId: '',
-    status: '',
-    lastActivity: '',
-    contextRefs: {},
-  };
-
-  // Parse issue ID from title
-  const titleMatch = content.match(/# Agent State: (.+)/);
-  if (titleMatch) state.issueId = titleMatch[1].trim();
-
-  // Parse status
-  const statusMatch = content.match(/Status: (.+)/);
-  if (statusMatch) state.status = statusMatch[1].trim();
-
-  // Parse last activity
-  const activityMatch = content.match(/Last activity: (.+)/);
-  if (activityMatch) state.lastActivity = activityMatch[1].trim();
-
-  // Parse checkpoint
-  const checkpointMatch = content.match(/Last checkpoint: "(.+)"/);
-  if (checkpointMatch) state.lastCheckpoint = checkpointMatch[1];
-
-  // Parse resume point
-  const resumeMatch = content.match(/Resume point: "(.+)"/);
-  if (resumeMatch) state.resumePoint = resumeMatch[1];
-
-  // Parse context refs
-  const workspaceMatch = content.match(/- Workspace: (.+)/);
-  if (workspaceMatch) state.contextRefs.workspace = workspaceMatch[1].trim();
-
-  const prdMatch = content.match(/- PRD: (.+)/);
-  if (prdMatch) state.contextRefs.prd = prdMatch[1].trim();
-
-  const beadsMatch = content.match(/- Beads: (.+)/);
-  if (beadsMatch) state.contextRefs.beads = beadsMatch[1].trim();
-
-  return state;
 }
 
 // ============== SUMMARY.md ==============
@@ -172,7 +34,7 @@ function getSummaryFile(agentId: string): string {
 /**
  * Append a work summary to SUMMARY.md
  */
-export function appendSummary(agentId: string, summary: SummaryEntry): void {
+export function appendSummarySync(agentId: string, summary: SummaryEntry): void {
   const dir = join(AGENTS_DIR, agentId);
   mkdirSync(dir, { recursive: true });
 
@@ -236,7 +98,7 @@ function getHistoryDir(agentId: string): string {
 /**
  * Log an action to queryable history
  */
-export function logHistory(
+export function logHistorySync(
   agentId: string,
   action: string,
   details?: Record<string, any>
@@ -258,7 +120,7 @@ export function logHistory(
 /**
  * Search history files for a pattern
  */
-export function searchHistory(agentId: string, pattern: string): string[] {
+export function searchHistorySync(agentId: string, pattern: string): string[] {
   const historyDir = getHistoryDir(agentId);
   if (!existsSync(historyDir)) return [];
 
@@ -285,7 +147,7 @@ export function searchHistory(agentId: string, pattern: string): string[] {
 /**
  * Get recent history entries
  */
-export function getRecentHistory(agentId: string, limit: number = 20): string[] {
+export function getRecentHistorySync(agentId: string, limit: number = 20): string[] {
   const historyDir = getHistoryDir(agentId);
   if (!existsSync(historyDir)) return [];
 
@@ -320,18 +182,18 @@ export interface ContextBudget {
 /**
  * Estimate token count (rough approximation: ~4 chars per token)
  */
-export function estimateTokens(text: string): number {
+export function estimateTokensSync(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
 /**
  * Check if context budget allows adding more content
  */
-export function checkContextBudget(
+export function checkContextBudgetSync(
   budget: ContextBudget,
   newContent: string
 ): { allowed: boolean; warning: boolean; remaining: number } {
-  const newTokens = estimateTokens(newContent);
+  const newTokens = estimateTokensSync(newContent);
   const totalUsed = budget.usedTokens + newTokens;
   const remaining = budget.maxTokens - totalUsed;
   const usageRatio = totalUsed / budget.maxTokens;
@@ -346,7 +208,7 @@ export function checkContextBudget(
 /**
  * Create a context budget for a session
  */
-export function createContextBudget(maxTokens: number = 100000): ContextBudget {
+export function createContextBudgetSync(maxTokens: number = 100000): ContextBudget {
   return {
     maxTokens,
     usedTokens: 0,
@@ -363,7 +225,7 @@ function getMaterializedDir(agentId: string): string {
 /**
  * Materialize tool output for later retrieval
  */
-export function materializeOutput(
+export function materializeOutputSync(
   agentId: string,
   toolName: string,
   output: string,
@@ -399,7 +261,7 @@ export function materializeOutput(
   writeFileSync(filepath, lines.join('\n'));
 
   // Log to history
-  logHistory(agentId, `materialized:${toolName}`, { file: filename });
+  logHistorySync(agentId, `materialized:${toolName}`, { file: filename });
 
   return filepath;
 }
@@ -407,7 +269,7 @@ export function materializeOutput(
 /**
  * List materialized outputs for an agent
  */
-export function listMaterialized(agentId: string): Array<{
+export function listMaterializedSync(agentId: string): Array<{
   tool: string;
   timestamp: number;
   file: string;
@@ -432,7 +294,80 @@ export function listMaterialized(agentId: string): Array<{
 /**
  * Read materialized output
  */
-export function readMaterialized(filepath: string): string | null {
+export function readMaterializedSync(filepath: string): string | null {
   if (!existsSync(filepath)) return null;
   return readFileSync(filepath, 'utf-8');
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+// Context-engineering helpers — sync FS by design (CLI / agent-local), wrapped
+// for callers in Effect graphs. FsError surfaces only on write paths.
+
+/** Append a work-summary entry for an agent. */
+export const appendSummary = (
+  agentId: string,
+  summary: SummaryEntry,
+): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => appendSummarySync(agentId, summary),
+    catch: (cause) =>
+      new FsError({ path: agentId, operation: 'append-summary', cause }),
+  });
+
+/** Append a history entry for an agent. */
+export const logHistory = (
+  ...args: Parameters<typeof logHistorySync>
+): Effect.Effect<void, FsError> =>
+  Effect.try({
+    try: () => logHistorySync(...args),
+    catch: (cause) =>
+      new FsError({ path: args[0], operation: 'log-history', cause }),
+  });
+
+/** Search agent history for a regex pattern. Pure-ish (logs on error). */
+export const searchHistory = (
+  agentId: string,
+  pattern: string,
+): Effect.Effect<string[]> => Effect.sync(() => searchHistorySync(agentId, pattern));
+
+/** Return the most recent history entries for an agent. Pure-ish. */
+export const getRecentHistory = (
+  agentId: string,
+  limit: number = 20,
+): Effect.Effect<string[]> => Effect.sync(() => getRecentHistorySync(agentId, limit));
+
+/** Estimate token count from text. Pure. */
+export const estimateTokens = (text: string): Effect.Effect<number> =>
+  Effect.sync(() => estimateTokensSync(text));
+
+/** Check a context budget against a token estimate. Pure. */
+export const checkContextBudget = (
+  ...args: Parameters<typeof checkContextBudgetSync>
+): Effect.Effect<ReturnType<typeof checkContextBudgetSync>> =>
+  Effect.sync(() => checkContextBudgetSync(...args));
+
+/** Construct a new context budget. Pure. */
+export const createContextBudget = (
+  maxTokens: number = 100000,
+): Effect.Effect<ContextBudget> => Effect.sync(() => createContextBudgetSync(maxTokens));
+
+/** Materialize agent output to a file (returns filepath). */
+export const materializeOutput = (
+  ...args: Parameters<typeof materializeOutputSync>
+): Effect.Effect<ReturnType<typeof materializeOutputSync>, FsError> =>
+  Effect.try({
+    try: () => materializeOutputSync(...args),
+    catch: (cause) =>
+      new FsError({ path: args[0], operation: 'materialize-output', cause }),
+  });
+
+/** Enumerate materialized files for an agent. Pure-ish. */
+export const listMaterialized = (
+  agentId: string,
+): Effect.Effect<ReturnType<typeof listMaterializedSync>> =>
+  Effect.sync(() => listMaterializedSync(agentId));
+
+/** Read a materialized file's contents (null when missing). Pure-ish. */
+export const readMaterialized = (
+  filepath: string,
+): Effect.Effect<string | null> => Effect.sync(() => readMaterializedSync(filepath));

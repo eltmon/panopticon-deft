@@ -4,23 +4,24 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   generateBasicInference,
-  updateInferenceDocument,
-  readInferenceDocument,
+  updateInferenceDocumentSync,
+  readInferenceDocumentSync,
   generateMonitoringPrompt,
 } from '../monitoring-agent.js';
+import { PAN_DIRNAME } from '../../pan-dir/index.js';
 
 describe('Monitoring Agent', () => {
   let testDir: string;
   let workspacePath: string;
-  let planningDir: string;
+  let panDir: string;
 
   beforeEach(() => {
     testDir = join(tmpdir(), `pan-test-${Date.now()}`);
     workspacePath = join(testDir, 'workspace');
-    planningDir = join(workspacePath, '.planning');
-    mkdirSync(join(planningDir, 'transcripts'), { recursive: true });
-    mkdirSync(join(planningDir, 'discussions'), { recursive: true });
-    mkdirSync(join(planningDir, 'notes'), { recursive: true });
+    panDir = join(workspacePath, PAN_DIRNAME);
+    mkdirSync(join(panDir, 'transcripts'), { recursive: true });
+    mkdirSync(join(panDir, 'discussions'), { recursive: true });
+    mkdirSync(join(panDir, 'notes'), { recursive: true });
   });
 
   afterEach(() => {
@@ -91,33 +92,33 @@ describe('Monitoring Agent', () => {
   });
 
   describe('updateInferenceDocument', () => {
-    it('should write INFERENCE.md to .planning directory', () => {
-      updateInferenceDocument(workspacePath, '# Test Inference');
+    it('should write INFERENCE.md to .pan directory', () => {
+      updateInferenceDocumentSync(workspacePath, '# Test Inference');
 
-      const filePath = join(planningDir, 'INFERENCE.md');
+      const filePath = join(panDir, 'INFERENCE.md');
       expect(existsSync(filePath)).toBe(true);
       expect(readFileSync(filePath, 'utf-8')).toBe('# Test Inference');
     });
 
-    it('should create .planning directory if it does not exist', () => {
+    it('should create .pan directory if it does not exist', () => {
       const newWorkspace = join(testDir, 'new-workspace');
-      updateInferenceDocument(newWorkspace, '# New Inference');
+      updateInferenceDocumentSync(newWorkspace, '# New Inference');
 
-      const filePath = join(newWorkspace, '.planning', 'INFERENCE.md');
+      const filePath = join(newWorkspace, PAN_DIRNAME, 'INFERENCE.md');
       expect(existsSync(filePath)).toBe(true);
     });
   });
 
   describe('readInferenceDocument', () => {
     it('should return null when INFERENCE.md does not exist', () => {
-      const result = readInferenceDocument(join(testDir, 'nonexistent'));
+      const result = readInferenceDocumentSync(join(testDir, 'nonexistent'));
       expect(result).toBeNull();
     });
 
     it('should return content when INFERENCE.md exists', () => {
-      writeFileSync(join(planningDir, 'INFERENCE.md'), '# Existing Inference', 'utf-8');
+      writeFileSync(join(panDir, 'INFERENCE.md'), '# Existing Inference', 'utf-8');
 
-      const result = readInferenceDocument(workspacePath);
+      const result = readInferenceDocumentSync(workspacePath);
       expect(result).toBe('# Existing Inference');
     });
   });

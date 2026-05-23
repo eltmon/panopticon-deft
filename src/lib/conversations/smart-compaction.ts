@@ -1,6 +1,13 @@
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Effect } from 'effect';
 import { buildSpawnEnvForModel, getProviderEnvForModel } from '../agents.js';
+import { getClaudePermissionFlagsSync } from '../claude-permissions.js';
+import type { RuntimeName } from '../runtimes/types.js';
+import { FsError, ProcessSpawnError } from '../errors.js';
 
 const SUMMARY_TIMEOUT_MS = 60_000;
 const FORK_SUMMARY_TIMEOUT_MS = 300_000;
@@ -15,6 +22,10 @@ export interface CompactionOptions {
   richMode?: boolean;
   /** 'compact' = native compaction (returns stub if nothing to summarize). 'fork' = always produce a real summary for conversation forks. */
   mode?: 'compact' | 'fork';
+  /** When true, include thinking block content in the serialized conversation sent to the summary model. Default: true. */
+  includeThinkingInSummary?: boolean;
+  /** Runtime harness used for model-backed summary generation. */
+  harness?: RuntimeName;
 }
 
 export interface CompactionResult {
@@ -341,7 +352,7 @@ function truncateForSummary(text: string, maxChars: number): string {
   return `${text.slice(0, maxChars)}\n\n[... ${text.length - maxChars} more characters truncated]`;
 }
 
-function serializeEntry(entry: any): string | undefined {
+function serializeEntry(entry: any, includeThinking: boolean = true): string | undefined {
   if (entry.type === 'user' && entry.message) {
     const content = entry.message.content;
     let text = '';
@@ -383,7 +394,7 @@ function serializeEntry(entry: any): string | undefined {
       for (const block of content) {
         if (block.type === 'text' && block.text) {
           textParts.push(block.text);
-        } else if (block.type === 'thinking' && block.thinking) {
+        } else if (block.type === 'thinking' && block.thinking && includeThinking) {
           textParts.push(`[thinking]: ${block.thinking}`);
         } else if (block.type === 'tool_use') {
           const args = block.input || {};
@@ -410,10 +421,10 @@ function serializeEntry(entry: any): string | undefined {
   return undefined;
 }
 
-function serializeConversation(entries: any[]): string {
+function serializeConversation(entries: any[], includeThinking: boolean = true): string {
   const parts: string[] = [];
   for (const entry of entries) {
-    const serialized = serializeEntry(entry);
+    const serialized = serializeEntry(entry, includeThinking);
     if (serialized) parts.push(serialized);
   }
   return parts.join('\n\n');
@@ -601,28 +612,89 @@ Be thorough. Preserve exact file paths, function names, error messages, and code
 // LLM call
 // ============================================================================
 
-export async function runModelSummary(prompt: string, model?: string, timeoutMs?: number): Promise<string> {
+async function runPiModelSummary(prompt: string, model: string, timeoutMs?: number): Promise<string> {
+  const sessionDir = await mkdtemp(join(tmpdir(), 'panopticon-pi-summary-'));
+  const effectiveTimeout = timeoutMs ?? SUMMARY_TIMEOUT_MS;
+  const spawnEnv = await buildSpawnEnvForModel(model);
+
+  const child = spawn('pi', [
+    '--mode', 'rpc',
+    '--model', model,
+    '--session-dir', sessionDir,
+    '--no-context-files',
+  ], {
+    env: spawnEnv,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf-8');
+  child.stderr.setEncoding('utf-8');
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error(`Pi summary generation timed out after ${effectiveTimeout}ms`));
+      }, effectiveTimeout);
+
+      child.on('error', err => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+      child.on('close', code => {
+        clearTimeout(timeout);
+        if (code !== 0 && !stdout.trim()) {
+          const detail = stderr.trim() || `exit code ${code}`;
+          reject(new Error(`Pi summary generation failed: ${detail}`));
+          return;
+        }
+        const summary = stdout.trim();
+        if (!summary) {
+          reject(new Error('Pi summary generation returned empty output'));
+          return;
+        }
+        resolve(summary);
+      });
+
+      child.stdin.end(`${JSON.stringify({ id: randomUUID(), type: 'prompt', message: prompt })}\n`);
+    });
+  } finally {
+    await rm(sessionDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}async function runModelSummaryPromise(prompt: string, model?: string, timeoutMs?: number, harness: RuntimeName = 'claude-code'): Promise<string> {
   const useModel = model || DEFAULT_SUMMARY_MODEL;
+  console.log(`[claude-invoke] purpose=smart-summary | model=${useModel} | harness=${harness} | source=smart-compaction.ts:runModelSummary | promptChars=${prompt.length} | timeoutMs=${timeoutMs ?? SUMMARY_TIMEOUT_MS}`);
+
+  if (harness === 'pi') {
+    const summary = await runPiModelSummary(prompt, useModel, timeoutMs);
+    console.log(`[claude-invoke] SUCCESS purpose=smart-summary | model=${useModel} | harness=pi | outputChars=${summary.length}`);
+    return summary;
+  }
+
   const args = [
     '-p',
     '--model', useModel,
-    '--dangerously-skip-permissions',
-    '--permission-mode', 'bypassPermissions',
+    ...getClaudePermissionFlagsSync(),
   ];
 
   // Sanitize parent provider env (strip ANTHROPIC_BASE_URL etc.) and inject the
   // correct provider env for `useModel`. If provider env lookup fails (e.g.
   // missing API key), let it throw — the caller (compactConversationNative)
   // falls back to a heuristic summary.
-  const spawnEnv = buildSpawnEnvForModel(useModel);
-  const injectedKeys = Object.keys(getProviderEnvForModel(useModel));
+  const spawnEnv = await buildSpawnEnvForModel(useModel);
+  const injectedKeys = Object.keys(await getProviderEnvForModel(useModel));
+  const command = 'claude';
   if (injectedKeys.length > 0) {
-    console.log(`[smart-compaction] Spawning claude -p for summary with model ${useModel}, injecting provider env: ${injectedKeys.join(', ')}`);
+    console.log(`[smart-compaction] Spawning ${command} for summary with model ${useModel}, injecting provider env: ${injectedKeys.join(', ')}`);
   } else {
-    console.log(`[smart-compaction] Spawning claude -p for summary with model ${useModel} (anthropic, parent provider env stripped)`);
+    console.log(`[smart-compaction] Spawning ${command} for summary with model ${useModel} (anthropic, parent provider env stripped)`);
   }
 
-  const child = spawn('claude', args, {
+  const child = spawn(command, args, {
     env: spawnEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -650,14 +722,17 @@ export async function runModelSummary(prompt: string, model?: string, timeoutMs?
       clearTimeout(timeout);
       if (code !== 0) {
         const detail = stderr.trim() || stdout.trim() || `exit code ${code}`;
+        console.error(`[claude-invoke] FAILED purpose=smart-summary | model=${useModel} | error="exit code ${code}: ${detail.slice(0, 200)}"`);
         reject(new Error(`Summary generation failed: ${detail}`));
         return;
       }
       const summary = stdout.trim();
       if (!summary) {
+        console.error(`[claude-invoke] FAILED purpose=smart-summary | model=${useModel} | error="empty output"`);
         reject(new Error(`Summary generation returned empty output`));
         return;
       }
+      console.log(`[claude-invoke] SUCCESS purpose=smart-summary | model=${useModel} | outputChars=${summary.length}`);
       resolve(summary);
     });
   });
@@ -669,6 +744,7 @@ async function generateSummaryFromPrompt(
   model: string | undefined,
   richMode: boolean,
   timeoutMs?: number,
+  harness: RuntimeName = 'claude-code',
 ): Promise<string> {
   const conversationText = `<conversation>\n${serialized}\n</conversation>`;
   let promptText = `${conversationText}\n\n`;
@@ -691,17 +767,18 @@ async function generateSummaryFromPrompt(
 
   // Wrap in system prompt via claude -p
   const fullPrompt = `${SUMMARIZATION_SYSTEM_PROMPT}\n\n${messages[0].content[0].text}`;
-  return runModelSummary(fullPrompt, model, timeoutMs);
+  return (await Effect.runPromise(runModelSummary(fullPrompt, model, timeoutMs, harness)));
 }
 
 async function generateTurnPrefixSummary(
   serialized: string,
   model: string | undefined,
   timeoutMs?: number,
+  harness: RuntimeName = 'claude-code',
 ): Promise<string> {
   const promptText = `<conversation>\n${serialized}\n</conversation>\n\n${TURN_PREFIX_PROMPT}`;
   const fullPrompt = `${SUMMARIZATION_SYSTEM_PROMPT}\n\n${promptText}`;
-  return runModelSummary(fullPrompt, model, timeoutMs);
+  return (await Effect.runPromise(runModelSummary(fullPrompt, model, timeoutMs, harness)));
 }
 
 // ============================================================================
@@ -749,6 +826,8 @@ async function generateChunkedSummary(
   model: string | undefined,
   richMode: boolean,
   timeoutMs: number,
+  includeThinking: boolean = true,
+  harness: RuntimeName = 'claude-code',
 ): Promise<string> {
   const budget = getChunkBudgetChars(model);
   const chunks = chunkEntriesByBudget(entries, budget);
@@ -758,23 +837,17 @@ async function generateChunkedSummary(
 
   let running: string | undefined = initialPreviousSummary;
   for (let i = 0; i < chunks.length; i++) {
-    const serialized = serializeConversation(chunks[i]);
+    const serialized = serializeConversation(chunks[i], includeThinking);
     if (!serialized.trim()) continue;
     console.log(
       `[smart-compaction] Summarizing chunk ${i + 1}/${chunks.length} ` +
       `(${serialized.length} chars, ${chunks[i].length} entries) with ${model ?? DEFAULT_SUMMARY_MODEL}`,
     );
-    running = await generateSummaryFromPrompt(serialized, running, model, richMode, timeoutMs);
+    running = await generateSummaryFromPrompt(serialized, running, model, richMode, timeoutMs, harness);
   }
 
   return running ?? '';
-}
-
-// ============================================================================
-// Main smart compaction
-// ============================================================================
-
-export async function generateSmartSummary(options: CompactionOptions): Promise<CompactionResult> {
+}async function generateSmartSummaryPromise(options: CompactionOptions): Promise<CompactionResult> {
   const entries = await parseEntries(options.jsonlPath);
   if (entries.length === 0) {
     throw new Error(`Session file is empty: ${options.jsonlPath}`);
@@ -787,6 +860,8 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
   const reserveTokens = options.reserveTokens ?? 16384;
   const model = options.model || DEFAULT_SUMMARY_MODEL;
   const richMode = options.richMode ?? false;
+  const includeThinking = options.includeThinkingInSummary ?? true;
+  const harness = options.harness ?? 'claude-code';
   const tokensBefore = estimateContextTokens(entries);
 
   // Detect previous compact boundary for incremental summarization
@@ -834,7 +909,7 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
   // Generate summaries
   const llmTimeoutMs = isFork ? FORK_SUMMARY_TIMEOUT_MS : undefined;
   let summary: string;
-  let serializedHistory = serializeConversation(messagesToSummarize);
+  let serializedHistory = serializeConversation(messagesToSummarize, includeThinking);
   let hasHistory = serializedHistory.trim().length > 0;
 
   // For forks, always produce a real summary. If the selected history slice is
@@ -843,7 +918,7 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
   if (isFork && !hasHistory && !cutPoint.isSplitTurn) {
     const allMessages = entries.slice(boundaryStart, cutPoint.firstKeptEntryIndex);
     if (allMessages.length > 0) {
-      serializedHistory = serializeConversation(allMessages);
+      serializedHistory = serializeConversation(allMessages, includeThinking);
       hasHistory = serializedHistory.trim().length > 0;
     }
   }
@@ -860,10 +935,10 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
       // Summarize from the previous compact boundary (if any) forward — the
       // previousSummary already covers everything before boundaryStart.
       const forkEntries = boundaryStart > 0 ? entries.slice(boundaryStart) : entries;
-      const anyContent = forkEntries.some((e) => serializeEntry(e));
+      const anyContent = forkEntries.some((e) => serializeEntry(e, includeThinking));
       if (anyContent) {
         try {
-          summary = await generateChunkedSummary(forkEntries, previousSummary, model, richMode, forkTimeoutMs);
+          summary = await generateChunkedSummary(forkEntries, previousSummary, model, richMode, forkTimeoutMs, includeThinking, harness);
         } catch (error) {
           throw new Error(`Smart summary generation failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -884,9 +959,9 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
       if (hasPrefix) {
         const [historyResult, turnPrefixResult] = await Promise.all([
           hasHistory
-            ? generateSummaryFromPrompt(serializedHistory, previousSummary, model, richMode, llmTimeoutMs)
+            ? generateSummaryFromPrompt(serializedHistory, previousSummary, model, richMode, llmTimeoutMs, harness)
             : Promise.resolve('No prior history.'),
-          generateTurnPrefixSummary(serializeConversation(turnPrefixMessages), model, llmTimeoutMs),
+          generateTurnPrefixSummary(serializeConversation(turnPrefixMessages, includeThinking), model, llmTimeoutMs, harness),
         ]);
         summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
       } else {
@@ -896,6 +971,7 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
           model,
           richMode,
           llmTimeoutMs,
+          harness,
         );
       }
     } catch (error) {
@@ -915,4 +991,53 @@ export async function generateSmartSummary(options: CompactionOptions): Promise<
     readFiles,
     modifiedFiles,
   };
+}
+
+// ─── Effect variants (PAN-1249, additive) ────────────────────────────────────
+//
+// Additive Effect surface for smart-compaction. The underlying Promise
+// functions remain canonical; these wrappers map failures to typed errors
+// (ProcessSpawnError for spawn / generation failures, FsError for IO).
+
+/** Effect variant of runModelSummary. */
+export function runModelSummary(
+  prompt: string,
+  model?: string,
+  timeoutMs?: number,
+  harness: RuntimeName = 'claude-code',
+): Effect.Effect<string, ProcessSpawnError> {
+  return Effect.tryPromise({
+    try: () => runModelSummaryPromise(prompt, model, timeoutMs, harness),
+    catch: (cause) =>
+      new ProcessSpawnError({
+        command: harness === 'pi' ? 'pi' : 'claude',
+        args: ['-p', model ?? 'default'],
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+}
+
+/** Effect variant of generateSmartSummary. */
+export function generateSmartSummary(
+  options: CompactionOptions,
+): Effect.Effect<CompactionResult, FsError | ProcessSpawnError> {
+  return Effect.tryPromise({
+    try: () => generateSmartSummaryPromise(options),
+    catch: (cause) => {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      // Distinguish between fs failures (read jsonl) and spawn failures (LLM).
+      // The underlying impl throws plain Error in both cases; we map to
+      // FsError when the message hints at file IO, otherwise spawn.
+      if (msg.toLowerCase().includes('enoent') || msg.toLowerCase().includes('no such file')) {
+        return new FsError({ path: options.jsonlPath, operation: 'smart-summary-read', cause });
+      }
+      return new ProcessSpawnError({
+        command: 'claude',
+        args: ['-p', options.model ?? 'default'],
+        message: msg,
+        cause,
+      });
+    },
+  });
 }

@@ -5,7 +5,8 @@
  * hierarchy: CLI > Project > Global > Env > Default
  */
 
-import { loadConfig } from './config-yaml.js';
+import { Data, Effect } from 'effect';
+import { loadConfigSync } from './config-yaml.js';
 import { getShadowModeFromEnv } from './env-loader.js';
 import { isShadowed, getPendingSyncCount } from './shadow-state.js';
 import type { TrackerType } from './tracker/interface.js';
@@ -32,22 +33,7 @@ export interface ShadowModeResult {
   source: 'cli' | 'existing' | 'project' | 'global' | 'env' | 'default';
   /** Which tracker this applies to */
   trackerType?: TrackerType;
-}
-
-/**
- * Resolve shadow mode configuration
- *
- * Priority (highest to lowest):
- * 1. CLI flag --shadow / --no-shadow
- * 2. Existing shadow state for the issue
- * 3. Per-project .pan.yaml shadow.enabled
- * 4. Global ~/.panopticon/config.yaml shadow.enabled
- * 5. Global ~/.panopticon.env SHADOW_MODE
- * 6. Default: false
- *
- * Per-tracker configuration is checked after the global setting.
- */
-export async function resolveShadowMode(options: ShadowModeOptions = {}): Promise<ShadowModeResult> {
+}async function resolveShadowModePromise(options: ShadowModeOptions = {}): Promise<ShadowModeResult> {
   const { cliFlag, issueId, trackerType } = options;
 
   // 1. CLI flag takes highest priority
@@ -60,7 +46,7 @@ export async function resolveShadowMode(options: ShadowModeOptions = {}): Promis
   }
 
   // 2. Check if issue already has shadow state
-  if (issueId && (await isShadowed(issueId))) {
+  if (issueId && (await Effect.runPromise(isShadowed(issueId)))) {
     return {
       enabled: true,
       source: 'existing',
@@ -69,7 +55,7 @@ export async function resolveShadowMode(options: ShadowModeOptions = {}): Promis
   }
 
   // Load configuration (this merges project, global, and env settings)
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
   // 3. Check per-project configuration (already merged into config.shadow)
   // 4. Check global configuration (already merged into config.shadow)
@@ -97,55 +83,27 @@ export async function resolveShadowMode(options: ShadowModeOptions = {}): Promis
     source,
     trackerType,
   };
-}
-
-/**
- * Simple boolean check for shadow mode
- * Convenience function that just returns whether shadow mode is enabled
- */
-export async function isShadowModeEnabled(options: ShadowModeOptions = {}): Promise<boolean> {
-  return (await resolveShadowMode(options)).enabled;
-}
-
-/**
- * Check if shadow mode should skip tracker updates
- *
- * This is the main function to use in commands that would normally
- * update the issue tracker. It considers all configuration sources.
- *
- * @example
- * ```typescript
- * if (shouldSkipTrackerUpdate('MIN-123', { cliFlag: options.shadow })) {
- *   // Skip the tracker update
- * } else {
- *   // Update the tracker as normal
- * }
- * ```
- */
-export async function shouldSkipTrackerUpdate(
+}async function isShadowModeEnabledPromise(options: ShadowModeOptions = {}): Promise<boolean> {
+  return (await Effect.runPromise(resolveShadowMode(options))).enabled;
+}async function shouldSkipTrackerUpdatePromise(
   issueId: string,
   cliFlag?: boolean,
   trackerType: TrackerType = 'linear'
 ): Promise<boolean> {
-  return isShadowModeEnabled({
+  return (await Effect.runPromise(isShadowModeEnabled({
     cliFlag,
     issueId,
     trackerType,
-  });
-}
-
-/**
- * Get shadow mode status message for display
- */
-export async function getShadowModeStatus(options: ShadowModeOptions = {}): Promise<string> {
-  const result = await resolveShadowMode(options);
+  })));
+}async function getShadowModeStatusPromise(options: ShadowModeOptions = {}): Promise<string> {
+  const result = await Effect.runPromise(resolveShadowMode(options));
 
   if (!result.enabled) {
     return 'Shadow mode: disabled';
   }
 
   const sourceLabels: Record<string, string> = {
-    cli: 'CLI flag',
+    'cli': 'CLI flag',
     existing: 'existing shadow state',
     project: 'project config',
     global: 'global config',
@@ -161,7 +119,7 @@ export async function getShadowModeStatus(options: ShadowModeOptions = {}): Prom
  * Check if shadow mode is configured at the project level
  */
 export function hasProjectShadowConfig(): boolean {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
   // Check if there's any project-specific shadow configuration
   // This is a heuristic - if shadow is enabled but not from env, it's likely project config
@@ -171,23 +129,101 @@ export function hasProjectShadowConfig(): boolean {
 
   // Check if any per-tracker overrides are set
   return Object.values(config.shadow.trackers).some(v => v !== false);
-}
-
-/**
- * Get a summary of shadow mode configuration
- */
-export async function getShadowModeSummary(): Promise<{
+}async function getShadowModeSummaryPromise(): Promise<{
   globalEnabled: boolean;
   perTracker: Record<TrackerType, boolean>;
   envSet: boolean;
   pendingSyncCount: number;
 }> {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
   return {
     globalEnabled: config.shadow.enabled,
     perTracker: config.shadow.trackers,
     envSet: process.env.SHADOW_MODE !== undefined,
-    pendingSyncCount: await getPendingSyncCount(),
+    pendingSyncCount: await Effect.runPromise(getPendingSyncCount()),
   };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Tagged error for shadow-mode Effect variants. */
+export class ShadowModeError extends Data.TaggedError('ShadowModeError')<{
+  readonly operation: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `resolveShadowMode`. */
+export const resolveShadowMode = (
+  options: ShadowModeOptions = {},
+): Effect.Effect<ShadowModeResult, ShadowModeError> =>
+  Effect.tryPromise({
+    try: () => resolveShadowModePromise(options),
+    catch: (cause) =>
+      new ShadowModeError({
+        operation: 'resolveShadowMode',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `isShadowModeEnabled`. */
+export const isShadowModeEnabled = (
+  options: ShadowModeOptions = {},
+): Effect.Effect<boolean, ShadowModeError> =>
+  Effect.tryPromise({
+    try: () => isShadowModeEnabledPromise(options),
+    catch: (cause) =>
+      new ShadowModeError({
+        operation: 'isShadowModeEnabled',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `shouldSkipTrackerUpdate`. */
+export const shouldSkipTrackerUpdate = (
+  issueId: string,
+  cliFlag?: boolean,
+  trackerType: TrackerType = 'linear',
+): Effect.Effect<boolean, ShadowModeError> =>
+  Effect.tryPromise({
+    try: () => shouldSkipTrackerUpdatePromise(issueId, cliFlag, trackerType),
+    catch: (cause) =>
+      new ShadowModeError({
+        operation: 'shouldSkipTrackerUpdate',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getShadowModeStatus`. */
+export const getShadowModeStatus = (
+  options: ShadowModeOptions = {},
+): Effect.Effect<string, ShadowModeError> =>
+  Effect.tryPromise({
+    try: () => getShadowModeStatusPromise(options),
+    catch: (cause) =>
+      new ShadowModeError({
+        operation: 'getShadowModeStatus',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+
+/** Effect variant of `getShadowModeSummary`. */
+export const getShadowModeSummary = (): Effect.Effect<
+  Awaited<ReturnType<typeof getShadowModeSummaryPromise>>,
+  ShadowModeError
+> =>
+  Effect.tryPromise({
+    try: () => getShadowModeSummaryPromise(),
+    catch: (cause) =>
+      new ShadowModeError({
+        operation: 'getShadowModeSummary',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+

@@ -13,6 +13,12 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createSign } from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { Effect } from 'effect';
+import { GitHubApiError, ConfigError, FsError } from './errors.js';
+
+const execAsync = promisify(exec);
 
 const APP_DIR = join(homedir(), '.panopticon', 'github-app');
 
@@ -90,13 +96,7 @@ function generateJWT(appId: string, privateKey: string): string {
   const signature = signer.sign(privateKey, 'base64url');
 
   return `${header}.${payload}.${signature}`;
-}
-
-/**
- * Generate a short-lived installation access token (~1 hour TTL).
- * Used for git push and PR operations by agent workspaces.
- */
-export async function generateInstallationToken(
+}async function generateInstallationTokenPromise(
   config?: GitHubAppConfig
 ): Promise<InstallationToken> {
   const appConfig = config || loadGitHubAppConfig();
@@ -135,7 +135,7 @@ async function getInstallationAccessToken(): Promise<string> {
   if (!config) {
     throw new Error('GitHub App not configured. Run: node scripts/create-github-app.mjs');
   }
-  const { token } = await generateInstallationToken(config);
+  const { token } = await Effect.runPromise(generateInstallationToken(config));
   return token;
 }
 
@@ -223,9 +223,7 @@ async function getCommitCheckState(
     pending: pendingStatus || pendingChecks,
     failed: failedStatus || failedChecks,
   };
-}
-
-export async function getPullRequestState(
+}async function getPullRequestStatePromise(
   owner: string,
   repo: string,
   number: number,
@@ -261,9 +259,7 @@ export async function getPullRequestState(
     checksPending: checkState.pending,
     checksFailed: checkState.failed,
   };
-}
-
-export async function mergePullRequestWithApp(
+}async function mergePullRequestWithAppPromise(
   owner: string,
   repo: string,
   number: number,
@@ -370,7 +366,7 @@ export async function reportCommitStatus(
   const config = loadGitHubAppConfig();
   if (!config) return; // Silently skip in fallback mode
 
-  const { token } = await generateInstallationToken(config);
+  const { token } = await Effect.runPromise(generateInstallationToken(config));
 
   const response = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/statuses/${sha}`,
@@ -393,16 +389,53 @@ export async function reportCommitStatus(
 }
 
 /**
- * Refresh the installation token for a workspace (call when token expires).
- * Updates the credential file in-place.
+ * Post the `panopticon/tests` commit status for the HEAD of a workspace.
+ *
+ * Used by verification-runner (pre-review gate) and the test specialist
+ * (post-review gate) to signal that Panopticon has run the test suite
+ * against this exact commit. The `test` job in .github/workflows/ci.yml
+ * reads this status and skips its own vitest run when it's `success`,
+ * eliminating duplicate test execution for pipeline-managed PRs.
+ *
+ * Non-pipeline pushes (no workspace, no `panopticon/tests` status) cause
+ * CI to fall through and run vitest as normal — defense in depth.
+ *
+ * Failures are non-fatal: status posting is informational and must never
+ * block the verification or test specialist's primary outcome.
  */
-export async function refreshWorkspaceToken(
+export async function postPanopticonTestsStatus(
+  workspacePath: string,
+  owner: string,
+  repo: string,
+  status: 'success' | 'failure',
+  description: string,
+): Promise<void> {
+  if (!isGitHubAppConfigured()) return;
+  try {
+    const { stdout } = await execAsync('git rev-parse HEAD', {
+      cwd: workspacePath,
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
+    const sha = stdout.trim();
+    if (!sha) return;
+    // Context name MUST match branch protection's required_status_checks.contexts
+    // for main, which is the singular "panopticon/test". Don't change to plural
+    // without coordinating the branch protection rule update.
+    await reportCommitStatus(owner, repo, sha, status, 'panopticon/test', description);
+    console.log(
+      `[github-app] Posted panopticon/test=${status} for ${sha.slice(0, 8)} in ${owner}/${repo}`,
+    );
+  } catch (err: any) {
+    console.warn(`[github-app] Failed to post panopticon/test status: ${err.message}`);
+  }
+}async function refreshWorkspaceTokenPromise(
   workspacePath: string,
 ): Promise<void> {
   const config = loadGitHubAppConfig();
   if (!config) throw new Error('GitHub App not configured');
 
-  const { token } = await generateInstallationToken(config);
+  const { token } = await Effect.runPromise(generateInstallationToken(config));
   const { writeFileSync } = await import('fs');
   const credFile = join(workspacePath, '.git', 'pan-credentials');
   writeFileSync(credFile, `https://x-access-token:${token}@github.com\n`, { mode: 0o600 });
@@ -428,3 +461,79 @@ export function getAppStatus(): {
   }
   return { configured: false, mode: 'fallback' };
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+const apiCatch = (operation: string) => (cause: unknown) =>
+  new GitHubApiError({
+    operation,
+    status: 0,
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+  });
+
+/**
+ * Effect-native generateInstallationToken. Fails with ConfigError if the
+ * GitHub App is not configured locally; GitHubApiError on transport / 4xx.
+ */
+export const generateInstallationToken = (
+  config?: GitHubAppConfig,
+): Effect.Effect<InstallationToken, GitHubApiError | ConfigError> =>
+  Effect.gen(function* () {
+    const cfg = config ?? loadGitHubAppConfig();
+    if (!cfg) {
+      return yield* Effect.fail(
+        new ConfigError({ message: 'GitHub App not configured' }),
+      );
+    }
+    return yield* Effect.tryPromise({
+      try: () => generateInstallationTokenPromise(cfg),
+      catch: apiCatch('generateInstallationToken'),
+    });
+  });
+
+/** Effect-native getPullRequestState — typed-error fetch + check aggregator. */
+export const getPullRequestState = (
+  owner: string,
+  repo: string,
+  number: number,
+): Effect.Effect<GitHubPullRequestState, GitHubApiError> =>
+  Effect.tryPromise({
+    try: () => getPullRequestStatePromise(owner, repo, number),
+    catch: apiCatch('getPullRequestState'),
+  });
+
+/** Effect-native mergePullRequestWithApp — typed-error merge call. */
+export const mergePullRequestWithApp = (
+  owner: string,
+  repo: string,
+  number: number,
+  method: 'merge' | 'squash' | 'rebase' = 'squash',
+  sha?: string,
+): Effect.Effect<{ merged: boolean; message?: string }, GitHubApiError> =>
+  Effect.tryPromise({
+    try: () => mergePullRequestWithAppPromise(owner, repo, number, method, sha),
+    catch: apiCatch('mergePullRequestWithApp'),
+  });
+
+/** Effect-native refreshWorkspaceToken — fails with FsError or GitHubApiError. */
+export const refreshWorkspaceToken = (
+  workspacePath: string,
+): Effect.Effect<void, GitHubApiError | ConfigError | FsError> =>
+  Effect.gen(function* () {
+    const cfg = loadGitHubAppConfig();
+    if (!cfg) {
+      return yield* Effect.fail(
+        new ConfigError({ message: 'GitHub App not configured' }),
+      );
+    }
+    return yield* Effect.tryPromise({
+      try: () => refreshWorkspaceTokenPromise(workspacePath),
+      catch: (cause) =>
+        new FsError({
+          path: join(workspacePath, '.git', 'pan-credentials'),
+          operation: 'refreshWorkspaceToken',
+          cause,
+        }),
+    });
+  });

@@ -10,27 +10,23 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { loadConfig } from './config.js';
+import { Data, Effect } from 'effect';
+import { loadConfigSync } from './config.js';
 import { createFlyProviderFromConfig } from './remote/index.js';
-import { saveWorkspaceMetadata } from './remote/workspace-metadata.js';
+import { saveWorkspaceMetadataSync } from './remote/workspace-metadata.js';
 import type { RemoteWorkspaceMetadata } from './remote/interface.js';
-import { extractTeamPrefix, findProjectByTeam, resolveProjectFromIssue, getIssuePrefix } from './projects.js';
+import { extractTeamPrefix, findProjectByTeamSync, resolveProjectFromIssueSync, getIssuePrefix } from './projects.js';
 
 const execAsync = promisify(exec);
 
 export interface CreateRemoteWorkspaceOptions {
   dryRun?: boolean;
   spinner?: { text: string };
-}
-
-/**
- * Create a remote workspace on Fly.io
- */
-export async function createRemoteWorkspace(
+}async function createRemoteWorkspacePromise(
   issueId: string,
   options: CreateRemoteWorkspaceOptions = {}
 ): Promise<RemoteWorkspaceMetadata> {
-  const config = loadConfig();
+  const config = loadConfigSync();
   const remoteConfig = config.remote;
 
   if (!remoteConfig?.enabled) {
@@ -43,7 +39,7 @@ export async function createRemoteWorkspace(
 
   // Determine project context
   const teamPrefix = extractTeamPrefix(issueId);
-  const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+  const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
   const projectRoot = projectConfig?.path || process.cwd();
 
   // Determine project identifier for VM name
@@ -92,16 +88,16 @@ export async function createRemoteWorkspace(
   }
 
   // Step 1: Create VM
-  await fly.createVm(vmName);
+  await Effect.runPromise(fly.createVm(vmName));
 
   // Step 2: Add GitHub host key and clone repository on VM
   if (options.spinner) {
     options.spinner.text = 'Cloning repository on VM...';
   }
-  await fly.ssh(vmName, 'mkdir -p ~/.ssh && ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null');
-  const cloneResult = await fly.ssh(vmName, `git clone ${repoUrl} ~/workspace`);
+  await Effect.runPromise(fly.ssh(vmName, 'mkdir -p ~/.ssh && ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null'));
+  const cloneResult = await Effect.runPromise(fly.ssh(vmName, `git clone ${repoUrl} ~/workspace`));
   if (cloneResult.exitCode !== 0) {
-    await fly.deleteVm(vmName);
+    await Effect.runPromise(fly.deleteVm(vmName));
     throw new Error(`Failed to clone: ${cloneResult.stderr}`);
   }
 
@@ -109,9 +105,9 @@ export async function createRemoteWorkspace(
   if (options.spinner) {
     options.spinner.text = 'Creating feature branch...';
   }
-  const branchResult = await fly.ssh(vmName, `cd ~/workspace && git checkout -b ${branchName}`);
+  const branchResult = await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace && git checkout -b ${branchName}`));
   if (branchResult.exitCode !== 0) {
-    await fly.ssh(vmName, `cd ~/workspace && git checkout ${branchName} || git checkout -b ${branchName}`);
+    await Effect.runPromise(fly.ssh(vmName, `cd ~/workspace && git checkout ${branchName} || git checkout -b ${branchName}`));
   }
 
   // Step 4: Configure environment for shared infra
@@ -124,9 +120,9 @@ ISSUE_ID=${issueId.toUpperCase()}
 DATABASE_NAME=${dbName}
 `;
 
-  await fly.ssh(vmName, `cat > ~/workspace/.env.remote << 'EOF'
+  await Effect.runPromise(fly.ssh(vmName, `cat > ~/workspace/.env.remote << 'EOF'
 ${envContent}
-EOF`);
+EOF`));
 
   // Step 6: Install beads CLI globally on remote VM
   if (options.spinner) {
@@ -148,7 +144,7 @@ EOF`);
   let frontendUrl = '';
   let apiUrl = '';
 
-  const composeCheck = await fly.ssh(vmName, 'ls ~/workspace/docker-compose.yml ~/workspace/.devcontainer/docker-compose.yml 2>/dev/null | head -1');
+  const composeCheck = await Effect.runPromise(fly.ssh(vmName, 'ls ~/workspace/docker-compose.yml ~/workspace/.devcontainer/docker-compose.yml 2>/dev/null | head -1'));
 
   if (composeCheck.stdout.trim()) {
     if (options.spinner) {
@@ -158,7 +154,7 @@ EOF`);
       ? '~/workspace/.devcontainer'
       : '~/workspace';
 
-    const upResult = await fly.ssh(vmName, `cd ${composeDir} && docker compose up -d 2>&1`);
+    const upResult = await Effect.runPromise(fly.ssh(vmName, `cd ${composeDir} && docker compose up -d 2>&1`));
     containersStarted = upResult.exitCode === 0;
 
     if (containersStarted) {
@@ -166,8 +162,8 @@ EOF`);
         options.spinner.text = 'Exposing ports...';
       }
       try {
-        frontendUrl = await fly.exposePort(vmName, 4173);
-        apiUrl = await fly.exposePort(vmName, 7000);
+        frontendUrl = await Effect.runPromise(fly.exposePort(vmName, 4173));
+        apiUrl = await Effect.runPromise(fly.exposePort(vmName, 7000));
       } catch {
         // Port exposure failed - not critical
       }
@@ -188,7 +184,34 @@ EOF`);
     location: 'remote',
   };
 
-  saveWorkspaceMetadata(metadata);
+  saveWorkspaceMetadataSync(metadata);
 
   return metadata;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Tagged error for remote-workspace Effect variants. */
+export class RemoteWorkspaceError extends Data.TaggedError('RemoteWorkspaceError')<{
+  readonly issueId: string;
+  readonly stage: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Effect variant of `createRemoteWorkspace`. */
+export const createRemoteWorkspace = (
+  issueId: string,
+  options: CreateRemoteWorkspaceOptions = {},
+): Effect.Effect<RemoteWorkspaceMetadata, RemoteWorkspaceError> =>
+  Effect.tryPromise({
+    try: () => createRemoteWorkspacePromise(issueId, options),
+    catch: (cause) =>
+      new RemoteWorkspaceError({
+        issueId,
+        stage: 'createRemoteWorkspace',
+        message: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });
+

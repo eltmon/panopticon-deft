@@ -5,6 +5,7 @@
  * can be unit-tested independently of the Express server.
  */
 
+import { Effect } from 'effect';
 import type { ReviewStatus } from './review-status.js';
 import type { HookItem } from './hooks.js';
 
@@ -23,7 +24,7 @@ export interface QueuePositionResult {
  * Returns {0, specialist} when the status indicates active processing,
  * or {null, null} when no active phase is detected (caller must check queues).
  */
-export function computeQueuePositionFromStatus(
+export function computeQueuePositionFromStatusSync(
   status: Pick<ReviewStatus, 'reviewStatus' | 'testStatus' | 'mergeStatus'> | null
 ): QueuePositionResult {
   if (status?.reviewStatus === 'reviewing') {
@@ -42,10 +43,25 @@ export function computeQueuePositionFromStatus(
  * Find this issueId's 1-based position in a specialist's pending queue.
  * Returns -1 if not found (caller interprets as "not queued").
  */
-export function findPositionInQueue(issueId: string, items: HookItem[]): number {
+export function findPositionInQueueSync(issueId: string, items: HookItem[]): number {
   const upper = issueId.toUpperCase();
   const idx = items.findIndex(
     (item) => item.payload?.issueId?.toUpperCase() === upper
   );
   return idx >= 0 ? idx + 1 : -1;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Effect variant of {@link computeQueuePositionFromStatusSync}. Pure; cannot fail. */
+export const computeQueuePositionFromStatus = (
+  status: Pick<ReviewStatus, 'reviewStatus' | 'testStatus' | 'mergeStatus'> | null,
+): Effect.Effect<QueuePositionResult, never> =>
+  Effect.sync(() => computeQueuePositionFromStatusSync(status));
+
+/** Effect variant of {@link findPositionInQueueSync}. Pure; cannot fail. */
+export const findPositionInQueue = (
+  issueId: string,
+  items: HookItem[],
+): Effect.Effect<number, never> =>
+  Effect.sync(() => findPositionInQueueSync(issueId, items));

@@ -27,10 +27,13 @@ vi.mock('../../../../../src/lib/database/index.js', () => ({
 
 vi.mock('../../../../../src/lib/pipeline-notifier.js', () => ({
   notifyPipeline: vi.fn(),
+  notifyPipelineSync: vi.fn(),
 }));
 vi.mock('../../../../../src/lib/activity-logger.js', () => ({
   emitActivityEntry: vi.fn(),
+  emitActivityEntrySync: vi.fn(),
   emitActivityTts: vi.fn(),
+  emitActivityTtsSync: vi.fn(),
 }));
 
 // Stub modules imported at workspaces.ts module scope.
@@ -48,11 +51,15 @@ const { saveAgentRuntimeStateMock, getAgentRuntimeStateMock } = vi.hoisted(() =>
 
 vi.mock('../../../../../src/lib/agents.js', () => ({
   listRunningAgents: vi.fn().mockReturnValue([]),
+  listRunningAgentsSync: vi.fn().mockReturnValue([]),
   getAgentState: vi.fn(),
+  getAgentStateSync: vi.fn(),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
   messageAgent: vi.fn(),
   saveAgentRuntimeState: saveAgentRuntimeStateMock,
   getAgentRuntimeState: getAgentRuntimeStateMock,
+  getAgentRuntimeStateSync: getAgentRuntimeStateMock,
   getAgentRuntimeStateAsync: vi.fn(),
   transitionIssueToInReview: vi.fn(),
   spawnAgent: vi.fn(),
@@ -81,7 +88,7 @@ afterEach(() => {
 // ─── Import under test (after mocks) ──────────────────────────────────────────
 
 import { processResetReviewPipeline } from '../../../../../src/dashboard/server/routes/workspaces.js';
-import { setReviewStatus, getReviewStatus } from '../../../../../src/lib/review-status.js';
+import { setReviewStatusSync, getReviewStatusSync } from '../../../../../src/lib/review-status.js';
 
 // ─── Route-contract tests ─────────────────────────────────────────────────────
 
@@ -100,7 +107,7 @@ describe('processResetReviewPipeline — POST /api/review/:issueId/reset route c
   });
 
   it('200: resets review/test/merge/verification status to pending', () => {
-    setReviewStatus('PAN-1', {
+    setReviewStatusSync('PAN-1', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       mergeStatus: 'failed',
@@ -115,7 +122,7 @@ describe('processResetReviewPipeline — POST /api/review/:issueId/reset route c
     expect(result.httpStatus).toBe(200);
     expect(result.body.success).toBe(true);
 
-    const after = getReviewStatus('PAN-1');
+    const after = getReviewStatusSync('PAN-1');
     expect(after?.reviewStatus).toBe('pending');
     expect(after?.testStatus).toBe('pending');
     expect(after?.mergeStatus).toBe('pending');
@@ -123,6 +130,37 @@ describe('processResetReviewPipeline — POST /api/review/:issueId/reset route c
     expect(after?.autoRequeueCount).toBe(0);
     expect(after?.verificationStatus).toBe('pending');
     expect(after?.verificationCycleCount).toBe(0);
+  });
+
+  it('200: clears the stuck marker and circuit-breaker retry counters', () => {
+    // A human-initiated reset is an explicit circuit-breaker override. If the
+    // stuck marker / retry budgets survive, the deacon immediately re-skips the
+    // workspace and the "override" is a no-op (root cause of the PAN-977 jam).
+    setReviewStatusSync('PAN-2', {
+      reviewStatus: 'passed',
+      testStatus: 'pending',
+      stuck: true,
+      stuckReason: 'review_infrastructure_failure',
+      stuckAt: new Date().toISOString(),
+      stuckDetails: '{"reviewRetryCount":3}',
+      reviewRetryCount: 3,
+      testRetryCount: 3,
+      mergeRetryCount: 2,
+      recoveryStartedAt: new Date().toISOString(),
+    });
+
+    const result = processResetReviewPipeline('PAN-2', true);
+    expect(result.httpStatus).toBe(200);
+
+    const after = getReviewStatusSync('PAN-2');
+    expect(after?.stuck).toBeFalsy();
+    expect(after?.stuckReason).toBeUndefined();
+    expect(after?.stuckAt).toBeUndefined();
+    expect(after?.stuckDetails).toBeUndefined();
+    expect(after?.reviewRetryCount).toBe(0);
+    expect(after?.testRetryCount).toBe(0);
+    expect(after?.mergeRetryCount).toBe(0);
+    expect(after?.recoveryStartedAt).toBeUndefined();
   });
 
   // ─── THE REGRESSION TEST — locks down PAN-805 fix ──────────────────────────

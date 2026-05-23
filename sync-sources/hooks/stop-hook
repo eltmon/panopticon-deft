@@ -1,0 +1,137 @@
+#!/bin/bash
+# ~/.panopticon/bin/stop-hook  (PAN-800)
+#
+# Fires on Claude Code Stop. Emits agent.activity_changed(idle) — the reducer
+# clears currentTool / thinking / waiting on that transition, so no separate
+# waiting_cleared is needed. Still chains to specialist-stop-hook and
+# work-agent-stop-hook, and still fires the planning auto-completion call.
+
+set +e
+
+# Log first-thing so we have empirical evidence the hook fired, regardless of
+# whether anything downstream succeeded. Silent failures in pan_resolve_agent_id
+# used to leave zero trace, making "did the Stop hook even fire?" impossible to
+# answer post-hoc.
+LOG_DIR="$HOME/.panopticon/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+echo "[$(date -Iseconds)] stop-hook: invoked CLAUDE_SESSION_ID=${CLAUDE_SESSION_ID:-unset} PANOPTICON_AGENT_ID=${PANOPTICON_AGENT_ID:-unset} cwd=$(pwd)" \
+  >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=pan-hook-lib.sh
+. "$SCRIPT_DIR/pan-hook-lib.sh" 2>/dev/null || {
+  echo "[$(date -Iseconds)] stop-hook: pan-hook-lib.sh source failed — exiting" \
+    >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+  exit 0
+}
+
+if ! pan_resolve_agent_id; then
+  echo "[$(date -Iseconds)] stop-hook: pan_resolve_agent_id failed (CLAUDE_SESSION_ID=${CLAUDE_SESSION_ID:-unset} cwd=$(pwd)) — exiting" \
+    >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+  exit 0
+fi
+
+echo "[$(date -Iseconds)] stop-hook: resolved AGENT_ID=$AGENT_ID — proceeding" \
+  >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+
+TS=$(date -Iseconds)
+BODY="{\"kind\":\"activity\",\"activity\":\"idle\",\"timestamp\":\"$TS\"}"
+pan_emit_event "$AGENT_ID" "$BODY"
+
+# ── API error detection (all agent types) ────────────────────────────────
+# If the agent stopped because of a transient API error, nudge it to retry.
+# This runs before chaining to specialist/work-agent hooks because it
+# applies universally. 5-minute cooldown per agent.
+LOG_DIR="$HOME/.panopticon/logs"
+mkdir -p "$LOG_DIR"
+API_ERROR_NUDGE_FILE="$HOME/.panopticon/agents/$AGENT_ID/.last-api-error-nudge"
+
+OUTPUT=$(tmux capture-pane -t "$AGENT_ID" -p -S -100 2>/dev/null || echo "")
+if [ -n "$OUTPUT" ]; then
+  API_ERROR_DETECTED=false
+  for pattern in \
+    "API Error: The server had an error while processing your request" \
+    "API Error: Overloaded" \
+    "API Error: Rate limit" \
+    "API Error: Request was aborted" \
+    "API Error: Timed out" \
+    "529 Overloaded" \
+    "502 Bad Gateway" \
+    "503 Service Unavailable"; do
+    if echo "$OUTPUT" | grep -qF "$pattern"; then
+      API_ERROR_DETECTED=true
+      break
+    fi
+  done
+
+  if [ "$API_ERROR_DETECTED" = "true" ]; then
+    SHOULD_NUDGE=true
+    if [ -f "$API_ERROR_NUDGE_FILE" ]; then
+      LAST_API_NUDGE=$(cat "$API_ERROR_NUDGE_FILE" 2>/dev/null || echo "0")
+      NOW=$(date +%s)
+      if [ $(( NOW - LAST_API_NUDGE )) -lt 300 ]; then
+        SHOULD_NUDGE=false
+      fi
+    fi
+
+    if [ "$SHOULD_NUDGE" = "true" ]; then
+      mkdir -p "$(dirname "$API_ERROR_NUDGE_FILE")"
+      date +%s > "$API_ERROR_NUDGE_FILE" 2>/dev/null || true
+
+      echo "[$(date -Iseconds)] stop-hook: $AGENT_ID api_error detected — nudging retry" \
+        >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+
+      tmpfile=$(mktemp)
+      echo "You stopped due to a transient API error. This is a temporary server issue, not a problem with your work. Continue from where you left off. Do NOT start over — pick up exactly where you stopped." > "$tmpfile"
+      tmux load-buffer "$tmpfile" 2>/dev/null
+      tmux paste-buffer -t "$AGENT_ID" 2>/dev/null
+      sleep 0.3
+      tmux send-keys -t "$AGENT_ID" C-m 2>/dev/null
+      rm -f "$tmpfile"
+    fi
+  fi
+fi
+
+# Chain to specialist-specific hook (auto-completion detection).
+SPECIALIST_HOOK="$HOME/.panopticon/bin/specialist-stop-hook"
+if [ -x "$SPECIALIST_HOOK" ]; then
+  "$SPECIALIST_HOOK" &
+fi
+
+# Chain to work-agent completion detection (nudges agents that forgot `pan work done`).
+WORK_AGENT_HOOK="$HOME/.panopticon/bin/work-agent-stop-hook"
+if [ -x "$WORK_AGENT_HOOK" ]; then
+  "$WORK_AGENT_HOOK" &
+fi
+
+# Auto-mark planning complete when a planning agent finishes.
+if [[ "$AGENT_ID" == planning-* ]]; then
+  ISSUE_ID=$(echo "$AGENT_ID" | sed 's/^planning-//' | tr '[:lower:]' '[:upper:]')
+  if [ -n "$ISSUE_ID" ]; then
+    curl -s -m 1.0 -X POST "$PAN_DASHBOARD_URL/api/issues/$ISSUE_ID/complete-planning" \
+      -H "Content-Type: application/json" \
+      -d '{"skipKill":true}' > /dev/null 2>&1 &
+  fi
+fi
+
+# PAN-1059 session-reaper: when the review synthesis session ends, kill any
+# convoy sub-reviewer sessions (agent-<id>-review-{security,correctness,...}).
+# Pattern: agent-<issueId>-review   (no trailing sub-role suffix → synthesis)
+if [[ "$AGENT_ID" =~ ^agent-(.+)-review$ ]]; then
+  REVIEW_ISSUE="${BASH_REMATCH[1]}"
+  KILLED_ANY=false
+  for SUBROLE in security correctness performance requirements; do
+    CONVOY_SESSION="agent-${REVIEW_ISSUE}-review-${SUBROLE}"
+    if tmux -L panopticon kill-session -t "$CONVOY_SESSION" 2>/dev/null; then
+      KILLED_ANY=true
+      echo "[$(date -Iseconds)] stop-hook: $AGENT_ID killed convoy $CONVOY_SESSION" \
+        >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+    fi
+  done
+  if [ "$KILLED_ANY" = "true" ]; then
+    echo "[$(date -Iseconds)] stop-hook: $AGENT_ID synthesis ended — convoy reaped for $REVIEW_ISSUE" \
+      >> "$LOG_DIR/hooks.log" 2>/dev/null || true
+  fi
+fi
+
+exit 0

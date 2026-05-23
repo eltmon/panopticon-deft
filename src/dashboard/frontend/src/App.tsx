@@ -2,13 +2,12 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { Toaster, toast } from 'sonner';
 import { KanbanBoard } from './components/KanbanBoard';
-import { AgentList } from './components/AgentList';
-import { AgentOutputPanel } from './components/AgentOutputPanel';
+import { FleetAgentsView } from './components/Agents/FleetAgentsView';
 import { HealthDashboard } from './components/HealthDashboard';
 import { SkillsList } from './components/SkillsList';
 import { ActivityPanel } from './components/ActivityPanel';
-import { AwaitingMergePage } from './components/AwaitingMergePage';
 import { ConfirmationDialog, ConfirmationRequest } from './components/ConfirmationDialog';
+import { ChannelPermissionDialog } from './components/ChannelPermissionDialog';
 import { EventRouter } from './components/EventRouter';
 import { MetricsSummaryRow } from './components/MetricsSummaryRow';
 import { MetricsPage } from './components/MetricsPage';
@@ -16,23 +15,37 @@ import { CostsPage } from './components/CostsPage';
 import { SettingsPage } from './components/Settings/SettingsPage';
 import { SearchModal } from './components/search/SearchModal';
 import { CommandPalette } from './components/CommandPalette';
-import { MissionControl } from './components/MissionControl';
+import { CommandDeck } from './components/CommandDeck';
+import { PipelineView } from './components/Pipeline/PipelineView';
+import { AwaitingMergePage } from './components/AwaitingMergePage';
+import { IssueDrawer } from './components/drawer/IssueDrawer';
 import { ResourcesPanel } from './components/ResourcesPanel';
 import { GodViewPage } from './components/GodView';
+import { ConversationsPage } from './components/conversations/ConversationsPage';
+import { SessionFeedSidebar } from './components/sessionFeed/SessionFeedSidebar';
+import { AutoPresoView } from './components/autopreso/AutoPresoView';
+import { FlywheelPage } from './pages/FlywheelPage';
 import { Tab } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { BootstrapGate } from './components/BootstrapGate';
 import { KanbanSkeleton } from './components/skeletons/KanbanSkeleton';
-import { AgentListSkeleton } from './components/skeletons/AgentListSkeleton';
+import { AgentsSkeleton } from './components/skeletons/AgentsSkeleton';
+import { PipelineSkeleton } from './components/skeletons/PipelineSkeleton';
 import { GodViewSkeleton } from './components/skeletons/GodViewSkeleton';
-import { DetailPanelLayout } from './components/DetailPanelLayout';
-import { UpgradeAnnouncement } from './components/upgrade-announcement/UpgradeAnnouncement';
+
 import { StandaloneTerminal } from './components/StandaloneTerminal';
 import { DeaconPauseBanner } from './components/DeaconPauseToggle';
+import { NoResumeBanner } from './components/NoResumeBanner';
 import { StoppedAgentsBanner } from './components/StoppedAgentsBanner';
-import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { CodexAuthBanner } from './components/CodexAuthBanner';
+import { useCodexAutoRetry } from './hooks/useCodexAutoRetry';
+import { SystemHealthPill } from './components/SystemHealthPill';
+import { CostWarningStyles } from './components/shared/costWarning';
+import { AlertTriangle, CheckCircle2, History, RefreshCw } from 'lucide-react';
 import { Agent, Issue } from './types';
-import { useDashboardStore, selectAgentList, selectIssues, selectDashboardLifecycle } from './lib/store';
+import { useDashboardStore, selectAgents, selectChannelPermissionRequests, selectIssues, selectDashboardLifecycle } from './lib/store';
+import { refreshDashboardState } from './lib/refresh-dashboard-state';
+import type { ClaudeChannelPermissionBehavior } from '@panctl/contracts';
 import type { ViewMode as ConversationViewMode } from './components/chat/ConversationPanel';
 
 interface TrackerStatusItem {
@@ -50,11 +63,13 @@ interface TrackerStatus {
 }
 
 const TAB_PATHS: Record<Tab, string> = {
-  kanban: '/',
+  pipeline: '/',
+  kanban: '/board',
   'command-deck': '/command-deck',
   agents: '/agents',
+  flywheel: '/flywheel',
   resources: '/resources',
-  'awaiting-merge': '/awaiting-merge',
+  autopreso: '/autopreso',
   activity: '/activity',
   metrics: '/metrics',
   costs: '/costs',
@@ -62,16 +77,23 @@ const TAB_PATHS: Record<Tab, string> = {
   health: '/health',
   settings: '/settings',
   'god-view': '/god-view',
+  sessions: '/sessions',
+  'awaiting-merge': '/awaiting-merge',
 };
 
-const PATH_TO_TAB: Record<string, Tab> = Object.fromEntries(
-  Object.entries(TAB_PATHS).map(([tab, path]) => [path, tab as Tab])
-) as Record<string, Tab>;
+const PATH_TO_TAB: Record<string, Tab> = {
+  ...Object.fromEntries(
+    Object.entries(TAB_PATHS).map(([tab, path]) => [path, tab as Tab])
+  ) as Record<string, Tab>,
+  '/pipeline': 'pipeline',
+};
+
+export const SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY = 'panopticon.ui.sessionFeedSidebarOpen';
 
 function getTabFromPath(): Tab {
   const path = window.location.pathname;
   if (path.startsWith('/conv/')) return 'command-deck';
-  return PATH_TO_TAB[path] || 'kanban';
+  return PATH_TO_TAB[path] || 'pipeline';
 }
 
 export function getConversationViewModeFromSearch(search = window.location.search): ConversationViewMode {
@@ -105,10 +127,31 @@ export function serializeConversationViewModes(viewModes: ConversationViewModeMa
     .join(',');
 }
 
-/** Extract conversation ID from /conv/:id path, or null if not matching. */
+export function normalizeLegacyAwaitingMergeRoute(_path = window.location.pathname, _search = window.location.search): string | null {
+  // Awaiting Merge is its own dedicated page again — no redirect to /pipeline.
+  // Kept as a stub so existing imports/tests still resolve.
+  return null;
+}
+
+function normalizeCurrentRoute() {
+  // No legacy route normalization needed currently — Awaiting Merge is a
+  // first-class page at /awaiting-merge again.
+}
+
+function readSessionFeedSidebarOpen(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY) === 'true';
+}
+
+/** Extract conversation route key from /conv/:key path, or null if not matching. */
 export function getConvIdFromPath(path = window.location.pathname): string | null {
-  const match = path.match(/^\/conv\/(\d+)$/);
-  return match ? match[1] : null;
+  const match = path.match(/^\/conv\/([^/]+)$/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1] ?? '');
+  } catch {
+    return match[1] ?? null;
+  }
 }
 
 export function getConversationRouteState() {
@@ -158,10 +201,16 @@ export function buildConversationUrl(
   return query ? `/conv/${id}?${query}` : `/conv/${id}`;
 }
 
+// Cached supervisor URL — populated by successful /api/version polls.
+// Used as a final fallback for Force Restart when the dashboard is dead.
+let cachedSupervisorUrl: string | null = null;
+
 async function fetchBackendHealth(): Promise<{ version: string }> {
   const res = await fetch('/api/version');
   if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-  return res.json();
+  const data = await res.json();
+  if (data.supervisorUrl) cachedSupervisorUrl = data.supervisorUrl;
+  return data;
 }
 
 async function fetchTrackerStatus(): Promise<TrackerStatus> {
@@ -185,6 +234,27 @@ async function respondToConfirmation(id: string, confirmed: boolean): Promise<vo
   if (!res.ok) throw new Error('Failed to respond to confirmation');
 }
 
+async function respondToChannelPermission(
+  agentId: string,
+  requestId: string,
+  behavior: ClaudeChannelPermissionBehavior,
+): Promise<void> {
+  const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/permissions/${encodeURIComponent(requestId)}/respond`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ behavior }),
+  });
+  if (res.ok) return;
+  let message = `Failed to respond to permission request (${res.status})`;
+  try {
+    const body = await res.json() as { error?: string };
+    if (body?.error) message = body.error;
+  } catch {
+    // Ignore invalid JSON bodies and fall back to the generic message.
+  }
+  throw new Error(message);
+}
+
 interface CliproxyStatus {
   running: boolean;
   pid: number | null;
@@ -202,23 +272,32 @@ async function restartCliproxy(): Promise<void> {
   if (!res.ok) throw new Error('Failed to restart CLIProxy');
 }
 
+function StandaloneTerminalRoute({ sessionName, token }: { sessionName: string; token?: string }) {
+  useCodexAutoRetry();
+  return (
+    <div className="h-screen overflow-hidden bg-[#0d1117]">
+      <EventRouter />
+      <StandaloneTerminal sessionName={sessionName} token={token} />
+    </div>
+  );
+}
+
 export default function App() {
+  useEffect(() => {
+    normalizeCurrentRoute();
+  }, []);
   const terminalPath = window.location.pathname;
   const terminalSession = new URLSearchParams(window.location.search).get('terminal');
   if (terminalPath.startsWith('/terminal/') || terminalSession) {
     const sessionName = terminalPath.startsWith('/terminal/')
       ? terminalPath.replace('/terminal/', '')
       : terminalSession!;
-    return (
-      <div className="h-screen overflow-hidden bg-[#0d1117]">
-        <EventRouter />
-        <StandaloneTerminal sessionName={sessionName} />
-      </div>
-    );
+    const token = new URLSearchParams(window.location.search).get('token') ?? undefined;
+    return <StandaloneTerminalRoute sessionName={sessionName} token={token} />;
   }
 
   const [activeTab, setActiveTabState] = useState<Tab>(() => getConversationRouteState().tab);
-  const [selectedAgent, setSelectedAgentState] = useState<string | null>(() => {
+  const [, setSelectedAgentState] = useState<string | null>(() => {
     const hash = window.location.hash;
     if (hash.startsWith('#agent=')) return decodeURIComponent(hash.slice(7));
     return null;
@@ -231,6 +310,7 @@ export default function App() {
       window.history.replaceState(null, '', window.location.pathname);
     }
   }, []);
+  useCodexAutoRetry();
   // Sync deep-link on hash change (browser back/forward or direct navigation)
   useEffect(() => {
     const onHashChange = () => {
@@ -276,12 +356,16 @@ export default function App() {
 
   const queryClient = useQueryClient();
 
-  const [selectedIssue, setSelectedIssue] = useState<string | null>(null);
-  const [planDialogIssueId, setPlanDialogIssueId] = useState<string | null>(null);
+  const [_planDialogIssueId, setPlanDialogIssueId] = useState<string | null>(null);
   const [currentConfirmation, setCurrentConfirmation] = useState<ConfirmationRequest | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  const [isSessionFeedSidebarOpen, setIsSessionFeedSidebarOpen] = useState(readSessionFeedSidebarOpen);
   const [trackerBannerDismissed, setTrackerBannerDismissed] = useState(false);
+
+  const drawerOpen = useDashboardStore((state) => state.drawer.issueId !== null);
+  const openIssue = useDashboardStore((state) => state.openIssue);
+  const syncDrawerFromUrl = useDashboardStore((state) => state.syncDrawerFromUrl);
 
   // Dashboard lifecycle state from event store (restart events)
   const dashboardLifecycle = useDashboardStore(selectDashboardLifecycle);
@@ -296,8 +380,35 @@ export default function App() {
     retryDelay: 1000,
     staleTime: 0,
   });
-  // Only show banner after 2 consecutive failures to avoid flicker on transient errors
-  const showBackendBanner = backendDown && backendFailureCount >= 2;
+  // Banner state machine for the backend health indicator.
+  //   'down'        — red banner, retrying, force-restart available
+  //   'recovering'  — yellow banner, "back up", auto-hides after a short pause
+  //   null          — hidden (steady state)
+  // The "down" entry threshold is still 2 failed polls so a single hiccup
+  // doesn't latch the banner. Recovery is one success — but rather than
+  // snapping closed we transition to a yellow confirmation that fades on a
+  // timer, so the user gets explicit feedback that things are back instead
+  // of having the banner just disappear.
+  const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [bannerState, setBannerState] = useState<'down' | 'recovering' | null>(null);
+  useEffect(() => {
+    if (backendDown) {
+      if (recoveryTimerRef.current) {
+        clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+      }
+      if (backendFailureCount >= 2) setBannerState('down');
+    } else if (bannerState === 'down') {
+      setBannerState('recovering');
+      recoveryTimerRef.current = setTimeout(() => {
+        setBannerState(null);
+        recoveryTimerRef.current = null;
+      }, 2500);
+    }
+  }, [backendDown, backendFailureCount, bannerState]);
+  useEffect(() => () => {
+    if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current);
+  }, []);
   // Restart banner: shown when dashboard is in a planned restart (lifecycle active)
   const showRestartBanner = dashboardLifecycle.active;
 
@@ -335,6 +446,49 @@ export default function App() {
     },
   });
 
+  // Force Restart for the dashboard backend. Three-layer fallback chain:
+  // 1. Electron bridge — most direct, available only in desktop app
+  // 2. Dashboard's own endpoint — works when dashboard is wedged but responding
+  // 3. Supervisor sidecar — works even when dashboard is fully dead; URL was
+  //    cached from the last healthy /api/version poll.
+  const restartBackendMutation = useMutation({
+    mutationFn: async () => {
+      const bridge = window.panopticonBridge;
+      if (bridge?.restartDashboard) {
+        await bridge.restartDashboard();
+        return;
+      }
+
+      // Layer 2 — try dashboard endpoint (short timeout since it may hang if wedged)
+      try {
+        const res = await fetch('/api/system/restart-dashboard', {
+          method: 'POST',
+          signal: AbortSignal.timeout(3000),
+        });
+        if (res.ok) return;
+      } catch {
+        // Fall through to supervisor
+      }
+
+      // Layer 3 — supervisor sidecar, independent of dashboard process
+      const supervisorUrl = cachedSupervisorUrl;
+      if (!supervisorUrl) {
+        throw new Error('Dashboard is unreachable and supervisor URL is unknown — try restarting from the CLI.');
+      }
+      const res = await fetch(`${supervisorUrl}/restart-dashboard`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) throw new Error(`Supervisor returned ${res.status}`);
+    },
+    onSuccess: () => {
+      toast.success('Restart requested — reconnecting…');
+    },
+    onError: (err: Error) => {
+      toast.error('Restart failed: ' + err.message);
+    },
+  });
+
   // URL-synced tab navigation
   const setActiveTab = useCallback((tab: Tab) => {
     setActiveTabState(tab);
@@ -344,25 +498,57 @@ export default function App() {
     }
   }, []);
 
+  const setSessionFeedSidebarOpen = useCallback((open: boolean) => {
+    setIsSessionFeedSidebarOpen(open);
+    window.localStorage.setItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY, String(open));
+  }, []);
+
   // Handle browser back/forward
   useEffect(() => {
     const onPopState = () => {
+      normalizeCurrentRoute();
       const routeState = getConversationRouteState();
       setActiveTabState(routeState.tab);
       setSelectedConvIdState(routeState.convId);
       setConversationViewModeState(routeState.viewMode);
       setConversationViewModes(routeState.viewModes);
+      syncDrawerFromUrl();
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, []);
+  }, [syncDrawerFromUrl]);
 
   // Agents from Zustand store (event-sourced — no polling)
   // Cast to Agent[] since AgentSnapshot is a compatible subset for the fields used here
-  const agents = useDashboardStore(selectAgentList) as unknown as Agent[];
+  const agents = useDashboardStore(selectAgents) as unknown as Agent[];
+  const channelPermissionRequests = useDashboardStore(selectChannelPermissionRequests);
+  const [optimisticallyResolvedChannelPermissionRequestIds, setOptimisticallyResolvedChannelPermissionRequestIds] =
+    useState<Set<string>>(new Set());
 
   // Issues from Zustand store (event-sourced via snapshot — no polling)
   const issues = useDashboardStore(selectIssues) as unknown as Issue[];
+  const visibleChannelPermissionRequests = channelPermissionRequests.filter(
+    (request) => !optimisticallyResolvedChannelPermissionRequestIds.has(request.requestId)
+  );
+  const currentChannelPermissionRequest = visibleChannelPermissionRequests[0] ?? null;
+  const currentChannelPermissionIssueId = currentChannelPermissionRequest?.issueId
+    ?? agents.find((agent) => agent.id === currentChannelPermissionRequest?.agentId)?.issueId;
+
+  useEffect(() => {
+    setOptimisticallyResolvedChannelPermissionRequestIds((prev) => {
+      const next = new Set<string>();
+      const visibleRequestIds = new Set(channelPermissionRequests.map((request) => request.requestId));
+      for (const requestId of prev) {
+        if (visibleRequestIds.has(requestId)) {
+          next.add(requestId);
+        }
+      }
+      if (next.size === prev.size && Array.from(next).every((requestId) => prev.has(requestId))) {
+        return prev;
+      }
+      return next;
+    });
+  }, [channelPermissionRequests]);
 
   // Poll for pending confirmations
   const { data: confirmations = [] } = useQuery({
@@ -384,7 +570,7 @@ export default function App() {
   // Toast notification when a planning agent needs user input
   useEffect(() => {
     const planningAgentsNeedingInput = agents.filter(
-      (a) => a.agentPhase === 'planning' && a.hasPendingQuestion && a.status !== 'stopped'
+      (a) => a.role === 'plan' && a.hasPendingQuestion && a.status !== 'stopped'
     );
 
     for (const agent of planningAgentsNeedingInput) {
@@ -407,18 +593,43 @@ export default function App() {
     }
   }, [agents]);
 
-  // Find the work agent for selected issue (agent-<id>, not planning-<id>)
-  const selectedIssueAgent = selectedIssue
-    ? agents.find((a) => a.issueId?.toLowerCase() === selectedIssue.toLowerCase() && a.id.startsWith('agent-'))
-      ?? agents.find((a) => a.issueId?.toLowerCase() === selectedIssue.toLowerCase())
-      ?? null
-    : null;
-
-  // Find issue URL for selected issue
-  const selectedIssueData = selectedIssue
-    ? issues.find((i) => i.identifier.toLowerCase() === selectedIssue.toLowerCase())
-    : null;
-
+  const channelPermissionResponseMutation = useMutation({
+    mutationFn: ({
+      agentId,
+      requestId,
+      behavior,
+    }: {
+      agentId: string;
+      requestId: string;
+      behavior: ClaudeChannelPermissionBehavior;
+    }) => respondToChannelPermission(agentId, requestId, behavior),
+    onMutate: async (variables) => {
+      setOptimisticallyResolvedChannelPermissionRequestIds((prev) => {
+        const next = new Set(prev);
+        next.add(variables.requestId);
+        return next;
+      });
+    },
+    onSuccess: async (_data, variables) => {
+      await refreshDashboardState(queryClient);
+      toast.success(
+        variables.behavior === 'allow'
+          ? `Allowed ${variables.agentId} to continue`
+          : `Denied permission request for ${variables.agentId}`,
+      );
+    },
+    onError: (error: Error, variables) => {
+      setOptimisticallyResolvedChannelPermissionRequestIds((prev) => {
+        if (!prev.has(variables.requestId)) {
+          return prev;
+        }
+        const next = new Set(prev);
+        next.delete(variables.requestId);
+        return next;
+      });
+      toast.error(`Permission response failed: ${error.message}`);
+    },
+  });
 
   const handleConfirm = useCallback(async () => {
     if (!currentConfirmation) return;
@@ -439,6 +650,24 @@ export default function App() {
       console.error('Failed to deny:', error);
     }
   }, [currentConfirmation]);
+
+  const handleAllowChannelPermission = useCallback(() => {
+    if (!currentChannelPermissionRequest) return;
+    channelPermissionResponseMutation.mutate({
+      agentId: currentChannelPermissionRequest.agentId,
+      requestId: currentChannelPermissionRequest.requestId,
+      behavior: 'allow',
+    });
+  }, [channelPermissionResponseMutation, currentChannelPermissionRequest]);
+
+  const handleDenyChannelPermission = useCallback(() => {
+    if (!currentChannelPermissionRequest) return;
+    channelPermissionResponseMutation.mutate({
+      agentId: currentChannelPermissionRequest.agentId,
+      requestId: currentChannelPermissionRequest.requestId,
+      behavior: 'deny',
+    });
+  }, [channelPermissionResponseMutation, currentChannelPermissionRequest]);
 
   const handleCloseConfirmation = useCallback(() => {
     setCurrentConfirmation(null);
@@ -475,7 +704,7 @@ export default function App() {
       } else if (action.startsWith('open-workspace:')) {
         const issueId = action.slice('open-workspace:'.length);
         setActiveTab('kanban');
-        if (issueId) setSelectedIssue(issueId);
+        if (issueId) openIssue(issueId);
       } else if (action.startsWith('auto-start-nag:')) {
         // Format: auto-start-nag:<count>:<max>
         setIsPaletteOpen(false);
@@ -487,7 +716,7 @@ export default function App() {
       }
     });
     return unsub;
-  }, []);
+  }, [openIssue, setActiveTab]);
 
   // Auto-start nag toast for desktop app (launched 2-5 times without enabling)
   function showAutoStartNag(count: number, max: number): void {
@@ -510,14 +739,17 @@ export default function App() {
   }
 
   const handleSelectIssueFromSearch = useCallback((issueId: string) => {
-    setSelectedIssue(issueId);
     setActiveTab('kanban');
-  }, []);
+    openIssue(issueId);
+  }, [openIssue, setActiveTab]);
 
   return (
     <div className="h-screen flex flex-row overflow-hidden bg-background">
       {/* Event-sourced state: connects WsTransport → DashboardStore (PAN-428 B4) */}
       <EventRouter />
+
+      {/* Mounts @keyframes for the pulsing extreme-tier cost warning badge */}
+      <CostWarningStyles />
 
       {/* Collapsible sidebar navigation */}
       <Sidebar
@@ -528,8 +760,7 @@ export default function App() {
 
       {/* Main content area */}
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-        {/* Upgrade Announcement — shown once after upgrading to 0.7.0 */}
-        <UpgradeAnnouncement />
+        <NoResumeBanner />
 
         {/* Deacon Frozen Banner — shown whenever the global patrol pause flag is set */}
         <DeaconPauseBanner />
@@ -537,9 +768,12 @@ export default function App() {
         {/* Stopped Agents Banner — shown when agents are stopped (e.g., after reboot) */}
         <StoppedAgentsBanner />
 
+        {/* Codex Auth Banner — shown when Codex OAuth tokens are expired/burned */}
+        <CodexAuthBanner />
+
         {/* Dashboard Restart Banner — shown during a planned restart (post-merge deploy, pan restart) */}
         {showRestartBanner && (
-          <div className="bg-primary/15 border-b-2 border-primary/40 px-4 py-3 flex items-center gap-3 shrink-0">
+          <div className="bg-primary/15 border-b-2 border-primary/40 px-4 py-3 flex items-center gap-3 shrink-0 overflow-hidden animate-slide-down-banner">
             <RefreshCw className="w-5 h-5 text-primary shrink-0 animate-spin" />
             <p className="text-primary text-sm font-semibold flex-1">
               Dashboard is restarting
@@ -555,13 +789,30 @@ export default function App() {
         )}
 
         {/* Backend Offline Banner — shown when /api/version fails repeatedly AND not in a planned restart */}
-        {showBackendBanner && !showRestartBanner && (
-          <div className="bg-destructive/15 border-b-2 border-destructive/50 px-4 py-3 flex items-center gap-3 shrink-0">
+        {bannerState === 'down' && !showRestartBanner && (
+          <div className="bg-destructive/15 border-b-2 border-destructive/50 px-4 py-3 flex items-center gap-3 shrink-0 overflow-hidden animate-slide-down-banner">
             <AlertTriangle className="w-5 h-5 text-destructive shrink-0" />
             <p className="text-destructive text-sm font-semibold flex-1">
-              Backend is unreachable — dashboard data is stale. Check that <code className="font-mono bg-destructive/20 px-1 rounded">pan up</code> is running.
+              Backend is unreachable — waiting for it to come back.
             </p>
             <span className="text-destructive/60 text-xs shrink-0 animate-pulse">● Retrying…</span>
+            <button
+              onClick={() => restartBackendMutation.mutate()}
+              disabled={restartBackendMutation.isPending}
+              className="px-4 py-1.5 bg-destructive/20 hover:bg-destructive/30 text-destructive text-sm font-bold rounded-md border border-destructive/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            >
+              {restartBackendMutation.isPending ? 'Restarting…' : 'Force Restart'}
+            </button>
+          </div>
+        )}
+
+        {/* Backend Recovered Banner — yellow confirmation, auto-hides */}
+        {bannerState === 'recovering' && !showRestartBanner && (
+          <div className="bg-warning/15 border-b-2 border-warning/50 px-4 py-3 flex items-center gap-3 shrink-0 overflow-hidden animate-slide-down-banner">
+            <CheckCircle2 className="w-5 h-5 text-warning-foreground shrink-0" />
+            <p className="text-warning-foreground text-sm font-semibold flex-1">
+              Backend is back up.
+            </p>
           </div>
         )}
 
@@ -610,10 +861,29 @@ export default function App() {
           </div>
         )}
 
-        <main className="flex-1 flex overflow-hidden">
+        <div className="relative border-b border-border bg-background px-3 py-1 shrink-0">
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              aria-label="Toggle activity feed"
+              aria-pressed={isSessionFeedSidebarOpen}
+              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              onClick={() => setSessionFeedSidebarOpen(!isSessionFeedSidebarOpen)}
+            >
+              <History className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <SystemHealthPill />
+          </div>
+        </div>
+
+        <div className="min-h-0 flex flex-1 overflow-hidden">
+        <main
+          data-drawer-open={drawerOpen ? 'true' : undefined}
+          className="relative flex-1 flex overflow-hidden data-[drawer-open=true]:before:pointer-events-none data-[drawer-open=true]:before:absolute data-[drawer-open=true]:before:inset-0 data-[drawer-open=true]:before:z-[80] data-[drawer-open=true]:before:bg-primary/[0.04] data-[drawer-open=true]:before:backdrop-blur-[2px]"
+        >
           {activeTab === 'command-deck' && (
             <div className="w-full h-full">
-              <MissionControl
+              <CommandDeck
                 issues={issues}
                 convId={selectedConvId}
                 conversationViewMode={conversationViewMode}
@@ -622,6 +892,18 @@ export default function App() {
               />
             </div>
           )}
+        {activeTab === 'pipeline' && (
+          <BootstrapGate fallback={<PipelineSkeleton />}>
+            <div className="w-full h-full overflow-hidden">
+              <PipelineView onSearchOpen={() => setIsSearchOpen(true)} onTabChange={(tab) => setActiveTab(tab as Parameters<typeof setActiveTab>[0])} />
+            </div>
+          </BootstrapGate>
+        )}
+        {activeTab === 'awaiting-merge' && (
+          <div className="w-full h-full overflow-auto">
+            <AwaitingMergePage />
+          </div>
+        )}
         {activeTab === 'kanban' && (
           <BootstrapGate fallback={
             <div className="flex-1 overflow-auto p-6 w-full">
@@ -629,41 +911,23 @@ export default function App() {
             </div>
           }>
             <>
-              <div className={`flex-1 overflow-auto p-6 ${selectedIssue ? '' : 'w-full'}`}>
+              <div className="flex-1 overflow-auto p-6 w-full">
                 <MetricsSummaryRow />
                 <KanbanBoard
-                  selectedIssue={selectedIssue}
-                  onSelectIssue={setSelectedIssue}
+                  selectedIssue={null}
+                  onSelectIssue={(issueId) => {
+                    if (issueId) openIssue(issueId);
+                  }}
                   onPlanDialogChange={setPlanDialogIssueId}
                 />
               </div>
-              {selectedIssue && selectedIssueData && (
-                <DetailPanelLayout
-                  agent={selectedIssueAgent ?? undefined}
-                  issueId={selectedIssue}
-                  issueUrl={selectedIssueData.url}
-                  issue={selectedIssueData}
-                  onClose={() => setSelectedIssue(null)}
-                  suppressTerminal={planDialogIssueId === selectedIssue}
-                />
-              )}
             </>
           </BootstrapGate>
         )}
         {activeTab === 'agents' && (
-          <BootstrapGate fallback={<AgentListSkeleton />}>
-            <div className="flex w-full h-full overflow-hidden">
-              <div className={`${selectedAgent ? 'w-1/2 lg:w-5/12' : 'w-full'} overflow-y-auto p-6`}>
-                <AgentList
-                  selectedAgent={selectedAgent}
-                  onSelectAgent={setSelectedAgent}
-                />
-              </div>
-              {selectedAgent && (
-                <div className="flex-1 min-w-0 h-full flex flex-col border-l border-divider">
-                  <AgentOutputPanel agentId={selectedAgent} />
-                </div>
-              )}
+          <BootstrapGate fallback={<AgentsSkeleton />}>
+            <div className="h-full w-full overflow-y-auto">
+              <FleetAgentsView onNavigateToIssues={() => setActiveTab('kanban')} />
             </div>
           </BootstrapGate>
         )}
@@ -702,14 +966,31 @@ export default function App() {
             <CostsPage />
           </div>
         )}
-        {activeTab === 'awaiting-merge' && (
-          <div className="w-full overflow-auto">
-            <AwaitingMergePage />
+        {activeTab === 'autopreso' && (
+          <div className="w-full h-full overflow-hidden">
+            <AutoPresoView />
+          </div>
+        )}
+        {activeTab === 'flywheel' && (
+          <div className="w-full h-full overflow-hidden">
+            <FlywheelPage
+              onOpenSettings={() => setActiveTab('settings')}
+              onNavigateAgent={(agentId) => {
+                setSelectedAgent(agentId);
+                setActiveTab('agents');
+              }}
+              onNavigateIssue={(issueId) => openIssue(issueId)}
+            />
           </div>
         )}
         {activeTab === 'settings' && (
           <div className="p-6 w-full overflow-auto">
             <SettingsPage />
+          </div>
+        )}
+        {activeTab === 'sessions' && (
+          <div className="w-full h-full overflow-hidden">
+            <ConversationsPage />
           </div>
         )}
         {activeTab === 'god-view' && (
@@ -724,7 +1005,22 @@ export default function App() {
           </BootstrapGate>
         )}
         </main>
+        {isSessionFeedSidebarOpen && (
+          <SessionFeedSidebar onClose={() => setSessionFeedSidebarOpen(false)} />
+        )}
+        </div>
       </div>
+
+      <IssueDrawer />
+
+      <ChannelPermissionDialog
+        request={currentChannelPermissionRequest}
+        issueId={currentChannelPermissionIssueId}
+        isOpen={!!currentChannelPermissionRequest}
+        isSubmitting={channelPermissionResponseMutation.isPending}
+        onAllow={handleAllowChannelPermission}
+        onDeny={handleDenyChannelPermission}
+      />
 
       {/* Confirmation Dialog */}
       <ConfirmationDialog
@@ -750,7 +1046,7 @@ export default function App() {
         onClose={() => setIsPaletteOpen(false)}
         onNavigate={(tab, issueId) => {
           setActiveTab(tab as Tab);
-          if (issueId) setSelectedIssue(issueId);
+          if (issueId) openIssue(issueId);
         }}
       />
 

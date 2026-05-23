@@ -3,6 +3,7 @@
  * Covers the new step 0 logic in src/lib/cloister/merge-agent.ts.
  */
 
+import { Effect } from 'effect';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { join } from 'path';
 
@@ -10,26 +11,44 @@ import { join } from 'path';
 const mockUnref = vi.hoisted(() => vi.fn());
 const mockSpawnChild = vi.hoisted(() => ({ pid: 12345, unref: mockUnref }));
 const mockSpawn = vi.hoisted(() => vi.fn(() => mockSpawnChild));
-const mockExec = vi.hoisted(() => vi.fn((_cmd: string, _opts: any, cb: any) => {
-  if (typeof _opts === 'function') _opts(null, '', '');
-  else if (cb) cb(null, '', '');
+const mockExecAsync = vi.hoisted(() => vi.fn(async (cmd: string) => {
+  if (cmd.includes('git rev-parse --verify')) return { stdout: 'deadbeef\n', stderr: '' };
+  if (cmd.includes('git merge-base --is-ancestor')) return { stdout: '', stderr: '' };
+  if (cmd.includes('git diff origin/main...')) return { stdout: '', stderr: '' };
+  if (cmd.includes('gh pr list')) return { stdout: '[]', stderr: '' };
+  return { stdout: '', stderr: '' };
+}));
+const mockCreateResetMarker = vi.hoisted(() => vi.fn(async (input: unknown) => ({ id: 'reset-1', ...(input as Record<string, unknown>) })));
+const mockExec = vi.hoisted(() => vi.fn((cmd: string, optionsOrCb?: any, maybeCb?: any) => {
+  const callback = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
+  if (typeof callback === 'function') {
+    mockExecAsync(cmd).then(
+      ({ stdout, stderr }) => callback(null, stdout, stderr),
+      (error) => callback(error, '', error instanceof Error ? error.message : String(error)),
+    );
+  }
 }));
 
-const kCustom = Symbol.for('nodejs.util.promisify.custom');
-(mockExec as any)[kCustom] = vi.fn().mockResolvedValue({ stdout: '', stderr: '' });
-
-vi.mock('child_process', () => ({
-  spawn: mockSpawn,
-  exec: mockExec,
-  execFile: mockExec,
-}));
+vi.mock('child_process', () => {
+  (mockExec as any)[Symbol.for('nodejs.util.promisify.custom')] = mockExecAsync;
+  return {
+    spawn: mockSpawn,
+    exec: mockExec,
+    execFile: mockExec,
+  };
+});
 
 // ── fs/promises mock ──────────────────────────────────────────────────────────
 const mockWriteFile = vi.hoisted(() => vi.fn<() => Promise<void>>().mockResolvedValue(undefined));
 
-vi.mock('fs/promises', () => ({
-  writeFile: mockWriteFile,
-}));
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    writeFile: mockWriteFile,
+    rm: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 // ── fs mock ───────────────────────────────────────────────────────────────────
 vi.mock('fs', async (importOriginal) => {
@@ -46,14 +65,22 @@ vi.mock('fs', async (importOriginal) => {
 
 // ── Other dependency mocks ────────────────────────────────────────────────────
 vi.mock('../../../src/lib/tmux.js', () => ({
+  sendKeys: vi.fn(() => Effect.void),
   sendKeysAsync: vi.fn().mockResolvedValue(undefined),
-  sessionExists: vi.fn().mockReturnValue(false),
-  killSession: vi.fn(),
+  sessionExists: vi.fn(() => Effect.succeed(false)),
+  sessionExistsSync: vi.fn().mockReturnValue(false),
+  sessionExistsAsync: vi.fn().mockResolvedValue(false),
+  listSessionNames: vi.fn(() => Effect.succeed([])),
+  listSessionNamesAsync: vi.fn().mockResolvedValue([]),
+  killSession: vi.fn(() => Effect.void),
+  killSessionSync: vi.fn(() => Effect.void),
   killSessionAsync: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../../src/lib/paths.js', () => ({
   PANOPTICON_HOME: '/tmp/panopticon-test',
+  AGENTS_DIR: '/tmp/panopticon-test/agents',
+  getPanopticonHome: vi.fn(() => '/tmp/panopticon-test'),
   PROJECT_DOCS_SUBDIR: 'docs',
   PROJECT_PRDS_SUBDIR: 'prds',
   PROJECT_PRDS_ACTIVE_SUBDIR: 'active',
@@ -63,20 +90,22 @@ vi.mock('../../../src/lib/paths.js', () => ({
 
 vi.mock('../../../src/lib/tracker-utils.js', () => ({
   resolveGitHubIssue: vi.fn().mockReturnValue({ isGitHub: false }),
+  resolveGitHubIssueSync: vi.fn().mockReturnValue({ isGitHub: false }),
+  resolveTrackerType: vi.fn().mockReturnValue('github'),
+  resolveTrackerTypeSync: vi.fn().mockReturnValue('github'),
 }));
 
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
-  getSessionId: vi.fn().mockReturnValue(null),
-  recordWake: vi.fn(),
   getTmuxSessionName: vi.fn().mockReturnValue('test-session'),
-  wakeSpecialist: vi.fn().mockResolvedValue({ success: false }),
   spawnEphemeralSpecialist: vi.fn().mockResolvedValue({ success: false }),
   isRunning: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: vi.fn().mockReturnValue(null),
+  resolveProjectFromIssueSync: vi.fn().mockReturnValue(null),
   loadProjectsConfig: vi.fn().mockReturnValue({ projects: {} }),
+  loadProjectsConfigSync: vi.fn().mockReturnValue({ projects: {} }),
 }));
 
 vi.mock('../../../src/lib/cloister/validation.js', () => ({
@@ -87,6 +116,16 @@ vi.mock('../../../src/lib/cloister/validation.js', () => ({
 
 vi.mock('../../../src/lib/activity-log.js', () => ({
   logActivity: vi.fn(),
+}));
+
+vi.mock('../../../src/lib/review-status.js', () => ({
+  getReviewStatusSync: vi.fn().mockReturnValue(null),
+  setReviewStatus: vi.fn(),
+  setReviewStatusSync: vi.fn(),
+}));
+
+vi.mock('../../../src/lib/memory/cli.js', () => ({
+  createResetMarker: mockCreateResetMarker,
 }));
 
 vi.mock('../../../src/lib/git-utils.js', () => ({
@@ -168,6 +207,11 @@ describe('postMergeLifecycle — step 0 deploy handoff', () => {
     expect(mockSpawn).toHaveBeenCalledOnce();
   });
 
+  // The in-process fallback path exercises several real dynamic imports and
+  // unmocked side-effects (review-status writes, git-activity append, etc.)
+  // that can cumulatively run past the default 10s vitest timeout on a busy
+  // CI host. The 30s timeout below is well over the observed ~13s real-clock
+  // duration and matches what the verification gate retry budget allows.
   it('falls through to in-process lifecycle when writeFile throws', async () => {
     mockWriteFile.mockRejectedValue(new Error('disk full'));
 
@@ -176,14 +220,25 @@ describe('postMergeLifecycle — step 0 deploy handoff', () => {
 
     // Spawn should not be called since writeFile threw
     expect(mockSpawn).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it('falls through to in-process lifecycle when spawn throws', async () => {
     mockSpawn.mockImplementation(() => { throw new Error('spawn ENOENT'); });
 
     // Should not throw — catches and falls through
     await expect(postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH)).resolves.not.toThrow();
-  });
+  }, 30_000);
+
+  it('creates a workspace-scoped memory reset marker in the in-process lifecycle', async () => {
+    await postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH, { skipDeploy: true });
+
+    expect(mockCreateResetMarker).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'test-project',
+      scope: 'workspace',
+      scopeId: 'feature-pan-444',
+      reason: 'post-merge cleanup',
+    }));
+  }, 30_000);
 
   it('step 0 does not run when idempotency guard is set', async () => {
     // Guard is set externally (simulating a second invocation after in-process lifecycle ran).
@@ -198,6 +253,16 @@ describe('postMergeLifecycle — step 0 deploy handoff', () => {
     await postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH);
     expect(mockWriteFile).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it('coalesces concurrent post-merge lifecycle calls before step 0 repeats', async () => {
+    const first = postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH);
+    const second = postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH);
+
+    await Promise.all([first, second]);
+
+    expect(mockWriteFile).toHaveBeenCalledOnce();
+    expect(mockSpawn).toHaveBeenCalledOnce();
   });
 });
 

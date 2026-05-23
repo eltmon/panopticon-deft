@@ -1,4 +1,6 @@
 import { jsonResponse } from "../http-helpers.js";
+import { BLANKED_PROVIDER_ENV } from '../../../lib/child-env.js';
+import { getClaudePermissionFlagsStringSync, resolvePermissionModeSync, DSP_FLAG, BYPASS_PERMISSION_MODE } from '../../../lib/claude-permissions.js';
 /**
  * Conversations route module — Effect HttpRouter.Layer (PAN-416)
  *
@@ -7,38 +9,56 @@ import { jsonResponse } from "../http-helpers.js";
  *   POST   /api/conversations                — spawn a new conversation
  *   POST   /api/conversations/:name/stop     — kill session, mark ended (preserves row)
  *   POST   /api/conversations/:name/archive  — kill session and hide from list
+ *   DELETE /api/conversations/:name          — cleanup alias: kill and archive, preserve transcript
  *   POST   /api/conversations/:name/resume   — reattach or respawn
  *
- * Conversations are NEVER deleted from the database. The only removal verb is `archive`.
+ * Conversations are NEVER deleted from the database, and JSONL transcript files are never removed.
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { exec, spawn } from 'node:child_process';
+import { existsSync, createReadStream } from 'node:fs';
+import { mkdir, writeFile, readFile, stat, realpath, rename, rm, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { createReadStream } from 'node:fs';
-import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 
-const execAsync = promisify(exec);
+import { resolveClaudeSessionId } from './jsonl-resolver.js';
+import { validateOrigin } from './origin-validation.js';
+import { parseRelativeTime } from '../../../lib/conversations/search.js';
+import { getProjectSync } from '../../../lib/projects.js';
+import {
+  findCommitAtTime,
+  diffSinceCommit,
+  diffFilesAgainstHead,
+  diffPatchSinceCommit,
+  diffPatchFilesAgainstHead,
+  type TurnDiffFileChange,
+} from '../../../lib/checkpoint/checkpoint-manager.js';
 
-import { Effect, Layer } from 'effect';
+import { Effect, Layer, Option } from 'effect';
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/unstable/http';
+import * as Multipart from 'effect/unstable/http/Multipart';
 
 import {
   listConversations,
+  listArchivedConversationsWithEnrichment,
   getConversationByName,
   getConversationById,
   createConversation,
   markConversationEnded,
   markConversationActive,
   updateLastAttached,
-  updateSessionFile,
   updateConversationTitle,
   updateConversationCost,
-  updateConversationModel,
+  setConversationModel,
+  setConversationHarness,
+  setConversationClaudeSessionId,
+  updateConversationDeliveryMethod,
+  updateConversationForkFallbackReason,
+  recordConversationHandoff,
+  backfillConversationModel,
   archiveConversation,
   unarchiveConversation,
   canReplaceTitle,
@@ -46,33 +66,356 @@ import {
   setFavorite,
   removeFavorite,
   updateForkStatus,
+  updateSpawnError,
+  type ArchivedConversationListOptions,
+  type ArchivedConversationWithEnrichment,
+  type Conversation,
 } from '../../../lib/database/conversations-db.js';
 import {
-  sendKeysAsync,
-  capturePaneAsync,
-  sessionExistsAsync,
-  killSessionAsync,
-  createSessionAsync,
-  setOptionAsync,
+  sendRawKeystroke,
+  MessageDeliveryFailed,
+  capturePane,
+  sessionExists,
+  killSession,
+  createSession,
+  setOption,
   waitForClaudePrompt,
+  listSessionNames,
 } from '../../../lib/tmux.js';
-import { getProviderForModel } from '../../../lib/providers.js';
+import { deliverAgentMessage, writeChannelsBridgeMcpConfig, dismissDevChannelsDialog } from '../../../lib/agents.js';
+import { markRespawnPending } from '../services/pending-respawn.js';
 import {
   getAgentRuntimeBaseCommand,
   getProviderExportsForModel,
+  getProviderEnvForModel,
+  getProviderAuthMode,
 } from '../../../lib/agents.js';
+import { writeBridgeTokenSync } from '../../../lib/bridge-token.js';
+import { isClaudeCodeChannelsEnabled } from '../../../lib/config-yaml.js';
+import { writePtyToken } from '../../../lib/pty-token.js';
+import { canUseHarnessSync } from '../../../lib/harness-policy.js';
+import { getProviderForModelSync } from '../../../lib/providers.js';
+import { withConcurrencyLimit } from '../../../lib/concurrency.js';
+import type { RuntimeName } from '../../../lib/runtimes/types.js';
+import { piFifoPaths } from '../../../lib/runtimes/pi-fifo.js';
+import { generateLauncherScriptSync } from '../../../lib/launcher-generator.js';
 import {
+  computeContextUsage,
   parseConversationMessages,
   parseFromLastCompactBoundary,
   summarizeConversationActivity,
+  type ParseState,
 } from '../services/conversation-service.js';
+import { parsePiConversationMessages } from '../services/pi-conversation-parser.js';
 import {
   maybeCompactBeforeRespawn,
   compactConversationNative,
   shouldInterceptManualCompact,
+  isCompacting,
 } from '../services/conversation-compaction.js';
-import { encodeClaudeProjectDir } from '../../../lib/paths.js';
-import { generateSummaryForFork, reserveSummaryForkSession } from '../../../lib/conversations/summary-fork.js';
+import { sessionFilePath, encodeClaudeProjectDir, packageRoot } from '../../../lib/paths.js';
+import { convertConversationTranscript } from '../../../lib/session-format-converter.js';
+import { getEventStore } from '../event-store.js';
+import {
+  generateSummaryForFork,
+  generateFallbackSummary,
+  reserveSummaryForkSession,
+  copySessionFromCompactBoundary,
+  requestHandoffFromAgent,
+  handoffPreconditionFallbackReason,
+  handoffFailureReason,
+  logHandoffFallback,
+  type SummaryForkMode,
+} from '../../../lib/conversations/summary-fork.js';
+import {
+  CONVERSATION_TITLE_MODEL,
+  serializeConversationTranscript,
+  summarizeFirstMessageTitle,
+  summarizeTranscriptTitle,
+  summarizeTranscriptAbout,
+} from '../../../lib/conversations/transcript-summary.js';
+import {
+  ensureConversationAttachmentDir,
+  getConversationAttachmentsRoot,
+  extractConversationAttachmentPaths,
+  hasConversationAttachment,
+  isManagedConversationAttachmentPath,
+  removeConversationAttachment,
+  cleanupUnreferencedConversationAttachments,
+  cleanupConversationAttachments,
+} from '../services/conversation-attachments.js';
+
+const execAsync = promisify(exec);
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const MAX_MESSAGE_LENGTH = 50_000;
+const MAX_FILENAME_LENGTH = 255;
+const PTY_SUPERVISOR_SOCKET_WAIT_MS = 30_000;
+const CONVERSATION_LIST_ENRICHMENT_CONCURRENCY = 8;
+
+/** Quote a string for safe use in a bash script using single-quote wrapping. */
+function shellQuote(str: string): string {
+  return "'" + str.replace(/'/g, "'\"'\"'") + "'";
+}
+
+const SAFE_MODEL_PATTERN = /^[a-zA-Z0-9_.:\/-]+$/;
+const SAFE_EFFORT_PATTERN = /^(low|medium|high)$/;
+const SAFE_PROJECT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const SAFE_ISSUE_ID_PATTERN = /^[A-Z0-9]+-[0-9]+$/;
+
+async function resolveAllowedHarness(requested: unknown, model?: string | null): Promise<RuntimeName> {
+  const harness: RuntimeName = requested === 'pi' || requested === 'claude-code' ? requested : 'claude-code';
+  // Conversation runtime only honors non-default harnesses when a concrete model is
+  // passed through to getAgentRuntimeBaseCommand(). Without a model,
+  // spawnConversationSession() intentionally launches the default Claude Code
+  // command, so persist the matching default harness as the effective value.
+  if (!model) return 'claude-code';
+  const decision = canUseHarnessSync(harness, model, await getProviderAuthMode(model));
+  return decision.allowed ? harness : 'claude-code';
+}
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+
+const UPLOAD_RATE_LIMIT_WINDOW_MS = 60_000;
+const UPLOAD_RATE_LIMIT_MAX = 10;
+const UPLOAD_RATE_LIMIT_MAP_MAX = 1_000;
+const uploadRateLimit = new Map<string, { count: number; resetAt: number }>();
+
+function isLoopbackAddress(addr: string): boolean {
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function getHeader(
+  request: HttpServerRequest.HttpServerRequest,
+  name: string,
+): string | undefined {
+  const value = (request.headers as Record<string, string | string[] | undefined>)[name];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function getClientIp(request: HttpServerRequest.HttpServerRequest): string {
+  const remoteAddress = Option.getOrElse(request.remoteAddress, () => 'unknown');
+  // Only trust X-Forwarded-From when the direct connection comes from a
+  // loopback address (i.e. we are behind a local reverse proxy). Otherwise
+  // a client can spoof any IP and bypass rate-limiting.
+  if (isLoopbackAddress(remoteAddress)) {
+    const forwarded = getHeader(request, 'x-forwarded-for');
+    if (forwarded) {
+      return forwarded.split(',')[0].trim();
+    }
+  }
+  return remoteAddress;
+}
+
+const SAFE_SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+
+let lastRateLimitPruneAt = 0;
+
+function checkUploadRateLimit(remoteAddress: string): boolean {
+  const now = Date.now();
+  // Prune stale entries at most once per rate-limit window to avoid O(n)
+  // scans on every request. The hard size cap is still enforced after pruning.
+  if (now - lastRateLimitPruneAt > UPLOAD_RATE_LIMIT_WINDOW_MS) {
+    lastRateLimitPruneAt = now;
+    for (const [ip, entry] of uploadRateLimit) {
+      if (now > entry.resetAt) {
+        uploadRateLimit.delete(ip);
+      }
+    }
+  }
+  // If still over cap after pruning stale entries, evict oldest entries
+  // (Map iteration order is insertion order).
+  while (uploadRateLimit.size >= UPLOAD_RATE_LIMIT_MAP_MAX) {
+    const firstKey = uploadRateLimit.keys().next().value;
+    if (firstKey !== undefined) {
+      uploadRateLimit.delete(firstKey);
+    } else {
+      break;
+    }
+  }
+  const entry = uploadRateLimit.get(remoteAddress);
+  if (!entry || now > entry.resetAt) {
+    uploadRateLimit.set(remoteAddress, { count: 1, resetAt: now + UPLOAD_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= UPLOAD_RATE_LIMIT_MAX) {
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
+// ─── Messages cache ───────────────────────────────────────────────────────────
+
+const MESSAGES_CACHE_MAX = 100;
+const messagesCache = new Map<
+  string,
+  {
+    mtimeMs: number;
+    size: number;
+    result: Awaited<ReturnType<typeof parseConversationMessages>>;
+    byteOffset: number;
+    parseState: ParseState | undefined;
+  }
+>();
+
+async function getCachedMessages(
+  sessionFile: string,
+  isSpecialist: boolean,
+): Promise<Awaited<ReturnType<typeof parseConversationMessages>>> {
+  const fileStats = await stat(sessionFile);
+  const cacheKey = `${sessionFile}:${isSpecialist}`;
+  const cached = messagesCache.get(cacheKey);
+  if (cached && cached.mtimeMs === fileStats.mtimeMs && cached.size === fileStats.size && cached.byteOffset >= fileStats.size) {
+    return cached.result;
+  }
+
+  let result: Awaited<ReturnType<typeof parseConversationMessages>>;
+
+  // Pi sessions use a different JSONL schema than Claude Code. The Pi parser
+  // produces the same ParseResult shape and we cache by file path, so the
+  // rest of the pipeline (cost rollup, streaming flag, etc.) is unchanged.
+  // Pi files don't support the incremental-parse path — we always do a full
+  // read; chat sessions are small enough that this is fine.
+  if (isPiSessionFile(sessionFile)) {
+    result = await parsePiConversationMessages(sessionFile);
+  } else if (isSpecialist) {
+    result = await parseFromLastCompactBoundary(sessionFile);
+  } else if (
+    cached &&
+    cached.parseState &&
+    cached.byteOffset <= fileStats.size &&
+    cached.size <= fileStats.size
+  ) {
+    // Incremental parse: file grew, continue from where we left off.
+    const incremental = await parseConversationMessages(sessionFile, cached.byteOffset, cached.parseState);
+    if (incremental.byteOffset < cached.byteOffset) {
+      // File was truncated or rotated — fall back to full parse.
+      result = await parseConversationMessages(sessionFile, 0);
+    } else {
+      // Materialize the merged result once and cache concrete structures.
+      // Lazy getters chained across cache entries grew an unbounded wrapper
+      // chain across polls and re-allocated the full history on every read.
+      const cachedResult = cached.result;
+      const mergedMessages = cachedResult.messages.concat(incremental.messages);
+      const mergedWorkLog = cachedResult.workLog.concat(incremental.workLog);
+      const mergedCompactBoundaries = (cachedResult.compactBoundaries ?? []).concat(incremental.compactBoundaries ?? []);
+      const mergedFileEdits = new Map(cachedResult.fileEditsByAssistantId ?? []);
+      for (const [k, v] of incremental.fileEditsByAssistantId ?? []) {
+        const existing = mergedFileEdits.get(k);
+        mergedFileEdits.set(k, existing ? [...existing, ...v] : v);
+      }
+      result = {
+        messages: mergedMessages,
+        workLog: mergedWorkLog,
+        byteOffset: incremental.byteOffset,
+        streaming: incremental.streaming,
+        totalCost: cachedResult.totalCost + incremental.totalCost,
+        pendingToolUse: incremental.pendingToolUse,
+        unresolvedResults: incremental.unresolvedResults,
+        lastSequence: incremental.lastSequence,
+        mtimeMs: incremental.mtimeMs,
+        proposedPlan: incremental.proposedPlan ?? cachedResult.proposedPlan,
+        compactBoundaries: mergedCompactBoundaries,
+        planToolUseIds: incremental.planToolUseIds,
+        permissionMode: incremental.permissionMode ?? cachedResult.permissionMode,
+        fileEditsByAssistantId: mergedFileEdits,
+      };
+    }
+  } else {
+    // Full parse (no cache, file shrank, or first time).
+    result = await parseConversationMessages(sessionFile, 0);
+  }
+
+  messagesCache.set(cacheKey, {
+    mtimeMs: fileStats.mtimeMs,
+    size: fileStats.size,
+    result,
+    byteOffset: result.byteOffset,
+    parseState: {
+      pendingToolUse: result.pendingToolUse,
+      unresolvedResults: result.unresolvedResults,
+      lastSequence: result.lastSequence,
+      planToolUseIds: result.planToolUseIds,
+      proposedPlan: result.proposedPlan,
+      permissionMode: result.permissionMode,
+    },
+  });
+  if (messagesCache.size > MESSAGES_CACHE_MAX) {
+    const firstKey = messagesCache.keys().next().value;
+    if (firstKey !== undefined) {
+      messagesCache.delete(firstKey);
+    }
+  }
+  return result;
+}
+
+// ─── Favorites cache ───────────────────────────────────────────────────────────
+
+const FAVORITES_CACHE_TTL_MS = 5000;
+let favoritesCache: { timestamp: number; ids: Set<string> } | null = null;
+
+function getCachedFavoritedIds(): Set<string> {
+  const now = Date.now();
+  if (favoritesCache && now - favoritesCache.timestamp < FAVORITES_CACHE_TTL_MS) {
+    return favoritesCache.ids;
+  }
+  const ids = new Set(listFavoritedIds('conversation'));
+  favoritesCache = { timestamp: now, ids };
+  return ids;
+}
+
+function invalidateFavoritesCache(): void {
+  favoritesCache = null;
+}
+
+// ─── CSRF / Origin validation ────────────────────────────────────────────────
+
+/** Validate a caller-supplied cwd is an existing directory under the user's home. */
+async function validateCwdContainment(cwd: string): Promise<boolean> {
+  if (!cwd.startsWith('/')) return false;
+  const segments = cwd.split('/').filter(Boolean);
+  if (segments.includes('..')) return false;
+
+  try {
+    const resolved = await realpath(cwd);
+    const stats = await stat(resolved);
+    if (!stats.isDirectory()) return false;
+    const home = homedir();
+    // Require the resolved cwd to be under the user's home directory
+    if (!resolved.startsWith(`${home}/`) && resolved !== home) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const ALLOWED_UPLOAD_MIME_TYPES = new Map<string, string>([
+  ['image/png', '.png'],
+  ['image/jpeg', '.jpg'],
+  ['image/gif', '.gif'],
+  ['image/webp', '.webp'],
+]);
+
+/** Validate image magic bytes match the declared MIME type. */
+function validateImageMagicBytes(bytes: Buffer, mimeType: string): boolean {
+  switch (mimeType) {
+    case 'image/png':
+      return bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47;
+    case 'image/jpeg':
+      return bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
+    case 'image/gif':
+      return bytes.length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38;
+    case 'image/webp':
+      return (
+        bytes.length >= 12 &&
+        bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+        bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+      );
+    default:
+      return false;
+  }
+}
 
 /**
  * Wait for Claude Code to show its input prompt (❯) in the tmux pane.
@@ -81,7 +424,7 @@ import { generateSummaryForFork, reserveSummaryForkSession } from '../../../lib/
 async function waitForClaudeReady(tmuxSession: string): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    const output = await capturePaneAsync(tmuxSession, 200);
+    const output = await Effect.runPromise(capturePane(tmuxSession, 200));
     if (output.includes('❯')) {
       console.log(`[conversations] Claude Code ready in ${tmuxSession}`);
       return;
@@ -91,10 +434,104 @@ async function waitForClaudeReady(tmuxSession: string): Promise<void> {
   console.warn(`[conversations] Timed out waiting for Claude Code prompt in ${tmuxSession}`);
 }
 
-/** Compute the deterministic JSONL session file path from cwd + session UUID. */
-function sessionFilePath(cwd: string, sessionId: string): string {
-  const encodedCwd = encodeClaudeProjectDir(cwd);
-  return join(homedir(), '.claude', 'projects', encodedCwd, `${sessionId}.jsonl`);
+/**
+ * Wait until Pi's TUI has rendered into the tmux pane.
+ *
+ * Pi TUI mode does not write a ready.json marker (that was an RPC-mode
+ * artifact). We instead poll capture-pane for non-empty content, which
+ * indicates Pi has drawn at least its title/prompt line. This is the same
+ * shape of readiness check we use for Claude Code's interactive prompt.
+ */
+/**
+ * Map a Panopticon model id to the matching Pi-side provider name. Pi has
+ * its own provider taxonomy (`pi --list-models`); the IDs differ from our
+ * internal {@link getProviderForModelSync}. Returning `undefined` lets Pi fall
+ * back to its registry order.
+ *
+ * Pi conversations rely on the user's own Pi auth (`~/.pi/agent/auth.json`).
+ * We only constrain *which* Pi provider Pi uses; we never inject keys.
+ */
+function piProviderForModel(modelId: string): string | undefined {
+  const provider = getProviderForModelSync(modelId).name;
+  switch (provider) {
+    case 'openai':
+      return 'openai-codex';
+    case 'anthropic':
+      return 'anthropic';
+    case 'google':
+      return 'google';
+    case 'minimax':
+      return 'minimax';
+    case 'zai':
+      return 'zai';
+    case 'kimi':
+      return 'kimi-coding';
+    case 'mimo':
+      return 'xiaomi';
+    default:
+      return undefined;
+  }
+}
+
+async function waitForPiTuiReady(tmuxSession: string, timeoutMs = 30_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const snapshot = await Effect.runPromise(
+      capturePane(tmuxSession, 10).pipe(Effect.catch(() => Effect.succeed(''))),
+    );
+    if (snapshot.trim().length > 0) {
+      console.log(`[conversations] Pi TUI ready for ${tmuxSession}`);
+      return true;
+    }
+    await new Promise<void>((r) => setTimeout(r, 250));
+  }
+  console.warn(`[conversations] Timed out waiting for Pi TUI to render in ${tmuxSession}`);
+  return false;
+}
+
+async function resolveSessionFile(conv: Conversation): Promise<string | null> {
+  // Pi conversations write their own JSONL into the agent's session dir,
+  // not into ~/.claude/projects/<dir>/<id>.jsonl. The path uses a per-run
+  // timestamped filename, so we resolve by globbing the directory.
+  if (conv.harness === 'pi') {
+    return resolvePiSessionFile(conv.tmuxSession);
+  }
+  if (conv.claudeSessionId) {
+    return sessionFilePath(conv.cwd, conv.claudeSessionId);
+  }
+  return null;
+}
+
+/**
+ * Return the most-recently-written Pi JSONL session file for a conversation,
+ * or null if Pi hasn't created one yet (TUI just started, or session reset).
+ * The dashboard chat panel uses this to render Pi conversation history.
+ */
+async function resolvePiSessionFile(tmuxSession: string): Promise<string | null> {
+  const sessionDir = join(homedir(), '.panopticon', 'agents', tmuxSession, 'sessions');
+  if (!existsSync(sessionDir)) return null;
+  try {
+    const entries = (await readdir(sessionDir)).filter((name) => name.endsWith('.jsonl'));
+    if (entries.length === 0) return null;
+    // Filenames are `<iso-timestamp>_<session-id>.jsonl` — newest sorts last.
+    entries.sort();
+    return join(sessionDir, entries[entries.length - 1]!);
+  } catch {
+    return null;
+  }
+}
+
+/** Detect whether a session file path is a Pi conversation JSONL. */
+function isPiSessionFile(sessionFile: string): boolean {
+  return sessionFile.includes('/.panopticon/agents/') && sessionFile.includes('/sessions/');
+}
+
+async function resolveForkSourceSessionFile(conv: Conversation): Promise<string | null> {
+  const claudeSessionFile = await resolveSessionFile(conv);
+  if (claudeSessionFile && existsSync(claudeSessionFile)) {
+    return claudeSessionFile;
+  }
+  return claudeSessionFile;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -109,6 +546,209 @@ const readJsonBody = Effect.gen(function* () {
   }
 });
 
+export function parseSummaryForkFocus(value: unknown): { ok: true; focus: string | undefined } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, focus: undefined };
+  if (typeof value !== 'string') return { ok: false, error: 'focus must be a string' };
+  const focus = value.trim();
+  if (!focus) return { ok: true, focus: undefined };
+  if (focus.length > 500) return { ok: false, error: 'focus must be 500 characters or fewer' };
+  if (/[\x00-\x1f\x7f]/u.test(focus)) return { ok: false, error: 'focus must not contain control characters' };
+  return { ok: true, focus };
+}
+
+function safeUploadExtension(filename: string, mimeType: string): string {
+  const mimeExtension = ALLOWED_UPLOAD_MIME_TYPES.get(mimeType);
+  if (!mimeExtension) return '';
+  const originalExtension = extname(filename).toLowerCase();
+  return originalExtension === mimeExtension ? originalExtension : mimeExtension;
+}
+
+export async function handleConversationHandoffDoc(
+  name: string,
+): Promise<HttpServerResponse.HttpServerResponse> {
+  const conv = getConversationByName(name);
+  if (!conv) {
+    return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+  }
+  if (!conv.handoffDocPath) {
+    return jsonResponse({ error: 'Handoff document not found' }, { status: 404 });
+  }
+
+  try {
+    const docText = await readFile(conv.handoffDocPath, 'utf-8');
+    return HttpServerResponse.text(docText, {
+      contentType: 'text/markdown',
+      headers: {
+        'Content-Disposition': `inline; filename="${conv.name}-handoff.md"`,
+      },
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === 'ENOENT') {
+      return jsonResponse({ error: 'Handoff document is no longer available' }, { status: 410 });
+    }
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`[conversations] failed to read handoff doc for "${name}":`, msg);
+    return jsonResponse({ error: 'Failed to read handoff document' }, { status: 500 });
+  }
+}
+
+export async function handleConversationImageUpload(
+  name: string,
+  filename: string,
+  bytes: Buffer,
+  mimeType: string,
+): Promise<ReturnType<typeof jsonResponse>> {
+  const conv = getConversationByName(name);
+  if (!conv) {
+    return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+  }
+
+  if (!filename || !mimeType) {
+    return jsonResponse({ error: 'filename and mimeType are required' }, { status: 400 });
+  }
+
+  if (filename.length > MAX_FILENAME_LENGTH) {
+    return jsonResponse(
+      { error: `filename exceeds maximum length of ${MAX_FILENAME_LENGTH} characters` },
+      { status: 400 },
+    );
+  }
+
+  if (!ALLOWED_UPLOAD_MIME_TYPES.has(mimeType)) {
+    return jsonResponse({ error: `Unsupported mimeType: ${mimeType}` }, { status: 400 });
+  }
+
+  if (bytes.length === 0) {
+    return jsonResponse({ error: 'Payload is empty' }, { status: 400 });
+  }
+
+  if (bytes.length > MAX_UPLOAD_BYTES) {
+    return jsonResponse(
+      { error: `Payload exceeds maximum size of ${MAX_UPLOAD_BYTES} bytes` },
+      { status: 400 },
+    );
+  }
+
+  if (!validateImageMagicBytes(bytes, mimeType)) {
+    return jsonResponse({ error: 'File content does not match declared MIME type' }, { status: 400 });
+  }
+
+  const extension = safeUploadExtension(filename, mimeType)!;
+
+  // Re-verify conversation exists before writing — it may have been deleted or
+  // archived during the async validation above.
+  const convBeforeWrite = getConversationByName(name);
+  if (!convBeforeWrite) {
+    return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+  }
+
+  const attachmentDir = await ensureConversationAttachmentDir(name);
+  // Pre-write containment: resolve the directory before writing to detect
+  // any symlink tampering that would redirect writes outside the intended
+  // root. This eliminates the TOCTOU window between write and check.
+  let resolvedDir: string;
+  let attachmentsRoot: string;
+  try {
+    resolvedDir = await realpath(attachmentDir);
+    attachmentsRoot = await realpath(getConversationAttachmentsRoot());
+  } catch (err) {
+    console.error('[conversations] Failed to resolve attachment path:', err);
+    return jsonResponse({ error: 'Attachment directory is misconfigured' }, { status: 500 });
+  }
+  if (!resolvedDir.startsWith(`${attachmentsRoot}/`)) {
+    return jsonResponse({ error: 'Invalid attachment path' }, { status: 500 });
+  }
+
+  const fileName = `${randomUUID()}${extension}`;
+  const path = join(resolvedDir, fileName);
+  const tmpPath = `${path}.tmp`;
+  try {
+    await writeFile(tmpPath, bytes);
+    await rename(tmpPath, path);
+  } catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+
+  return jsonResponse({ path });
+}
+
+export async function handleConversationMessage(
+  name: string,
+  body: Record<string, unknown>,
+): Promise<ReturnType<typeof jsonResponse>> {
+  const conv = getConversationByName(name);
+  if (!conv) {
+    return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+  }
+
+  const message = typeof body['message'] === 'string' ? body['message'].trim() : '';
+  if (!message) {
+    return jsonResponse({ error: 'Message is required' }, { status: 400 });
+  }
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    return jsonResponse(
+      { error: `Message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` },
+      { status: 400 },
+    );
+  }
+
+  // Panopticon-native compaction writes Claude-format JSONL records. It must
+  // only run on Claude Code conversations — running it on a Pi conversation
+  // would corrupt the Pi transcript (P0, 2026-05-14). For Pi, let `/compact`
+  // pass through to Pi's own compaction.
+  if ((conv.harness ?? 'claude-code') === 'claude-code' && shouldInterceptManualCompact(message)) {
+    const compactSessionFile = await resolveSessionFile(conv);
+    if (!compactSessionFile || !existsSync(compactSessionFile)) {
+      return jsonResponse({ error: `No session file found for conversation ${conv.name}` }, { status: 400 });
+    }
+    const result = await compactConversationNative(compactSessionFile, conv.name);
+    return jsonResponse({ ok: true, compacted: true, mode: 'panopticon-native', model: result.model });
+  }
+
+  const allAttachmentPaths = extractConversationAttachmentPaths(message);
+  // Validate managed attachments concurrently — each check is independent IO.
+  const managedChecks = await Promise.all(
+    allAttachmentPaths.map(async (attachmentPath) => {
+      const managed = await isManagedConversationAttachmentPath(attachmentPath);
+      if (!managed) return { managed: false as const, attachmentPath };
+      const hasAttachment = await hasConversationAttachment(conv.name, attachmentPath);
+      return { managed: true as const, attachmentPath, hasAttachment };
+    }),
+  );
+  for (const check of managedChecks) {
+    if (check.managed && !check.hasAttachment) {
+      return jsonResponse({ error: 'One or more attached images are unavailable for this conversation' }, { status: 400 });
+    }
+    // Unmanaged @paths in prose are allowed to pass through
+  }
+
+  try {
+    await deliverAgentMessage(
+      conv.tmuxSession,
+      message,
+      'conversation-message',
+      resolveConversationDeliveryMethod(conv),
+    );
+  } catch (deliveryErr: unknown) {
+    const errMsg = deliveryErr instanceof Error ? deliveryErr.message : String(deliveryErr);
+    if (errMsg.includes('MessageDeliveryFailed')) {
+      return jsonResponse({ error: errMsg.replace('MessageDeliveryFailed: ', '') }, { status: 503 });
+    }
+    throw deliveryErr;
+  }
+
+  // Generate AI title for conversations created via instant-start (no message at creation)
+  if (conv.titleSource === 'default') {
+    void generateAiTitle(name, message).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[TITLE-GEN-FAILED] AI title generation FAILED for "${name}" — NO RETRY, NO FALLBACK:`, msg);
+    });
+  }
+
+  return jsonResponse({ ok: true });
+}
+
 /** Generate a default conversation name, e.g. 20260404-1234 */
 function generateConversationName(): string {
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -122,16 +762,49 @@ function sanitizeName(name: string): string {
 
 /** Check if a tmux session exists (async, non-blocking) */
 async function tmuxSessionExists(sessionName: string): Promise<boolean> {
-  return sessionExistsAsync(sessionName);
+  return Effect.runPromise(sessionExists(sessionName));
 }
 
 async function waitForTmuxSession(sessionName: string, timeoutMs = 30000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (await sessionExistsAsync(sessionName)) return;
+    if (await Effect.runPromise(sessionExists(sessionName))) return;
     await new Promise(r => setTimeout(r, 250));
   }
   throw new Error(`Timed out waiting for tmux session ${sessionName}`);
+}
+
+function shouldUseSupervisorForConversation(harness: RuntimeName): boolean {
+  return harness === 'claude-code'
+    && process.env.PANOPTICON_DOCKER_WORKSPACE !== '1'
+    && process.env.PAN_DOCKER !== '1';
+}
+
+function resolveConversationDeliveryMethod(conv: Conversation): 'auto' | 'channels' | 'tmux' {
+  return conv.deliveryMethod ?? ((conv.harness ?? 'claude-code') === 'claude-code' ? 'auto' : 'tmux');
+}
+
+function resolvePtySupervisorScriptPath(): string {
+  return join(packageRoot, 'dist', 'pty-supervisor.js');
+}
+
+function getPtySupervisorSocketPath(agentId: string): string {
+  return join(process.env.PANOPTICON_HOME ?? join(homedir(), '.panopticon'), 'sockets', `pty-${agentId}.sock`);
+}
+
+async function waitForPtySupervisorSocket(agentId: string, timeoutMs = PTY_SUPERVISOR_SOCKET_WAIT_MS): Promise<void> {
+  const socketPath = getPtySupervisorSocketPath(agentId);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const info = await stat(socketPath);
+      if ((info.mode & 0o777) === 0o600) return;
+    } catch {
+      // not bound yet
+    }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  throw new Error(`Timed out waiting for PTY supervisor socket ${socketPath}`);
 }
 
 /**
@@ -162,23 +835,46 @@ async function extractModelFromSessionFile(sessionFile: string): Promise<string 
   return null;
 }
 
+let backfillRunning = false;
+
 /**
  * Backfill model column for existing conversations that have a session file
  * but no model stored. Runs once on server startup (async, non-blocking).
+ * Guarded against concurrent runs to prevent races.
  */
 async function backfillConversationModels(): Promise<void> {
-  const convs = listConversations();
-  let backfilled = 0;
-  for (const conv of convs) {
-    if (conv.model || !conv.sessionFile) continue;
-    const model = await extractModelFromSessionFile(conv.sessionFile);
-    if (model) {
-      updateConversationModel(conv.name, model);
-      backfilled++;
+  if (backfillRunning) return;
+  backfillRunning = true;
+  try {
+    const convs = listConversations();
+    // Async filter — resolveSessionFile may need to glob the agent dir for Pi.
+    const probe = await Promise.all(
+      convs.map(async (conv) => (!conv.model ? await resolveSessionFile(conv) : null)),
+    );
+    const candidates = convs.filter((_, i) => probe[i] !== null);
+    const BATCH_SIZE = 10;
+    let backfilled = 0;
+    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+      const batch = candidates.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async (conv) => {
+          const sessionFile = await resolveSessionFile(conv);
+          if (!sessionFile) return false;
+          const model = await extractModelFromSessionFile(sessionFile);
+          if (model && SAFE_MODEL_PATTERN.test(model)) {
+            backfillConversationModel(conv.name, model);
+            return true;
+          }
+          return false;
+        }),
+      );
+      backfilled += results.filter(Boolean).length;
     }
-  }
-  if (backfilled > 0) {
-    console.log(`[conversations] Backfilled model for ${backfilled} conversation(s)`);
+    if (backfilled > 0) {
+      console.log(`[conversations] Backfilled model for ${backfilled} conversation(s)`);
+    }
+  } finally {
+    backfillRunning = false;
   }
 }
 
@@ -198,12 +894,7 @@ void backfillConversationModels().catch((err: unknown) => {
 // boundary and continuation summary directly to the JSONL so subsequent
 // `--resume` calls load only the summarized context forward.
 
-function sessionIdFromFile(sessionFile: string | null | undefined): string | undefined {
-  if (!sessionFile) return undefined;
-  return sessionFile.split('/').pop()?.replace('.jsonl', '') ?? undefined;
-}
-
-async function spawnConversationSession(
+export async function spawnConversationSession(
   tmuxSession: string,
   cwd: string,
   claudeSessionId: string,
@@ -211,125 +902,411 @@ async function spawnConversationSession(
   effort?: string,
   issueId?: string,
   resume = false,
+  harness: RuntimeName = 'claude-code',
+  plainFork = false,
 ): Promise<void> {
   const stateDir = join(homedir(), '.panopticon', 'conversations', tmuxSession);
   await mkdir(stateDir, { recursive: true });
 
   const launcherScript = join(stateDir, 'launcher.sh');
 
-  const permissionFlags = '--dangerously-skip-permissions --permission-mode bypassPermissions';
+  const permissionFlags = getClaudePermissionFlagsStringSync();
   let runtimeCommand = `claude ${permissionFlags}`;
-  const providerEnvExports: string[] = [];
+  let providerExportsStr = '';
+  let providerEnv: Record<string, string> = {};
+  let piFields: {
+    harness: 'pi';
+    piMode: 'tui';
+    piExtensionPath: string;
+    piSessionDir: string;
+    resumeSessionId?: string;
+  } | undefined;
   if (model) {
-    runtimeCommand = getAgentRuntimeBaseCommand(model);
-    if (!runtimeCommand.includes('--dangerously-skip-permissions')) {
-      runtimeCommand = `${runtimeCommand} --dangerously-skip-permissions`;
+    if (!SAFE_MODEL_PATTERN.test(model)) {
+      throw new Error('Invalid model name');
     }
-    if (!runtimeCommand.includes('--permission-mode')) {
-      runtimeCommand = `${runtimeCommand} --permission-mode bypassPermissions`;
+    runtimeCommand = await getAgentRuntimeBaseCommand(model, undefined, undefined, harness);
+    // Defensive permission-flag injection.
+    // getAgentRuntimeBaseCommand already emits the correct flags for every code path
+    // (direct/CLIProxy/--agent/claudish), so in a healthy build the appends below are
+    // no-ops. They exist as a belt-and-braces guard for future code paths that might
+    // forget to thread the resolved mode through. The critical safety property:
+    // The DSP literal lives in claude-permissions.ts only; reference it via
+    // the imported constants so the lint guard stays tight.
+    // NEVER add DSP when the resolved mode is 'auto'. Enterprise users rely
+    // on Auto being honored; a silent escalation to bypass is a P0 trust violation.
+    const mode = resolvePermissionModeSync();
+    if (mode === 'auto') {
+      if (!runtimeCommand.includes('--permission-mode')) {
+        runtimeCommand = `${runtimeCommand} --permission-mode auto`;
+      }
+      // Refuse to run with mixed signals: if the base command already contains DSP
+      // while the user explicitly chose Auto, that is a substrate bug that must
+      // surface, not be silently downgraded.
+      if (runtimeCommand.includes(DSP_FLAG)) {
+        throw new Error(
+          `Refusing to spawn ${tmuxSession}: resolved mode is 'auto' but base command for model "${model}" contains ${DSP_FLAG}. This is a substrate bug; do not silently bypass user Settings.`,
+        );
+      }
+    } else {
+      if (!runtimeCommand.includes(DSP_FLAG)) {
+        runtimeCommand = `${runtimeCommand} ${DSP_FLAG}`;
+      }
+      if (!runtimeCommand.includes('--permission-mode')) {
+        runtimeCommand = `${runtimeCommand} --permission-mode ${BYPASS_PERMISSION_MODE}`;
+      }
     }
-    const providerExports = getProviderExportsForModel(model).trim();
-    if (providerExports) {
-      providerEnvExports.push(...providerExports.split('\n').filter(Boolean));
+    providerExportsStr = (await getProviderExportsForModel(model)).trim();
+    providerEnv = await getProviderEnvForModel(model);
+
+    if (harness === 'pi') {
+      // Conversations run Pi in TUI mode (the default Pi terminal UI). This
+      // gives users an actual terminal in the tmux pane — they can type
+      // directly into Pi, and dashboard-composer messages are delivered via
+      // tmux paste-buffer (sendKeysAsync) just like Claude Code. Pi still
+      // writes JSONL session files to --session-dir, so cost parsing and
+      // resume keep working.
+      //
+      // Work-agents (spawned elsewhere) keep --mode rpc + FIFO because
+      // Cloister needs the structured delivery primitive. See PAN-1067.
+      const paths = piFifoPaths(tmuxSession);
+      const piSessionDir = join(paths.agentDir, 'sessions');
+      await mkdir(paths.agentDir, { recursive: true, mode: 0o700 });
+      await mkdir(piSessionDir, { recursive: true, mode: 0o700 });
+      // No FIFO needed in TUI mode — Pi reads from the pane stdin.
+      const storedPiSessionId = resume
+        ? (await readFile(join(paths.agentDir, 'session.id'), 'utf-8').then((s) => s.trim()).catch(() => undefined))
+        : undefined;
+      piFields = {
+        harness: 'pi',
+        piMode: 'tui',
+        piExtensionPath: resolve(process.cwd(), 'packages/pi-extension/dist/index.js'),
+        piSessionDir,
+        resumeSessionId: storedPiSessionId || undefined,
+      };
+
     }
   }
 
-  const envExports = [
-    `export TERM=xterm-256color`,
-    `export COLORTERM=truecolor`,
-    `export LANG=C.UTF-8`,
-    `export LC_ALL=C.UTF-8`,
-    ...(issueId ? [`export PANOPTICON_ISSUE_ID="${issueId}"`] : []),
-    ...providerEnvExports,
-  ].join('\n');
+  // Pi's CLI matches `--model <id>` against its full registry; with
+  // ambiguous IDs like "gpt-5.4" (which exist under multiple providers),
+  // the first registry hit wins — and that hit can be a provider the user
+  // has no auth for (e.g. azure-openai-responses). Pass the model as
+  // `<pi-provider>/<id>` so Pi's resolveCliModel locks in the intended
+  // provider. The user's pi auth (`~/.pi/agent/auth.json`) determines
+  // whether the call actually succeeds.
+  let launcherModel = model;
+  if (harness === 'pi' && model) {
+    const piProvider = piProviderForModel(model);
+    if (piProvider) launcherModel = `${piProvider}/${model}`;
+  }
 
-  const sessionArgs = [
-    resume ? `--resume "${claudeSessionId}"` : `--session-id "${claudeSessionId}"`,
-    ...(effort ? [`--effort "${effort}"`] : []),
-  ].join(' ');
+  if (effort && !SAFE_EFFORT_PATTERN.test(effort)) {
+    throw new Error('Invalid effort level');
+  }
 
-  await writeFile(launcherScript, `#!/bin/bash
-${envExports}
-cd "${cwd}"
-trap '' HUP
-${runtimeCommand} ${sessionArgs}
-echo ""
-echo "Conversation session ended. Close this panel or click Resume to start a new session."
-while true; do sleep 60; done
-`, { mode: 0o755 });
+  const useSupervisor = shouldUseSupervisorForConversation(harness);
+  let supervisorScriptPath: string | undefined;
+  if (useSupervisor) {
+    supervisorScriptPath = resolvePtySupervisorScriptPath();
+    if (!existsSync(supervisorScriptPath)) {
+      throw new Error('pty-supervisor build artifact missing — run `npm run build`.');
+    }
+    await writePtyToken(tmuxSession);
+  }
+
+  // Channels setup for Claude Code conversations when the experimental flag
+  // is on. Writes a per-session bridge token and MCP config so Claude loads
+  // the panopticon-bridge stdio server on startup.
+  //
+  // Plain forks skip channels wiring entirely. Two reasons:
+  //   1. The panopticon-bridge MCP server registers its tool schema into
+  //      Claude's context budget. On a plain fork the whole source JSONL is
+  //      loaded via --resume; pushing borderline-sized conversations across
+  //      Claude Code's ~200K auto-compact threshold defeats the entire
+  //      purpose of plain fork (pick up exactly where you left off).
+  //   2. dismissDevChannelsDialog spams Enter to clear the dev-channels
+  //      warning. If the resumed session shows an auto-compact suggestion in
+  //      the same window, a stray Enter confirms it — silently triggering
+  //      /compact on the brand-new fork.
+  // Subsequent messages to the fork can still reach the agent via tmux,
+  // which is the channels delivery fallback anyway.
+  let channelsBridgeMcpConfig: string | undefined;
+  if (
+    !piFields &&
+    !plainFork &&
+    isClaudeCodeChannelsEnabled() &&
+    (!model || getProviderForModelSync(model).name === 'anthropic') &&
+    process.env.CLAUDE_CODE_USE_BEDROCK !== '1' &&
+    process.env.CLAUDE_CODE_USE_VERTEX !== '1' &&
+    process.env.CLAUDE_CODE_USE_FOUNDRY !== '1' &&
+    process.env.PANOPTICON_DOCKER_WORKSPACE !== '1' &&
+    process.env.PAN_DOCKER !== '1'
+  ) {
+    channelsBridgeMcpConfig = join(stateDir, 'agent-mcp.json');
+    writeBridgeTokenSync(tmuxSession);
+    await writeChannelsBridgeMcpConfig(channelsBridgeMcpConfig, tmuxSession);
+  }
+
+  // Atomic write: a concurrent resume/switch-model for the same conversation
+  // reuses this exact path. Writing in place lets the other spawn read a
+  // half-written launcher; write to a unique temp file then rename (atomic on
+  // the same filesystem).
+  const launcherTmp = `${launcherScript}.${randomUUID()}.tmp`;
+  await writeFile(
+    launcherTmp,
+    generateLauncherScriptSync({
+      role: 'work',
+      spawnMode: 'conversation',
+      workingDir: cwd,
+      setTerminalEnv: true,
+      unsetProviderEnv: true,
+      panopticonEnv: { ...(issueId ? { issueId } : {}), ...((piFields || useSupervisor) ? { agentId: tmuxSession } : {}) },
+      providerExports: providerExportsStr || undefined,
+      trapHup: true,
+      baseCommand: runtimeCommand,
+      model: launcherModel,
+      ...(piFields ?? {
+        resumeSessionId: resume ? claudeSessionId : undefined,
+        sessionId: resume ? undefined : claudeSessionId,
+      }),
+      extraArgs: !piFields && effort ? `--effort "${effort}"` : undefined,
+      keepAlive: true,
+      fileMode: 0o700,
+      channelsBridgeMcpConfig,
+      useSupervisor,
+      supervisorScriptPath,
+    }),
+    { mode: 0o700 },
+  );
+  await rename(launcherTmp, launcherScript);
 
   // Kill any stale session with the same name
   try {
-    await killSessionAsync(tmuxSession);
+    await Effect.runPromise(killSession(tmuxSession));
   } catch {
     // ignore missing stale session
   }
 
-  // Spawn the session
-  await createSessionAsync(tmuxSession, cwd, `bash '${launcherScript}'`, {
-    env: {
-      TERM: 'xterm-256color',
-    },
-  });
+  console.log(`[claude-invoke] purpose=conversation-session | model=${model || 'default'} | source=conversations.ts:spawnConversationSession | session=${tmuxSession} | resume=${resume} | command="${runtimeCommand}"`);
+
+  // Pre-accept Claude Code's trust + bypass-permissions disclaimers BEFORE
+  // spawn so the new claude process reads acceptance from ~/.claude.json on
+  // startup and skips both dialogs. Without this, the "Bypass Permissions
+  // mode" prompt blocks the session in the tmux pane — its default option
+  // is "No, exit", so any Enter (including from dismissDevChannelsDialog)
+  // tears the session down and the user sees "Conversation session ended"
+  // immediately after launch. Work/specialist spawns already do this in
+  // src/lib/agents.ts; conversations were the only spawn path missing it.
+  try {
+    const { preTrustDirectory } = await import('../../../lib/workspace-manager.js') as { preTrustDirectory: (dir: string) => void };
+    preTrustDirectory(cwd);
+  } catch { /* non-fatal */ }
+
+  // Spawn the session — blank out provider env vars (ANTHROPIC_BASE_URL,
+  // ANTHROPIC_API_KEY, etc.) via tmux -e flags so the launcher script's
+  // exports are the sole source of provider configuration. The tmux server
+  // inherits the parent's env and -e can only SET, not UNSET, so we set
+  // provider vars to empty strings to override stale inherited values.
+  try {
+    await Effect.runPromise(createSession(tmuxSession, cwd, `bash ${shellQuote(launcherScript)}`, {
+      env: {
+        ...BLANKED_PROVIDER_ENV,
+        TERM: 'xterm-256color',
+      },
+    }));
+  } catch (err) {
+    if ((err as { code?: string })?.code === 'ENOENT') {
+      throw new Error(
+        'tmux is not installed. Install it with: brew install tmux (macOS) or sudo apt-get install tmux (Linux)',
+      );
+    }
+    throw err;
+  }
+
+  if (useSupervisor) {
+    await waitForPtySupervisorSocket(tmuxSession);
+  }
+
+  // Channels: dismiss the dev-channels confirmation dialog so the bridge MCP
+  // server starts and the socket is created. Fire-and-forget — the helper
+  // self-polls for the dialog and presses Enter. Awaiting it here blocked the
+  // POST /api/conversations response (and therefore the conversation appearing
+  // in the list) for up to 20s. waitForClaudeReady below naturally waits for
+  // the prompt, which only appears once this dismissal lands, so the two run
+  // concurrently without a race.
+  if (channelsBridgeMcpConfig) {
+    void dismissDevChannelsDialog(tmuxSession).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[conversations] dismissDevChannelsDialog failed for ${tmuxSession}: ${msg}`);
+    });
+  }
 
   // Keep session alive when clients disconnect
-  await setOptionAsync(tmuxSession, 'destroy-unattached', 'off');
-  await setOptionAsync(tmuxSession, 'remain-on-exit', 'on');
+  await Effect.runPromise(setOption(tmuxSession, 'destroy-unattached', 'off'));
+  await Effect.runPromise(setOption(tmuxSession, 'remain-on-exit', 'on'));
 }
 
 /**
- * Generate an AI title for a conversation using Claude CLI (T3Code pattern).
- * Runs `claude -p --output-format json --json-schema ...` with the first message
- * as input, then updates the conversation title if it hasn't been manually renamed.
+ * Generate an AI title for a conversation from its opening message (T3Code pattern).
+ * Runs at conversation creation; updates the title only if it hasn't been
+ * manually renamed (`canReplaceTitle`). No fallback — if generation fails the
+ * error is logged and the existing title is kept.
+ *
+ * For an explicit, whole-conversation re-title see the retitle route below.
  */
 async function generateAiTitle(conversationName: string, firstMessage: string): Promise<void> {
   const conv = getConversationByName(conversationName);
-  if (!conv || !canReplaceTitle(conv)) return;
+  if (!conv || !canReplaceTitle(conv)) {
+    return;
+  }
 
-  const schema = JSON.stringify({
-    type: 'object',
-    properties: { title: { type: 'string' } },
-    required: ['title'],
-  });
+  console.log(`[claude-invoke] purpose=conversation-title | model=${CONVERSATION_TITLE_MODEL} | source=conversations.ts:generateAiTitle | conversation=${conversationName} | promptChars=${firstMessage.length}`);
 
-  const prompt = [
-    'You write concise thread titles for coding conversations.',
-    'Summarize the user\'s request in 3-8 words.',
-    'Avoid quotes, filler, prefixes, and trailing punctuation.',
-    '',
-    'User message:',
-    firstMessage,
-  ].join('\n');
-
-  const { stdout } = await execAsync(
-    `echo ${JSON.stringify(prompt)} | claude -p --output-format json --json-schema ${JSON.stringify(schema)} --model claude-haiku-4-5-20251001 --dangerously-skip-permissions --permission-mode bypassPermissions`,
-    { encoding: 'utf-8', timeout: 30_000 },
-  );
-
-  // Claude CLI returns { structured_output: { title: "..." }, ... } or { result: "..." }
-  const parsed = JSON.parse(stdout.trim());
-  const aiTitle: string | undefined =
-    parsed?.structured_output?.title ?? parsed?.title;
-
-  if (!aiTitle || !aiTitle.trim()) return;
-
-  // Sanitize: strip quotes, normalize whitespace, take first line only
-  const sanitized = aiTitle
-    .trim()
-    .split(/\r?\n/)[0]
-    ?.trim()
-    .replace(/^['"`]+|['"`]+$/g, '')
-    .trim()
-    .replace(/\s+/g, ' ');
-
-  if (!sanitized) return;
+  const sanitized = await summarizeFirstMessageTitle(firstMessage);
+  if (!sanitized) {
+    console.warn(`[generateAiTitle] Model returned empty title for "${conversationName}"`);
+    return;
+  }
 
   // Re-check eligibility (may have been renamed while we waited)
   const freshConv = getConversationByName(conversationName);
-  if (!freshConv || !canReplaceTitle(freshConv)) return;
+  if (!freshConv || !canReplaceTitle(freshConv)) {
+    console.log(`[generateAiTitle] Conversation "${conversationName}" was renamed while generating title; skipping update`);
+    return;
+  }
 
   updateConversationTitle(conversationName, sanitized, 'ai');
-  console.log(`[conversations] AI title for "${conversationName}": ${sanitized}`);
+  console.log(`[claude-invoke] SUCCESS purpose=conversation-title | model=${CONVERSATION_TITLE_MODEL} | conversation=${conversationName} | outputChars=${sanitized.length}`);
+}
+
+// ─── Conversation retitle / about summary ─────────────────────────────────────
+//
+// Both read the conversation's own JSONL transcript on demand. The memory
+// Observation pipeline never observes ad-hoc conversations (it watches only
+// work-role pipeline agents), so there is no pre-computed data to draw on —
+// the transcript itself is the source of truth. A follow-up issue tracks
+// extending the observation pipeline to conversations.
+
+/** Conversations with a retitle currently running — guards against double-clicks. */
+const retitleInFlight = new Set<string>();
+
+interface ConversationAboutSummary {
+  summary: string;
+  messageCount: number;
+  generatedAt: string;
+}
+
+/** transcript-size-keyed cache so re-opening the About drawer doesn't re-summarize. */
+const aboutSummaryCache = new Map<string, { transcriptSize: number; data: ConversationAboutSummary }>();
+const ABOUT_SUMMARY_CACHE_MAX = 100;
+
+type ArchivedConversationResponse = {
+  id: number;
+  source: 'managed-archived';
+  conversationName: string;
+  jsonlPath: string | null;
+  workspacePath: string;
+  primaryModel: string | null;
+  messageCount: number;
+  firstTs: string;
+  lastTs: string;
+  estimatedCost: number;
+  tokenInput: number;
+  tokenOutput: number;
+  toolsUsed: string[];
+  filesTouched: string[];
+  tags: string[];
+  summary: string | null;
+  enrichmentLevel: 0 | 1 | 2 | 3;
+  enrichmentFailed: boolean;
+  panopticonManaged: true;
+  panIssueId: string | null;
+  archivedAt: string;
+};
+
+function parseStringArrayColumn(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function mapArchivedConversation(row: ArchivedConversationWithEnrichment): ArchivedConversationResponse {
+  return {
+    id: row.id,
+    source: 'managed-archived',
+    conversationName: row.name,
+    jsonlPath: row.discoveredJsonlPath ?? (row.claudeSessionId ? sessionFilePath(row.cwd, row.claudeSessionId) : null),
+    workspacePath: row.cwd,
+    primaryModel: row.primaryModel ?? row.model,
+    messageCount: row.messageCount ?? 0,
+    firstTs: row.firstTs ?? row.createdAt,
+    lastTs: row.lastTs ?? row.archivedAt,
+    estimatedCost: row.estimatedCost ?? row.totalCost,
+    tokenInput: row.tokenInput ?? 0,
+    tokenOutput: row.tokenOutput ?? 0,
+    toolsUsed: parseStringArrayColumn(row.toolsUsed),
+    filesTouched: parseStringArrayColumn(row.filesTouched),
+    tags: parseStringArrayColumn(row.tags),
+    summary: row.summary ?? row.title,
+    enrichmentLevel: ((row.enrichmentLevel ?? 0) as 0 | 1 | 2 | 3),
+    enrichmentFailed: Boolean(row.enrichmentFailed),
+    panopticonManaged: true,
+    panIssueId: row.issueId,
+    archivedAt: row.archivedAt,
+  };
+}
+
+function parseOptionalNumberParam(params: URLSearchParams, name: string): number | undefined {
+  const value = params.get(name);
+  if (value === null) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function parseArchivedConversationListOptions(params: URLSearchParams): ArchivedConversationListOptions {
+  const options: ArchivedConversationListOptions = {};
+  const workspacePath = params.get('workspacePath');
+  const primaryModel = params.get('primaryModel');
+  const since = params.get('since');
+  const tag = params.get('tag');
+  const tool = params.get('tool');
+  const file = params.get('file');
+  const minCost = parseOptionalNumberParam(params, 'minCost');
+  const maxCost = parseOptionalNumberParam(params, 'maxCost');
+  const enrichmentLevel = parseOptionalNumberParam(params, 'enrichmentLevel');
+  const rawLimit = parseOptionalNumberParam(params, 'limit');
+  const rawOffset = parseOptionalNumberParam(params, 'offset');
+
+  if (workspacePath) options.workspacePath = workspacePath;
+  if (primaryModel) options.primaryModel = primaryModel;
+  if (since) options.since = parseRelativeTime(since);
+  if (params.get('managed') === 'true') options.managed = true;
+  if (params.get('enriched') === 'true') options.enriched = true;
+  if (tag) options.tags = [tag];
+  if (tool) options.tools = [tool];
+  if (file) options.files = [file];
+  if (minCost !== undefined) options.minCost = minCost;
+  if (maxCost !== undefined) options.maxCost = maxCost;
+  if (enrichmentLevel !== undefined) options.enrichmentLevel = enrichmentLevel;
+  options.limit = rawLimit === undefined ? 50 : Math.min(Math.max(rawLimit, 0), 100);
+  if (rawOffset !== undefined) options.offset = Math.max(rawOffset, 0);
+  return options;
+}
+
+export async function handleArchivedConversationsList(options: ArchivedConversationListOptions = {}): Promise<ReturnType<typeof jsonResponse>> {
+  try {
+    const rows = listArchivedConversationsWithEnrichment(options).map(mapArchivedConversation);
+    return jsonResponse(rows);
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error('[conversations] list archived conversations failed:', msg);
+    return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+  }
 }
 
 // ─── Route: GET /api/conversations ───────────────────────────────────────────
@@ -338,44 +1315,77 @@ const getConversationsRoute = HttpRouter.add(
   'GET',
   '/api/conversations',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     return yield* Effect.promise(async () => {
     try {
-        const conversations = listConversations();
-        const favoritedNames = new Set(listFavoritedIds('conversation'));
+        const url = new URL(request.url, 'http://localhost');
+        const limitParam = url.searchParams.get('limit');
+        const offsetParam = url.searchParams.get('offset');
+        const limit = limitParam ? Math.min(parseInt(limitParam, 10), 1000) : 500;
+        const offset = offsetParam ? Math.max(parseInt(offsetParam, 10), 0) : 0;
+        const conversations = listConversations({ limit, offset });
+        const favoritedNames = getCachedFavoritedIds();
 
         // Enrich with live tmux status
-        // Grace period: treat recently-created active conversations as alive (tmux may not have
-        // started yet — spawn is async). After 30s we fall back to the actual tmux check.
-        const SPAWN_GRACE_MS = 30_000;
-        const enriched = await Promise.all(
-          conversations.map(async (conv) => {
-            const withinGrace =
-              conv.status === 'active' &&
-              !conv.endedAt &&
-              Date.now() - new Date(conv.createdAt).getTime() < SPAWN_GRACE_MS;
-            const sessionAlive = !conv.forkStatus && (withinGrace || (await tmuxSessionExists(conv.tmuxSession)));
-
+        // Grace period removed (PAN-826): POST /api/conversations now waits for
+        // Claude to be ready before returning 201, so newly-created conversations
+        // are always live by the time they appear in the list.
+        const liveSessionNames = new Set(await Effect.runPromise(listSessionNames()));
+        const enriched = await Effect.runPromise(withConcurrencyLimit(
+          conversations.map((conv) => Effect.promise(async () => {
+            const sessionAlive = !conv.forkStatus && liveSessionNames.has(conv.tmuxSession);
             let isWorking = false;
             let currentTool: string | null = null;
-            if (sessionAlive && conv.sessionFile) {
+            let contextUsage = null;
+            const convSf = await resolveSessionFile(conv);
+
+            if (convSf && existsSync(convSf)) {
+              if (sessionAlive) {
+                try {
+                  const summary = await summarizeConversationActivity(convSf);
+                  isWorking = summary.isWorking;
+                  currentTool = summary.currentTool;
+                } catch {
+                  // JSONL parse failure — fall back to defaults
+                }
+              }
               try {
-                const summary = await summarizeConversationActivity(conv.sessionFile);
-                isWorking = summary.isWorking;
-                currentTool = summary.currentTool;
+                contextUsage = await computeContextUsage(convSf, conv.model);
               } catch {
-                isWorking = false;
+                contextUsage = null;
               }
             }
 
-            return { ...conv, sessionAlive, isWorking, currentTool, isFavorited: favoritedNames.has(conv.name) };
-          }),
-        );
+            const compacting = convSf ? isCompacting(convSf) : false;
+            return { ...conv, sessionAlive, isWorking, currentTool, isFavorited: favoritedNames.has(conv.name), compacting, contextUsage };
+          })),
+          CONVERSATION_LIST_ENRICHMENT_CONCURRENCY,
+        ));
 
         return jsonResponse(enriched);
       }    catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to list conversations: ' + msg }, { status: 500 });
+        console.error('[conversations] list conversations failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
         }})
+  }),
+);
+
+const getArchivedConversationsRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/archived',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const url = new URL(request.url, 'http://localhost');
+    return yield* Effect.promise(() => handleArchivedConversationsList(parseArchivedConversationListOptions(url.searchParams)));
   }),
 );
 
@@ -385,24 +1395,61 @@ const getConversationRoute = HttpRouter.add(
   'GET',
   '/api/conversations/:id',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
-    const id = Number(params['id']);
+    const rawId = params['id'] ?? '';
+    const numericId = Number(rawId);
     return yield* Effect.promise(async () => {
       try {
-        if (isNaN(id)) {
-          return jsonResponse({ error: 'Invalid conversation ID' }, { status: 400 });
-        }
-        const conv = getConversationById(id);
+        // The list endpoint deliberately excludes agent/planning/specialist
+        // rows (kept out of the human-conversations sidebar), but consumers
+        // like AgentOutputPanel still need to fetch a single agent row by
+        // name. When the path param looks like a name rather than a number,
+        // resolve via getConversationByName instead of getConversationById.
+        const conv = !Number.isNaN(numericId) && /^\d+$/.test(rawId)
+          ? getConversationById(numericId)
+          : getConversationByName(rawId);
         if (!conv) {
           return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         }
         const sessionAlive = await tmuxSessionExists(conv.tmuxSession);
-        return jsonResponse({ ...conv, sessionAlive });
+        const convSf = await resolveSessionFile(conv);
+        let contextUsage = null;
+        if (convSf && existsSync(convSf)) {
+          try {
+            contextUsage = await computeContextUsage(convSf, conv.model);
+          } catch {
+            contextUsage = null;
+          }
+        }
+        return jsonResponse({ ...conv, sessionAlive, contextUsage });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to get conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] get conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
+  }),
+);
+
+// ─── Route: GET /api/conversations/:name/handoff-doc ─────────────────────────
+
+const getConversationHandoffDocRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/:name/handoff-doc',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(() => handleConversationHandoffDoc(name));
   }),
 );
 
@@ -416,67 +1463,148 @@ const postConversationRoute = HttpRouter.add(
   'POST',
   '/api/conversations',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const body = yield* readJsonBody;
+
+    // Log request origin to trace who is creating conversations
+    const reqOrigin = getHeader(request, 'origin') ?? 'none';
+    const reqReferer = getHeader(request, 'referer') ?? 'none';
+    const reqUserAgent = getHeader(request, 'user-agent') ?? 'none';
+    const reqXff = getHeader(request, 'x-forwarded-for') ?? 'none';
+    const reqIp = request.headers['x-real-ip'] ?? 'local';
+    console.log(`[conversations] POST /api/conversations origin=${reqOrigin} referer=${reqReferer} ua=${reqUserAgent.slice(0, 80)} xff=${reqXff} ip=${reqIp}`);
+
     return yield* Effect.promise(async () => {
       try {
         const message = typeof body['message'] === 'string' ? body['message'].trim() : '';
         const model = typeof body['model'] === 'string' ? body['model'].trim() : undefined;
         const effort = typeof body['effort'] === 'string' ? body['effort'].trim() : undefined;
+        const harness = await resolveAllowedHarness(body['harness'], model);
         const issueId = typeof body['issueId'] === 'string' ? body['issueId'] : undefined;
-        const cwd = join(homedir(), 'Projects');
-
-        if (!message) {
-          return jsonResponse({ error: 'message is required' }, { status: 400 });
+        const projectKey = typeof body['projectKey'] === 'string' ? body['projectKey'].trim() : undefined;
+        const applyProviderOverride = body['applyProviderOverride'] === true;
+        if (issueId && !SAFE_ISSUE_ID_PATTERN.test(issueId)) {
+          return jsonResponse({ error: 'Invalid issueId' }, { status: 400 });
+        }
+        if (model && !SAFE_MODEL_PATTERN.test(model)) {
+          return jsonResponse({ error: 'Invalid model' }, { status: 400 });
+        }
+        if (effort && !SAFE_EFFORT_PATTERN.test(effort)) {
+          return jsonResponse({ error: 'Invalid effort' }, { status: 400 });
+        }
+        let cwd = join(homedir(), 'Projects');
+        if (projectKey) {
+          const projectConfig = getProjectSync(projectKey);
+          if (projectConfig?.path && existsSync(projectConfig.path)) {
+            cwd = projectConfig.path;
+          } else {
+            return jsonResponse({ error: `Unknown project: ${projectKey}` }, { status: 400 });
+          }
         }
 
-        // Generate identifiers
-        const name = generateConversationName();
+        if (message && message.length > MAX_MESSAGE_LENGTH) {
+          return jsonResponse(
+            { error: `message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` },
+            { status: 400 },
+          );
+        }
+
+        // Generate identifiers — retry on UNIQUE collision (extremely unlikely
+        // with HHMMSS+random, but cheap insurance against sub-second races).
+        let name = generateConversationName();
+        for (let i = 0; i < 5 && getConversationByName(name); i++) {
+          name = generateConversationName();
+        }
         const tmuxSession = `conv-${name}`;
         const claudeSessionId = randomUUID();
-        const sessionFile = sessionFilePath(cwd, claudeSessionId);
 
-        console.log(`[conversations] Creating conversation "${name}" with model=${model ?? 'default'} effort=${effort ?? 'default'}`);
+        console.log(`[conversations] Creating conversation "${name}" with model=${model ?? 'default'} effort=${effort ?? 'default'} cwd=${cwd}`);
 
-        // Spawn tmux session with model + effort + deterministic session ID
-        await spawnConversationSession(tmuxSession, cwd, claudeSessionId, model, effort, issueId);
-        console.log(`[conversations] tmux session ${tmuxSession} spawned, JSONL: ${sessionFile}`);
-
-        // Title = truncated first message (T3Code pattern)
+        // Title = truncated first message (T3Code pattern), or default
         const MAX_TITLE_LEN = 60;
-        const title = message.slice(0, MAX_TITLE_LEN) + (message.length > MAX_TITLE_LEN ? '…' : '');
+        const title = message
+          ? message.slice(0, MAX_TITLE_LEN) + (message.length > MAX_TITLE_LEN ? '…' : '')
+          : 'New conversation';
 
-        // Create DB record
+        // Create the DB record FIRST — before spawning the tmux session and
+        // waiting up to 30s for the runtime to render. Previously the row was
+        // inserted last, so a brand-new conversation did not exist in the DB
+        // (and could not appear in the list) for the entire spawn+ready window.
+        // Insert immediately, emit a realtime event, then spawn.
         const conv = createConversation({
           name,
           tmuxSession,
           cwd,
           issueId,
-          sessionFile,
+          claudeSessionId,
           title,
-          titleSource: 'auto',
+          titleSource: message ? 'auto' : 'default',
           titleSeed: title,
           model,
           effort,
+          harness,
+        });
+        getEventStore().emitOnly({
+          type: 'conversation.created',
+          timestamp: new Date().toISOString(),
+          payload: { conversationName: name },
         });
 
-        // Wait for Claude Code to be ready, send message, and generate title — all async.
-        // Don't block the HTTP response; the frontend will poll for messages.
+        // Spawn the tmux session, wait for the runtime to render, and deliver
+        // the initial message in the BACKGROUND. The POST returns as soon as
+        // the DB row exists so the client can both render AND select the new
+        // conversation immediately — previously the response was held for the
+        // whole spawn + up-to-30s ready wait, so the conversation appeared in
+        // the list but could not be auto-opened until spawn finished.
         void (async () => {
           try {
-            await waitForClaudeReady(tmuxSession);
-            await sendKeysAsync(tmuxSession, message, 'conversation-message');
-            void generateAiTitle(name, message).catch((err: unknown) => {
-              console.error(`[conversations] AI title generation failed for "${name}":`, err);
+            await spawnConversationSession(tmuxSession, cwd, claudeSessionId, model, effort, issueId, false, harness);
+            console.log(`[conversations] tmux session ${tmuxSession} spawned, sessionId: ${claudeSessionId}`);
+
+            if (harness === 'pi') {
+              await waitForPiTuiReady(tmuxSession);
+            } else {
+              // Bounded by waitForClaudeReady's existing 30s timeout.
+              await waitForClaudeReady(tmuxSession);
+              console.log(`[conversations] Claude ready in ${tmuxSession}`);
+            }
+
+            // If a message was provided, send it now that the runtime is ready.
+            if (message) {
+              await deliverAgentMessage(tmuxSession, message, 'conversation-message', resolveConversationDeliveryMethod(conv));
+            }
+          } catch (spawnErr: unknown) {
+            const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+            console.error(`[conversations] background spawn failed for ${tmuxSession}: ${msg}`);
+            updateSpawnError(name, msg);
+            getEventStore().emitOnly({
+              type: 'conversation.created',
+              timestamp: new Date().toISOString(),
+              payload: { conversationName: name },
             });
-          } catch (err) {
-            console.error(`[conversations] Failed to send first message to ${tmuxSession}:`, err);
           }
         })();
 
-        return jsonResponse({ ...conv, sessionAlive: true }, { status: 201 });
+        // Generate AI title in background (non-blocking)
+        if (message) {
+          void generateAiTitle(name, message).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[TITLE-GEN-FAILED] AI title generation FAILED for "${name}" — NO RETRY, NO FALLBACK:`, msg);
+          });
+        }
+
+        // sessionAlive is false at response time — the tmux session spawns in
+        // the background task above. The list query and terminal panel both
+        // pick up liveness on their own once the session exists.
+        return jsonResponse({ ...conv, sessionAlive: false }, { status: 201 });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to create conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] create conversation failed:', msg);
+        return jsonResponse({ error: msg || 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -493,6 +1621,11 @@ const postConversationStopRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/stop',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     return yield* Effect.promise(async () => {
@@ -502,13 +1635,21 @@ const postConversationStopRoute = HttpRouter.add(
           return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         }
 
-        await killSessionAsync(conv.tmuxSession).catch(() => {});
+        await Effect.runPromise(killSession(conv.tmuxSession).pipe(Effect.catch(() => Effect.succeed(undefined))));
         markConversationEnded(name);
+        // Fire-and-forget cleanup after a brief pause for in-flight JSONL writes.
+        // Do NOT await — attachment pruning can read the entire JSONL and must
+        // not block the HTTP response critical path.
+        void (async () => {
+          await new Promise((r) => setTimeout(r, 500));
+          await cleanupUnreferencedConversationAttachments({ name: conv.name, sessionFile: (conv as { sessionFile?: string | null }).sessionFile ?? null });
+        })();
 
         return jsonResponse({ success: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to stop conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] stop conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -520,6 +1661,11 @@ const postConversationResumeRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/resume',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     const body = yield* readJsonBody;
@@ -550,21 +1696,68 @@ const postConversationResumeRoute = HttpRouter.add(
         // Respawn: resume the previous Claude Code session using --resume
         // Resume must never mutate the JSONL — `claude --resume` loads the full raw
         // transcript. Auto-compaction here would fork the conversation (PAN-802).
-        const oldSessionId = sessionIdFromFile(conv.sessionFile);
+        const oldSessionId = conv.claudeSessionId;
+        // Harness is PINNED per conversation. A resume must never re-derive it
+        // from the model — that silently flipped Pi conversations to Claude Code
+        // and orphaned their transcripts (P0, 2026-05-14). Changing the runtime
+        // for an existing conversation only happens through the explicit
+        // switch-model path, which converts the transcript format.
+        const harness: RuntimeName = conv.harness ?? 'claude-code';
         const modelChanged = !!model && model !== conv.model;
 
-        // Persist the new model so the dropdown reflects what we're respawning with.
-        if (model && modelChanged) updateConversationModel(name, model);
+        if (!(await validateCwdContainment(conv.cwd))) {
+          return jsonResponse({ error: 'Invalid cwd' }, { status: 400 });
+        }
 
-        await spawnConversationSession(conv.tmuxSession, conv.cwd, oldSessionId ?? randomUUID(), model, effort, conv.issueId ?? undefined, !!oldSessionId);
-        await waitForTmuxSession(conv.tmuxSession);
-        await waitForClaudePrompt(conv.tmuxSession, 30000).catch(() => false);
+        // Validate model before persisting so invalid values never reach the DB.
+        if (model && modelChanged && !SAFE_MODEL_PATTERN.test(model)) {
+          return jsonResponse({ error: 'Invalid model' }, { status: 400 });
+        }
 
-        markConversationActive(name);
-        return jsonResponse({ ...conv, status: 'active', model: model ?? conv.model, reattached: false, sessionAlive: true });
+        // Persist the new model so the dropdown reflects what we're respawning
+        // with. Harness is unchanged on resume — no write needed.
+        if (model && modelChanged) setConversationModel(name, model);
+
+        // Resume only if the transcript actually exists. A conversation with a
+        // session id but no resolvable file means its history was lost or
+        // orphaned (e.g. an earlier bad harness flip) — log it loudly rather
+        // than silently `--resume`-ing into a "No conversation found" error.
+        let canResume = !!oldSessionId;
+        if (oldSessionId) {
+          const resumeFile = await resolveSessionFile(conv);
+          if (!resumeFile || !existsSync(resumeFile)) {
+            canResume = false;
+            console.error(
+              `[conversations] SESSION-LOST ${name} harness=${harness} ` +
+              `claudeSessionId=${oldSessionId} resolved=${resumeFile ?? 'null'} — ` +
+              `resuming with a fresh session`,
+            );
+          }
+        }
+
+        // Mark the session as mid-respawn so terminal WS reconnects landing
+        // in the tmux-down window don't get a fatal 4404. The tmux session
+        // is already dead here (sessionAlive was false) — this guards the
+        // window between now and `waitForTmuxSession` returning.
+        const respawn = markRespawnPending(conv.tmuxSession);
+        try {
+          await spawnConversationSession(conv.tmuxSession, conv.cwd, oldSessionId ?? randomUUID(), model, effort, conv.issueId ?? undefined, canResume, harness);
+          await waitForTmuxSession(conv.tmuxSession);
+          if (harness === 'pi') {
+            await waitForPiTuiReady(conv.tmuxSession);
+          } else {
+            await (await Effect.runPromise(waitForClaudePrompt(conv.tmuxSession, 30000))).catch(() => false);
+          }
+
+          markConversationActive(name);
+          return jsonResponse({ ...conv, status: 'active', model: model ?? conv.model, harness, reattached: false, sessionAlive: true });
+        } finally {
+          respawn.done();
+        }
       }    catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to resume conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] resume conversation failed:', msg);
+        return jsonResponse({ error: msg || 'Internal server error' }, { status: 500 });
         }})
   }),
 );
@@ -579,6 +1772,11 @@ const postConversationSwitchModelRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/switch-model',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     const body = yield* readJsonBody;
@@ -593,35 +1791,159 @@ const postConversationSwitchModelRoute = HttpRouter.add(
           ? body['model'].trim()
           : (conv.model ?? undefined);
 
-        // Always kill the existing session first (if alive) so the model change takes effect
-        await killSessionAsync(conv.tmuxSession).catch(() => {});
+        // Harness is PINNED per conversation. It changes ONLY when the request
+        // explicitly asks for a different one — never silently re-derived from
+        // the model (that flipped Pi conversations to Claude Code, P0). An
+        // explicit change is validated against the ToS policy gate and fails
+        // loudly rather than silently downgrading.
+        const currentHarness: RuntimeName = conv.harness ?? 'claude-code';
+        const requestedHarness = body['harness'];
+        let harness: RuntimeName = currentHarness;
+        if (requestedHarness === 'pi' || requestedHarness === 'claude-code') {
+          if (requestedHarness !== currentHarness) {
+            const policyModel = model ?? conv.model ?? '';
+            const decision = canUseHarnessSync(
+              requestedHarness,
+              policyModel,
+              await getProviderAuthMode(policyModel),
+            );
+            if (!decision.allowed) {
+              return jsonResponse(
+                { error: decision.reason ?? 'Harness not allowed for this model' },
+                { status: 400 },
+              );
+            }
+          }
+          harness = requestedHarness;
+        }
+        const harnessChanged = harness !== currentHarness;
 
-        // Persist the new model
-        if (model) updateConversationModel(name, model);
+        // Mark the session as mid-respawn BEFORE killing it so terminal
+        // WS reconnects landing in the kill→spawn gap don't get a fatal
+        // 4404. The marker is cleared in the `finally` below regardless
+        // of which branch returns or throws.
+        const respawn = markRespawnPending(conv.tmuxSession);
+        try {
+          // Always kill the existing session first (if alive) so the model change takes effect
+          await Effect.runPromise(killSession(conv.tmuxSession).pipe(Effect.catch(() => Effect.succeed(undefined))));
 
-        // Extract the session UUID from the existing session file path
-        const oldSessionId = sessionIdFromFile(conv.sessionFile);
+          if (!(await validateCwdContainment(conv.cwd))) {
+            return jsonResponse({ error: 'Invalid cwd' }, { status: 400 });
+          }
 
-        // Compact (if needed) then respawn with the new model before reporting success.
-        const sessionFile = conv.sessionFile;
-        const cwd = conv.cwd;
-        const tmuxSession = conv.tmuxSession;
-        const effort = conv.effort ?? undefined;
-        const issueId = conv.issueId ?? undefined;
-        await maybeCompactBeforeRespawn({ sessionFile, cwd, modelChanged: true });
-        await spawnConversationSession(tmuxSession, cwd, oldSessionId ?? randomUUID(), model, effort, issueId, !!oldSessionId);
-        await waitForTmuxSession(tmuxSession);
-        await waitForClaudePrompt(tmuxSession, 30000).catch(() => false);
+          // Validate model before persisting so invalid values never reach the DB.
+          if (model && !SAFE_MODEL_PATTERN.test(model)) {
+            return jsonResponse({ error: 'Invalid model' }, { status: 400 });
+          }
 
-        markConversationActive(name);
-        return jsonResponse({ ...conv, status: 'active', model, reattached: false, sessionAlive: true });
+          // Persist the new model and harness
+          if (model) setConversationModel(name, model);
+          if (harnessChanged) setConversationHarness(name, harness);
+
+          // Extract the session UUID from the existing session file path
+          const oldSessionId = conv.claudeSessionId;
+
+          // Compact (if needed) then respawn with the new model before reporting success.
+          const sessionFile = await resolveSessionFile(conv);
+          const cwd = conv.cwd;
+          const tmuxSession = conv.tmuxSession;
+          const effort = conv.effort ?? undefined;
+          const issueId = conv.issueId ?? undefined;
+
+          // Only resume if the session JSONL actually exists — Claude Code's --resume
+          // fails with "No conversation found" if the file is missing (e.g., first
+          // model switch on a fresh conversation or cross-provider switch).
+          let resumeSessionId = oldSessionId ?? randomUUID();
+          let canResume = !!oldSessionId && !!sessionFile && existsSync(sessionFile);
+          if (oldSessionId && !canResume) {
+            console.error(
+              `[conversations] SESSION-LOST ${name} harness=${currentHarness} ` +
+              `claudeSessionId=${oldSessionId} resolved=${sessionFile ?? 'null'} — ` +
+              `switch-model will start a fresh session`,
+            );
+          }
+
+          if (harnessChanged) {
+            // Runtime change: convert the existing transcript into the target
+            // harness's format so history carries over. Native (Claude-format)
+            // compaction must NOT run here — it would write Claude records into a
+            // Pi JSONL (or vice versa). The converter produces a fresh session in
+            // the target format and returns its session id.
+            if (canResume && sessionFile) {
+              try {
+                const result = await Effect.runPromise(convertConversationTranscript({
+                  fromHarness: currentHarness,
+                  toHarness: harness,
+                  sourceSessionFile: sessionFile,
+                  cwd,
+                  tmuxSession,
+                }));
+                resumeSessionId = result.sessionId;
+                canResume = true;
+                if (harness === 'claude-code') setConversationClaudeSessionId(name, result.sessionId);
+              } catch (convErr) {
+                const cm = convErr instanceof Error ? convErr.message : String(convErr);
+                console.error(`[conversations] SESSION-CONVERT-FAILED ${name} ${currentHarness}->${harness}: ${cm}`);
+                canResume = false;
+              }
+            } else {
+              // No source transcript to convert — start the new harness fresh.
+              canResume = false;
+            }
+          } else if (harness === 'claude-code') {
+            // Same harness, Claude Code: native (Claude-format) compaction is correct.
+            await maybeCompactBeforeRespawn({ sessionFile, cwd, modelChanged: true });
+          }
+          // Pi staying on Pi: skip native compaction — it is Claude-format only and
+          // would corrupt the Pi JSONL. Pi manages its own context.
+
+          await spawnConversationSession(tmuxSession, cwd, resumeSessionId, model, effort, issueId, canResume, harness);
+          await waitForTmuxSession(tmuxSession);
+          if (harness === 'pi') {
+            await waitForPiTuiReady(tmuxSession);
+          } else {
+            await (await Effect.runPromise(waitForClaudePrompt(tmuxSession, 30000))).catch(() => false);
+          }
+
+          markConversationActive(name);
+          return jsonResponse({ ...conv, status: 'active', model, harness, reattached: false, sessionAlive: true });
+        } finally {
+          respawn.done();
+        }
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to switch model: ' + msg }, { status: 500 });
+        console.error('[conversations] switch model failed:', msg);
+        return jsonResponse({ error: msg || 'Internal server error' }, { status: 500 });
       }
     });
   }),
 );
+
+// Cache specialist session file lookups to avoid O(n) directory scans.
+// TTL ensures restarted sessions (new UUID → new JSONL) don't serve stale data.
+const SPECIALIST_SESSION_CACHE_TTL_MS = 10_000;
+const specialistSessionFileCache = new Map<string, { path: string; timestamp: number }>();
+const SPECIALIST_SESSION_CACHE_MAX = 50;
+
+function getSpecialistSessionCache(name: string): string | undefined {
+  const entry = specialistSessionFileCache.get(name);
+  if (!entry) return undefined;
+  if (Date.now() - entry.timestamp > SPECIALIST_SESSION_CACHE_TTL_MS) {
+    specialistSessionFileCache.delete(name);
+    return undefined;
+  }
+  return entry.path;
+}
+
+function setSpecialistSessionCache(name: string, sessionFile: string): void {
+  specialistSessionFileCache.set(name, { path: sessionFile, timestamp: Date.now() });
+  if (specialistSessionFileCache.size > SPECIALIST_SESSION_CACHE_MAX) {
+    const firstKey = specialistSessionFileCache.keys().next().value;
+    if (firstKey !== undefined) {
+      specialistSessionFileCache.delete(firstKey);
+    }
+  }
+}
 
 // ─── Route: GET /api/conversations/:name/messages ────────────────────────────
 
@@ -629,6 +1951,11 @@ const getConversationMessagesRoute = HttpRouter.add(
   'GET',
   '/api/conversations/:name/messages',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     return yield* Effect.promise(async () => {
@@ -637,28 +1964,47 @@ const getConversationMessagesRoute = HttpRouter.add(
 
         // Fall back to specialist session file when name is a specialist tmux session
         // (e.g. specialist-panopticon-cli-merge-agent) and not in the conversations DB.
-        let sessionFile: string | null | undefined = conv?.sessionFile;
+        let sessionFile: string | null | undefined = conv ? await resolveSessionFile(conv) : undefined;
         if (!conv) {
-          const specialistMatch = name.match(/^specialist-(.+)-(review-agent|test-agent|merge-agent)$/);
-          if (specialistMatch) {
-            const [, project, type] = specialistMatch;
-            const panHome = process.env['PANOPTICON_HOME'] || join(homedir(), '.panopticon');
-            const sessionIdFile = join(panHome, 'specialists', 'projects', project, `${type}.session`);
+          const cached = getSpecialistSessionCache(name);
+          if (cached) {
+            sessionFile = cached;
+          } else if (/^(specialist-|agent-|planning-)/.test(name)) {
+            // Resolve JSONL via the unified session-id lookup chain
+            // (session.id file → sessions.json → runtime state) in
+            // ~/.panopticon/agents/<name>/. Covers work agents, planning
+            // agents, and all specialist types (reviewers, test, merge).
             try {
-              const { readFile, readdir } = await import('node:fs/promises');
-              const sessionId = (await readFile(sessionIdFile, 'utf-8')).trim();
-              if (sessionId) {
+              const claudeSessionId = await resolveClaudeSessionId(name);
+              if (claudeSessionId && SAFE_SESSION_ID_PATTERN.test(claudeSessionId)) {
                 const claudeProjects = join(homedir(), '.claude', 'projects');
                 const dirs = await readdir(claudeProjects);
-                for (const dir of dirs) {
-                  const candidate = join(claudeProjects, dir, `${sessionId}.jsonl`);
-                  if (existsSync(candidate)) {
-                    sessionFile = candidate;
-                    break;
-                  }
+                const SAFE_DIR_PATTERN = /^[a-zA-Z0-9_.-]+$/;
+                const candidates = dirs
+                  .filter((dir) => SAFE_DIR_PATTERN.test(dir))
+                  .map((dir) => join(claudeProjects, dir, `${claudeSessionId}.jsonl`));
+                const STAT_BATCH_SIZE = 50;
+                let found: string | null = null;
+                for (let i = 0; i < candidates.length && !found; i += STAT_BATCH_SIZE) {
+                  const batch = candidates.slice(i, i + STAT_BATCH_SIZE);
+                  const checks = await Promise.all(
+                    batch.map(async (candidate) => {
+                      try {
+                        await stat(candidate);
+                        return candidate;
+                      } catch {
+                        return null;
+                      }
+                    }),
+                  );
+                  found = checks.find((c): c is string => c !== null) ?? null;
+                }
+                if (found) {
+                  sessionFile = found;
+                  setSpecialistSessionCache(name, found);
                 }
               }
-            } catch { /* session file not found */ }
+            } catch { /* session resolution failed */ }
           }
           if (!sessionFile) {
             return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
@@ -672,16 +2018,23 @@ const getConversationMessagesRoute = HttpRouter.add(
         }
 
         try {
-          // Specialists: parse only from the last compact_boundary so the display
-          // shows only the current context window, not the full 30-day history.
-          const isSpecialist = !conv && /^specialist-/.test(name);
-          const result = isSpecialist
-            ? await parseFromLastCompactBoundary(sessionFile)
-            : await parseConversationMessages(sessionFile, 0);
+          // Always parse the full file — compact boundaries render as visual
+          // dividers in MessagesTimeline; truncating at them hides the actual
+          // conversation content (root cause of empty reviewer Conversation tab).
+          const result = await getCachedMessages(sessionFile, false);
 
           // Cache cost in DB so the conversation list can show it without re-parsing
           if (result.totalCost > 0 && conv) {
             updateConversationCost(name, result.totalCost);
+          }
+
+          let contextUsage = null;
+          if (conv) {
+            try {
+              contextUsage = await computeContextUsage(sessionFile, conv.model);
+            } catch {
+              contextUsage = null;
+            }
           }
 
           return jsonResponse({
@@ -689,6 +2042,10 @@ const getConversationMessagesRoute = HttpRouter.add(
             workLog: result.workLog,
             streaming: result.streaming,
             totalCost: result.totalCost,
+            proposedPlan: result.proposedPlan,
+            compactBoundaries: (result.compactBoundaries?.length ?? 0) > 0 ? result.compactBoundaries : undefined,
+            compacting: isCompacting(sessionFile) || undefined,
+            contextUsage,
           });
         } catch (parseErr: unknown) {
           // File may not exist yet — Claude Code is still starting up.
@@ -701,7 +2058,76 @@ const getConversationMessagesRoute = HttpRouter.add(
         }
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to load messages: ' + msg }, { status: 500 });
+        console.error('[conversations] load messages failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: POST /api/conversations/:name/upload-image ───────────────────────
+
+const postConversationUploadImageRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/upload-image',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+
+    const remoteAddress = getClientIp(request);
+    if (!checkUploadRateLimit(remoteAddress)) {
+      return jsonResponse({ error: 'Rate limit exceeded' }, { status: 429 });
+    }
+
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const multipart = yield* Effect.provideContext(
+      request.multipart,
+      Multipart.limitsServices({
+        maxFileSize: MAX_UPLOAD_BYTES,
+        maxTotalSize: MAX_UPLOAD_BYTES,
+        maxParts: 3,
+        maxFieldSize: 1024,
+      }),
+    );
+    const files = multipart['file'] as Multipart.PersistedFile[] | undefined;
+    const filenameField = multipart['filename'] as string | string[] | undefined;
+    const mimeTypeField = multipart['mimeType'] as string | string[] | undefined;
+
+    const file = files?.[0];
+    const filenameRaw = Array.isArray(filenameField) ? filenameField[0] : filenameField;
+    const mimeTypeRaw = Array.isArray(mimeTypeField) ? mimeTypeField[0] : mimeTypeField;
+
+    if (typeof filenameRaw !== 'string') {
+      return jsonResponse({ error: 'filename is required' }, { status: 400 });
+    }
+    if (typeof mimeTypeRaw !== 'string') {
+      return jsonResponse({ error: 'mimeType is required' }, { status: 400 });
+    }
+    const filename = filenameRaw;
+    const mimeType = mimeTypeRaw;
+
+    if (!file || !file.path) {
+      return jsonResponse({ error: 'file is required' }, { status: 400 });
+    }
+
+    return yield* Effect.promise(async () => {
+      try {
+        const UPLOAD_READ_TIMEOUT_MS = 10_000;
+        const bytes = await Promise.race([
+          readFile(file.path),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Upload read timeout')), UPLOAD_READ_TIMEOUT_MS),
+          ),
+        ]);
+        return await handleConversationImageUpload(name, filename, bytes, mimeType);
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] upload image failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -709,10 +2135,15 @@ const getConversationMessagesRoute = HttpRouter.add(
 
 // ─── Route: POST /api/conversations/:name/message ────────────────────────────
 
-const postConversationMessageRoute = HttpRouter.add(
+const postConversationDeleteImageRoute = HttpRouter.add(
   'POST',
-  '/api/conversations/:name/message',
+  '/api/conversations/:name/delete-image',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     const body = yield* readJsonBody;
@@ -722,33 +2153,94 @@ const postConversationMessageRoute = HttpRouter.add(
         if (!conv) {
           return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         }
-
-        const message = typeof body['message'] === 'string' ? body['message'].trim() : '';
-        if (!message) {
-          return jsonResponse({ error: 'Message is required' }, { status: 400 });
+        const path = typeof body['path'] === 'string' ? body['path'].trim() : '';
+        if (!path) {
+          return jsonResponse({ error: 'path is required' }, { status: 400 });
         }
-
-        if (shouldInterceptManualCompact(message)) {
-          if (!conv.sessionFile || !existsSync(conv.sessionFile)) {
-            return jsonResponse({ error: `No session file found for conversation ${conv.name}` }, { status: 400 });
-          }
-          const result = await compactConversationNative(conv.sessionFile);
-          return jsonResponse({ ok: true, compacted: true, mode: 'panopticon-native', model: result.model });
+        const removed = await removeConversationAttachment(name, path);
+        if (!removed) {
+          return jsonResponse({ error: 'Attachment not found for conversation' }, { status: 404 });
         }
-
-        // Deliver via tmux load-buffer + paste-buffer (reliable delivery pattern)
-        await sendKeysAsync(conv.tmuxSession, message, 'conversation-message');
-
         return jsonResponse({ ok: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to send message: ' + msg }, { status: 500 });
+        console.error('[conversations] delete image failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+const postConversationMessageRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/message',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const body = yield* readJsonBody;
+    return yield* Effect.promise(async () => {
+      try {
+        return await handleConversationMessage(name, body);
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] send message failed:', msg);
+        // MessageDeliveryFailed includes a pane snapshot for debugging
+        if (error instanceof Error && error.name === 'MessageDeliveryFailed') {
+          return jsonResponse({
+            error: 'Message delivery failed — text did not reach the terminal',
+            deliveryFailed: true,
+            details: msg,
+          }, { status: 504 });
+        }
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: POST /api/conversations/:name/delivery-method ─────────────────────
+
+const postConversationDeliveryMethodRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/delivery-method',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const body = yield* readJsonBody;
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+        const deliveryMethod = body['deliveryMethod'] ?? body['method'];
+        if (deliveryMethod !== 'auto' && deliveryMethod !== 'channels' && deliveryMethod !== 'tmux' && deliveryMethod !== null) {
+          return jsonResponse({ error: "deliveryMethod must be 'auto', 'channels', 'tmux', or null" }, { status: 400 });
+        }
+        updateConversationDeliveryMethod(name, deliveryMethod as 'auto' | 'channels' | 'tmux' | null);
+        return jsonResponse({ ok: true, deliveryMethod });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] update delivery method failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
 );
 
 // ─── Route: PATCH /api/conversations/:name ────────────────────────────────────
+
+const MAX_TITLE_LENGTH = 200;
 
 export function patchConversationTitle(
   name: string,
@@ -760,8 +2252,12 @@ export function patchConversationTitle(
   }
 
   if (typeof body.title === 'string' && body.title.trim()) {
+    const trimmed = body.title.trim();
+    if (trimmed.length > MAX_TITLE_LENGTH) {
+      return { status: 400, body: { error: `Title exceeds maximum length of ${MAX_TITLE_LENGTH} characters` } };
+    }
     // User explicitly renamed → mark as 'manual' so AI won't auto-replace
-    updateConversationTitle(name, body.title.trim(), 'manual');
+    updateConversationTitle(name, trimmed, 'manual');
   }
 
   return { status: 200, body: { success: true } };
@@ -771,6 +2267,11 @@ const patchConversationRoute = HttpRouter.add(
   'PATCH',
   '/api/conversations/:name',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     const body = yield* readJsonBody;
@@ -780,7 +2281,43 @@ const patchConversationRoute = HttpRouter.add(
         return jsonResponse(result.body, { status: result.status });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to update conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] update conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+const deleteConversationRoute = HttpRouter.add(
+  'DELETE',
+  '/api/conversations/:name',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+
+        await Effect.runPromise(killSession(conv.tmuxSession).pipe(Effect.catch(() => Effect.succeed(undefined))));
+        markConversationEnded(name);
+        archiveConversation(name);
+        removeFavorite('conversation', name);
+        invalidateFavoritesCache();
+        await cleanupConversationAttachments(name);
+
+        return jsonResponse({ success: true });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] delete conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -792,6 +2329,11 @@ const postConversationArchiveRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/archive',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     return yield* Effect.promise(async () => {
@@ -800,18 +2342,27 @@ const postConversationArchiveRoute = HttpRouter.add(
         if (!conv) {
           return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         }
+        if (conv.archivedAt) {
+          return jsonResponse({ error: 'Conversation is already archived' }, { status: 400 });
+        }
 
         // Kill tmux session if still alive
-        await killSessionAsync(conv.tmuxSession).catch(() => {});
+        await Effect.runPromise(killSession(conv.tmuxSession).pipe(Effect.catch(() => Effect.succeed(undefined))));
 
-        // Mark as ended and archived
+        // Mark as ended and archived, unfavorite if starred
         markConversationEnded(name);
         archiveConversation(name);
+        removeFavorite('conversation', name);
+        invalidateFavoritesCache();
+        // Unconditionally remove all attachments — archiving is permanent and
+        // unsent paste uploads should not leak.
+        await cleanupConversationAttachments(name);
 
         return jsonResponse({ success: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to archive conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] archive conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -823,6 +2374,11 @@ const postConversationUnarchiveRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/unarchive',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = params['name'] ?? '';
     return yield* Effect.promise(async () => {
@@ -839,7 +2395,8 @@ const postConversationUnarchiveRoute = HttpRouter.add(
         return jsonResponse({ success: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to unarchive conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] unarchive conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -855,25 +2412,33 @@ const postConversationRestartAllRoute = HttpRouter.add(
   'POST',
   '/api/conversations/restart-all',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     return yield* Effect.promise(async () => {
       try {
         const allConvs = listConversations();
-        // Filter to conversations with a live tmux session
-        const convs: typeof allConvs = [];
-        for (const c of allConvs) {
-          if (await tmuxSessionExists(c.tmuxSession)) convs.push(c);
-        }
+        // Filter to conversations with a live tmux session — use a single
+        // listSessionNamesAsync() call instead of N subprocess spawns.
+        const liveSessionNames = new Set(await Effect.runPromise(listSessionNames()));
+        const convs = allConvs.filter((c) => liveSessionNames.has(c.tmuxSession));
         const results: { name: string; model: string | null; status: string }[] = [];
 
         for (const conv of convs) {
+          // Mark mid-respawn so terminal WS reconnects don't 4404 in the
+          // kill→spawn gap. Cleared in finally so failures still release it.
+          const respawn = markRespawnPending(conv.tmuxSession);
           try {
             // Kill existing tmux session
-            await killSessionAsync(conv.tmuxSession).catch(() => {});
+            await Effect.runPromise(killSession(conv.tmuxSession).pipe(Effect.catch(() => Effect.succeed(undefined))));
 
             // Re-spawn with stored model
-            const oldSessionId = conv.sessionFile
-              ? conv.sessionFile.split('/').pop()?.replace('.jsonl', '') ?? undefined
-              : undefined;
+            const oldSessionId = conv.claudeSessionId;
+            const sessionFileForResume = await resolveSessionFile(conv);
+            const canResume = !!oldSessionId && !!sessionFileForResume && existsSync(sessionFileForResume);
+            const harness = await resolveAllowedHarness(conv.harness, conv.model);
             await spawnConversationSession(
               conv.tmuxSession,
               conv.cwd,
@@ -881,14 +2446,18 @@ const postConversationRestartAllRoute = HttpRouter.add(
               conv.model ?? undefined,
               conv.effort ?? undefined,
               conv.issueId ?? undefined,
-              !!oldSessionId,
+              canResume,
+              harness,
             );
+            setConversationHarness(conv.name, harness);
             markConversationActive(conv.name);
             results.push({ name: conv.name, model: conv.model, status: 'restarted' });
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`[conversations] Failed to restart ${conv.name}:`, msg);
-            results.push({ name: conv.name, model: conv.model, status: `failed: ${msg}` });
+            results.push({ name: conv.name, model: conv.model, status: 'failed' });
+          } finally {
+            respawn.done();
           }
         }
 
@@ -896,7 +2465,8 @@ const postConversationRestartAllRoute = HttpRouter.add(
         return jsonResponse({ restarted: results.length, results });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to restart conversations: ' + msg }, { status: 500 });
+        console.error('[conversations] restart conversations failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -908,6 +2478,11 @@ const postConversationFavoriteRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/favorite',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = decodeURIComponent(params['name'] ?? '');
     return yield* Effect.promise(async () => {
@@ -915,10 +2490,12 @@ const postConversationFavoriteRoute = HttpRouter.add(
         const conv = getConversationByName(name);
         if (!conv) return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         setFavorite('conversation', name);
+        invalidateFavoritesCache();
         return jsonResponse({ favorited: true });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to favorite conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] favorite conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -930,6 +2507,11 @@ const deleteConversationFavoriteRoute = HttpRouter.add(
   'DELETE',
   '/api/conversations/:name/favorite',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = decodeURIComponent(params['name'] ?? '');
     return yield* Effect.promise(async () => {
@@ -937,10 +2519,12 @@ const deleteConversationFavoriteRoute = HttpRouter.add(
         const conv = getConversationByName(name);
         if (!conv) return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         removeFavorite('conversation', name);
+        invalidateFavoritesCache();
         return jsonResponse({ favorited: false });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to unfavorite conversation: ' + msg }, { status: 500 });
+        console.error('[conversations] unfavorite conversation failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
       }
     });
   }),
@@ -948,12 +2532,120 @@ const deleteConversationFavoriteRoute = HttpRouter.add(
 
 // ─── Route: POST /api/conversations/:name/summary-fork ───────────────────────
 
-async function runForkPipeline(convName: string, parentConv: Conversation, sessionId: string, summaryModel?: string): Promise<void> {
+async function injectForkSummary(conv: Conversation, summary: string): Promise<void> {
+  updateForkStatus(conv.name, 'injecting');
+  if (conv.harness === 'pi') {
+    await waitForPiTuiReady(conv.tmuxSession, 60000);
+  } else {
+    const ready = await (await Effect.runPromise(waitForClaudePrompt(conv.tmuxSession, 60000))).catch(() => false);
+    if (!ready) {
+      console.warn(`[summary-fork] Prompt not detected in time for ${conv.name}, sending summary anyway`);
+    }
+  }
+  await deliverAgentMessage(conv.tmuxSession, summary, 'summary-fork', resolveConversationDeliveryMethod(conv));
+}
+
+async function runForkPipeline(
+  convName: string,
+  parentConv: Conversation,
+  sessionId: string,
+  summaryModel?: string,
+  forkMode: SummaryForkMode = 'summary',
+  localSummaryOnly = false,
+  includeThinkingInSummary?: boolean,
+  summaryHarness?: RuntimeName,
+  handoffFocus?: string,
+): Promise<void> {
   const conv = getConversationByName(convName);
   if (!conv) throw new Error(`Fork conversation ${convName} not found`);
 
-  if (!parentConv.sessionFile) throw new Error(`Parent has no session file`);
-  const { summary } = await generateSummaryForFork(parentConv.sessionFile, summaryModel);
+  const parentSessionFile = await resolveForkSourceSessionFile(parentConv);
+  if (!parentSessionFile) throw new Error(`Parent has no session file`);
+
+  if (forkMode === 'plain') {
+    if (conv.harness === 'pi') {
+      // Plain forks copy a Claude-format JSONL session file and spawn with --resume.
+      // Pi cannot consume Claude JSONL, so a Pi plain fork would silently start
+      // empty while the pipeline reported success. The summary-fork route already
+      // rejects launchHarness='pi'; this guard is defense in depth so the pipeline
+      // itself never produces a "successful" empty Pi session.
+      throw new Error('Plain forks cannot launch under the Pi harness — Pi cannot consume Claude session history.');
+    }
+    // Plain Claude Code fork: copy JSONL from last compact boundary into the new
+    // session file, then spawn with --resume so Claude Code loads the history
+    // directly.
+    const forkSessionFile = await resolveSessionFile(conv);
+    if (!forkSessionFile) throw new Error(`Fork conversation ${convName} has no session file`);
+    await Effect.runPromise(copySessionFromCompactBoundary(parentSessionFile, forkSessionFile));
+
+    updateForkStatus(convName, 'spawning');
+    await spawnConversationSession(
+      conv.tmuxSession,
+      conv.cwd,
+      sessionId,
+      conv.model ?? undefined,
+      conv.effort ?? undefined,
+      conv.issueId ?? undefined,
+      true, // resume — load the copied JSONL history
+      conv.harness ?? 'claude-code',
+      true, // plainFork — skip channels MCP wiring so it doesn't inflate the
+            // resumed context past Claude Code's auto-compact threshold
+    );
+    await waitForTmuxSession(conv.tmuxSession);
+
+    // No summary injection needed for plain Claude Code forks.
+    markConversationActive(convName);
+    updateForkStatus(convName, null);
+    return;
+  }
+
+  let summary: string;
+  let effectiveForkMode = forkMode;
+  let handoffDocPath: string | null = null;
+  let forkFallbackReason: string | null = null;
+
+  const buildSummary = async (): Promise<string> => {
+    if (localSummaryOnly) {
+      return Effect.runPromise(generateFallbackSummary(parentSessionFile));
+    }
+    const result = await generateSummaryForFork(parentSessionFile, summaryModel, includeThinkingInSummary, summaryHarness);
+    return result.summary;
+  };
+
+  if (forkMode === 'handoff') {
+    const preconditionFallback = await handoffPreconditionFallbackReason(parentConv);
+    if (preconditionFallback) {
+      forkFallbackReason = preconditionFallback;
+      effectiveForkMode = 'summary';
+      logHandoffFallback(parentConv, preconditionFallback);
+      summary = await buildSummary();
+    } else {
+      try {
+        const handoff = await requestHandoffFromAgent(parentConv, handoffFocus);
+        summary = handoff.docText;
+        handoffDocPath = handoff.docPath;
+      } catch (error) {
+        forkFallbackReason = handoffFailureReason(error);
+        effectiveForkMode = 'summary';
+        logHandoffFallback(parentConv, forkFallbackReason);
+        summary = await buildSummary();
+      }
+    }
+  } else {
+    summary = await buildSummary();
+  }
+
+  updateConversationForkFallbackReason(convName, forkFallbackReason);
+  updateConversationTitle(
+    convName,
+    effectiveForkMode === 'handoff'
+      ? `Handoff: ${parentConv.title || parentConv.name}`
+      : `Summary Fork: ${parentConv.title || parentConv.name}`,
+    'manual',
+  );
+  if (handoffDocPath) {
+    recordConversationHandoff(parentConv.name, convName, handoffDocPath);
+  }
 
   updateForkStatus(convName, 'spawning');
   await spawnConversationSession(
@@ -963,15 +2655,12 @@ async function runForkPipeline(convName: string, parentConv: Conversation, sessi
     conv.model ?? undefined,
     conv.effort ?? undefined,
     conv.issueId ?? undefined,
+    false,
+    conv.harness ?? 'claude-code',
   );
   await waitForTmuxSession(conv.tmuxSession);
 
-  updateForkStatus(convName, 'injecting');
-  const ready = await waitForClaudePrompt(conv.tmuxSession, 60000).catch(() => false);
-  if (!ready) {
-    console.warn(`[summary-fork] Prompt not detected in time for ${convName}, sending summary anyway`);
-  }
-  await sendKeysAsync(conv.tmuxSession, summary, 'summary-fork');
+  await injectForkSummary(conv, summary);
 
   markConversationActive(convName);
   updateForkStatus(convName, null);
@@ -981,6 +2670,11 @@ const postConversationSummaryForkRoute = HttpRouter.add(
   'POST',
   '/api/conversations/:name/summary-fork',
   Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
     const params = yield* HttpRouter.params;
     const name = decodeURIComponent(params['name'] ?? '');
     const body = yield* readJsonBody;
@@ -991,7 +2685,12 @@ const postConversationSummaryForkRoute = HttpRouter.add(
           return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
         }
 
-        if (!conv.sessionFile || !existsSync(conv.sessionFile)) {
+        if (conv.harness === 'pi') {
+          return jsonResponse({ error: 'Forking Pi conversations is not supported until Pi session transcript export is available.' }, { status: 400 });
+        }
+
+        const sourceSessionFile = await resolveForkSourceSessionFile(conv);
+        if (!sourceSessionFile || !existsSync(sourceSessionFile)) {
           return jsonResponse({ error: `No session file found for conversation ${conv.name}` }, { status: 400 });
         }
 
@@ -1004,37 +2703,90 @@ const postConversationSummaryForkRoute = HttpRouter.add(
         const cwd = typeof body['cwd'] === 'string' && body['cwd'].trim()
           ? body['cwd'].trim()
           : undefined;
+        const requestedForkMode = body['forkMode'];
+        let forkMode: SummaryForkMode = 'summary';
+        if (requestedForkMode !== undefined) {
+          if (requestedForkMode !== 'summary' && requestedForkMode !== 'plain' && requestedForkMode !== 'handoff') {
+            return jsonResponse({ error: 'Invalid forkMode' }, { status: 400 });
+          }
+          forkMode = requestedForkMode;
+        } else if (body['plain'] === true) {
+          console.debug('[summary-fork] legacy plain=true mapped to forkMode=plain');
+          forkMode = 'plain';
+        }
+        const focusResult = parseSummaryForkFocus(body['focus']);
+        if (!focusResult.ok) {
+          return jsonResponse({ error: focusResult.error }, { status: 400 });
+        }
+        const handoffFocus = focusResult.focus;
+        const localSummaryOnly = body['localSummaryOnly'] === true;
+        const includeThinkingInSummary = body['includeThinkingInSummary'] === true;
+        const customTitle = typeof body['title'] === 'string' ? body['title'].trim() : undefined;
+
+        if (cwd && !(await validateCwdContainment(cwd))) {
+          return jsonResponse({ error: 'Invalid cwd' }, { status: 400 });
+        }
 
         if (typeof body['model'] === 'string' && !model) {
           return jsonResponse({ error: 'model must not be blank' }, { status: 400 });
         }
 
-        const { sessionId, sessionFile } = await reserveSummaryForkSession(
+        if (model && !SAFE_MODEL_PATTERN.test(model)) {
+          return jsonResponse({ error: 'Invalid model' }, { status: 400 });
+        }
+
+        if (typeof body['summaryModel'] === 'string' && summaryModel && !SAFE_MODEL_PATTERN.test(summaryModel)) {
+          return jsonResponse({ error: 'Invalid summaryModel' }, { status: 400 });
+        }
+
+        const { sessionId, sessionFile } = await Effect.runPromise(reserveSummaryForkSession(
           cwd || conv.cwd || process.cwd(),
-        );
+        ));
 
         const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
         const suffix = randomUUID().slice(0, 4);
         const newName = `${timestamp}-${suffix}`;
         const newTmux = `conv-${newName}`;
         const launchModel = model || conv.model;
+        const effectiveSummaryModel = summaryModel || 'claude-sonnet-4-6';
+        const launchHarness = await resolveAllowedHarness(body['harness'], launchModel);
+        const summaryHarness = await resolveAllowedHarness(body['summaryHarness'], effectiveSummaryModel);
+        if (forkMode === 'plain' && launchHarness === 'pi') {
+          // Plain forks copy a Claude-format JSONL session file and spawn with --resume.
+          // Pi cannot consume Claude JSONL history, so a Pi plain fork would silently
+          // start an empty session. Summary forks are fine because they inject the
+          // generated summary through the Pi FIFO after spawn (see injectForkSummary).
+          return jsonResponse({
+            error: 'Plain forks cannot launch under Pi — Pi cannot consume Claude session history. Use a summary fork to launch under Pi.',
+          }, { status: 400 });
+        }
+        const defaultTitle = forkMode === 'plain'
+          ? `Fork: ${conv.title || conv.name}`
+          : forkMode === 'handoff'
+            ? `Handoff: ${conv.title || conv.name}`
+            : `Summary Fork: ${conv.title || conv.name}`;
 
         const newConv = createConversation({
           name: newName,
           tmuxSession: newTmux,
           cwd: cwd || conv.cwd || process.cwd(),
           issueId: conv.issueId ?? undefined,
-          title: `Summary Fork: ${conv.title || conv.name}`,
+          title: customTitle || defaultTitle,
           titleSource: 'manual',
-          titleSeed: `Summary Fork of ${conv.name}`,
-          sessionFile,
+          titleSeed: forkMode === 'plain'
+            ? `Fork of ${conv.name}`
+            : forkMode === 'handoff'
+              ? `Handoff of ${conv.name}`
+              : `Summary Fork of ${conv.name}`,
+          claudeSessionId: sessionId,
           model: launchModel ?? undefined,
           effort: conv.effort ?? undefined,
-          forkStatus: 'summarizing',
+          harness: launchHarness,
+          forkStatus: forkMode === 'plain' ? 'spawning' : forkMode === 'handoff' ? 'handoff' : 'summarizing',
         });
         markConversationActive(newConv.name);
 
-        runForkPipeline(newConv.name, conv, sessionId, summaryModel).catch((err) => {
+        runForkPipeline(newConv.name, conv, sessionId, summaryModel, forkMode, localSummaryOnly, includeThinkingInSummary, summaryHarness, handoffFocus).catch((err) => {
           console.error(`[fork-pipeline] Failed for ${newConv.name}:`, err);
           updateForkStatus(newConv.name, 'failed', err?.message ?? String(err));
         });
@@ -1045,7 +2797,536 @@ const postConversationSummaryForkRoute = HttpRouter.add(
         });
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return jsonResponse({ error: 'Failed to create summary fork: ' + msg }, { status: 500 });
+        console.error('[conversations] create summary fork failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: POST /api/conversations/:name/plan-action ────────────────────────
+
+const PLAN_ACTION_KEYSTROKES: Record<string, string> = {
+  'approve-auto': '1',
+  'approve-manual': '2',
+  'reject-ultraplan': '3',
+};
+
+const postConversationPlanActionRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/plan-action',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const body = yield* readJsonBody;
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+
+        const action = typeof body['action'] === 'string' ? body['action'] : '';
+        const feedback = typeof body['feedback'] === 'string' ? body['feedback'].trim() : '';
+
+        if (action === 'reject-feedback') {
+          await Effect.runPromise(sendRawKeystroke(conv.tmuxSession, '4', 'plan-action-reject'));
+          if (feedback) {
+            await new Promise(r => setTimeout(r, 300));
+            await deliverAgentMessage(conv.tmuxSession, feedback, 'plan-action-feedback', resolveConversationDeliveryMethod(conv));
+          }
+          return jsonResponse({ ok: true });
+        }
+
+        const keystroke = PLAN_ACTION_KEYSTROKES[action];
+        if (!keystroke) {
+          return jsonResponse({ error: `Invalid action: ${action}` }, { status: 400 });
+        }
+
+        await Effect.runPromise(sendRawKeystroke(conv.tmuxSession, keystroke, `plan-action-${action}`));
+        return jsonResponse({ ok: true });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] plan action failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: GET /api/conversations/:name/diffs ──────────────────────────────
+
+const getConversationDiffsRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/:name/diffs',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name) ?? (/^\d+$/.test(name) ? getConversationById(parseInt(name, 10)) : null);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+
+        const sessionFile = await resolveSessionFile(conv);
+        if (!sessionFile || !existsSync(sessionFile)) {
+          return jsonResponse({ summaries: [] });
+        }
+
+        // Parse JSONL for file-modifying tool_use blocks per turn.
+        // Works for all conversation types: devroot, in-repo, and worktree.
+        // Per-turn git diffs use findCommitAtTime(repoRoot, conv.createdAt) so they
+        // capture committed changes too, not just working-tree modifications.
+        const parsed = await getCachedMessages(sessionFile, false);
+        const { fileEditsByAssistantId } = parsed;
+        if (!fileEditsByAssistantId || fileEditsByAssistantId.size === 0) {
+          return jsonResponse({ summaries: [] });
+        }
+
+        // Group file paths by git repo root, then compute per-file diffs
+        const summaries: Array<{
+          turnId: string;
+          completedAt: string;
+          status: string;
+          files: TurnDiffFileChange[];
+          assistantMessageId: string;
+        }> = [];
+
+        // Build a set of assistant messages for timestamp lookup
+        const assistantMessages = parsed.messages.filter(m => m.role === 'assistant');
+        const assistantById = new Map(assistantMessages.map(m => [m.id, m]));
+
+        // Cache git repo root and base-commit lookups (both keyed by repo root)
+        const repoRootCache = new Map<string, string | null>();
+        const baseCommitCache = new Map<string, string | null>();
+
+        for (const [assistantId, edits] of fileEditsByAssistantId) {
+          const asstMsg = assistantById.get(assistantId);
+          const completedAt = asstMsg?.completedAt ?? asstMsg?.createdAt ?? new Date().toISOString();
+
+          // Group files by their git repo
+          const filesByRepo = new Map<string, string[]>();
+
+          for (const edit of edits) {
+            const filePath = edit.filePath;
+            // Find git repo root for this file
+            const dir = filePath.substring(0, filePath.lastIndexOf('/')) || filePath;
+            let repoRoot = repoRootCache.get(dir);
+            if (repoRoot === undefined) {
+              try {
+                const { stdout } = await promisify(exec)(
+                  'git rev-parse --show-toplevel',
+                  { cwd: dir, encoding: 'utf-8' },
+                );
+                repoRoot = stdout.trim();
+              } catch {
+                repoRoot = null;
+              }
+              repoRootCache.set(dir, repoRoot);
+            }
+            if (!repoRoot) continue;
+
+            // Convert absolute path to repo-relative
+            const relativePath = filePath.startsWith(repoRoot + '/')
+              ? filePath.slice(repoRoot.length + 1)
+              : filePath;
+
+            let repoFiles = filesByRepo.get(repoRoot);
+            if (!repoFiles) {
+              repoFiles = [];
+              filesByRepo.set(repoRoot, repoFiles);
+            }
+            if (!repoFiles.includes(relativePath)) {
+              repoFiles.push(relativePath);
+            }
+          }
+
+          // Compute diffs per repo and merge.
+          // Diff against the conversation's base commit (the commit that existed just before
+          // the conversation started) so that committed changes are included in the summary —
+          // not just uncommitted working-tree changes.
+          const allFiles: TurnDiffFileChange[] = [];
+          for (const [repoRoot, filePaths] of filesByRepo) {
+            try {
+              // Resolve base commit once per repo root
+              if (!baseCommitCache.has(repoRoot)) {
+                baseCommitCache.set(repoRoot, await Effect.runPromise(findCommitAtTime(repoRoot, conv.createdAt)));
+              }
+              const baseCommit = baseCommitCache.get(repoRoot) ?? null;
+
+              let diffs: TurnDiffFileChange[];
+              if (baseCommit) {
+                // Diff specific files against the pre-conversation base commit.
+                // This captures changes whether committed or still in the working tree.
+                const { stdout: numstat } = await promisify(exec)(
+                  `git diff --numstat --no-color ${baseCommit} -- ${filePaths.map(p => JSON.stringify(p)).join(' ')}`,
+                  { cwd: repoRoot, encoding: 'utf-8' },
+                );
+                const { stdout: nameStatus } = await promisify(exec)(
+                  `git diff --name-status --no-color ${baseCommit} -- ${filePaths.map(p => JSON.stringify(p)).join(' ')}`,
+                  { cwd: repoRoot, encoding: 'utf-8' },
+                );
+                const statusMap = new Map<string, string>();
+                for (const line of nameStatus.split('\n')) {
+                  if (!line.trim()) continue;
+                  const parts = line.split('\t');
+                  if (parts.length >= 2) statusMap.set(parts[parts.length - 1], parts[0]);
+                }
+                diffs = [];
+                for (const line of numstat.split('\n')) {
+                  if (!line.trim()) continue;
+                  const [addStr, delStr, ...pathParts] = line.split('\t');
+                  const path = pathParts.join('\t');
+                  if (!path) continue;
+                  diffs.push({ path, kind: statusMap.get(path), additions: parseInt(addStr, 10) || 0, deletions: parseInt(delStr, 10) || 0 });
+                }
+              } else {
+                // No base commit (repo too new) — fall back to working-tree-vs-HEAD diff
+                diffs = await Effect.runPromise(diffFilesAgainstHead(repoRoot, filePaths));
+              }
+              allFiles.push(...diffs);
+            } catch {
+              // git diff failed — skip this repo
+            }
+          }
+
+          if (allFiles.length > 0) {
+            summaries.push({
+              turnId: `conv-turn-${assistantId}`,
+              completedAt,
+              status: 'completed',
+              files: allFiles,
+              assistantMessageId: assistantId,
+            });
+          }
+        }
+
+        return jsonResponse({ summaries });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] diffs failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: GET /api/conversations/:name/diffs/full ─────────────────────────
+
+const getConversationDiffFullRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/:name/diffs/full',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+
+        const cwd = conv.cwd;
+        const isInRepo = existsSync(join(cwd, '.git'));
+
+        if (isInRepo) {
+          const baseCommit = await Effect.runPromise(findCommitAtTime(cwd, conv.createdAt));
+          if (!baseCommit) return jsonResponse({ diff: '' });
+          const diff = await Effect.runPromise(diffPatchSinceCommit(cwd, baseCommit));
+          return jsonResponse({ diff });
+        }
+
+        // Devroot: aggregate all file edits across all turns
+        const sessionFile = await resolveSessionFile(conv);
+        if (!sessionFile || !existsSync(sessionFile)) return jsonResponse({ diff: '' });
+
+        const parsed = await getCachedMessages(sessionFile, false);
+        const { fileEditsByAssistantId } = parsed;
+        if (!fileEditsByAssistantId || fileEditsByAssistantId.size === 0) return jsonResponse({ diff: '' });
+
+        const repoRootCache = new Map<string, string | null>();
+        const filesByRepo = new Map<string, string[]>();
+
+        for (const [, edits] of fileEditsByAssistantId) {
+          for (const edit of edits) {
+            const dir = edit.filePath.substring(0, edit.filePath.lastIndexOf('/')) || edit.filePath;
+            let repoRoot = repoRootCache.get(dir);
+            if (repoRoot === undefined) {
+              try {
+                const { stdout } = await promisify(exec)('git rev-parse --show-toplevel', { cwd: dir, encoding: 'utf-8' });
+                repoRoot = stdout.trim();
+              } catch { repoRoot = null; }
+              repoRootCache.set(dir, repoRoot);
+            }
+            if (!repoRoot) continue;
+            const relativePath = edit.filePath.startsWith(repoRoot + '/') ? edit.filePath.slice(repoRoot.length + 1) : edit.filePath;
+            let repoFiles = filesByRepo.get(repoRoot);
+            if (!repoFiles) { repoFiles = []; filesByRepo.set(repoRoot, repoFiles); }
+            if (!repoFiles.includes(relativePath)) repoFiles.push(relativePath);
+          }
+        }
+
+        const patches: string[] = [];
+        for (const [repoRoot, filePaths] of filesByRepo) {
+          try {
+            const patch = await Effect.runPromise(diffPatchFilesAgainstHead(repoRoot, filePaths));
+            if (patch) patches.push(patch);
+          } catch { /* file may have been committed */ }
+        }
+
+        return jsonResponse({ diff: patches.join('\n') });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] diff full failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: GET /api/conversations/:name/diffs/:turnId ──────────────────────
+
+const getConversationDiffTurnRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/:name/diffs/:turnId',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    const turnId = params['turnId'] ?? '';
+    const reqUrl = new URL(request.url, 'http://localhost');
+    const fileFilter = reqUrl.searchParams.get('file') ?? undefined;
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name) ?? (/^\d+$/.test(name) ? getConversationById(parseInt(name, 10)) : null);
+        if (!conv) return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+
+        const cwd = conv.cwd;
+        const isInRepo = existsSync(join(cwd, '.git'));
+
+        if (isInRepo) {
+          // For in-repo conversations, try single diff since conversation start.
+          // Falls through to per-turn JSONL path if no base commit (cwd is in a repo
+          // with no commits before the conversation started).
+          const baseCommit = await Effect.runPromise(findCommitAtTime(cwd, conv.createdAt));
+          if (baseCommit) {
+            const diff = await Effect.runPromise(diffPatchSinceCommit(cwd, baseCommit, fileFilter));
+            return jsonResponse({ turnId, diff });
+          }
+        }
+
+        // Devroot: extract assistant ID from turnId (format: conv-turn-<assistantId>)
+        const assistantId = turnId.startsWith('conv-turn-') ? turnId.slice('conv-turn-'.length) : turnId;
+        const sessionFile = await resolveSessionFile(conv);
+        if (!sessionFile || !existsSync(sessionFile)) return jsonResponse({ diff: '' });
+
+        const parsed = await getCachedMessages(sessionFile, false);
+        const edits = parsed.fileEditsByAssistantId?.get(assistantId);
+        if (!edits || edits.length === 0) return jsonResponse({ diff: '' });
+
+        const repoRootCache = new Map<string, string | null>();
+        const filesByRepo = new Map<string, string[]>();
+
+        for (const edit of edits) {
+          const dir = edit.filePath.substring(0, edit.filePath.lastIndexOf('/')) || edit.filePath;
+          let repoRoot = repoRootCache.get(dir);
+          if (repoRoot === undefined) {
+            try {
+              const { stdout } = await promisify(exec)('git rev-parse --show-toplevel', { cwd: dir, encoding: 'utf-8' });
+              repoRoot = stdout.trim();
+            } catch { repoRoot = null; }
+            repoRootCache.set(dir, repoRoot);
+          }
+          if (!repoRoot) continue;
+          const relativePath = edit.filePath.startsWith(repoRoot + '/') ? edit.filePath.slice(repoRoot.length + 1) : edit.filePath;
+          if (fileFilter && relativePath !== fileFilter) continue;
+          let repoFiles = filesByRepo.get(repoRoot);
+          if (!repoFiles) { repoFiles = []; filesByRepo.set(repoRoot, repoFiles); }
+          if (!repoFiles.includes(relativePath)) repoFiles.push(relativePath);
+        }
+
+        const baseCommitByRepo = new Map<string, string | null>();
+        const patches: string[] = [];
+        for (const [repoRoot, filePaths] of filesByRepo) {
+          try {
+            if (!baseCommitByRepo.has(repoRoot)) {
+              baseCommitByRepo.set(repoRoot, await Effect.runPromise(findCommitAtTime(repoRoot, conv.createdAt)));
+            }
+            const baseCommit = baseCommitByRepo.get(repoRoot) ?? null;
+            let patch: string;
+            if (baseCommit) {
+              const { stdout } = await promisify(exec)(
+                `git diff --patch --minimal --no-color ${baseCommit} -- ${filePaths.map(p => JSON.stringify(p)).join(' ')}`,
+                { cwd: repoRoot, encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 },
+              );
+              patch = stdout;
+            } else {
+              patch = await Effect.runPromise(diffPatchFilesAgainstHead(repoRoot, filePaths));
+            }
+            if (patch) patches.push(patch);
+          } catch { /* file may have been committed or repo unavailable */ }
+        }
+
+        return jsonResponse({ turnId, diff: patches.join('\n') });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('[conversations] diff turn failed:', msg);
+        return jsonResponse({ error: 'Internal server error' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: POST /api/conversations/:name/retitle ────────────────────────────
+//
+// Regenerate the conversation title from the *whole* transcript (not just the
+// opening message). This is an explicit user action, so it overrides even a
+// manually-set title and records the new title with source 'ai'.
+
+const postConversationRetitleRoute = HttpRouter.add(
+  'POST',
+  '/api/conversations/:name/retitle',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+        if (retitleInFlight.has(name)) {
+          return jsonResponse(
+            { error: 'A title regeneration is already running for this conversation' },
+            { status: 409 },
+          );
+        }
+        const sessionFile = await resolveSessionFile(conv);
+        if (!sessionFile || !existsSync(sessionFile)) {
+          return jsonResponse({ error: 'Conversation has no transcript yet' }, { status: 400 });
+        }
+        const { messages } = await getCachedMessages(sessionFile, false);
+        const transcript = serializeConversationTranscript(messages);
+        if (!transcript.trim()) {
+          return jsonResponse(
+            { error: 'Conversation has no messages to summarize yet' },
+            { status: 400 },
+          );
+        }
+
+        retitleInFlight.add(name);
+        try {
+          console.log(`[claude-invoke] purpose=conversation-retitle | model=${CONVERSATION_TITLE_MODEL} | conversation=${name} | transcriptChars=${transcript.length}`);
+          const title = await summarizeTranscriptTitle(transcript);
+          if (!title) {
+            return jsonResponse({ error: 'Title model returned an empty result' }, { status: 502 });
+          }
+          // Explicit user action — override any prior title, including manual ones.
+          updateConversationTitle(name, title, 'ai');
+          console.log(`[claude-invoke] SUCCESS purpose=conversation-retitle | conversation=${name} | title="${title}"`);
+          return jsonResponse({ title });
+        } finally {
+          retitleInFlight.delete(name);
+        }
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error(`[conversations] retitle failed for "${name}":`, msg);
+        return jsonResponse({ error: 'Failed to regenerate title' }, { status: 500 });
+      }
+    });
+  }),
+);
+
+// ─── Route: GET /api/conversations/:name/about ───────────────────────────────
+//
+// A few-sentence description of what the conversation has been about, derived
+// from the transcript. Cached by transcript size — re-opening the drawer is
+// free until the conversation grows. Pass ?refresh=1 to force regeneration.
+
+const getConversationAboutRoute = HttpRouter.add(
+  'GET',
+  '/api/conversations/:name/about',
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const originCheck = validateOrigin(request);
+    if (!originCheck.ok) {
+      return jsonResponse({ error: originCheck.error }, { status: 403 });
+    }
+    const params = yield* HttpRouter.params;
+    const name = params['name'] ?? '';
+    return yield* Effect.promise(async () => {
+      try {
+        const conv = getConversationByName(name);
+        if (!conv) {
+          return jsonResponse({ error: 'Conversation not found' }, { status: 404 });
+        }
+        const url = new URL(request.url, 'http://localhost');
+        const forceRefresh = url.searchParams.get('refresh') === '1';
+
+        const sessionFile = await resolveSessionFile(conv);
+        if (!sessionFile || !existsSync(sessionFile)) {
+          return jsonResponse({ summary: null, messageCount: 0, generatedAt: null });
+        }
+        const { size } = await stat(sessionFile);
+        const cached = aboutSummaryCache.get(name);
+        if (!forceRefresh && cached && cached.transcriptSize === size) {
+          return jsonResponse({ ...cached.data, cached: true });
+        }
+
+        const { messages } = await getCachedMessages(sessionFile, false);
+        const conversational = messages.filter(
+          (m) => m.role !== 'system' && typeof m.text === 'string' && m.text.trim().length > 0,
+        );
+        if (conversational.length === 0) {
+          return jsonResponse({ summary: null, messageCount: 0, generatedAt: null });
+        }
+
+        const transcript = serializeConversationTranscript(messages);
+        console.log(`[claude-invoke] purpose=conversation-about | model=${CONVERSATION_TITLE_MODEL} | conversation=${name} | transcriptChars=${transcript.length}`);
+        const summary = await summarizeTranscriptAbout(transcript);
+        if (!summary) {
+          return jsonResponse({ error: 'Summary model returned an empty result' }, { status: 502 });
+        }
+
+        const data: ConversationAboutSummary = {
+          summary,
+          messageCount: conversational.length,
+          generatedAt: new Date().toISOString(),
+        };
+        aboutSummaryCache.set(name, { transcriptSize: size, data });
+        if (aboutSummaryCache.size > ABOUT_SUMMARY_CACHE_MAX) {
+          const firstKey = aboutSummaryCache.keys().next().value;
+          if (firstKey !== undefined) aboutSummaryCache.delete(firstKey);
+        }
+        console.log(`[claude-invoke] SUCCESS purpose=conversation-about | conversation=${name} | summaryChars=${summary.length}`);
+        return jsonResponse({ ...data, cached: false });
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error(`[conversations] about summary failed for "${name}":`, msg);
+        return jsonResponse({ error: 'Failed to summarize conversation' }, { status: 500 });
       }
     });
   }),
@@ -1055,9 +3336,12 @@ const postConversationSummaryForkRoute = HttpRouter.add(
 
 export const conversationsRouteLayer = Layer.mergeAll(
   getConversationsRoute,
+  getArchivedConversationsRoute,
   getConversationRoute,
+  getConversationHandoffDocRoute,
   postConversationRoute,
   patchConversationRoute,
+  deleteConversationRoute,
   postConversationStopRoute,
   postConversationResumeRoute,
   postConversationSwitchModelRoute,
@@ -1065,10 +3349,19 @@ export const conversationsRouteLayer = Layer.mergeAll(
   postConversationArchiveRoute,
   postConversationUnarchiveRoute,
   getConversationMessagesRoute,
+  postConversationUploadImageRoute,
+  postConversationDeleteImageRoute,
   postConversationMessageRoute,
+  postConversationDeliveryMethodRoute,
   postConversationFavoriteRoute,
   deleteConversationFavoriteRoute,
   postConversationSummaryForkRoute,
+  postConversationPlanActionRoute,
+  getConversationDiffsRoute,
+  getConversationDiffFullRoute,
+  getConversationDiffTurnRoute,
+  postConversationRetitleRoute,
+  getConversationAboutRoute,
 );
 
 export default conversationsRouteLayer;

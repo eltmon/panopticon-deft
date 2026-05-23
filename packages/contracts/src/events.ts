@@ -1,20 +1,27 @@
 import { Schema } from "effect"
 import {
   Activity,
+  AgentChannelReply,
   AgentId,
-  AgentPhase,
   AgentResolution,
   AgentRuntimeSnapshot,
   AgentSnapshot,
   AgentStatus,
+  ChannelPermissionRequestSnapshot,
+  ClaudeChannelPermissionBehavior,
   IssueId,
   ResourceStats,
   ReviewStatusSnapshot,
+  Role,
   SequenceNumber,
-  SpecialistSnapshot,
-  SpecialistType,
   WaitingReason,
 } from "./types"
+import {
+  MemoryObservation,
+  MemoryStatus,
+  RagDecision,
+  ResetMarker,
+} from "./memory"
 
 // ─── Agent Events ─────────────────────────────────────────────────────────────
 
@@ -32,9 +39,53 @@ export const AgentStoppedEvent = Schema.Struct({
   type: Schema.Literal("agent.stopped"),
   sequence: SequenceNumber,
   timestamp: Schema.String,
-  payload: Schema.Struct({ agentId: AgentId, issueId: IssueId }),
+  payload: Schema.Struct({ agentId: AgentId, issueId: IssueId, sessionId: Schema.optional(Schema.String) }),
 })
 export type AgentStoppedEvent = typeof AgentStoppedEvent.Type
+
+export const AgentHeartbeatDeadEvent = Schema.Struct({
+  type: Schema.Literal("agent.heartbeat_dead"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ agentId: AgentId, issueId: Schema.optional(IssueId), sessionId: Schema.optional(Schema.String) }),
+})
+export type AgentHeartbeatDeadEvent = typeof AgentHeartbeatDeadEvent.Type
+
+/** Role lifecycle — work agent completed implementation and is ready for review. */
+export const WorkCompletedEvent = Schema.Struct({
+  type: Schema.Literal("work.completed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ issueId: IssueId, agentId: Schema.optional(AgentId) }),
+})
+export type WorkCompletedEvent = typeof WorkCompletedEvent.Type
+
+/** Role lifecycle — generic agent completion signal, normalized by Cloister by role. */
+export const AgentCompletedEvent = Schema.Struct({
+  type: Schema.Literal("agent.completed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ issueId: IssueId, agentId: Schema.optional(AgentId), role: Schema.optional(Role) }),
+})
+export type AgentCompletedEvent = typeof AgentCompletedEvent.Type
+
+/** Role lifecycle — review approved the branch and testing should start. */
+export const ReviewApprovedEvent = Schema.Struct({
+  type: Schema.Literal("review.approved"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ issueId: IssueId }),
+})
+export type ReviewApprovedEvent = typeof ReviewApprovedEvent.Type
+
+/** Role lifecycle — tests passed and shipping should prepare the branch. */
+export const TestPassedEvent = Schema.Struct({
+  type: Schema.Literal("test.passed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ issueId: IssueId }),
+})
+export type TestPassedEvent = typeof TestPassedEvent.Type
 
 /** Replaces socket.io `godview:status-change` */
 export const AgentStatusChangedEvent = Schema.Struct({
@@ -43,8 +94,20 @@ export const AgentStatusChangedEvent = Schema.Struct({
   timestamp: Schema.String,
   payload: Schema.Struct({
     agentId: AgentId,
+    issueId: Schema.optional(IssueId),
     status: AgentStatus,
     previousStatus: Schema.optional(AgentStatus),
+    stoppedByUser: Schema.optional(Schema.Boolean),
+    paused: Schema.optional(Schema.Boolean),
+    pausedReason: Schema.optional(Schema.NullOr(Schema.String)),
+    pausedAt: Schema.optional(Schema.NullOr(Schema.String)),
+    troubled: Schema.optional(Schema.Boolean),
+    troubledAt: Schema.optional(Schema.NullOr(Schema.String)),
+    consecutiveFailures: Schema.optional(Schema.Number),
+    firstFailureInRunAt: Schema.optional(Schema.NullOr(Schema.String)),
+    lastFailureAt: Schema.optional(Schema.NullOr(Schema.String)),
+    lastFailureReason: Schema.optional(Schema.NullOr(Schema.String)),
+    lastFailureNextRetryAt: Schema.optional(Schema.NullOr(Schema.String)),
   }),
 })
 export type AgentStatusChangedEvent = typeof AgentStatusChangedEvent.Type
@@ -65,9 +128,11 @@ export const AgentEnrichmentChangedEvent = Schema.Struct({
   timestamp: Schema.String,
   payload: Schema.Struct({
     agentId: AgentId,
-    agentPhase: Schema.optional(AgentPhase),
+    role: Schema.optional(Role),
     hasPendingQuestion: Schema.Boolean,
     pendingQuestionCount: Schema.Number,
+    pendingQuestionPrompt: Schema.optional(Schema.String),
+    pendingQuestionReason: Schema.optional(Schema.String),
     resolution: Schema.optional(AgentResolution),
     resolutionCount: Schema.optional(Schema.Number),
   }),
@@ -144,6 +209,27 @@ export const AgentWaitingClearedEvent = Schema.Struct({
 })
 export type AgentWaitingClearedEvent = typeof AgentWaitingClearedEvent.Type
 
+export const AgentPermissionRequestedEvent = Schema.Struct({
+  type: Schema.Literal("agent.permission_requested"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: ChannelPermissionRequestSnapshot,
+})
+export type AgentPermissionRequestedEvent = typeof AgentPermissionRequestedEvent.Type
+
+export const AgentPermissionResolvedEvent = Schema.Struct({
+  type: Schema.Literal("agent.permission_resolved"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    requestId: Schema.String,
+    agentId: AgentId,
+    issueId: Schema.optional(IssueId),
+    behavior: ClaudeChannelPermissionBehavior,
+  }),
+})
+export type AgentPermissionResolvedEvent = typeof AgentPermissionResolvedEvent.Type
+
 export const AgentMessageReceivedEvent = Schema.Struct({
   type: Schema.Literal("agent.message_received"),
   sequence: SequenceNumber,
@@ -155,6 +241,17 @@ export const AgentMessageReceivedEvent = Schema.Struct({
   }),
 })
 export type AgentMessageReceivedEvent = typeof AgentMessageReceivedEvent.Type
+
+export const AgentChannelReplyEvent = Schema.Struct({
+  type: Schema.Literal("agent.channel_reply"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    agentId: AgentId,
+    reply: AgentChannelReply,
+  }),
+})
+export type AgentChannelReplyEvent = typeof AgentChannelReplyEvent.Type
 
 export const AgentModelSetEvent = Schema.Struct({
   type: Schema.Literal("agent.model_set"),
@@ -205,6 +302,28 @@ export const AgentStateRestoredEvent = Schema.Struct({
   }),
 })
 export type AgentStateRestoredEvent = typeof AgentStateRestoredEvent.Type
+
+/** Emitted when a turn diff checkpoint is captured and diff computed */
+export const AgentTurnDiffCompletedEvent = Schema.Struct({
+  type: Schema.Literal("agent.turn_diff_completed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    agentId: AgentId,
+    turnId: Schema.String,
+    completedAt: Schema.String,
+    files: Schema.Array(Schema.Struct({
+      path: Schema.String,
+      kind: Schema.optional(Schema.String),
+      additions: Schema.optional(Schema.Number),
+      deletions: Schema.optional(Schema.Number),
+    })),
+    checkpointRef: Schema.optional(Schema.String),
+    assistantMessageId: Schema.optional(Schema.String),
+    checkpointTurnCount: Schema.optional(Schema.Number),
+  }),
+})
+export type AgentTurnDiffCompletedEvent = typeof AgentTurnDiffCompletedEvent.Type
 
 // ─── Planning Events ──────────────────────────────────────────────────────────
 
@@ -339,33 +458,122 @@ export const PipelineTestCompletedEvent = Schema.Struct({
 })
 export type PipelineTestCompletedEvent = typeof PipelineTestCompletedEvent.Type
 
+/**
+ * PAN-915 — reviewer session received a new prompt (spawn or resume of a
+ * canonical PAN-830 session). Drives event-driven `reviewSubStatuses[role] =
+ * 'running'` and tracking of `reviewSessionNames` without polling tmux.
+ */
+export const ReviewReviewerStartedEvent = Schema.Struct({
+  type: Schema.Literal("review.reviewer_started"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    role: Schema.String,
+    sessionName: Schema.String,
+  }),
+})
+export type ReviewReviewerStartedEvent = typeof ReviewReviewerStartedEvent.Type
+
+/**
+ * PAN-915 — reviewer wrote its output file (round complete for that role).
+ * Updates `reviewSubStatuses[role] = 'done'` event-driven.
+ */
+export const ReviewReviewerCompletedEvent = Schema.Struct({
+  type: Schema.Literal("review.reviewer_completed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    role: Schema.String,
+  }),
+})
+export type ReviewReviewerCompletedEvent = typeof ReviewReviewerCompletedEvent.Type
+
+/**
+ * Review specialist timeout telemetry. Emitted once per timed-out reviewer wait
+ * attempt so operators can distinguish transient auto-retries from terminal
+ * review failures.
+ */
+export const ReviewSpecialistTimedOutEvent = Schema.Struct({
+  type: Schema.Literal("review.specialist.timed_out"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    role: Schema.String,
+    sessionName: Schema.String,
+    attempt: Schema.Number,
+    maxRetries: Schema.Number,
+    willRetry: Schema.Boolean,
+  }),
+})
+export type ReviewSpecialistTimedOutEvent = typeof ReviewSpecialistTimedOutEvent.Type
+
+/**
+ * PAN-915 — review coordinator session spawned. Surfaces in the dashboard so
+ * the kanban card can show "review in progress" the instant the coordinator
+ * starts, not after the first reviewer finishes.
+ */
+export const ReviewCoordinatorStartedEvent = Schema.Struct({
+  type: Schema.Literal("review.coordinator_started"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    sessionName: Schema.String,
+  }),
+})
+export type ReviewCoordinatorStartedEvent = typeof ReviewCoordinatorStartedEvent.Type
+
+/** Review coordinator died before writing a terminal exit marker. */
+export const ReviewCoordinatorDiedEvent = Schema.Struct({
+  type: Schema.Literal("review.coordinator.died"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    sessionName: Schema.String,
+    reason: Schema.String,
+  }),
+})
+export type ReviewCoordinatorDiedEvent = typeof ReviewCoordinatorDiedEvent.Type
+
 // ─── Specialist Events ────────────────────────────────────────────────────────
 
-/** New — specialist became active */
+const SpecialistLifecycleState = Schema.Literals(["active", "sleeping", "uninitialized"])
+
+/** New — role-backed specialist became active */
 export const SpecialistStartedEvent = Schema.Struct({
   type: Schema.Literal("specialist.started"),
   sequence: SequenceNumber,
   timestamp: Schema.String,
-  payload: Schema.Struct({ specialist: SpecialistSnapshot }),
+  payload: Schema.Struct({
+    name: Role,
+    state: SpecialistLifecycleState,
+    isRunning: Schema.Boolean,
+    currentIssue: Schema.optional(Schema.String),
+    lastWake: Schema.optional(Schema.String),
+  }),
 })
 export type SpecialistStartedEvent = typeof SpecialistStartedEvent.Type
 
-/** New — specialist completed work */
+/** New — role-backed specialist completed work */
 export const SpecialistCompletedEvent = Schema.Struct({
   type: Schema.Literal("specialist.completed"),
   sequence: SequenceNumber,
   timestamp: Schema.String,
-  payload: Schema.Struct({ name: SpecialistType, issueId: Schema.optional(IssueId) }),
+  payload: Schema.Struct({ name: Role, issueId: Schema.optional(IssueId) }),
 })
 export type SpecialistCompletedEvent = typeof SpecialistCompletedEvent.Type
 
-/** New — specialist failed */
+/** New — role-backed specialist failed */
 export const SpecialistFailedEvent = Schema.Struct({
   type: Schema.Literal("specialist.failed"),
   sequence: SequenceNumber,
   timestamp: Schema.String,
   payload: Schema.Struct({
-    name: SpecialistType,
+    name: Role,
     issueId: Schema.optional(IssueId),
     error: Schema.String,
   }),
@@ -382,6 +590,19 @@ export const ResourcesUpdatedEvent = Schema.Struct({
   payload: Schema.Struct({ resources: ResourceStats }),
 })
 export type ResourcesUpdatedEvent = typeof ResourcesUpdatedEvent.Type
+
+export const SystemHealthSeverityChangedEvent = Schema.Struct({
+  type: Schema.Literal("system.health_severity_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    previousSeverity: Schema.String,
+    severity: Schema.String,
+    reasons: Schema.Array(Schema.String),
+    leakedSpecialistCount: Schema.Number,
+  }),
+})
+export type SystemHealthSeverityChangedEvent = typeof SystemHealthSeverityChangedEvent.Type
 
 // ─── Issue Events ─────────────────────────────────────────────────────────────
 
@@ -412,6 +633,7 @@ export const IssueStatusChangedEvent = Schema.Struct({
     issueId: IssueId,
     status: Schema.String,
     canonicalStatus: Schema.String,
+    labels: Schema.optional(Schema.Array(Schema.String)),
   }),
 })
 export type IssueStatusChangedEvent = typeof IssueStatusChangedEvent.Type
@@ -470,6 +692,8 @@ export const ActivityTtsEvent = Schema.Struct({
     utterance: Schema.String,
     priority: Schema.optional(Schema.Number),
     issueId: Schema.optional(IssueId),
+    source: Schema.optional(Schema.String),
+    eventType: Schema.optional(Schema.String),
   }),
 })
 export type ActivityTtsEvent = typeof ActivityTtsEvent.Type
@@ -571,6 +795,65 @@ export const WorkspaceAbortedEvent = Schema.Struct({
 })
 export type WorkspaceAbortedEvent = typeof WorkspaceAbortedEvent.Type
 
+// ─── Memory Events ────────────────────────────────────────────────────────────
+
+export const MemoryObservationCreatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.observation_created"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ observation: MemoryObservation }),
+})
+export type MemoryObservationCreatedEvent = typeof MemoryObservationCreatedEvent.Type
+
+export const MemoryStatusUpdatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.status_updated"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    identity: Schema.Struct({ projectId: Schema.String, workspaceId: Schema.String, issueId: IssueId }),
+    status: MemoryStatus,
+    previousStatus: Schema.optional(MemoryStatus),
+  }),
+})
+export type MemoryStatusUpdatedEvent = typeof MemoryStatusUpdatedEvent.Type
+
+export const MemoryRollupTriggeredEvent = Schema.Struct({
+  type: Schema.Literal("memory.rollup_triggered"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    projectId: Schema.String,
+    workspaceId: Schema.String,
+    issueId: IssueId,
+    pendingCount: Schema.Number,
+    turnIds: Schema.Array(Schema.String),
+    threshold: Schema.Number,
+  }),
+})
+export type MemoryRollupTriggeredEvent = typeof MemoryRollupTriggeredEvent.Type
+
+export const MemoryResetMarkerCreatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.reset_marker_created"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ marker: ResetMarker }),
+})
+export type MemoryResetMarkerCreatedEvent = typeof MemoryResetMarkerCreatedEvent.Type
+
+export const MemoryHealthChangedEvent = Schema.Struct({
+  type: Schema.Literal("memory.health_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    projectId: Schema.String,
+    issueId: IssueId,
+    status: Schema.Literals(["healthy", "degraded", "failing"]),
+    reason: Schema.NullOr(Schema.String),
+    ragDecision: Schema.optional(RagDecision),
+  }),
+})
+export type MemoryHealthChangedEvent = typeof MemoryHealthChangedEvent.Type
+
 // ─── Cost Events ──────────────────────────────────────────────────────────────
 
 /** New — cost event recorded in the store */
@@ -588,6 +871,132 @@ export const CostEventRecordedEvent = Schema.Struct({
 })
 export type CostEventRecordedEvent = typeof CostEventRecordedEvent.Type
 
+// ─── Conversation Events ──────────────────────────────────────────────────────
+
+/** Emitted (in-memory only, not persisted) when a Panopticon-native compaction starts or completes. */
+export const ConversationCompactingChangedEvent = Schema.Struct({
+  type: Schema.Literal("conversation.compacting_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    conversationName: Schema.String,
+    compacting: Schema.Boolean,
+  }),
+})
+export type ConversationCompactingChangedEvent = typeof ConversationCompactingChangedEvent.Type
+
+/** Emitted (in-memory only) when a new conversation row is created, so the
+ * sidebar list can refresh immediately instead of waiting for its poll tick. */
+export const ConversationCreatedEvent = Schema.Struct({
+  type: Schema.Literal("conversation.created"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    conversationName: Schema.String,
+  }),
+})
+export type ConversationCreatedEvent = typeof ConversationCreatedEvent.Type
+
+/** Emitted (in-memory only) when a PermissionRequest hook fires or resolves for a conversation. */
+export const ConversationPermissionChangedEvent = Schema.Struct({
+  type: Schema.Literal("conversation.permission_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    conversationName: Schema.String,
+    waiting: Schema.Boolean,
+    toolName: Schema.optional(Schema.String),
+  }),
+})
+export type ConversationPermissionChangedEvent = typeof ConversationPermissionChangedEvent.Type
+
+// ─── Conversation Discovery Events (PAN-457) ──────────────────────────────────
+
+/** Scan started */
+export const ScanStartedEvent = Schema.Struct({
+  type: Schema.Literal("scan.started"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    mode: Schema.Literals(['targeted', 'watched', 'system']),
+    dirs: Schema.Array(Schema.String),
+  }),
+})
+export type ScanStartedEvent = typeof ScanStartedEvent.Type
+
+/** Scan progress tick */
+export const ScanProgressEvent = Schema.Struct({
+  type: Schema.Literal("scan.progress"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    dirsProcessed: Schema.Number,
+    dirsTotal: Schema.Number,
+    sessionsFound: Schema.Number,
+    elapsedMs: Schema.Number,
+  }),
+})
+export type ScanProgressEvent = typeof ScanProgressEvent.Type
+
+/** Scan completed */
+export const ScanCompleteEvent = Schema.Struct({
+  type: Schema.Literal("scan.complete"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    inserted: Schema.Number,
+    updated: Schema.Number,
+    skipped: Schema.Number,
+    errors: Schema.Number,
+    durationMs: Schema.Number,
+  }),
+})
+export type ScanCompleteEvent = typeof ScanCompleteEvent.Type
+
+/** Per-session enrichment progress */
+export const EnrichProgressEvent = Schema.Struct({
+  type: Schema.Literal("enrich.progress"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    sessionId: Schema.Number,
+    level: Schema.Number,
+    model: Schema.String,
+    cost: Schema.Number,
+    success: Schema.Boolean,
+    error: Schema.optional(Schema.String),
+  }),
+})
+export type EnrichProgressEvent = typeof EnrichProgressEvent.Type
+
+/** Enrichment batch completed */
+export const EnrichCompleteEvent = Schema.Struct({
+  type: Schema.Literal("enrich.complete"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    processed: Schema.Number,
+    totalCost: Schema.Number,
+    failures: Schema.Number,
+    durationMs: Schema.Number,
+  }),
+})
+export type EnrichCompleteEvent = typeof EnrichCompleteEvent.Type
+
+/** Per-session embedding progress */
+export const EmbedProgressEvent = Schema.Struct({
+  type: Schema.Literal("embed.progress"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    sessionId: Schema.Number,
+    model: Schema.String,
+    success: Schema.Boolean,
+    error: Schema.optional(Schema.String),
+  }),
+})
+export type EmbedProgressEvent = typeof EmbedProgressEvent.Type
+
 // ─── Union ────────────────────────────────────────────────────────────────────
 
 /** All domain events — the shape streamed via subscribeDomainEvents RPC */
@@ -596,6 +1005,11 @@ export const DomainEvent = Schema.Union([
   AgentEnrichmentChangedEvent,
   AgentStartedEvent,
   AgentStoppedEvent,
+  AgentHeartbeatDeadEvent,
+  WorkCompletedEvent,
+  AgentCompletedEvent,
+  ReviewApprovedEvent,
+  TestPassedEvent,
   AgentStatusChangedEvent,
   AgentOutputReceivedEvent,
   // PAN-800 runtime events
@@ -604,11 +1018,15 @@ export const DomainEvent = Schema.Union([
   AgentThinkingStoppedEvent,
   AgentWaitingStartedEvent,
   AgentWaitingClearedEvent,
+  AgentPermissionRequestedEvent,
+  AgentPermissionResolvedEvent,
   AgentMessageReceivedEvent,
+  AgentChannelReplyEvent,
   AgentModelSetEvent,
   AgentCurrentIssueSetEvent,
   AgentResolutionChangedEvent,
   AgentStateRestoredEvent,
+  AgentTurnDiffCompletedEvent,
   PlanningStartedEvent,
   PlanningFailedEvent,
   PlanningSyncEvent,
@@ -622,10 +1040,16 @@ export const DomainEvent = Schema.Union([
   PipelineReviewCompletedEvent,
   PipelineTestStartedEvent,
   PipelineTestCompletedEvent,
+  ReviewReviewerStartedEvent,
+  ReviewReviewerCompletedEvent,
+  ReviewSpecialistTimedOutEvent,
+  ReviewCoordinatorStartedEvent,
+  ReviewCoordinatorDiedEvent,
   SpecialistStartedEvent,
   SpecialistCompletedEvent,
   SpecialistFailedEvent,
   ResourcesUpdatedEvent,
+  SystemHealthSeverityChangedEvent,
   IssuesSnapshotEvent,
   IssuesUpdatedEvent,
   IssueStatusChangedEvent,
@@ -634,6 +1058,11 @@ export const DomainEvent = Schema.Union([
   ActivityDetailedEvent,
   ActivityTtsEvent,
   ShadowInferenceUpdateEvent,
+  MemoryObservationCreatedEvent,
+  MemoryStatusUpdatedEvent,
+  MemoryRollupTriggeredEvent,
+  MemoryResetMarkerCreatedEvent,
+  MemoryHealthChangedEvent,
   CostEventRecordedEvent,
   WorkspaceCreatedEvent,
   WorkspaceWipeStartedEvent,
@@ -643,5 +1072,14 @@ export const DomainEvent = Schema.Union([
   DashboardLifecycleStartedEvent,
   DashboardLifecycleCompletedEvent,
   DashboardLifecycleFailedEvent,
+  ConversationCompactingChangedEvent,
+  ConversationCreatedEvent,
+  ConversationPermissionChangedEvent,
+  ScanStartedEvent,
+  ScanProgressEvent,
+  ScanCompleteEvent,
+  EnrichProgressEvent,
+  EnrichCompleteEvent,
+  EmbedProgressEvent,
 ])
 export type DomainEvent = typeof DomainEvent.Type

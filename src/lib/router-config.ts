@@ -1,9 +1,11 @@
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { Effect } from 'effect';
+import { FsError } from './errors.js';
 import type { SettingsConfig, ModelId } from './settings.js';
-import { getAllWorkTypes, WorkTypeId } from './work-types.js';
-import { WorkTypeRouter } from './work-type-router.js';
+import { loadConfigSync, resolveModel } from './config-yaml.js';
 
 // claude-code-router config directory
 const ROUTER_CONFIG_DIR = join(homedir(), '.claude-code-router');
@@ -65,7 +67,7 @@ export function generateRouterConfig(settings: SettingsConfig): RouterConfig {
       apiKey: settings.api_keys.openai.startsWith('$')
         ? settings.api_keys.openai
         : settings.api_keys.openai,
-      models: ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-nano', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'o3'],
+      models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
     });
   }
 
@@ -77,56 +79,43 @@ export function generateRouterConfig(settings: SettingsConfig): RouterConfig {
       apiKey: settings.api_keys.google.startsWith('$')
         ? settings.api_keys.google
         : settings.api_keys.google,
-      models: ['gemini-3.1-pro-preview', 'gemini-3-flash', 'gemini-3.1-flash-lite-preview'],
+      models: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview'],
     });
   }
 
   // See src/lib/providers.ts for direct API configuration
 
-  // Router rules: Map agent types to configured models
-
-  // Specialist agents
-  router['specialist-review-agent'] = {
+  // Legacy SettingsConfig still exposes historical keys; convert them to role keys
+  // so generated CCR config no longer depends on the removed WorkType registry.
+  router['role:review'] = {
     model: settings.models.specialists.review_agent,
   };
-  router['specialist-test-agent'] = {
+  router['role:test'] = {
     model: settings.models.specialists.test_agent,
   };
-  router['specialist-merge-agent'] = {
+  router['role:ship'] = {
     model: settings.models.specialists.merge_agent,
   };
-
-  // Complexity-based routing (for backward compatibility)
-  router['complexity-trivial'] = {
-    model: settings.models.complexity.trivial,
-  };
-  router['complexity-simple'] = {
-    model: settings.models.complexity.simple,
-  };
-  router['complexity-medium'] = {
-    model: settings.models.complexity.medium,
-  };
-  router['complexity-complex'] = {
+  router['role:plan'] = {
     model: settings.models.complexity.complex,
   };
-  router['complexity-expert'] = {
-    model: settings.models.complexity.expert,
+  router['role:work'] = {
+    model: settings.models.complexity.medium,
   };
 
   return { providers, router };
 }
 
 /**
- * Generate claude-code-router config from work types
+ * Generate claude-code-router config from role routing.
  *
- * This is the new work-type-based router configuration.
- * It generates routing rules for all 23 work types using the
- * WorkTypeRouter to resolve models.
+ * @deprecated Kept for CLI compatibility with older CCR setup commands. The
+ * role primitive owns model resolution; emitted router keys are role-based.
  */
 export function generateRouterConfigFromWorkTypes(): RouterConfig {
-  const workTypeRouter = new WorkTypeRouter();
-  const apiKeys = workTypeRouter.getApiKeys();
-  const enabledProviders = workTypeRouter.getEnabledProviders();
+  const { config } = loadConfigSync();
+  const apiKeys = config.apiKeys;
+  const enabledProviders = config.enabledProviders;
 
   const providers: Provider[] = [];
   const router: Record<string, RouterRule> = {};
@@ -145,7 +134,7 @@ export function generateRouterConfigFromWorkTypes(): RouterConfig {
       name: 'openai',
       baseURL: 'https://api.openai.com/v1',
       apiKey: apiKeys.openai.startsWith('$') ? apiKeys.openai : apiKeys.openai,
-      models: ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-nano', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'o3'],
+      models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'],
     });
   }
 
@@ -155,20 +144,18 @@ export function generateRouterConfigFromWorkTypes(): RouterConfig {
       name: 'google',
       baseURL: 'https://generativelanguage.googleapis.com/v1beta',
       apiKey: apiKeys.google.startsWith('$') ? apiKeys.google : apiKeys.google,
-      models: ['gemini-3.1-pro-preview', 'gemini-3-flash', 'gemini-3.1-flash-lite-preview'],
+      models: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview'],
     });
   }
 
-  // Kimi provider uses direct API, not router
-  // See src/lib/providers.ts for direct API configuration
-
-  // Generate router rules for all 23 work types
-  const allWorkTypes = getAllWorkTypes();
-  for (const workType of allWorkTypes) {
-    const resolution = workTypeRouter.getModel(workType);
-    router[workType] = {
-      model: resolution.model,
-    };
+  for (const role of ['plan', 'work', 'review', 'test', 'ship', 'flywheel'] as const) {
+    router[`role:${role}`] = { model: resolveModel(role, undefined, config) };
+  }
+  for (const subRole of ['inspect', 'inspect-deep'] as const) {
+    router[`role:work.${subRole}`] = { model: resolveModel('work', subRole, config) };
+  }
+  for (const subRole of ['security', 'correctness', 'performance', 'requirements'] as const) {
+    router[`role:review.${subRole}`] = { model: resolveModel('review', subRole, config) };
   }
 
   return { providers, router };
@@ -177,7 +164,7 @@ export function generateRouterConfigFromWorkTypes(): RouterConfig {
 /**
  * Write router config to ~/.claude-code-router/config.json
  */
-export function writeRouterConfig(config: RouterConfig): void {
+export function writeRouterConfigSync(config: RouterConfig): void {
   // Ensure directory exists
   if (!existsSync(ROUTER_CONFIG_DIR)) {
     mkdirSync(ROUTER_CONFIG_DIR, { recursive: true });
@@ -194,3 +181,23 @@ export function writeRouterConfig(config: RouterConfig): void {
 export function getRouterConfigPath(): string {
   return ROUTER_CONFIG_FILE;
 }
+
+// ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
+
+/** Effect variant of `writeRouterConfig`. Uses fs/promises so it's safe in
+ *  dashboard-server-reachable code paths (no event-loop blocking). */
+export const writeRouterConfig = (
+  config: RouterConfig,
+): Effect.Effect<void, FsError> =>
+  Effect.gen(function* () {
+    yield* Effect.tryPromise({
+      try: () => mkdir(ROUTER_CONFIG_DIR, { recursive: true }),
+      catch: (cause) => new FsError({ path: ROUTER_CONFIG_DIR, operation: 'mkdir', cause }),
+    });
+    const content = JSON.stringify(config, null, 2);
+    yield* Effect.tryPromise({
+      try: () => writeFile(ROUTER_CONFIG_FILE, content, 'utf8'),
+      catch: (cause) => new FsError({ path: ROUTER_CONFIG_FILE, operation: 'write', cause }),
+    });
+  });
+

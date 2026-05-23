@@ -1,58 +1,63 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
   Loader2,
   X,
-  Search,
+  ChevronDown,
   Code,
   Beaker,
-  FileText,
-  MessageSquare,
   Eye,
-  GitMerge,
-  Shield,
   Zap,
   CheckCircle,
-  Merge,
   Globe,
-  Calendar,
   Terminal,
   Brain,
   SplitSquareVertical,
-  BookMarked,
   BarChart3,
   Route,
   MessageCircle,
   Lightbulb,
-  User,
   AlertTriangle,
-  CheckSquare as VerifiedUser,
-  Eye as PageView,
-  ClipboardList,
   Key,
   GitBranch,
   Flag,
-  Settings,
   RefreshCw,
   Trash2,
+  Palette,
+  Wrench,
+  Monitor,
+  ShieldCheck,
+  Volume2,
+  Mic,
 } from 'lucide-react';
-import { useAlert } from '../DialogProvider';
-import { SettingsConfig, Provider, WorkTypeId, ModelId } from './types';
+import { SettingsConfig, Provider, ModelId, type TtsConfig } from './types';
 import { useUIPreferences } from '../../hooks/useUIPreferences';
+import { useDiffPreferences } from '../../hooks/useDiffPreferences';
+import { useCodexAuthStatus } from '../../hooks/useCodexAuthStatus';
+import { setReauthSession } from '../../lib/pending-codex-spawn';
 import { OpenRouterPage } from './OpenRouterPage';
+import { SensitiveText } from '../SensitiveText';
 import { DesktopSettingsSection } from './DesktopSettingsSection';
+import { WorkhorsePanel } from './WorkhorsePanel';
+import { RolesPanel } from './RolesPanel';
+import { SavedVoicesTab } from './SavedVoicesTab';
+import { VoiceDesignTab } from './VoiceDesignTab';
+import { VoicePresetsTab } from './VoicePresetsTab';
+import { TtsSystemVoicePicker } from './TtsSystemVoicePicker';
+import { MODELS_BY_PROVIDER, type OpenRouterFavoriteModel } from './modelCatalog';
+// PAN-1055: drop the cached available-models response when Settings is saved
+// so subsequent picker renders see the new provider/keys mix immediately.
+import { invalidateAvailableModelsCache } from '../shared/ModelPicker';
 import {
-  ModelOverrideModal,
-  getCapabilityMatchScore,
-  getModelById,
-  WORK_TYPE_CAPABILITIES,
-  CAPABILITY_INFO,
-  Capability,
-  MODELS_BY_PROVIDER,
-  OpenRouterFavoriteModel,
-} from './AgentCards/ModelOverrideModal';
-import { getEffectiveModelId } from './modelDefaults';
+  SettingsLayout,
+  SettingsHeader,
+  SettingsSidebarNav,
+  SettingsSection,
+  SettingsRow,
+  type NavItem,
+} from './primitives';
+import { ensureDashboardSession } from '../../lib/wsTransport';
 
 // OpenRouter types matching OpenRouterModelBrowser
 interface OpenRouterModelCatalog {
@@ -88,17 +93,129 @@ async function fetchSettings(): Promise<SettingsConfig> {
   return res.json();
 }
 
+interface TtsHealthResponse {
+  ok: boolean;
+  running: boolean;
+  pid: number | null;
+  daemonHost: string;
+  daemonPort: number;
+  phase?: 'stopped' | 'starting' | 'healthy' | 'unhealthy';
+  initializing?: boolean;
+  queueDepth?: number;
+  model?: unknown;
+  uptimeSeconds?: number;
+  gpuMemoryUsedMb?: number;
+  error?: string;
+}
+
+interface TtsVoiceListItem {
+  id: string;
+  name: string;
+  kind: 'preset' | 'design' | 'clone';
+  presetName?: string;
+  description?: string;
+  instruct?: string;
+}
+
+async function fetchTtsHealth(): Promise<TtsHealthResponse> {
+  const res = await fetch('/api/tts/health');
+  if (!res.ok) throw new Error('Failed to fetch TTS health');
+  return res.json();
+}
+
+async function startTtsDaemonRequest(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/tts/start', { method: 'POST' });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || body.ok !== true) throw new Error(body.error ?? body.status?.error ?? 'Failed to start TTS daemon');
+  return body;
+}
+
+function formatTtsUptime(seconds: number | undefined): string | undefined {
+  if (seconds === undefined) return undefined;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${remainingSeconds}s`;
+}
+
+function formatTtsGpuMemory(mb: number | undefined): string | undefined {
+  if (mb === undefined) return undefined;
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)}GB VRAM` : `${mb}MB VRAM`;
+}
+
+async function fetchTtsVoices(): Promise<TtsVoiceListItem[]> {
+  const res = await fetch('/api/tts/voices');
+  if (!res.ok) throw new Error('Failed to fetch TTS voices');
+  return res.json();
+}
+
 interface SaveSettingsResponse {
   success: boolean;
   message: string;
   warnings?: string[];
 }
 
+export function buildTtsAutosavePayload(latest: SettingsConfig, tts: TtsConfig): SettingsConfig {
+  return { ...latest, tts };
+}
+
 async function saveSettings(settings: SettingsConfig): Promise<SaveSettingsResponse> {
+  // PAN-1048 review feedback 004 (C4): WorkhorsePanel and RolesPanel save
+  // workhorses + roles via their own PUTs. SettingsPage's parent formData is
+  // populated once on mount and never refreshed, so a top-level save would
+  // ship a stale workhorses/roles snapshot and silently undo every model-routing
+  // change the user made through the child panels in this session.
+  // Refetch before each PUT and overlay the latest workhorses/roles on top
+  // of the parent's edits — those are the two slices the child panels own.
+  let merged: SettingsConfig = settings;
+  try {
+    const latest = await fetchSettings();
+    // workhorses + roles live on the API payload but are not modelled on
+    // SettingsConfig — child panels (WorkhorsePanel, RolesPanel) own those
+    // slices and PUT them directly through their own typed payloads, so the
+    // parent only needs to carry them through opaquely without losing them.
+    const latestRouting = latest as unknown as {
+      workhorses?: unknown;
+      roles?: unknown;
+    };
+    const parentConversationPatch: SettingsConfig['conversations'] = {
+      ...(settings.conversations?.compaction_model !== undefined
+        ? { compaction_model: settings.conversations.compaction_model }
+        : {}),
+      ...(settings.conversations?.manual_compact_mode !== undefined
+        ? { manual_compact_mode: settings.conversations.manual_compact_mode }
+        : {}),
+      ...(settings.conversations?.rich_compaction !== undefined
+        ? { rich_compaction: settings.conversations.rich_compaction }
+        : {}),
+      ...(settings.conversations?.title_model !== undefined
+        ? { title_model: settings.conversations.title_model }
+        : {}),
+    };
+    merged = {
+      ...settings,
+      conversations: {
+        ...latest.conversations,
+        ...parentConversationPatch,
+      },
+      ...(latestRouting.workhorses !== undefined
+        ? { workhorses: latestRouting.workhorses }
+        : {}),
+      ...(latestRouting.roles !== undefined
+        ? { roles: latestRouting.roles }
+        : {}),
+    } as SettingsConfig;
+  } catch (err) {
+    // Non-fatal — fall back to the parent's payload rather than blocking the
+    // save. The user gets the same overwrite semantics the bug surfaced, but
+    // only when the GET also fails (which would already be a bigger problem).
+    console.warn('[settings] Pre-save refetch failed; saving parent payload as-is:', err);
+  }
   const res = await fetch('/api/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(settings),
+    body: JSON.stringify(merged),
   });
   if (!res.ok) {
     const error = await res.text();
@@ -107,15 +224,82 @@ async function saveSettings(settings: SettingsConfig): Promise<SaveSettingsRespo
   return res.json();
 }
 
-async function fetchOptimalDefaults(): Promise<SettingsConfig> {
-  const res = await fetch('/api/settings/optimal-defaults');
-  if (!res.ok) throw new Error('Failed to fetch optimal defaults');
-  return res.json();
+interface VoiceSettings {
+  stt: {
+    provider: 'moonshine' | 'google-cloud';
+    moonshine: { model: string };
+    googleCloud: { apiKey: string; model: string };
+  };
+  autopreso: {
+    provider: 'openai' | 'codex' | 'ollama';
+    model: string;
+  };
 }
 
-async function fetchMiniMaxDefaults(): Promise<SettingsConfig> {
-  const res = await fetch('/api/settings/minimax-defaults');
-  if (!res.ok) throw new Error('Failed to fetch MiniMax defaults');
+const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
+  stt: {
+    provider: 'moonshine',
+    moonshine: { model: 'base' },
+    googleCloud: { apiKey: '', model: 'latest_long' },
+  },
+  autopreso: {
+    provider: 'openai',
+    model: 'gpt-4.1-mini',
+  },
+};
+
+interface VoiceHardwareSettings {
+  inputDevice: string;
+  outputDevice: string;
+  volume: number;
+}
+
+const DEFAULT_VOICE_HARDWARE_SETTINGS: VoiceHardwareSettings = {
+  inputDevice: '',
+  outputDevice: '',
+  volume: 1,
+};
+
+const VOICE_HARDWARE_STORAGE_KEY = 'panopticon.voice.hardwareSettings';
+
+function loadVoiceHardwareSettings(): VoiceHardwareSettings {
+  try {
+    const raw = window.localStorage.getItem(VOICE_HARDWARE_STORAGE_KEY);
+    if (!raw) return DEFAULT_VOICE_HARDWARE_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<VoiceHardwareSettings>;
+    return {
+      inputDevice: typeof parsed.inputDevice === 'string' ? parsed.inputDevice : '',
+      outputDevice: typeof parsed.outputDevice === 'string' ? parsed.outputDevice : '',
+      volume: typeof parsed.volume === 'number' ? Math.max(0, Math.min(1, parsed.volume)) : 1,
+    };
+  } catch {
+    return DEFAULT_VOICE_HARDWARE_SETTINGS;
+  }
+}
+
+function normalizeVoiceSettings(settings: Partial<VoiceSettings>): VoiceSettings {
+  return {
+    stt: settings.stt ?? DEFAULT_VOICE_SETTINGS.stt,
+    autopreso: settings.autopreso ?? DEFAULT_VOICE_SETTINGS.autopreso,
+  };
+}
+
+async function fetchVoiceSettings(): Promise<VoiceSettings> {
+  const res = await fetch('/api/voice/settings');
+  if (!res.ok) throw new Error('Failed to fetch voice settings');
+  return normalizeVoiceSettings(await res.json() as Partial<VoiceSettings>);
+}
+
+async function saveVoiceSettings(settings: VoiceSettings): Promise<VoiceSettings> {
+  const res = await fetch('/api/voice/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(error || 'Failed to save voice settings');
+  }
   return res.json();
 }
 
@@ -131,10 +315,13 @@ export function buildMiniMaxFormData(
       gemini_thinking_level: formData?.models.gemini_thinking_level,
     },
     api_keys: { ...(formData?.api_keys || {}) },
+    agents: { ...(formData?.agents || miniMaxDefaults.agents || {}) },
     tracker_keys: { ...(formData?.tracker_keys || {}) },
     conversations: { ...(formData?.conversations || miniMaxDefaults.conversations || {}) },
+    memory: { ...(formData?.memory || miniMaxDefaults.memory || {}) },
     tmux: { ...(formData?.tmux || miniMaxDefaults.tmux || {}) },
     openrouter: { ...(formData?.openrouter || miniMaxDefaults.openrouter || {}) },
+    tts: { ...(formData?.tts || miniMaxDefaults.tts || {}) },
   };
 }
 
@@ -156,6 +343,13 @@ async function testApiKey(provider: string, apiKey: string, model?: string): Pro
   return res.json();
 }
 
+function formatCodexExpiry(expiresAt?: string): string | null {
+  if (!expiresAt) return null;
+  const date = new Date(expiresAt);
+  if (Number.isNaN(date.getTime())) return null;
+  return `Expires ${date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+}
+
 // Provider definitions
 const PROVIDERS: { id: Provider; name: string; icon: any; placeholder: string }[] = [
   { id: 'anthropic', name: 'Anthropic', icon: Code, placeholder: 'sk-ant-...' },
@@ -164,7 +358,43 @@ const PROVIDERS: { id: Provider; name: string; icon: any; placeholder: string }[
   { id: 'kimi', name: 'Kimi (Moonshot)', icon: Zap, placeholder: 'sk-kimi-...' },
   { id: 'zai', name: 'Zhipu (GLM)', icon: Brain, placeholder: 'sk-zai-...' },
   { id: 'minimax', name: 'MiniMax', icon: Zap, placeholder: 'eyJ...' },
+  { id: 'mimo', name: 'Xiaomi MiMo', icon: Zap, placeholder: 'sk-... or tp-...' },
+  { id: 'nous', name: 'Nous Portal', icon: Globe, placeholder: 'ns-...' },
+  { id: 'dashscope', name: 'Alibaba DashScope', icon: Globe, placeholder: 'sk-...' },
 ];
+
+const TTS_EVENT_KEYS = [
+  'reviewStatus.passed',
+  'reviewStatus.failed',
+  'reviewStatus.blocked',
+  'testStatus.testing',
+  'testStatus.passed',
+  'testStatus.failed',
+  'testStatus.skipped',
+  'testStatus.dispatch_failed',
+  'verificationStatus.passed',
+  'verificationStatus.failed',
+  'verificationStatus.skipped',
+  'mergeStatus.queued',
+  'mergeStatus.merging',
+  'mergeStatus.verifying',
+  'mergeStatus.merged',
+  'mergeStatus.failed',
+  'readyForMerge',
+] as const;
+
+const TTS_AUTOSAVE_DEBOUNCE_MS = 400;
+
+const ACTIVITY_SOURCE_OPTIONS = [
+  'merge-agent',
+  'review-specialist',
+  'test-specialist',
+  'cloister',
+  'work-agent',
+  'planning-agent',
+  'dashboard',
+  'deploy-script',
+] as const;
 
 // Tracker definitions
 type TrackerType = 'linear' | 'github' | 'gitlab' | 'rally';
@@ -175,106 +405,57 @@ const TRACKERS: { id: TrackerType; name: string; icon: any; envVar: string; plac
   { id: 'rally', name: 'Rally', icon: Flag, envVar: 'RALLY_API_KEY', placeholder: '_abc123...' },
 ];
 
-// Agent definitions organized by category
-interface AgentDef { id: WorkTypeId; name: string; icon: any; description: string; implemented: boolean }
-interface AgentCategory { name: string; icon: any; agents: AgentDef[] }
-
-const AGENT_CATEGORIES: AgentCategory[] = [
-  {
-    name: 'Issue Agent Phases',
-    icon: ClipboardList,
-    agents: [
-      { id: 'issue-agent:exploration' as WorkTypeId, name: 'Exploration', icon: Search, description: 'Codebase discovery', implemented: true },
-      { id: 'issue-agent:implementation' as WorkTypeId, name: 'Implementation', icon: Code, description: 'Write the code', implemented: true },
-      { id: 'issue-agent:testing' as WorkTypeId, name: 'Testing', icon: Beaker, description: 'Write & run tests', implemented: true },
-      { id: 'issue-agent:documentation' as WorkTypeId, name: 'Documentation', icon: FileText, description: 'Update docs', implemented: true },
-      { id: 'issue-agent:review-response' as WorkTypeId, name: 'Review Response', icon: MessageSquare, description: 'Address PR feedback', implemented: true },
-    ],
-  },
-  {
-    name: 'Specialist Agents',
-    icon: Brain,
-    agents: [
-      { id: 'specialist-review-agent' as WorkTypeId, name: 'Review Agent', icon: Eye, description: 'Automated code reviews', implemented: true },
-      { id: 'specialist-test-agent' as WorkTypeId, name: 'Test Agent', icon: Beaker, description: 'Test generation', implemented: true },
-      { id: 'specialist-merge-agent' as WorkTypeId, name: 'Merge Agent', icon: GitMerge, description: 'Merge conflict resolution', implemented: true },
-      { id: 'specialist-inspect-agent' as WorkTypeId, name: 'Inspect Agent', icon: PageView, description: 'Per-bead diff inspection', implemented: true },
-      { id: 'specialist-uat-agent' as WorkTypeId, name: 'UAT Agent', icon: VerifiedUser, description: 'User acceptance testing', implemented: true },
-    ],
-  },
-  {
-    name: 'Review Agents',
-    icon: SplitSquareVertical,
-    agents: [
-      { id: 'review:security' as WorkTypeId, name: 'Security', icon: Shield, description: 'Security analysis', implemented: true },
-      { id: 'review:performance' as WorkTypeId, name: 'Performance', icon: Zap, description: 'Performance review', implemented: true },
-      { id: 'review:correctness' as WorkTypeId, name: 'Correctness', icon: CheckCircle, description: 'Logic validation', implemented: true },
-      { id: 'review:requirements' as WorkTypeId, name: 'Requirements', icon: ClipboardList, description: 'Requirements coverage vs issue + vBRIEF', implemented: true },
-      { id: 'review:synthesis' as WorkTypeId, name: 'Synthesis', icon: Merge, description: 'Combine reviews', implemented: true },
-    ],
-  },
-  {
-    name: 'Subagents',
-    icon: User,
-    agents: [
-      { id: 'subagent:explore' as WorkTypeId, name: 'Explore', icon: Globe, description: 'Codebase exploration', implemented: true },
-      { id: 'subagent:plan' as WorkTypeId, name: 'Plan', icon: Calendar, description: 'Task breakdown', implemented: true },
-      { id: 'subagent:bash' as WorkTypeId, name: 'Bash', icon: Terminal, description: 'CLI commands', implemented: true },
-      { id: 'subagent:general-purpose' as WorkTypeId, name: 'General', icon: Lightbulb, description: 'General tasks', implemented: true },
-    ],
-  },
-  {
-    name: 'Workflow Agents',
-    icon: Route,
-    agents: [
-      { id: 'status-review' as WorkTypeId, name: 'Status Review', icon: BarChart3, description: 'AI status reviews (executive-facing)', implemented: true },
-    ],
-  },
-  {
-    name: 'Planning',
-    icon: Brain,
-    agents: [
-      { id: 'planning-agent' as WorkTypeId, name: 'Planning Agent', icon: BookMarked, description: 'vBRIEF plan generation', implemented: true },
-    ],
-  },
-  {
-    name: 'CLI Modes',
-    icon: Terminal,
-    agents: [
-      { id: 'cli:interactive' as WorkTypeId, name: 'Interactive', icon: MessageCircle, description: 'Conversation mode', implemented: true },
-      { id: 'cli:quick-command' as WorkTypeId, name: 'Quick Command', icon: Zap, description: 'One-shot queries', implemented: true },
-    ],
-  },
+const SETTINGS_NAV_ITEMS: NavItem[] = [
+  { id: 'model-routing', label: 'Model Routing', icon: Route },
+  { id: 'providers', label: 'Providers', icon: Key },
+  { id: 'permissions', label: 'Permissions', icon: ShieldCheck },
+  { id: 'voice', label: 'Voice', icon: Mic },
+  { id: 'conversations', label: 'Conversations', icon: MessageCircle },
+  { id: 'memory', label: 'Memory', icon: Brain },
+  { id: 'terminal', label: 'Terminal', icon: Terminal },
+  { id: 'tts', label: 'TTS', icon: Volume2 },
+  { id: 'tracker-keys', label: 'Tracker Keys', icon: GitBranch },
+  { id: 'appearance', label: 'Appearance', icon: Palette },
+  { id: 'diff', label: 'Diff', icon: SplitSquareVertical },
+  { id: 'desktop', label: 'Desktop App', icon: Monitor },
+  { id: 'maintenance', label: 'Maintenance', icon: Wrench },
 ];
-
-
-function getModelDisplay(modelId?: string): string {
-  if (!modelId) return 'Default';
-  const model = getModelById(modelId as ModelId);
-  if (model) return model.name;
-  // Fallback for unknown models
-  if (modelId.includes('claude')) return modelId.includes('opus') ? 'Opus 4.6' : modelId.includes('haiku') ? 'Haiku' : 'Sonnet 4.5';
-  if (modelId.includes('gpt')) return 'GPT-4o';
-  if (modelId.includes('gemini')) return modelId.includes('flash') ? 'Gemini Flash' : 'Gemini Pro';
-  if (modelId.includes('kimi')) return modelId.includes('k2.5') || modelId.includes('2.5') ? 'Kimi K2.5' : 'Kimi K2';
-  if (modelId.includes('glm')) return 'GLM-4';
-  if (modelId.includes('minimax')) return modelId.includes('highspeed') ? 'M2.7 HS' : 'M2.7';
-  return modelId;
-}
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
-  const showAlert = useAlert();
   const { prefs: uiPrefs, update: updateUIPrefs } = useUIPreferences();
+  const { prefs: diffPrefs, update: updateDiffPrefs } = useDiffPreferences();
+  const { data: codexAuth } = useCodexAuthStatus();
   const { data: settings, isLoading, error } = useQuery({
     queryKey: ['settings'],
     queryFn: fetchSettings,
   });
+  const { data: ttsHealth } = useQuery({
+    queryKey: ['tts-health'],
+    queryFn: fetchTtsHealth,
+    refetchInterval: 10_000,
+  });
+  const ttsVoicesQuery = useQuery({
+    queryKey: ['tts-voices'],
+    queryFn: fetchTtsVoices,
+    staleTime: 60_000,
+  });
+  const ttsVoices = ttsVoicesQuery.data ?? [];
+  const {
+    data: voiceSettings,
+    isLoading: voiceSettingsLoading,
+    error: voiceSettingsError,
+  } = useQuery({
+    queryKey: ['voice-settings'],
+    queryFn: fetchVoiceSettings,
+  });
 
   const [formData, setFormData] = useState<SettingsConfig | null>(null);
+  const [voiceFormData, setVoiceFormData] = useState<VoiceSettings | null>(null);
+  const [voiceHardwareSettings, setVoiceHardwareSettings] = useState<VoiceHardwareSettings>(loadVoiceHardwareSettings);
   const [showApiKey, setShowApiKey] = useState<Record<string, boolean>>({});
+  const [showVoiceApiKey, setShowVoiceApiKey] = useState(false);
   const [showTrackerKey, setShowTrackerKey] = useState<Record<string, boolean>>({});
-  const [modalWorkType, setModalWorkType] = useState<WorkTypeId | null>(null);
   const [testingProvider, setTestingProvider] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, TestApiKeyResult | null>>({});
   const [modelsModalProvider, setModelsModalProvider] = useState<Provider | null>(null);
@@ -291,18 +472,113 @@ export function SettingsPage() {
     expiresAt: number | null;
     hasAnthropicApiKey: boolean;
   } | null>(null);
-  const [refreshingAuth, setRefreshingAuth] = useState(false);
+  const [activeSection, setActiveSection] = useState('model-routing');
+  const [activeTtsVoiceTab, setActiveTtsVoiceTab] = useState<'presets' | 'design'>('presets');
+  const [expandedProviders, setExpandedProviders] = useState<Record<string, boolean>>({});
+  const pendingTtsSaveRef = useRef<TtsConfig | null>(null);
+  const ttsSaveInFlightRef = useRef(false);
+  const ttsSaveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const scrollToSection = useCallback((id: string) => {
+    setActiveSection(id);
+    const el = document.getElementById(id);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, []);
+
+  // ── Conversations & Search (embedding) config ──────────────────────────────
+  const [convConfig, setConvConfig] = useState<{
+    embeddings: boolean;
+    embeddingProvider: string;
+    embeddingModel: string;
+    embeddingAutoOnDeep: boolean;
+  } | null>(null);
+  const [convConfigDirty, setConvConfigDirty] = useState(false);
+  const [convConfigSaving, setConvConfigSaving] = useState(false);
+  const [embeddingTestResult, setEmbeddingTestResult] = useState<{ ok: boolean; latencyMs?: number; error?: string } | null>(null);
+  const [testingEmbedding, setTestingEmbedding] = useState(false);
 
   const fetchClaudeAuth = async () => {
-    setRefreshingAuth(true);
     try {
       const res = await fetch('/api/settings/claude-auth');
       if (res.ok) setClaudeAuth(await res.json());
     } catch { /* ignore */ }
-    finally { setRefreshingAuth(false); }
   };
 
   useEffect(() => { void fetchClaudeAuth(); }, []);
+
+  useEffect(() => {
+    ensureDashboardSession()
+      .then(() => fetch('/api/discovered-sessions/config', { credentials: 'include' }))
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d) setConvConfig(d); })
+      .catch(() => undefined);
+  }, []);
+
+  const handleConvConfigChange = (patch: Partial<typeof convConfig>) => {
+    setConvConfig((prev) => prev ? { ...prev, ...patch } : null);
+    setConvConfigDirty(true);
+    setEmbeddingTestResult(null);
+  };
+
+  const handleSaveConvConfig = async () => {
+    if (!convConfig) return;
+    setConvConfigSaving(true);
+    try {
+      await ensureDashboardSession();
+      const res = await fetch('/api/discovered-sessions/config', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(convConfig),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null) as { error?: string } | null;
+        throw new Error(body?.error ?? `HTTP ${res.status}`);
+      }
+      setFormData((prev) => prev ? {
+        ...prev,
+        conversations: {
+          ...prev.conversations,
+          embeddings: convConfig.embeddings,
+          embedding_provider: convConfig.embeddingProvider as 'openai' | 'voyage' | 'ollama',
+          embedding_model: convConfig.embeddingModel,
+          embedding_auto_on_deep: convConfig.embeddingAutoOnDeep,
+        },
+      } : prev);
+      setConvConfigDirty(false);
+      toast.success('Embedding settings saved');
+    } catch (err) {
+      toast.error(`Failed to save embedding settings: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setConvConfigSaving(false);
+    }
+  };
+
+  const handleTestEmbeddingConnection = async () => {
+    if (!convConfig) return;
+    setTestingEmbedding(true);
+    setEmbeddingTestResult(null);
+    try {
+      await ensureDashboardSession();
+      const res = await fetch('/api/discovered-sessions/test-connection', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: convConfig.embeddingProvider,
+          model: convConfig.embeddingModel,
+        }),
+      });
+      const result = await res.json();
+      setEmbeddingTestResult(result);
+    } catch (err) {
+      setEmbeddingTestResult({ ok: false, error: String(err) });
+    } finally {
+      setTestingEmbedding(false);
+    }
+  };
 
   useEffect(() => {
     fetchOpenRouterCatalog().then(setOrCatalog);
@@ -337,11 +613,36 @@ export function SettingsPage() {
     }
   }, [settings, formData]);
 
+  useEffect(() => {
+    if (voiceSettings && !voiceFormData) {
+      setVoiceFormData(voiceSettings);
+    }
+  }, [voiceSettings, voiceFormData]);
+
+  useEffect(() => {
+    window.localStorage.setItem(VOICE_HARDWARE_STORAGE_KEY, JSON.stringify(voiceHardwareSettings));
+  }, [voiceHardwareSettings]);
+
   const saveMutation = useMutation({
-    mutationFn: saveSettings,
-    onSuccess: (response) => {
+    mutationFn: async ({
+      settings: nextSettings,
+      voiceSettings: nextVoiceSettings,
+    }: {
+      settings: SettingsConfig;
+      voiceSettings: VoiceSettings;
+    }) => {
+      const [response, savedVoiceSettings] = await Promise.all([
+        saveSettings(nextSettings),
+        saveVoiceSettings(nextVoiceSettings),
+      ]);
+      return { response, savedVoiceSettings };
+    },
+    onSuccess: ({ response, savedVoiceSettings }) => {
+      invalidateAvailableModelsCache();
       queryClient.invalidateQueries({ queryKey: ['settings'] });
+      queryClient.setQueryData(['voice-settings'], savedVoiceSettings);
       queryClient.invalidateQueries({ queryKey: ['tracker-status'] });
+      setVoiceFormData(savedVoiceSettings);
 
       // Show success toast
       toast.success('Settings saved successfully');
@@ -358,7 +659,66 @@ export function SettingsPage() {
     },
   });
 
-  if (isLoading) {
+  const ttsStartMutation = useMutation({
+    mutationFn: startTtsDaemonRequest,
+    onSuccess: () => {
+      toast.success('TTS daemon started');
+      queryClient.invalidateQueries({ queryKey: ['tts-health'] });
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to start TTS daemon: ${error.message}`);
+      queryClient.invalidateQueries({ queryKey: ['tts-health'] });
+    },
+  });
+
+  const queueTtsSave = useCallback((next: TtsConfig) => {
+    pendingTtsSaveRef.current = next;
+    if (ttsSaveInFlightRef.current) return;
+
+    ttsSaveInFlightRef.current = true;
+    void (async () => {
+      while (true) {
+        const snapshot = pendingTtsSaveRef.current;
+        if (!snapshot) {
+          ttsSaveInFlightRef.current = false;
+          return;
+        }
+
+        pendingTtsSaveRef.current = null;
+        try {
+          const latest = await fetchSettings();
+          await saveSettings(buildTtsAutosavePayload(latest, snapshot));
+        } catch {
+          void 0;
+        }
+      }
+    })();
+  }, []);
+
+  const scheduleTtsSave = useCallback((next: TtsConfig, debounce = false) => {
+    if (ttsSaveDebounceRef.current) {
+      clearTimeout(ttsSaveDebounceRef.current);
+      ttsSaveDebounceRef.current = null;
+    }
+
+    if (!debounce) {
+      queueTtsSave(next);
+      return;
+    }
+
+    pendingTtsSaveRef.current = next;
+    ttsSaveDebounceRef.current = setTimeout(() => {
+      ttsSaveDebounceRef.current = null;
+      const snapshot = pendingTtsSaveRef.current;
+      if (snapshot) queueTtsSave(snapshot);
+    }, TTS_AUTOSAVE_DEBOUNCE_MS);
+  }, [queueTtsSave]);
+
+  useEffect(() => () => {
+    if (ttsSaveDebounceRef.current) clearTimeout(ttsSaveDebounceRef.current);
+  }, []);
+
+  if (isLoading || voiceSettingsLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <Loader2 className="w-8 h-8 text-primary animate-spin" />
@@ -366,15 +726,19 @@ export function SettingsPage() {
     );
   }
 
-  if (error || !formData) {
+  if (error || voiceSettingsError || !formData || !voiceFormData) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-destructive">Error: {(error as Error)?.message || 'Failed to load settings'}</div>
+        <div className="text-destructive">
+          Error: {(error as Error)?.message || (voiceSettingsError as Error)?.message || 'Failed to load settings'}
+        </div>
       </div>
     );
   }
 
-  const hasChanges = JSON.stringify(formData) !== JSON.stringify(settings);
+  const hasSettingsChanges = JSON.stringify(formData) !== JSON.stringify(settings);
+  const hasVoiceSettingsChanges = JSON.stringify(voiceFormData) !== JSON.stringify(voiceSettings);
+  const hasChanges = hasSettingsChanges || hasVoiceSettingsChanges;
 
   const handleProviderToggle = (provider: Provider) => {
     setFormData({
@@ -420,12 +784,160 @@ export function SettingsPage() {
     });
   };
 
+  const handleTtsConfigChange = (patch: Partial<TtsConfig>, options: { debounce?: boolean } = {}) => {
+    const nextTts = {
+      ...formData.tts,
+      ...patch,
+    };
+    const next: SettingsConfig = {
+      ...formData,
+      tts: nextTts,
+    };
+    setFormData(next);
+    scheduleTtsSave(nextTts, options.debounce === true);
+  };
+
+  const handleTtsVoiceMapChange = (eventKey: string, voiceId: string) => {
+    const nextVoiceMap = { ...(ttsConfig.voiceMap ?? {}) };
+    if (voiceId) nextVoiceMap[eventKey] = voiceId;
+    else delete nextVoiceMap[eventKey];
+    handleTtsConfigChange({ voiceMap: nextVoiceMap });
+  };
+
+  const handleTtsMutedSourceChange = (source: string, muted: boolean) => {
+    const current = ttsConfig.mutedSources ?? [];
+    const nextMutedSources = muted
+      ? Array.from(new Set([...current, source]))
+      : current.filter((value) => value !== source);
+    handleTtsConfigChange({ mutedSources: nextMutedSources });
+  };
+
+  const handleTtsTemplateChange = (eventKey: string, text: string) => {
+    handleTtsConfigChange({
+      utteranceTemplates: {
+        ...(ttsConfig.utteranceTemplates ?? {}),
+        [eventKey]: text,
+      },
+    });
+  };
+
+  const handleTtsTemplateKeyChange = (oldKey: string, newKey: string) => {
+    const nextTemplates = { ...(ttsConfig.utteranceTemplates ?? {}) };
+    const text = nextTemplates[oldKey] ?? '';
+    delete nextTemplates[oldKey];
+    nextTemplates[newKey] = text;
+    handleTtsConfigChange({ utteranceTemplates: nextTemplates });
+  };
+
+  const handleRemoveTtsTemplate = (eventKey: string) => {
+    const nextTemplates = { ...(ttsConfig.utteranceTemplates ?? {}) };
+    delete nextTemplates[eventKey];
+    handleTtsConfigChange({ utteranceTemplates: nextTemplates });
+  };
+
+  const handleAddTtsTemplate = () => {
+    const templates = ttsConfig.utteranceTemplates ?? {};
+    const eventKey = TTS_EVENT_KEYS.find((key) => templates[key] === undefined);
+    if (!eventKey) return;
+    handleTtsConfigChange({
+      utteranceTemplates: {
+        ...templates,
+        [eventKey]: '',
+      },
+    });
+  };
+
+  const handleVoiceProviderChange = (provider: VoiceSettings['stt']['provider']) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      stt: {
+        ...voiceFormData.stt,
+        provider,
+      },
+    });
+  };
+
+  const handleMoonshineModelChange = (model: string) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      stt: {
+        ...voiceFormData.stt,
+        moonshine: { model },
+      },
+    });
+  };
+
+  const handleGoogleCloudApiKeyChange = (apiKey: string) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      stt: {
+        ...voiceFormData.stt,
+        googleCloud: {
+          ...voiceFormData.stt.googleCloud,
+          apiKey,
+        },
+      },
+    });
+  };
+
+  const handleGoogleCloudModelChange = (model: string) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      stt: {
+        ...voiceFormData.stt,
+        googleCloud: {
+          ...voiceFormData.stt.googleCloud,
+          model,
+        },
+      },
+    });
+  };
+
+  const handleAutoPresoProviderChange = (provider: VoiceSettings['autopreso']['provider']) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      autopreso: {
+        ...voiceFormData.autopreso,
+        provider,
+      },
+    });
+  };
+
+  const handleAutoPresoModelChange = (model: string) => {
+    setVoiceFormData({
+      ...voiceFormData,
+      autopreso: {
+        ...voiceFormData.autopreso,
+        model,
+      },
+    });
+  };
+
+  const handleVoiceHardwareChange = <K extends keyof VoiceHardwareSettings>(
+    key: K,
+    value: VoiceHardwareSettings[K],
+  ) => {
+    setVoiceHardwareSettings({
+      ...voiceHardwareSettings,
+      [key]: value,
+    });
+  };
   const handleCompactionModelChange = (modelId: ModelId) => {
     setFormData({
       ...formData,
       conversations: {
         ...formData.conversations,
         compaction_model: modelId,
+      },
+    });
+  };
+
+  const handleTitleModelChange = (modelId: ModelId) => {
+    setFormData({
+      ...formData,
+      conversations: {
+        ...formData.conversations,
+        title_model: modelId,
       },
     });
   };
@@ -450,68 +962,81 @@ export function SettingsPage() {
     });
   };
 
-
-  const handleSetOverride = (workType: WorkTypeId, model: ModelId) => {
+  const updateMemorySettings = (memory: NonNullable<SettingsConfig['memory']>) => {
     setFormData({
       ...formData,
-      models: {
-        ...formData.models,
-        overrides: {
-          ...formData.models.overrides,
-          [workType]: model,
-        },
+      memory: {
+        ...formData.memory,
+        ...memory,
       },
     });
   };
 
-  const handleRemoveOverride = (workType: WorkTypeId) => {
-    const { [workType]: _removed, ...remainingOverrides } = formData.models.overrides;
-    setFormData({
+  const handleMemoryNumberChange = (
+    key: 'per_day_cost_cap_usd' | 'rollup_pending_threshold' | 'sidebar_refresh_interval_ms' | 'worker_concurrency',
+    value: string,
+  ) => {
+    updateMemorySettings({ [key]: value === '' ? undefined : Number(value) });
+  };
+
+  const handleClaudeCodeChannelsToggle = (enabled: boolean) => {
+    const next: SettingsConfig = {
       ...formData,
-      models: {
-        ...formData.models,
-        overrides: remainingOverrides,
+      experimental: {
+        ...formData.experimental,
+        claudeCodeChannels: enabled,
       },
+    };
+    setFormData(next);
+    saveMutation.mutate({
+      settings: next,
+      voiceSettings: voiceFormData,
     });
   };
 
-  const handleSave = () => saveMutation.mutate(formData);
-  const handleReset = () => setFormData(settings || null);
-
-  const handleRestoreOptimalDefaults = async () => {
-    try {
-      const optimalDefaults = await fetchOptimalDefaults();
-      // Deep clone to ensure React detects the change
-      const newFormData: SettingsConfig = {
-        models: {
-          providers: { ...(formData?.models.providers || optimalDefaults.models.providers) },
-          overrides: { ...optimalDefaults.models.overrides },
-          gemini_thinking_level: optimalDefaults.models.gemini_thinking_level,
+  const handleRtkToggle = (enabled: boolean) => {
+    const next: SettingsConfig = {
+      ...formData,
+      agents: {
+        ...formData.agents,
+        rtk: {
+          ...formData.agents?.rtk,
+          enabled,
         },
-        api_keys: { ...(formData?.api_keys || {}) },
-        conversations: {
-          ...(formData?.conversations || optimalDefaults.conversations || {}),
-        },
-        tracker_keys: { ...(formData?.tracker_keys || {}) },
-        tmux: { ...(formData?.tmux || optimalDefaults.tmux || {}) },
-        openrouter: { ...(formData?.openrouter || optimalDefaults.openrouter || {}) },
-      };
-      setFormData(newFormData);
-    } catch (error) {
-      console.error('Failed to fetch optimal defaults:', error);
-      showAlert({ message: 'Failed to load optimal defaults: ' + (error as Error).message, variant: 'error' });
-    }
+      },
+    };
+    setFormData(next);
+    saveMutation.mutate({
+      settings: next,
+      voiceSettings: voiceFormData,
+    });
   };
 
-  const handleRestoreMiniMaxDefaults = async () => {
-    try {
-      const miniMaxDefaults = await fetchMiniMaxDefaults();
-      setFormData(buildMiniMaxFormData(formData, miniMaxDefaults));
-    } catch (error) {
-      console.error('Failed to fetch MiniMax defaults:', error);
-      showAlert({ message: 'Failed to load optimal defaults: ' + (error as Error).message, variant: 'error' });
-    }
+  const handlePermissionModeChange = (mode: 'auto' | 'bypass') => {
+    const next: SettingsConfig = {
+      ...formData,
+      claude: {
+        ...formData.claude,
+        permissionMode: mode,
+      },
+    };
+    setFormData(next);
+    saveMutation.mutate({
+      settings: next,
+      voiceSettings: voiceFormData,
+    });
   };
+
+
+  const handleSave = () => saveMutation.mutate({
+    settings: formData,
+    voiceSettings: voiceFormData,
+  });
+  const handleReset = () => {
+    setFormData(settings || null);
+    setVoiceFormData(voiceSettings || DEFAULT_VOICE_SETTINGS);
+  };
+
 
   const handleTestApiKey = async (provider: Provider) => {
     const apiKey = formData?.api_keys[provider as keyof typeof formData.api_keys];
@@ -554,352 +1079,271 @@ export function SettingsPage() {
     }
   };
 
+  const ttsConfig = formData.tts ?? {};
+  const ttsVolume = ttsConfig.volume ?? 1;
+  const ttsRate = ttsConfig.rate ?? 1;
+  const ttsMaxChars = ttsConfig.maxChars ?? 140;
+  const ttsDaemonOnline = ttsHealth?.ok === true;
+  const ttsDaemonStarting = ttsHealth?.phase === 'starting' || ttsHealth?.initializing === true;
+  const ttsDaemonStatus = ttsHealth === undefined ? 'checking' : ttsDaemonOnline ? 'online' : ttsDaemonStarting ? 'starting' : ttsHealth.running ? 'unhealthy' : 'offline';
+  const ttsDaemonModel = typeof ttsHealth?.model === 'string' ? ttsHealth.model : undefined;
+  const ttsDaemonUptime = formatTtsUptime(ttsHealth?.uptimeSeconds);
+  const ttsDaemonGpuMemory = formatTtsGpuMemory(ttsHealth?.gpuMemoryUsedMb);
+  const ttsDaemonDetails = [
+    ttsHealth ? `${ttsHealth.daemonHost}:${ttsHealth.daemonPort}` : undefined,
+    ttsHealth?.pid ? `pid ${ttsHealth.pid}` : undefined,
+    ttsHealth?.queueDepth !== undefined ? `queue ${ttsHealth.queueDepth}` : undefined,
+    ttsDaemonGpuMemory,
+    ttsDaemonUptime ? `uptime ${ttsDaemonUptime}` : undefined,
+  ].filter(Boolean).join(' | ');
+  const ttsTemplateEntries = Object.entries(ttsConfig.utteranceTemplates ?? {});
+  const canAddTtsTemplate = ttsTemplateEntries.length < TTS_EVENT_KEYS.length;
+
   return (
-    <div>
-      {/* Sticky action bar */}
-      <div className="sticky top-0 z-30 bg-surface/95 backdrop-blur-sm border-b border-divider shadow-sm">
-        <div className="max-w-[1200px] mx-auto px-6 md:px-10 flex items-center justify-between py-3">
-          <div className="flex items-center gap-2">
-            <Settings className="w-5 h-5 text-primary" />
-            <h1 className="text-content text-lg font-black tracking-tight">Settings</h1>
-          </div>
-          <div className="flex items-center gap-3">
-            {saveMutation.isSuccess && (
-              <span className="flex items-center gap-1.5 text-success text-sm">
-                <CheckCircle className="w-4 h-4" />
-                Saved!
-              </span>
-            )}
-            {saveMutation.isError && (
-              <span className="flex items-center gap-1.5 text-destructive text-sm">
-                <AlertTriangle className="w-4 h-4" />
-                Save failed
-              </span>
-            )}
-            <button
-              onClick={handleRestoreOptimalDefaults}
-              className="px-3 py-1.5 text-warning hover:text-warning/80 font-semibold text-sm transition-colors flex items-center gap-1.5"
-              title="Set all model assignments to research-based optimal defaults (Anthropic + Kimi)"
-            >
-              <Zap className="w-4 h-4" />
-              Optimal Defaults
-            </button>
-            <button
-              onClick={handleRestoreMiniMaxDefaults}
-              className="px-3 py-1.5 text-amber-400 hover:text-amber-300 font-semibold text-sm transition-colors flex items-center gap-1.5"
-              title="Set all model assignments to MiniMax M2.7 (lowest cost)"
-            >
-              <Zap className="w-4 h-4" />
-              MiniMax Defaults
-            </button>
-            <button
-              onClick={handleReset}
-              disabled={!hasChanges}
-              className="px-3 py-1.5 text-content-muted hover:text-content font-semibold text-sm transition-colors disabled:opacity-40"
-            >
-              Undo
-            </button>
-            <button
-              onClick={handleSave}
-              disabled={!hasChanges || saveMutation.isPending}
-              className="px-5 py-1.5 bg-primary hover:bg-primary/90 text-primary-foreground font-black rounded-lg transition-all shadow-md shadow-primary/20 text-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-            >
-              {saveMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
-              Save Changes
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div className="max-w-[1200px] mx-auto px-6 md:px-10 py-8">
-      {/* Page Header */}
-      <div className="flex flex-col gap-1 mb-8">
-        <div className="flex items-center gap-2 mb-1">
-          <Settings className="w-8 h-8 text-primary" />
-          <h1 className="text-content text-4xl font-black tracking-tight">Settings</h1>
-        </div>
-        <p className="text-content-muted text-base">Configure AI model orchestration and agent permissions.</p>
-      </div>
-
+    <SettingsLayout
+      header={
+        <SettingsHeader
+          title="Settings"
+          hasChanges={hasChanges}
+          saving={saveMutation.isPending}
+          saveSuccess={saveMutation.isSuccess}
+          saveError={saveMutation.isError}
+          onSave={handleSave}
+          onReset={handleReset}
+        />
+      }
+      sidebar={
+        <SettingsSidebarNav
+          items={SETTINGS_NAV_ITEMS}
+          activeId={activeSection}
+          onSelect={scrollToSection}
+        />
+      }
+    >
       {/* Deprecation Warning Banner */}
       {formData.deprecation_warnings && formData.deprecation_warnings.length > 0 && (
-        <div className="badge-bg-warning border badge-border-warning rounded-xl px-4 py-3 mb-6">
+        <div className="bg-warning/10 border border-warning/25 rounded-lg px-4 py-3 mb-6">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="w-6 h-6 text-warning shrink-0 mt-0.5" />
+            <AlertTriangle className="w-5 h-5 text-warning shrink-0 mt-0.5" />
             <div className="flex-1">
-              <p className="text-warning font-semibold mb-2">
-                Deprecated Model IDs Detected
+              <p className="text-warning text-sm font-medium mb-1">
+                Deprecated model IDs detected
               </p>
-              <div className="space-y-1">
+              <div className="space-y-0.5">
                 {formData.deprecation_warnings.map((warning, idx) => (
-                  <p key={idx} className="text-warning/90 text-sm">
-                    <span className="font-mono text-xs badge-bg-warning px-1.5 py-0.5 rounded">{warning.workType}</span>
+                  <p key={idx} className="text-muted-foreground text-xs">
+                    <code className="font-mono">{warning.workType}</code>
                     {': '}
-                    <span className="font-mono text-xs badge-bg-warning px-1.5 py-0.5 rounded line-through">
-                      {warning.from}
-                    </span>
+                    <code className="font-mono line-through">{warning.from}</code>
                     {' → '}
-                    <span className="font-mono text-xs badge-bg-warning px-1.5 py-0.5 rounded">
-                      {warning.to}
-                    </span>
+                    <code className="font-mono">{warning.to}</code>
                   </p>
                 ))}
               </div>
-              <p className="text-warning/80 text-xs mt-3">
-                Click <span className="font-semibold">Save</span> to automatically migrate to current model IDs. A backup will be created before migration.
+              <p className="text-muted-foreground text-xs mt-2">
+                Save to migrate automatically.
               </p>
             </div>
           </div>
         </div>
       )}
 
+      {/* Model Routing */}
+      <section id="model-routing" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
+          Model Routing
+        </h2>
 
-      {/* Smart Model Selection Hero */}
-      <section className="mb-10">
-        <div className="bg-surface-raised border border-divider rounded-xl overflow-hidden">
-          <div className="flex flex-col lg:flex-row">
-            {/* Visualization */}
-            <div className="lg:w-2/5 bg-surface p-8 flex flex-col justify-center items-center border-b lg:border-b-0 lg:border-r border-divider relative overflow-hidden">
-              <div className="absolute inset-0 opacity-10 pointer-events-none bg-[radial-gradient(circle_at_50%_50%,#3b82f6_0%,transparent_70%)]" />
-              <div className="relative z-10 flex flex-col items-center gap-6 w-full max-w-xs">
-                <div className="flex items-center justify-between w-full">
-                  <div className="size-12 rounded-lg bg-surface-emphasis border border-divider-strong flex items-center justify-center shadow-sm">
-                    <Terminal className="w-5 h-5 text-content-subtle" />
-                  </div>
-                  <div className="flex-1 h-px bg-gradient-to-r from-divider-strong via-primary to-divider-strong mx-2" />
-                  <div className="size-12 rounded-lg bg-surface-emphasis border border-divider-strong flex items-center justify-center shadow-sm">
-                    <User className="w-5 h-5 text-primary" />
-                  </div>
-                  <div className="flex-1 h-px bg-gradient-to-r from-divider via-primary to-divider mx-2" />
-                  <div className="size-12 rounded-lg bg-primary flex items-center justify-center shadow-lg">
-                    <Zap className="w-5 h-5 text-content" />
-                  </div>
-                </div>
-                <div className="flex justify-between w-full px-2 text-[10px] uppercase tracking-widest font-bold text-content-muted">
-                  <span>Task</span>
-                  <span>Capability</span>
-                  <span>Model</span>
-                </div>
-              </div>
-            </div>
-            {/* Content */}
-            <div className="lg:w-3/5 p-8">
-              <div className="flex items-center gap-2 mb-4">
-                <span className="px-2 py-0.5 badge-bg-primary text-primary text-[10px] font-bold uppercase tracking-wider rounded border badge-border-primary">Active</span>
-                <h3 className="text-content text-xl font-bold">Smart Model Selection</h3>
-              </div>
-              <p className="text-content-muted mb-6 leading-relaxed">
-                Panopticon automatically routes tasks to the optimal model based on capabilities, token budget, and latency requirements.
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="flex items-start gap-3">
-                  <CheckCircle className="w-4 h-4 text-primary mt-1" />
-                  <div>
-                    <p className="text-sm font-semibold text-content">Capability Matching</p>
-                    <p className="text-xs text-content-muted">Best model for each task type</p>
-                  </div>
-                </div>
-                <div className="flex items-start gap-3">
-                  <CheckCircle className="w-4 h-4 text-primary mt-1" />
-                  <div>
-                    <p className="text-sm font-semibold text-content">Cost Optimization</p>
-                    <p className="text-xs text-content-muted">Balance performance vs spend</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <WorkhorsePanel />
+        <RolesPanel />
       </section>
 
-      {/* Claude Code Authentication */}
-      <section className="mb-12">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
-          Claude Code
-          <div className="h-px flex-1 bg-divider-strong" />
+      {/* Providers */}
+      <section id="providers" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
+          Providers
         </h2>
-        <div className="bg-surface-raised border border-divider rounded-xl p-6 flex flex-col gap-4">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex items-start gap-4">
-              {/* Status dot */}
-              <div className={`mt-1 w-3 h-3 rounded-full shrink-0 ${
-                claudeAuth?.loggedIn ? 'bg-success' :
-                claudeAuth?.expired ? 'bg-warning' :
-                claudeAuth?.installed ? 'bg-destructive' :
-                'bg-muted-foreground'
-              }`} />
-              <div>
-                {claudeAuth === null ? (
-                  <p className="text-content-body text-sm">Checking authentication status…</p>
-                ) : !claudeAuth.installed ? (
-                  <>
-                    <p className="text-content font-semibold">Claude Code not detected</p>
-                    <p className="text-content-muted text-sm mt-1">
-                      Install Claude Code to use subscription-based authentication.
-                    </p>
-                  </>
-                ) : claudeAuth.loggedIn ? (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <p className="text-content font-semibold">Logged in</p>
-                      {claudeAuth.subscriptionType && (
-                        <span className="text-[10px] font-black uppercase tracking-tighter px-2 py-0.5 rounded bg-primary/15 text-primary border border-primary/25">
-                          {claudeAuth.subscriptionType.toUpperCase()}
-                        </span>
-                      )}
-                    </div>
-                    {claudeAuth.rateLimitTier && (
-                      <p className="text-content-muted text-xs mt-1">
-                        Rate tier: <code className="font-mono text-content-subtle">{claudeAuth.rateLimitTier}</code>
-                      </p>
-                    )}
-                    {claudeAuth.hasAnthropicApiKey && (
-                      <div className="flex items-center gap-1.5 mt-2">
-                        <AlertTriangle className="w-3.5 h-3.5 text-warning shrink-0" />
-                        <p className="text-warning text-xs">
-                          <code className="font-mono">ANTHROPIC_API_KEY</code> is set — this overrides subscription auth for direct API calls
-                        </p>
-                      </div>
-                    )}
-                  </>
-                ) : claudeAuth.expired ? (
-                  <>
-                    <p className="text-content font-semibold text-warning">Session expired</p>
-                    <p className="text-content-muted text-sm mt-1">
-                      Your Claude Code session has expired. Run <code className="font-mono bg-surface-overlay px-1 rounded">claude</code> in the terminal and use <code className="font-mono bg-surface-overlay px-1 rounded">/login</code> to re-authenticate.
-                    </p>
-                  </>
-                ) : (
-                  <>
-                    <p className="text-content font-semibold">Not logged in</p>
-                    <p className="text-content-muted text-sm mt-1">
-                      No active subscription session. To log in, type <code className="font-mono bg-surface-overlay px-1 rounded">! claude</code> in the command bar, then use <code className="font-mono bg-surface-overlay px-1 rounded">/login</code>.
-                    </p>
-                    {claudeAuth.hasAnthropicApiKey && (
-                      <p className="text-content-subtle text-xs mt-2">
-                        Falling back to <code className="font-mono">ANTHROPIC_API_KEY</code> for Anthropic models.
-                      </p>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-            <button
-              onClick={() => void fetchClaudeAuth()}
-              disabled={refreshingAuth}
-              className="shrink-0 p-2 rounded-lg border border-divider hover:border-divider-strong text-content-muted hover:text-content transition-colors disabled:opacity-50"
-              title="Refresh auth status"
-            >
-              <RefreshCw className={`w-4 h-4 ${refreshingAuth ? 'animate-spin' : ''}`} />
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* Provider Configuration */}
-      <section className="mb-12">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
-          Provider Configuration
-          <div className="h-px flex-1 bg-divider-strong" />
-        </h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="space-y-1">
           {PROVIDERS.map((provider) => {
             const isDefault = provider.id === 'anthropic';
             const isEnabled = formData.models.providers[provider.id];
             const apiKey = formData.api_keys[provider.id as keyof typeof formData.api_keys] || '';
+            const isExpanded = expandedProviders[provider.id] || false;
+
+            const getAuthSummary = () => {
+              if (isDefault) {
+                if (claudeAuth?.loggedIn) return { text: claudeAuth.subscriptionType ? `${claudeAuth.subscriptionType} plan` : 'Subscription', variant: 'success' as const };
+                if (claudeAuth?.hasAnthropicApiKey) return { text: 'API key', variant: 'neutral' as const };
+                return { text: 'Not authenticated', variant: 'warning' as const };
+              }
+              if (provider.id === 'openai') {
+                if (codexAuth?.status === 'valid') return { text: 'OAuth', variant: 'success' as const };
+                if (codexAuth?.status === 'expired' || codexAuth?.status === 'burned') return { text: codexAuth.status, variant: 'warning' as const };
+              }
+              if (apiKey && !apiKey.startsWith('$')) return { text: 'Key configured', variant: 'success' as const };
+              if (apiKey?.startsWith('$')) return { text: `via ${apiKey}`, variant: 'neutral' as const };
+              return { text: 'No key', variant: 'neutral' as const };
+            };
+
+            const authSummary = getAuthSummary();
 
             return (
-              <div
-                key={provider.id}
-                className={`bg-surface-raised border rounded-xl p-5 relative transition-colors shadow-sm ${
-                  isDefault
-                    ? 'border-primary/50 shadow-lg shadow-primary/5'
-                    : 'border-divider hover:border-divider-strong'
-                }`}
-              >
-                {isDefault && (
-                  <div className="absolute -top-3 right-4">
-                    <span className="bg-primary text-primary-foreground text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-tighter">
-                      Default
+              <div key={provider.id} className="border border-transparent rounded-lg hover:border-border transition-colors">
+                {/* Summary row */}
+                <div className="flex items-center gap-3 px-3 py-2.5">
+                  <provider.icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                  <span className="text-sm font-medium text-foreground flex-1 min-w-0">{provider.name}</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                      authSummary.variant === 'success' ? 'text-success bg-success/10' :
+                      authSummary.variant === 'warning' ? 'text-warning bg-warning/10' :
+                      'text-muted-foreground bg-muted/50'
+                    }`}>
+                      {authSummary.text}
                     </span>
-                  </div>
-                )}
-                <div className="flex items-center gap-3 mb-5">
-                  <div className="size-10 rounded-lg bg-surface-emphasis border border-divider flex items-center justify-center">
-                    <provider.icon className="w-5 h-5 text-content-subtle" />
-                  </div>
-                  <span className="font-bold text-content">{provider.name}</span>
-                  {/* Subscription badge in the Anthropic card header */}
-                  {isDefault && claudeAuth?.loggedIn && claudeAuth.subscriptionType && (
-                    <span className="text-[9px] font-black uppercase tracking-tighter px-1.5 py-0.5 rounded bg-primary/15 text-primary border border-primary/25">
-                      {claudeAuth.subscriptionType.toUpperCase()}
-                    </span>
-                  )}
-                  <div className="ml-auto">
                     <button
+                      type="button"
                       onClick={() => handleProviderToggle(provider.id)}
-                      className={`w-10 h-5 rounded-full relative transition-colors ${
-                        isEnabled ? 'bg-primary' : 'bg-surface-emphasis'
-                      } cursor-pointer`}
+                      role="switch"
+                      aria-checked={isEnabled}
+                      aria-label={`${isEnabled ? 'Disable' : 'Enable'} ${provider.name}`}
+                      className={`w-8 h-4.5 rounded-full relative transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                        isEnabled ? 'bg-primary' : 'bg-muted'
+                      }`}
                     >
-                      <div
-                        className={`absolute top-0.5 size-4 bg-white rounded-full transition-all ${
-                          isEnabled ? 'right-0.5' : 'left-0.5'
-                        }`}
-                      />
+                      <span className={`absolute top-0.5 size-3.5 bg-white rounded-full transition-all ${
+                        isEnabled ? 'right-0.5' : 'left-0.5'
+                      }`} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedProviders(prev => ({ ...prev, [provider.id]: !prev[provider.id] }))}
+                      className="p-1 text-muted-foreground hover:text-foreground transition-colors rounded"
+                      aria-expanded={isExpanded}
+                      aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${provider.name} details`}
+                    >
+                      <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isExpanded ? '' : '-rotate-90'}`} />
                     </button>
                   </div>
                 </div>
-                <div className="space-y-3">
-                  <div className="relative">
-                    {/* Anthropic: show authentication method rather than raw API key field */}
+
+                {/* Expanded details */}
+                {isExpanded && (
+                  <div className="px-3 pb-3 pt-0 ml-7 space-y-3">
                     {isDefault ? (
-                      <div>
-                        <label className="text-[10px] uppercase font-bold text-content-muted mb-1 block">Authentication</label>
+                      <div className="space-y-2">
                         {claudeAuth?.loggedIn ? (
-                          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-success/10 border border-success/20">
-                            <div className="w-2 h-2 rounded-full bg-success shrink-0" />
-                            <span className="text-xs text-success font-medium">
-                              Subscription{claudeAuth.subscriptionType ? ` — ${claudeAuth.subscriptionType.toUpperCase()} plan` : ''}
+                          <div className="flex items-center gap-2 text-xs">
+                            <div className="w-1.5 h-1.5 rounded-full bg-success" />
+                            <span className="text-muted-foreground">
+                              Subscription{claudeAuth.subscriptionType ? ` — ${claudeAuth.subscriptionType.toUpperCase()}` : ''}
+                              {claudeAuth.rateLimitTier ? ` · ${claudeAuth.rateLimitTier}` : ''}
                             </span>
                           </div>
                         ) : claudeAuth?.hasAnthropicApiKey ? (
-                          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-primary/10 border border-primary/20">
-                            <Key className="w-3.5 h-3.5 text-primary shrink-0" />
-                            <span className="text-xs text-primary font-medium">API Key (via env)</span>
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <Key className="w-3 h-3" />
+                            <span>Using ANTHROPIC_API_KEY from environment</span>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-warning/10 border border-warning/20">
-                            <AlertTriangle className="w-3.5 h-3.5 text-warning shrink-0" />
-                            <span className="text-xs text-warning">Not authenticated — see Claude Code section above</span>
-                          </div>
+                          <p className="text-xs text-warning">
+                            Not authenticated. Run <code className="font-mono bg-muted px-1 rounded">claude</code> and use <code className="font-mono bg-muted px-1 rounded">/login</code>.
+                          </p>
                         )}
                         {claudeAuth?.hasAnthropicApiKey && claudeAuth.loggedIn && (
-                          <p className="text-[10px] text-warning mt-1.5 flex items-center gap-1">
-                            <AlertTriangle className="w-3 h-3 shrink-0" />
-                            <code className="font-mono">ANTHROPIC_API_KEY</code> overrides subscription for direct API calls
+                          <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3 text-warning" />
+                            ANTHROPIC_API_KEY overrides subscription for direct API calls
                           </p>
                         )}
                       </div>
+                    ) : provider.id === 'openai' ? (
+                      <div className="space-y-2">
+                        {codexAuth?.status === 'valid' ? (
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <div className="w-1.5 h-1.5 rounded-full bg-success" />
+                            <span>Subscription OAuth active</span>
+                            {codexAuth.email && (
+                              <SensitiveText value={codexAuth.email} className="text-[10px] text-muted-foreground" />
+                            )}
+                            {formatCodexExpiry(codexAuth.expiresAt) && (
+                              <span className="text-[10px] text-muted-foreground">{formatCodexExpiry(codexAuth.expiresAt)}</span>
+                            )}
+                          </div>
+                        ) : (codexAuth?.status === 'expired' || codexAuth?.status === 'burned') ? (
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-warning capitalize">{codexAuth.status}</span>
+                            {codexAuth.email && (
+                              <SensitiveText value={codexAuth.email} className="text-[10px] text-muted-foreground" />
+                            )}
+                            {formatCodexExpiry(codexAuth.expiresAt) && (
+                              <span className="text-[10px] text-muted-foreground">{formatCodexExpiry(codexAuth.expiresAt)}</span>
+                            )}
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const res = await fetch('/api/settings/codex-reauth', { method: 'POST' });
+                                  if (!res.ok) {
+                                    const body = await res.json().catch(() => ({}));
+                                    throw new Error(body.error || `Failed (${res.status})`);
+                                  }
+                                  const { sessionName, statusToken } = await res.json() as { sessionName: string; statusToken: string };
+                                  setReauthSession(sessionName, statusToken);
+                                  window.location.href = `/terminal/${sessionName}`;
+                                } catch (err) {
+                                  toast.error(err instanceof Error ? err.message : 'Failed to start re-authentication');
+                                }
+                              }}
+                              className="text-[10px] text-warning hover:text-warning/80 underline"
+                            >
+                              Re-authenticate
+                            </button>
+                          </div>
+                        ) : null}
+                        {/* API key input for OpenAI */}
+                        <div className="relative">
+                          <input
+                            type={showApiKey[provider.id] ? 'text' : 'password'}
+                            value={apiKey}
+                            onChange={(e) => handleApiKeyChange(provider.id, e.target.value)}
+                            placeholder={provider.placeholder}
+                            autoComplete="off"
+                            className="w-full bg-background border border-border rounded-md px-3 py-1.5 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-foreground pr-14"
+                          />
+                          {apiKey && (
+                            <>
+                              <button
+                                onClick={() => setShowApiKey({ ...showApiKey, [provider.id]: !showApiKey[provider.id] })}
+                                className="absolute right-7 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                title={showApiKey[provider.id] ? 'Hide' : 'Show'}
+                                aria-label={showApiKey[provider.id] ? 'Hide key' : 'Show key'}
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => handleApiKeyChange(provider.id, '')}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-destructive"
+                                title="Remove key"
+                                aria-label="Remove API key"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     ) : (
-                      <>
-                        <label className="text-[10px] uppercase font-bold text-content-muted mb-1 block">API Key</label>
-                        {/* Check if it's an unresolved env var reference */}
+                      <div className="space-y-2">
                         {apiKey.startsWith('$') ? (
-                          <div className="badge-bg-warning border badge-border-warning rounded-lg px-3 py-2">
-                            <div className="flex items-center gap-2 text-warning text-xs">
-                              <AlertTriangle className="w-4 h-4" />
-                              <span>Configured via <code className="font-mono bg-surface-overlay px-1 rounded">{apiKey}</code></span>
-                            </div>
-                            <p className="text-[10px] text-warning/70 mt-1">
-                              Set this environment variable or enter the key directly below
-                            </p>
+                          <div className="text-xs">
+                            <span className="text-muted-foreground">Env: </span>
+                            <code className="font-mono text-muted-foreground">{apiKey}</code>
                             <input
                               type="text"
                               placeholder={provider.placeholder}
                               onChange={(e) => handleApiKeyChange(provider.id, e.target.value)}
                               autoComplete="off"
-                              className="w-full bg-input-bg border border-divider-strong rounded-lg px-3 py-2 text-xs font-mono mt-2 focus:ring-1 focus:ring-primary focus:border-primary text-content-body"
+                              className="w-full bg-background border border-border rounded-md px-3 py-1.5 text-xs font-mono mt-1.5 focus:ring-1 focus:ring-primary focus:border-primary text-foreground"
                             />
                           </div>
                         ) : (
@@ -910,135 +1354,398 @@ export function SettingsPage() {
                               onChange={(e) => handleApiKeyChange(provider.id, e.target.value)}
                               placeholder={provider.placeholder}
                               autoComplete="off"
-                              autoCorrect="off"
-                              autoCapitalize="off"
-                              spellCheck={false}
-                              data-lpignore="true"
-                              data-1p-ignore="true"
-                              data-form-type="other"
-                              className={`w-full bg-input-bg border border-divider-strong rounded-lg px-3 py-2 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-content-body ${apiKey ? 'pr-16' : 'pr-8'}`}
+                              className="w-full bg-background border border-border rounded-md px-3 py-1.5 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-foreground pr-14"
                             />
                             {apiKey && (
-                              <button
-                                onClick={() => setShowApiKey({ ...showApiKey, [provider.id]: !showApiKey[provider.id] })}
-                                className="absolute right-8 top-1/2 -translate-y-1/2 text-content-muted hover:text-content-body"
-                                title={showApiKey[provider.id] ? 'Hide key' : 'Show key'}
-                              >
-                                {showApiKey[provider.id] ? (
-                                  <Eye className="w-4 h-4" />
-                                ) : (
-                                  <Eye className="w-4 h-4 opacity-50" />
-                                )}
-                              </button>
-                            )}
-                            {apiKey && (
-                              <button
-                                onClick={() => handleApiKeyChange(provider.id, '')}
-                                className="absolute right-2 top-1/2 -translate-y-1/2 text-content-muted hover:text-destructive transition-colors"
-                                title="Delete API key"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              <>
+                                <button
+                                  onClick={() => setShowApiKey({ ...showApiKey, [provider.id]: !showApiKey[provider.id] })}
+                                  className="absolute right-7 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                  title={showApiKey[provider.id] ? 'Hide' : 'Show'}
+                                  aria-label={showApiKey[provider.id] ? 'Hide key' : 'Show key'}
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => handleApiKeyChange(provider.id, '')}
+                                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-destructive"
+                                  title="Remove key"
+                                  aria-label="Remove API key"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </>
                             )}
                           </div>
                         )}
-                      </>
+                      </div>
                     )}
-                  </div>
-                  {/* Action Buttons */}
-                  {!isDefault && (
-                    <div className="flex flex-col gap-2">
-                      {/* Show Models Button - only if we have a real API key */}
-                      {apiKey && !apiKey.startsWith('$') && (
+                    {/* Action buttons for non-default providers */}
+                    {!isDefault && apiKey && !apiKey.startsWith('$') && (
+                      <div className="flex items-center gap-2">
                         <button
                           onClick={() => setModelsModalProvider(provider.id)}
-                          className="flex items-center justify-center gap-1.5 px-3 py-1.5 badge-bg-primary hover:bg-primary/20 border badge-border-primary rounded-lg text-xs text-primary transition-colors w-full"
+                          className="text-xs text-primary hover:text-primary/80 font-medium"
                         >
-                          <BarChart3 className="w-3.5 h-3.5" />
-                          View Models
+                          View models
                         </button>
-                      )}
-                      {/* Test API Key Button - only if we have a real API key (not env var ref) */}
-                      {apiKey && !apiKey.startsWith('$') && (
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => handleTestApiKey(provider.id)}
-                            disabled={testingProvider === provider.id}
-                            className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-emphasis hover:bg-divider-strong border border-divider-strong rounded-lg text-xs text-content-body transition-colors disabled:opacity-50"
-                          >
-                            {testingProvider === provider.id ? (
-                              <Loader2 className="w-3 h-3 animate-spin" />
-                            ) : (
-                              <Beaker className="w-3.5 h-3.5" />
-                            )}
-                            Test 2+3
-                          </button>
-                          {testResults[provider.id] && (
-                            <div className={`flex items-center gap-1 text-xs ${testResults[provider.id]?.success ? 'text-success' : 'text-destructive'}`}>
-                              {testResults[provider.id]?.success ? (
-                                <CheckCircle className="w-3.5 h-3.5" />
-                              ) : (
-                                <AlertTriangle className="w-3.5 h-3.5" />
-                              )}
-                              {testResults[provider.id]?.success
-                                ? `${testResults[provider.id]?.latencyMs}ms`
-                                : testResults[provider.id]?.error}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                        <span className="text-border">·</span>
+                        <button
+                          onClick={() => handleTestApiKey(provider.id)}
+                          disabled={testingProvider === provider.id}
+                          className="text-xs text-muted-foreground hover:text-foreground font-medium disabled:opacity-50 flex items-center gap-1"
+                        >
+                          {testingProvider === provider.id && <Loader2 className="w-3 h-3 animate-spin" />}
+                          Test
+                        </button>
+                        {testResults[provider.id] && (
+                          <span className={`text-[10px] ${testResults[provider.id]?.success ? 'text-success' : 'text-destructive'}`}>
+                            {testResults[provider.id]?.success
+                              ? `${testResults[provider.id]?.latencyMs}ms`
+                              : testResults[provider.id]?.error?.slice(0, 20)}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
+            );
+          })}
+
+          {/* OpenRouter as part of providers */}
+          <div className="border border-transparent rounded-lg hover:border-border transition-colors">
+            <div className="flex items-center gap-3 px-3 py-2.5">
+              <Globe className="w-4 h-4 text-muted-foreground shrink-0" />
+              <span className="text-sm font-medium text-foreground flex-1">OpenRouter</span>
+              <div className="flex items-center gap-2">
+                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                  formData.api_keys.openrouter ? 'text-success bg-success/10' : 'text-muted-foreground bg-muted/50'
+                }`}>
+                  {formData.api_keys.openrouter ? 'Configured' : 'No key'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleProviderToggle('openrouter')}
+                  role="switch"
+                  aria-checked={!!formData.models.providers.openrouter}
+                  aria-label={`${formData.models.providers.openrouter ? 'Disable' : 'Enable'} OpenRouter`}
+                  className={`w-8 h-4.5 rounded-full relative transition-colors ${
+                    formData.models.providers.openrouter ? 'bg-primary' : 'bg-muted'
+                  }`}
+                >
+                  <span className={`absolute top-0.5 size-3.5 bg-white rounded-full transition-all ${
+                    formData.models.providers.openrouter ? 'right-0.5' : 'left-0.5'
+                  }`} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExpandedProviders(prev => ({ ...prev, openrouter: !prev.openrouter }))}
+                  className="p-1 text-muted-foreground hover:text-foreground transition-colors rounded"
+                  aria-expanded={expandedProviders.openrouter || false}
+                  aria-label={`${expandedProviders.openrouter ? 'Collapse' : 'Expand'} OpenRouter details`}
+                >
+                  <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expandedProviders.openrouter ? '' : '-rotate-90'}`} />
+                </button>
+              </div>
+            </div>
+            {expandedProviders.openrouter && (
+              <div className="px-3 pb-3 pt-0 ml-7">
+                <OpenRouterPage
+                  apiKey={formData.api_keys.openrouter}
+                  enabled={!!formData.models.providers.openrouter}
+                  onApiKeyChange={(key) => handleApiKeyChange('openrouter', key)}
+                  onToggleEnabled={() => handleProviderToggle('openrouter')}
+                  onApiKeySaved={(savedKey) => {
+                    setFormData(prev => prev ? {
+                      ...prev,
+                      api_keys: { ...prev.api_keys, openrouter: savedKey },
+                    } : prev);
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Permissions — controls what flags get passed to spawned `claude` processes */}
+      <section id="permissions" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4 flex items-center gap-2">
+          <ShieldCheck className="w-4 h-4 text-muted-foreground" />
+          Permissions
+        </h2>
+        <p className="text-xs text-muted-foreground mb-4">
+          How spawned Claude Code agents are gated. Applies to work agents, specialists,
+          conversations, and remote agents. Override per-invocation with{' '}
+          <code className="text-foreground/80 bg-muted px-1 py-0.5 rounded">--yolo</code>,{' '}
+          <code className="text-foreground/80 bg-muted px-1 py-0.5 rounded">--no-yolo</code>, or{' '}
+          <code className="text-foreground/80 bg-muted px-1 py-0.5 rounded">PAN_YOLO</code>.
+        </p>
+
+        <div className="space-y-2">
+          {([
+            {
+              value: 'auto',
+              title: 'Auto (recommended)',
+              flag: '--permission-mode auto',
+              description:
+                'Claude Code\'s built-in classifier auto-approves safe tool calls and blocks destructive ones (force pushes, exfiltration, rm -rf, writes outside workspace). Requires skipAutoPermissionPrompt: true in ~/.claude/settings.json.',
+            },
+            {
+              value: 'bypass',
+              title: 'Bypass (yolo)',
+              flag: '--dangerously-skip-permissions --permission-mode bypassPermissions',
+              description:
+                'Legacy Panopticon behavior. Every tool call auto-approved with no classifier — fastest, but the agent can do anything its file/network access allows. Use when running providers that reject the auto flag, or when the classifier is interfering with intentionally destructive automation.',
+            },
+          ] as const).map((opt) => {
+            const selected = (formData.claude?.permissionMode ?? 'auto') === opt.value;
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                data-testid={`permission-mode-${opt.value}`}
+                onClick={() => handlePermissionModeChange(opt.value)}
+                disabled={saveMutation.isPending}
+                className={`w-full text-left flex items-start gap-3 px-4 py-3 rounded-lg border transition-colors disabled:opacity-50 ${
+                  selected
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border bg-transparent hover:bg-muted/30'
+                }`}
+              >
+                <span
+                  className={`mt-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${
+                    selected ? 'border-primary' : 'border-muted-foreground/40'
+                  }`}
+                >
+                  {selected && <span className="h-2 w-2 rounded-full bg-primary" />}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-foreground">{opt.title}</span>
+                    <code className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                      {opt.flag}
+                    </code>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    {opt.description}
+                  </p>
+                </div>
+              </button>
             );
           })}
         </div>
       </section>
 
-      {/* OpenRouter */}
-      <section className="mb-12">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
-          OpenRouter
-          <div className="h-px flex-1 bg-divider-strong" />
+      {/* Voice */}
+      <section id="voice" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4 flex items-center gap-2">
+          <Mic className="w-4 h-4 text-muted-foreground" />
+          Voice
         </h2>
-        <OpenRouterPage
-          apiKey={formData.api_keys.openrouter}
-          enabled={!!formData.models.providers.openrouter}
-          onApiKeyChange={(key) => handleApiKeyChange('openrouter', key)}
-          onToggleEnabled={() => handleProviderToggle('openrouter')}
-          onApiKeySaved={(savedKey) => {
-            // OpenRouterPage already persisted the key — just sync local form state
-            setFormData(prev => prev ? {
-              ...prev,
-              api_keys: { ...prev.api_keys, openrouter: savedKey },
-            } : prev);
-          }}
-        />
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">STT provider</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Speech-to-text backend used by the voice widget and AutoPreso
+              </p>
+            </div>
+            <select
+              value={voiceFormData.stt.provider}
+              onChange={(e) => handleVoiceProviderChange(e.target.value as VoiceSettings['stt']['provider'])}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            >
+              <option value="moonshine">Moonshine</option>
+              <option value="google-cloud">Google Cloud STT</option>
+            </select>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">AutoPreso provider</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Whiteboard agent backend used for live diagram updates
+              </p>
+            </div>
+            <select
+              value={voiceFormData.autopreso.provider}
+              onChange={(e) => handleAutoPresoProviderChange(e.target.value as VoiceSettings['autopreso']['provider'])}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            >
+              <option value="openai">OpenAI</option>
+              <option value="codex">Codex</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">AutoPreso model</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Model passed to the whiteboard agent
+              </p>
+            </div>
+            <input
+              type="text"
+              value={voiceFormData.autopreso.model}
+              onChange={(e) => handleAutoPresoModelChange(e.target.value)}
+              placeholder="gpt-4.1-mini"
+              className="w-[260px] bg-background border border-border rounded-md px-2.5 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary focus:border-primary"
+            />
+          </div>
+
+          {voiceFormData.stt.provider === 'moonshine' ? (
+            <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+              <div className="min-w-0">
+                <span className="text-sm font-medium text-foreground">Moonshine model</span>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Tiny is faster; base is more accurate
+                </p>
+              </div>
+              <select
+                value={voiceFormData.stt.moonshine.model}
+                onChange={(e) => handleMoonshineModelChange(e.target.value)}
+                className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+              >
+                <option value="tiny">Tiny</option>
+                <option value="base">Base</option>
+              </select>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                <div className="min-w-0">
+                  <span className="text-sm font-medium text-foreground">Google Cloud API key</span>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Used only when Google Cloud STT is selected
+                  </p>
+                </div>
+                <div className="relative w-[260px] shrink-0">
+                  <input
+                    type={showVoiceApiKey ? 'text' : 'password'}
+                    value={voiceFormData.stt.googleCloud.apiKey}
+                    onChange={(e) => handleGoogleCloudApiKeyChange(e.target.value)}
+                    placeholder="Google Cloud API key"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    data-form-type="other"
+                    className="w-full bg-background border border-border rounded-md px-2.5 py-1.5 pr-8 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-foreground"
+                  />
+                  {voiceFormData.stt.googleCloud.apiKey && (
+                    <button
+                      type="button"
+                      onClick={() => setShowVoiceApiKey(!showVoiceApiKey)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      aria-label={showVoiceApiKey ? 'Hide Google Cloud API key' : 'Show Google Cloud API key'}
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                <div className="min-w-0">
+                  <span className="text-sm font-medium text-foreground">Google Cloud model</span>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Recognition model passed to Google Cloud STT
+                  </p>
+                </div>
+                <select
+                  value={voiceFormData.stt.googleCloud.model}
+                  onChange={(e) => handleGoogleCloudModelChange(e.target.value)}
+                  className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+                >
+                  <option value="latest_long">Latest long</option>
+                  <option value="latest_short">Latest short</option>
+                  <option value="command_and_search">Command and search</option>
+                </select>
+              </div>
+            </>
+          )}
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Input device</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Browser microphone device ID stored on this machine
+              </p>
+            </div>
+            <input
+              type="text"
+              value={voiceHardwareSettings.inputDevice}
+              onChange={(e) => handleVoiceHardwareChange('inputDevice', e.target.value)}
+              placeholder="Default microphone"
+              className="w-[260px] bg-background border border-border rounded-md px-2.5 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary focus:border-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Output device</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Browser speaker device ID stored on this machine
+              </p>
+            </div>
+            <input
+              type="text"
+              value={voiceHardwareSettings.outputDevice}
+              onChange={(e) => handleVoiceHardwareChange('outputDevice', e.target.value)}
+              placeholder="Default speaker"
+              className="w-[260px] bg-background border border-border rounded-md px-2.5 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary focus:border-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Voice volume</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Playback volume stored on this machine
+              </p>
+            </div>
+            <div className="flex items-center gap-3 w-[260px] shrink-0">
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={voiceHardwareSettings.volume}
+                onChange={(e) => handleVoiceHardwareChange('volume', Number(e.target.value))}
+                aria-label="Voice volume"
+                className="flex-1 accent-primary"
+              />
+              <span className="text-xs text-muted-foreground tabular-nums w-9 text-right">
+                {Math.round(voiceHardwareSettings.volume * 100)}%
+              </span>
+            </div>
+          </div>
+        </div>
       </section>
 
       {/* Conversations */}
-      <section id="conversations" className="mb-12 scroll-mt-4">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
+      <section id="conversations" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
           Conversations
-          <div className="h-px flex-1 bg-divider-strong" />
         </h2>
-        <p className="text-content-muted text-sm mb-6">
-          Control how Panopticon handles compaction for dashboard-owned resume flows and for typed <code>/compact</code> commands in the conversation composer.
-        </p>
-
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-          <div className="bg-surface-raised border border-divider rounded-xl p-5 space-y-4">
-            <div>
-              <h3 className="font-bold text-content">Compaction &amp; summary model</h3>
-              <p className="text-sm text-content-muted mt-1">
-                Used for native conversation compaction and as the default summary model when forking conversations. Does not affect Claude Code&apos;s built-in <code>/compact</code>.
-              </p>
+        <div className="space-y-1">
+          {/* Compaction model */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Compaction model</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Used for native compaction and fork summaries</p>
             </div>
             <select
               value={formData.conversations?.compaction_model || 'claude-haiku-4-5'}
               onChange={(e) => handleCompactionModelChange(e.target.value as ModelId)}
-              className="w-full bg-input-bg border border-divider-strong rounded-lg px-3 py-2 text-sm text-content-body focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
             >
               {Object.entries(MODELS_BY_PROVIDER).flatMap(([, providerDef]) =>
                 providerDef.models.map((model) => (
@@ -1053,238 +1760,764 @@ export function SettingsPage() {
                 </option>
               ))}
             </select>
-            <p className="text-xs text-content-muted">
-              Default: Claude Haiku 4.5 for fast, low-cost compaction.
-            </p>
           </div>
 
-          <div className="bg-surface-raised border border-divider rounded-xl p-5 space-y-4">
-            <div>
-              <h3 className="font-bold text-content">Typed /compact handling</h3>
-              <p className="text-sm text-content-muted mt-1">
-                Choose whether a user-typed <code>/compact</code> is passed through to Claude Code or intercepted and handled by Panopticon-native compaction.
-              </p>
+          {/* Title model */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Title generation model</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Generates conversation titles from first message</p>
             </div>
-            <div className="grid grid-cols-1 gap-3">
-              <button
-                type="button"
-                onClick={() => handleManualCompactModeChange('claude-code')}
-                className={`text-left rounded-xl border p-4 transition-colors ${
-                  (formData.conversations?.manual_compact_mode || 'claude-code') === 'claude-code'
-                    ? 'border-blue-500 bg-blue-500/10'
-                    : 'border-divider bg-surface-raised hover:border-divider-strong'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-4 mb-2">
-                  <div>
-                    <div className="font-bold text-content">Pass through to Claude Code</div>
-                    <div className="text-xs text-content-muted font-mono">Default</div>
-                  </div>
-                  {(formData.conversations?.manual_compact_mode || 'claude-code') === 'claude-code' && (
-                    <div className="text-blue-400 text-xs font-semibold">Selected</div>
-                  )}
-                </div>
-                <p className="text-sm text-content-muted">
-                  Preserve today&apos;s behavior: sending <code>/compact</code> directly to the Claude Code session.
-                </p>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleManualCompactModeChange('panopticon-native')}
-                className={`text-left rounded-xl border p-4 transition-colors ${
-                  formData.conversations?.manual_compact_mode === 'panopticon-native'
-                    ? 'border-emerald-500 bg-emerald-500/10'
-                    : 'border-divider bg-surface-raised hover:border-divider-strong'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-4 mb-2">
-                  <div>
-                    <div className="font-bold text-content">Use Panopticon-native compaction</div>
-                    <div className="text-xs text-content-muted font-mono">Opt-in override</div>
-                  </div>
-                  {formData.conversations?.manual_compact_mode === 'panopticon-native' && (
-                    <div className="text-emerald-400 text-xs font-semibold">Selected</div>
-                  )}
-                </div>
-                <p className="text-sm text-content-muted">
-                  Intercept typed <code>/compact</code> in the dashboard and run Panopticon&apos;s native compaction instead of Claude Code&apos;s built-in command.
-                </p>
-              </button>
-            </div>
+            <select
+              value={formData.conversations?.title_model || 'claude-haiku-4-5'}
+              onChange={(e) => handleTitleModelChange(e.target.value as ModelId)}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              {Object.entries(MODELS_BY_PROVIDER).flatMap(([, providerDef]) =>
+                providerDef.models.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {providerDef.name} — {model.name}
+                  </option>
+                ))
+              )}
+              {openRouterFavoriteModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  OpenRouter — {model.name}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="bg-surface-raised border border-divider rounded-xl p-5 space-y-4">
-            <div>
-              <h3 className="font-bold text-content">Richer compaction / forking summaries</h3>
-              <p className="text-sm text-content-muted mt-1">
-                Use a more verbose 9-section summary format instead of the default 6-section format. Includes all user messages and fuller code snippets.
+          {/* /compact handling */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">/compact handling</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {(formData.conversations?.manual_compact_mode || 'claude-code') === 'claude-code'
+                  ? 'Pass through to Claude Code'
+                  : 'Panopticon-native compaction'}
               </p>
             </div>
-            <div className="flex items-center justify-between gap-4">
-              <div className="text-sm text-content-body">
-                <span className={formData.conversations?.rich_compaction ? 'text-content' : 'text-content-muted'}>
-                  {formData.conversations?.rich_compaction ? 'Enabled' : 'Disabled'}
-                </span>
-                <span className="text-xs text-content-muted ml-2">(default: on)</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => handleRichCompactionChange(!formData.conversations?.rich_compaction)}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-                  formData.conversations?.rich_compaction ? 'bg-blue-500' : 'bg-gray-400'
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    formData.conversations?.rich_compaction ? 'translate-x-6' : 'translate-x-1'
+            <select
+              value={formData.conversations?.manual_compact_mode || 'claude-code'}
+              onChange={(e) => handleManualCompactModeChange(e.target.value as 'claude-code' | 'panopticon-native')}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            >
+              <option value="claude-code">Pass through</option>
+              <option value="panopticon-native">Native compaction</option>
+            </select>
+          </div>
+
+          {/* Rich compaction */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Rich summaries</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                9-section verbose format (higher token usage)
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!formData.conversations?.rich_compaction}
+              aria-label="Toggle rich compaction summaries"
+              onClick={() => handleRichCompactionChange(!formData.conversations?.rich_compaction)}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                formData.conversations?.rich_compaction ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                formData.conversations?.rich_compaction ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          <div className="border-t border-border my-2" />
+
+          {!convConfig ? (
+            <div className="flex items-center gap-2 px-4 py-3 text-xs text-muted-foreground">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              Loading embedding settings…
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                <div className="min-w-0">
+                  <span className="text-sm font-medium text-foreground">Semantic embeddings</span>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Store vector embeddings for semantic conversation search. Non-local providers receive session-derived summaries, tags, workspace paths, and tool names.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={convConfig.embeddings}
+                  aria-label="Toggle semantic embeddings"
+                  onClick={() => handleConvConfigChange({ embeddings: !convConfig.embeddings })}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                    convConfig.embeddings ? 'bg-primary' : 'bg-muted'
                   }`}
-                />
-              </button>
-            </div>
-            <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
-              <p className="text-xs text-amber-400 flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>
-                  Higher token usage per summary. Less efficient incremental updates. May hit the context window sooner, requiring more frequent compaction.
-                </span>
+                >
+                  <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                    convConfig.embeddings ? 'translate-x-[18px]' : 'translate-x-[3px]'
+                  }`} />
+                </button>
+              </div>
+
+              {convConfig.embeddings && (
+                <>
+                  <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                    <div className="min-w-0">
+                      <span className="text-sm font-medium text-foreground">Embedding provider</span>
+                      <p className="text-xs text-muted-foreground mt-0.5">Which API generates embeddings</p>
+                    </div>
+                    <select
+                      value={convConfig.embeddingProvider}
+                      onChange={(e) => {
+                        const provider = e.target.value;
+                        const defaultModel = provider === 'openai'
+                          ? 'text-embedding-3-small'
+                          : provider === 'voyage'
+                            ? 'voyage-code-3'
+                            : 'nomic-embed-text';
+                        handleConvConfigChange({ embeddingProvider: provider, embeddingModel: defaultModel });
+                      }}
+                      className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+                    >
+                      <option value="openai">OpenAI</option>
+                      <option value="voyage">Voyage AI</option>
+                      <option value="ollama">Ollama (local)</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                    <div className="min-w-0">
+                      <span className="text-sm font-medium text-foreground">Embedding model</span>
+                      <p className="text-xs text-muted-foreground mt-0.5">Model name for the selected provider</p>
+                    </div>
+                    <input
+                      type="text"
+                      value={convConfig.embeddingModel}
+                      onChange={(e) => handleConvConfigChange({ embeddingModel: e.target.value })}
+                      className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary w-[220px]"
+                      placeholder="text-embedding-3-small"
+                    />
+                  </div>
+
+                  {convConfig.embeddingProvider !== 'ollama' && (
+                    <div className="px-4 py-3 rounded-lg bg-muted/20">
+                      <p className="text-xs text-muted-foreground">
+                        API key is read from{' '}
+                        <code className="text-foreground/80 bg-muted px-1 py-0.5 rounded">
+                          {convConfig.embeddingProvider === 'openai' ? 'OPENAI_API_KEY' : 'VOYAGE_API_KEY'}
+                        </code>{' '}
+                        or <code className="text-foreground/80 bg-muted px-1 py-0.5 rounded">~/.panopticon.env</code>.
+                        Session-derived summaries, tags, workspace paths, and tool names are sent to this provider.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                    <div className="min-w-0">
+                      <span className="text-sm font-medium text-foreground">Auto-embed after deep enrichment</span>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Generate embeddings when a session is enriched at tier 2 or 3
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={convConfig.embeddingAutoOnDeep}
+                      aria-label="Toggle auto-embed after deep enrichment"
+                      onClick={() => handleConvConfigChange({ embeddingAutoOnDeep: !convConfig.embeddingAutoOnDeep })}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                        convConfig.embeddingAutoOnDeep ? 'bg-primary' : 'bg-muted'
+                      }`}
+                    >
+                      <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                        convConfig.embeddingAutoOnDeep ? 'translate-x-[18px]' : 'translate-x-[3px]'
+                      }`} />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleTestEmbeddingConnection}
+                        disabled={testingEmbedding}
+                        className="flex items-center gap-2 text-xs px-3 py-1.5 rounded-md border border-border hover:bg-muted/30 text-foreground transition-colors disabled:opacity-50"
+                      >
+                        {testingEmbedding ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                        Test connection
+                      </button>
+                      {embeddingTestResult && (
+                        <span className={`text-xs flex items-center gap-1 ${embeddingTestResult.ok ? 'text-success' : 'text-destructive'}`}>
+                          {embeddingTestResult.ok
+                            ? <><CheckCircle className="w-3.5 h-3.5" /> Connected ({embeddingTestResult.latencyMs}ms)</>
+                            : <><AlertTriangle className="w-3.5 h-3.5" /> {embeddingTestResult.error}</>}
+                        </span>
+                      )}
+                    </div>
+                    {convConfigDirty && (
+                      <button
+                        type="button"
+                        onClick={() => void handleSaveConvConfig()}
+                        disabled={convConfigSaving}
+                        className="flex items-center gap-2 text-xs px-3 py-1.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                      >
+                        {convConfigSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                        Save embeddings
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </div>
+      </section>
+
+      {/* Memory */}
+      <section id="memory" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4 flex items-center gap-2">
+          <Brain className="w-4 h-4 text-muted-foreground" />
+          Memory
+        </h2>
+        <p className="text-xs text-muted-foreground mb-4">
+          Configure durable memory extraction, prompt-time retrieval, rollups, and activity refresh behavior.
+        </p>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Extraction provider</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                PANOPTICON_MEMORY_PROVIDER and PANOPTICON_MEMORY_MODEL override these UI values.
               </p>
             </div>
+            <select
+              value={formData.memory?.provider || 'anthropic'}
+              onChange={(e) => updateMemorySettings({ provider: e.target.value as 'anthropic' | 'cliproxy' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            >
+              <option value="anthropic">Anthropic</option>
+              <option value="cliproxy">cliproxy</option>
+            </select>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Extraction model</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Used for observations, query expansion, and status rollups unless env vars override it</p>
+            </div>
+            <input
+              type="text"
+              value={formData.memory?.model || ''}
+              onChange={(e) => updateMemorySettings({ model: e.target.value || undefined })}
+              placeholder={formData.memory?.provider === 'cliproxy' ? 'gpt-4.1-nano' : 'claude-haiku-4-5-20251001'}
+              className="w-64 bg-background border border-border rounded-md px-2 py-1.5 text-xs font-mono text-foreground focus:ring-1 focus:ring-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Fallback provider</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Optional single fallback target when the primary provider fails</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={formData.memory?.fallback_provider || ''}
+                onChange={(e) => updateMemorySettings({ fallback_provider: e.target.value as 'anthropic' | 'cliproxy' | '' })}
+                className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+              >
+                <option value="">None</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="cliproxy">cliproxy</option>
+              </select>
+              <input
+                type="text"
+                value={formData.memory?.fallback_model || ''}
+                onChange={(e) => updateMemorySettings({ fallback_model: e.target.value || undefined })}
+                placeholder="fallback model"
+                className="w-44 bg-background border border-border rounded-md px-2 py-1.5 text-xs font-mono text-foreground focus:ring-1 focus:ring-primary"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Daily cost cap</span>
+              <p className="text-xs text-muted-foreground mt-0.5">USD per project per day; 0 disables the cap</p>
+            </div>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={formData.memory?.per_day_cost_cap_usd ?? 5}
+              onChange={(e) => handleMemoryNumberChange('per_day_cost_cap_usd', e.target.value)}
+              className="w-28 bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Disable observations</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Stops hook and poller memory registration on the next settings read, no restart required</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!(formData.memory?.observations_enabled ?? true)}
+              aria-label="Disable memory observations"
+              onClick={() => updateMemorySettings({ observations_enabled: !(formData.memory?.observations_enabled ?? true) })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                !(formData.memory?.observations_enabled ?? true) ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                !(formData.memory?.observations_enabled ?? true) ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Prompt-time injection</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Retrieve memory on user prompts using query expansion and RAG runs telemetry</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={formData.memory?.prompt_time_injection_enabled ?? true}
+              aria-label="Toggle prompt-time memory injection"
+              onClick={() => updateMemorySettings({ prompt_time_injection_enabled: !(formData.memory?.prompt_time_injection_enabled ?? true) })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                (formData.memory?.prompt_time_injection_enabled ?? true) ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                (formData.memory?.prompt_time_injection_enabled ?? true) ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Rollup threshold</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Pending turns required before synthesizing workspace status</p>
+            </div>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={formData.memory?.rollup_pending_threshold ?? 4}
+              onChange={(e) => handleMemoryNumberChange('rollup_pending_threshold', e.target.value)}
+              className="w-24 bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Extraction workers</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Maximum concurrent memory extractions across all sessions</p>
+            </div>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={formData.memory?.worker_concurrency ?? 4}
+              onChange={(e) => handleMemoryNumberChange('worker_concurrency', e.target.value)}
+              className="w-24 bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Sidebar refresh interval</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Milliseconds between activity fallback refreshes</p>
+            </div>
+            <input
+              type="number"
+              min="1"
+              step="1000"
+              value={formData.memory?.sidebar_refresh_interval_ms ?? 10000}
+              onChange={(e) => handleMemoryNumberChange('sidebar_refresh_interval_ms', e.target.value)}
+              className="w-28 bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            />
           </div>
         </div>
       </section>
 
       {/* Terminal */}
-      <section id="tmux" className="mb-12 scroll-mt-4">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
+      <section id="terminal" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
           Terminal
-          <div className="h-px flex-1 bg-divider-strong" />
         </h2>
-        <p className="text-content-muted text-sm mb-6">
-          Control whether Panopticon launches tmux in its own managed server with a Panopticon-owned config, or intentionally inherits your user tmux config.
-        </p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <button
-            type="button"
-            onClick={() => handleTmuxConfigModeChange('managed')}
-            className={`text-left rounded-xl border p-5 transition-colors ${
-              (formData.tmux?.config_mode || 'managed') === 'managed'
-                ? 'border-blue-500 bg-blue-500/10'
-                : 'border-divider bg-surface-raised hover:border-divider-strong'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-4 mb-2">
-              <div>
-                <div className="font-bold text-content">Managed tmux</div>
-                <div className="text-xs text-content-muted font-mono">Default</div>
-              </div>
-              {(formData.tmux?.config_mode || 'managed') === 'managed' && (
-                <div className="text-blue-400 text-xs font-semibold">Selected</div>
-              )}
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">tmux configuration</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {(formData.tmux?.config_mode || 'managed') === 'managed'
+                  ? 'Using Panopticon-managed tmux socket and config'
+                  : 'Inheriting your user tmux configuration'}
+              </p>
             </div>
-            <p className="text-sm text-content-muted">
-              Use Panopticon&apos;s own tmux socket and config file. This avoids depending on your dotfiles while preserving Panopticon&apos;s required mouse behavior.
-            </p>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => handleTmuxConfigModeChange('inherit-user')}
-            className={`text-left rounded-xl border p-5 transition-colors ${
-              formData.tmux?.config_mode === 'inherit-user'
-                ? 'border-amber-500 bg-amber-500/10'
-                : 'border-divider bg-surface-raised hover:border-divider-strong'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-4 mb-2">
-              <div>
-                <div className="font-bold text-content">Inherit user tmux</div>
-                <div className="text-xs text-content-muted font-mono">Advanced opt-out</div>
-              </div>
-              {formData.tmux?.config_mode === 'inherit-user' && (
-                <div className="text-amber-400 text-xs font-semibold">Selected</div>
-              )}
-            </div>
-            <p className="text-sm text-content-muted">
-              Use your existing tmux server/config behavior instead of Panopticon-managed tmux. Choose this only if you specifically want Panopticon to follow your personal tmux setup.
-            </p>
-          </button>
+            <select
+              value={formData.tmux?.config_mode || 'managed'}
+              onChange={(e) => handleTmuxConfigModeChange(e.target.value as 'managed' | 'inherit-user')}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary"
+            >
+              <option value="managed">Managed</option>
+              <option value="inherit-user">Inherit user</option>
+            </select>
+          </div>
         </div>
       </section>
 
-      {/* Tracker API Keys */}
-      <section className="mb-12">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
-          Tracker API Keys
-          <div className="h-px flex-1 bg-divider-strong" />
+      <SettingsSection
+        id="tts"
+        title="TTS"
+        description="Built-in voice playback"
+        actions={
+          <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs ${
+            ttsHealth === undefined
+              ? 'bg-muted/50 text-muted-foreground'
+              : ttsDaemonOnline
+                ? 'bg-success/10 text-success'
+                : ttsDaemonStarting
+                  ? 'bg-warning/10 text-warning'
+                  : 'bg-destructive/10 text-destructive'
+          }`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${ttsDaemonOnline ? 'bg-success' : 'bg-current'}`} />
+            Daemon status: {ttsDaemonStatus}
+          </span>
+        }
+      >
+        <SettingsRow
+          label="Enable TTS"
+          description="Speak activity events through the local Qwen3-TTS daemon"
+        >
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!ttsConfig.enabled}
+            aria-label="Toggle TTS"
+            onClick={() => handleTtsConfigChange({ enabled: !ttsConfig.enabled })}
+            disabled={saveMutation.isPending}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:opacity-50 ${
+              ttsConfig.enabled ? 'bg-primary' : 'bg-muted'
+            }`}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+              ttsConfig.enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'
+            }`} />
+          </button>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Daemon"
+          description={ttsDaemonDetails || ttsHealth?.error || 'Live Qwen TTS daemon status'}
+        >
+          <div className="flex flex-col items-end gap-1.5 text-right">
+            <span className={`text-sm font-medium ${ttsDaemonOnline ? 'text-success' : ttsDaemonStarting ? 'text-warning' : 'text-muted-foreground'}`}>
+              {ttsDaemonOnline ? 'running' : ttsDaemonStatus}
+            </span>
+            {ttsDaemonModel && (
+              <span className="max-w-xs truncate text-xs text-muted-foreground">{ttsDaemonModel}</span>
+            )}
+            {!ttsDaemonOnline && !ttsDaemonStarting && (
+              <button
+                type="button"
+                onClick={() => ttsStartMutation.mutate()}
+                disabled={ttsStartMutation.isPending}
+                className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50"
+              >
+                {ttsStartMutation.isPending ? 'Starting…' : 'Start daemon'}
+              </button>
+            )}
+          </div>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Volume"
+          description={`${Math.round(ttsVolume * 100)}% output volume`}
+        >
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={ttsVolume}
+            onChange={(e) => handleTtsConfigChange({ volume: Number(e.target.value) }, { debounce: true })}
+            disabled={saveMutation.isPending}
+            className="w-40 accent-primary disabled:opacity-50"
+          />
+          <span className="w-10 text-right text-xs tabular-nums text-muted-foreground">
+            {Math.round(ttsVolume * 100)}%
+          </span>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Rate"
+          description="Speech speed multiplier"
+        >
+          <input
+            type="number"
+            min={0.1}
+            step={0.1}
+            value={ttsRate}
+            onChange={(e) => handleTtsConfigChange({ rate: Number(e.target.value) }, { debounce: true })}
+            disabled={saveMutation.isPending}
+            className="w-24 rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary disabled:opacity-50"
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Max chars"
+          description="Maximum text length per spoken utterance"
+        >
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={ttsMaxChars}
+            onChange={(e) => handleTtsConfigChange({ maxChars: Number(e.target.value) }, { debounce: true })}
+            disabled={saveMutation.isPending}
+            className="w-24 rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary disabled:opacity-50"
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Drop info when queue full"
+          description="Skip low-priority speech when the daemon queue is saturated"
+        >
+          <button
+            type="button"
+            role="switch"
+            aria-checked={ttsConfig.dropInfoWhenFull ?? true}
+            aria-label="Toggle dropping low-priority TTS when queue is full"
+            onClick={() => handleTtsConfigChange({ dropInfoWhenFull: !(ttsConfig.dropInfoWhenFull ?? true) })}
+            disabled={saveMutation.isPending}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:opacity-50 ${
+              (ttsConfig.dropInfoWhenFull ?? true) ? 'bg-primary' : 'bg-muted'
+            }`}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+              (ttsConfig.dropInfoWhenFull ?? true) ? 'translate-x-[18px]' : 'translate-x-[3px]'
+            }`} />
+          </button>
+        </SettingsRow>
+
+        <TtsSystemVoicePicker
+          voices={ttsVoices}
+          isLoading={ttsVoicesQuery.isLoading}
+          systemVoiceId={ttsConfig.voice}
+          statusVoiceId={ttsConfig.statusVoice}
+          disabled={saveMutation.isPending}
+          onSetSystemVoice={(voiceId) => handleTtsConfigChange({ voice: voiceId })}
+          onSetStatusVoice={(voiceId) => handleTtsConfigChange({ statusVoice: voiceId })}
+        />
+
+        <div className="mt-6" data-testid="tts-voice-library-tabs">
+          <div className="rounded-t-xl border border-border/70 bg-card/40 p-2">
+            <div className="inline-flex rounded-lg bg-background/60 p-1">
+              {([
+                ['presets', 'CustomVoice Presets'],
+                ['design', 'VoiceDesign'],
+              ] as const).map(([tabId, label]) => (
+                <button
+                  key={tabId}
+                  type="button"
+                  onClick={() => setActiveTtsVoiceTab(tabId)}
+                  aria-pressed={activeTtsVoiceTab === tabId}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTtsVoiceTab === tabId
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-popover'
+                  }`}
+                  data-testid={`tts-voice-library-tab-${tabId}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {activeTtsVoiceTab === 'presets' ? <VoicePresetsTab /> : <VoiceDesignTab />}
+        </div>
+
+        <SavedVoicesTab />
+
+        <div className="mt-6 rounded-xl border border-border/70 bg-card/40 p-4" data-testid="tts-advanced-settings">
+          <div className="mb-4">
+            <h3 className="text-sm font-semibold text-foreground">Advanced</h3>
+            <p className="text-xs text-muted-foreground mt-1">
+              Route event types to specific voices, silence noisy activity sources, and override spoken text.
+            </p>
+          </div>
+
+          <div className="space-y-5">
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Voice Map</h4>
+                  <p className="text-xs text-muted-foreground mt-1">Use default falls back to the configured TTS voice.</p>
+                </div>
+                <span className="text-[10px] text-muted-foreground">{ttsVoices.length} saved voices</span>
+              </div>
+              <div className="overflow-hidden rounded-lg border border-border">
+                <div className="grid grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] bg-muted/30 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                  <span>Event key</span>
+                  <span>Voice</span>
+                </div>
+                {TTS_EVENT_KEYS.map((eventKey) => (
+                  <div key={eventKey} className="grid grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] items-center gap-3 border-t border-border px-3 py-2">
+                    <code className="truncate text-xs text-foreground">{eventKey}</code>
+                    <select
+                      value={ttsConfig.voiceMap?.[eventKey] ?? ''}
+                      onChange={(e) => handleTtsVoiceMapChange(eventKey, e.target.value)}
+                      disabled={saveMutation.isPending}
+                      aria-label={`Voice for ${eventKey}`}
+                      className="rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary disabled:opacity-50"
+                    >
+                      <option value="">Use default</option>
+                      {ttsVoices.map((voice) => (
+                        <option key={voice.id} value={voice.id}>{voice.name} ({voice.kind})</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <h4 className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Muted Sources</h4>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {ACTIVITY_SOURCE_OPTIONS.map((source) => (
+                  <label key={source} className="flex items-center gap-2 rounded-lg border border-border bg-background/60 px-3 py-2 text-xs text-foreground">
+                    <input
+                      type="checkbox"
+                      checked={ttsConfig.mutedSources?.includes(source) ?? false}
+                      onChange={(e) => handleTtsMutedSourceChange(source, e.target.checked)}
+                      disabled={saveMutation.isPending}
+                      className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-primary disabled:opacity-50"
+                    />
+                    <span>{source}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Utterance Templates</h4>
+                  <p className="text-xs text-muted-foreground mt-1">Templates may include {'{issueId}'}.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddTtsTemplate}
+                  disabled={!canAddTtsTemplate || saveMutation.isPending}
+                  className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-popover disabled:opacity-50"
+                >
+                  Add template
+                </button>
+              </div>
+              <div className="space-y-2">
+                {ttsTemplateEntries.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                    No utterance templates configured.
+                  </p>
+                )}
+                {ttsTemplateEntries.map(([eventKey, template]) => (
+                  <div key={eventKey} className="grid gap-2 rounded-lg border border-border bg-background/60 p-2 md:grid-cols-[minmax(12rem,16rem)_minmax(0,1fr)_auto]">
+                    <select
+                      value={eventKey}
+                      onChange={(e) => handleTtsTemplateKeyChange(eventKey, e.target.value)}
+                      disabled={saveMutation.isPending}
+                      aria-label="Template event key"
+                      className="rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary disabled:opacity-50"
+                    >
+                      {TTS_EVENT_KEYS.map((key) => (
+                        <option key={key} value={key}>{key}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={template}
+                      onChange={(e) => handleTtsTemplateChange(eventKey, e.target.value)}
+                      disabled={saveMutation.isPending}
+                      placeholder="e.g. {issueId} passed review"
+                      aria-label={`Template text for ${eventKey}`}
+                      className="rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary disabled:opacity-50"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveTtsTemplate(eventKey)}
+                      disabled={saveMutation.isPending}
+                      className="inline-flex items-center justify-center rounded-md border border-border px-2 py-1 text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                      aria-label={`Remove template for ${eventKey}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Tracker Keys */}
+      <section id="tracker-keys" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
+          Tracker Keys
         </h2>
-        <p className="text-content-muted text-sm mb-6">
-          Configure API keys for your issue trackers. These override environment variables ({TRACKERS.map(t => t.envVar).join(', ')}).
+        <p className="text-xs text-muted-foreground mb-3">
+          Override environment variables ({TRACKERS.map(t => t.envVar).join(', ')}).
         </p>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="space-y-1">
           {TRACKERS.map((tracker) => {
             const trackerKey = formData.tracker_keys?.[tracker.id] || '';
 
             return (
-              <div
-                key={tracker.id}
-                className="bg-surface-raised border border-divider rounded-xl p-5 relative transition-colors shadow-sm hover:border-divider-strong"
-              >
-                <div className="flex items-center gap-3 mb-5">
-                  <div className="size-10 rounded-lg bg-surface-emphasis border border-divider flex items-center justify-center">
-                    <tracker.icon className="w-5 h-5 text-content-subtle" />
+              <div key={tracker.id} className="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+                <tracker.icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-foreground">{tracker.name}</span>
+                    <span className="text-[10px] text-muted-foreground font-mono">{tracker.envVar}</span>
                   </div>
-                  <div>
-                    <span className="font-bold text-content">{tracker.name}</span>
-                    <p className="text-[10px] text-content-muted font-mono">{tracker.envVar}</p>
-                  </div>
+                  {trackerKey.startsWith('$') && (
+                    <p className="text-[10px] text-warning mt-0.5">
+                      Configured via env: <code className="font-mono">{trackerKey}</code>
+                    </p>
+                  )}
                 </div>
-                <div className="space-y-3">
-                  <div className="relative">
-                    <label className="text-[10px] uppercase font-bold text-content-muted mb-1 block">API Key / Token</label>
-                    {trackerKey.startsWith('$') ? (
-                      <div className="badge-bg-warning border badge-border-warning rounded-lg px-3 py-2">
-                        <div className="flex items-center gap-2 text-warning text-xs">
-                          <AlertTriangle className="w-4 h-4" />
-                          <span>Configured via <code className="font-mono bg-surface-overlay px-1 rounded">{trackerKey}</code></span>
-                        </div>
-                        <input
-                          type="text"
-                          placeholder={tracker.placeholder}
-                          onChange={(e) => handleTrackerKeyChange(tracker.id, e.target.value)}
-                          autoComplete="off"
-                          className="w-full bg-input-bg border border-divider-strong rounded-lg px-3 py-2 text-xs font-mono mt-2 focus:ring-1 focus:ring-primary focus:border-primary text-content-body"
-                        />
-                      </div>
-                    ) : (
-                      <div className="relative">
-                        <input
-                          type={showTrackerKey[tracker.id] ? 'text' : 'password'}
-                          value={trackerKey}
-                          onChange={(e) => handleTrackerKeyChange(tracker.id, e.target.value)}
-                          placeholder={tracker.placeholder}
-                          autoComplete="off"
-                          autoCorrect="off"
-                          autoCapitalize="off"
-                          spellCheck={false}
-                          data-lpignore="true"
-                          data-1p-ignore="true"
-                          data-form-type="other"
-                          className="w-full bg-input-bg border border-divider-strong rounded-lg px-3 py-2 pr-10 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-content-body"
-                        />
-                        <button
-                          onClick={() => setShowTrackerKey({ ...showTrackerKey, [tracker.id]: !showTrackerKey[tracker.id] })}
-                          className="absolute right-2 top-1/2 -translate-y-1/2 text-content-muted hover:text-content-body"
-                        >
-                          {showTrackerKey[tracker.id] ? (
-                            <Eye className="w-4 h-4" />
-                          ) : (
-                            <Eye className="w-4 h-4 opacity-50" />
-                          )}
-                        </button>
-                      </div>
-                    )}
-                  </div>
+                <div className="relative w-[200px] shrink-0">
+                  <input
+                    type={showTrackerKey[tracker.id] ? 'text' : 'password'}
+                    value={trackerKey.startsWith('$') ? '' : trackerKey}
+                    onChange={(e) => handleTrackerKeyChange(tracker.id, e.target.value)}
+                    placeholder={trackerKey.startsWith('$') ? 'Override env value...' : tracker.placeholder}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    data-form-type="other"
+                    className="w-full bg-background border border-border rounded-md px-2.5 py-1.5 pr-8 text-xs font-mono focus:ring-1 focus:ring-primary focus:border-primary text-foreground"
+                  />
+                  {(trackerKey && !trackerKey.startsWith('$')) && (
+                    <button
+                      onClick={() => setShowTrackerKey({ ...showTrackerKey, [tracker.id]: !showTrackerKey[tracker.id] })}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      aria-label={showTrackerKey[tracker.id] ? 'Hide key' : 'Show key'}
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -1292,171 +2525,243 @@ export function SettingsPage() {
         </div>
       </section>
 
-      {/* Agent Configuration by Category */}
-      <section id="model-assignments" className="mb-12 scroll-mt-4">
-        <h2 className="text-content text-2xl font-bold mb-2 flex items-center gap-3">
-          Model Assignments
-          <div className="h-px flex-1 bg-divider-strong" />
-        </h2>
-        <p className="text-content-muted text-sm mb-5 leading-relaxed">
-          Assign models to specific <strong className="text-content-body">work types</strong> — the internal routing identifiers that Panopticon uses to resolve which model an agent or workflow step should use. Click any card to change its model.
-        </p>
-
-        <div className="space-y-8">
-          {AGENT_CATEGORIES.map((category) => (
-            <div key={category.name}>
-              <div className="flex items-center gap-2 mb-4">
-                <category.icon className="w-5 h-5 text-content-muted" />
-                <h3 className="text-content-body font-semibold text-sm uppercase tracking-wider">{category.name}</h3>
-                <div className="h-px flex-1 bg-divider" />
-              </div>
-
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-                {category.agents.map((agent) => {
-                  const currentModelId = getEffectiveModelId(agent.id, formData.models.overrides);
-                  const modelDisplay = getModelDisplay(currentModelId);
-                  const { score, matched, missing } = getCapabilityMatchScore(currentModelId, agent.id);
-                  const requiredCaps = WORK_TYPE_CAPABILITIES[agent.id] || [];
-
-                  // Check if this model is deprecated
-                  const isDeprecated = formData.deprecation_warnings?.some(
-                    (w) => w.workType === agent.id && w.from === currentModelId
-                  );
-
-                  // Determine fit quality (poor fit is implicit else case)
-                  const isGoodFit = score >= 1 && !isDeprecated;
-                  const isOkFit = score >= 0.5 && score < 1 && !isDeprecated;
-
-                  // Build hover text
-                  const hoverText = [
-                    `${agent.name}: ${agent.description}`,
-                    !agent.implemented ? '⚠️ NOT YET IMPLEMENTED' : '',
-                    `Model: ${modelDisplay}`,
-                    isDeprecated ? '⚠️ DEPRECATED: Click to update to current model' : '',
-                    `Needs: ${requiredCaps.map(c => CAPABILITY_INFO[c].name).join(', ')}`,
-                    matched.length > 0 ? `✓ Has: ${matched.map(c => CAPABILITY_INFO[c].name).join(', ')}` : '',
-                    missing.length > 0 ? `✗ Missing: ${missing.map(c => CAPABILITY_INFO[c].name).join(', ')}` : '',
-                  ].filter(Boolean).join('\n');
-
-                  return (
-                    <div
-                      key={agent.id}
-                      onClick={() => agent.implemented && setModalWorkType(agent.id)}
-                      title={hoverText}
-                      className={`p-3 border rounded-lg transition-all group relative ${
-                        !agent.implemented
-                          ? 'opacity-50 bg-surface-emphasis border-divider cursor-not-allowed'
-                          : `cursor-pointer ${
-                            isDeprecated
-                              ? 'badge-bg-warning border-warning/50 hover:border-warning/70 hover:bg-warning/15'
-                              : isGoodFit
-                                ? 'badge-bg-success border-success/30 hover:border-success/50 hover:bg-success/10'
-                                : isOkFit
-                                  ? 'badge-bg-warning border-warning/30 hover:border-warning/50 hover:bg-warning/10'
-                                  : 'badge-bg-destructive border-destructive/30 hover:border-destructive/50 hover:bg-destructive/10'
-                            }`
-                      }`}
-                    >
-                      {isDeprecated && (
-                        <div className="absolute top-1 right-1">
-                          <span className="bg-warning text-foreground text-[8px] font-black px-1 py-0.5 rounded uppercase tracking-tighter">
-                            DEPRECATED
-                          </span>
-                        </div>
-                      )}
-                      {!agent.implemented && (
-                        <div className="absolute top-1 right-1">
-                          <span className="bg-muted-foreground text-foreground text-[8px] font-black px-1 py-0.5 rounded uppercase tracking-tighter">
-                            NOT YET IMPLEMENTED
-                          </span>
-                        </div>
-                      )}
-                      <div className="flex items-center justify-between mb-2">
-                        <agent.icon className={`w-4 h-4 ${
-                          isDeprecated ? 'text-warning' : isGoodFit ? 'text-success' : isOkFit ? 'text-warning' : 'text-destructive'
-                        }`} />
-                        {agent.implemented && (
-                          <span className={`text-[9px] font-bold ${
-                            isDeprecated ? 'text-warning' : isGoodFit ? 'text-success' : isOkFit ? 'text-warning' : 'text-destructive'
-                          }`}>
-                            {Math.round(score * 100)}%
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs font-semibold text-content truncate">{agent.name}</p>
-                      {agent.implemented && <p className="text-[10px] text-content-muted truncate mb-2">{modelDisplay}</p>}
-
-                      {/* Capability indicators */}
-                      <div className="flex gap-1 flex-wrap">
-                        {requiredCaps.slice(0, 3).map((cap: Capability) => {
-                          const hasIt = matched.includes(cap);
-                          return (
-                            <span
-                              key={cap}
-                              title={`${CAPABILITY_INFO[cap].name}: ${hasIt ? 'Model has this' : 'Model missing this'}`}
-                              className={`text-[8px] px-1 py-0.5 rounded ${
-                                hasIt
-                                  ? 'badge-bg-success text-success-foreground'
-                                  : 'badge-bg-destructive text-destructive-foreground'
-                              }`}
-                            >
-                              {CAPABILITY_INFO[cap].name}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
       {/* Appearance */}
-      <section className="mb-12">
-        <h2 className="text-content text-2xl font-bold mb-6 flex items-center gap-3">
-          <Eye className="w-6 h-6 text-primary" />
+      <section id="appearance" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">
           Appearance
         </h2>
-        <div className="bg-surface-raised border border-divider rounded-xl overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <h3 className="text-sm font-bold text-content flex items-center gap-2">
-                <GitMerge className="w-4 h-4 text-success" />
-                Ready to Merge shimmer
-              </h3>
-              <p className="text-xs text-content-muted mt-1">
-                Animate the "READY TO MERGE" badge with a subtle shimmer to draw attention to cards awaiting your merge approval.
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Ready to Merge shimmer</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Animate the badge with a subtle shimmer for cards awaiting merge approval
               </p>
             </div>
             <button
+              type="button"
               role="switch"
               aria-checked={uiPrefs.readyToMergeShimmer}
+              aria-label="Toggle Ready to Merge shimmer"
               onClick={() => updateUIPrefs({ readyToMergeShimmer: !uiPrefs.readyToMergeShimmer })}
-              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${uiPrefs.readyToMergeShimmer ? 'bg-primary' : 'bg-input'}`}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                uiPrefs.readyToMergeShimmer ? 'bg-primary' : 'bg-muted'
+              }`}
             >
-              <span
-                className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-150 ${uiPrefs.readyToMergeShimmer ? 'translate-x-5' : 'translate-x-0'}`}
-              />
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                uiPrefs.readyToMergeShimmer ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Diff */}
+      <section id="diff" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">Diff</h2>
+        <div className="space-y-1">
+          {/* diffRenderMode */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Diff style</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Unified (stacked) or split (side-by-side)</p>
+            </div>
+            <select
+              value={diffPrefs.diffRenderMode}
+              onChange={(e) => updateDiffPrefs({ diffRenderMode: e.target.value as 'stacked' | 'split' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              <option value="stacked">Stacked (unified)</option>
+              <option value="split">Split (side-by-side)</option>
+            </select>
+          </div>
+
+          {/* diffWordWrap */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Line wrapping</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Wrap long lines instead of scrolling horizontally</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={diffPrefs.diffWordWrap}
+              aria-label="Toggle line wrapping"
+              onClick={() => updateDiffPrefs({ diffWordWrap: !diffPrefs.diffWordWrap })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                diffPrefs.diffWordWrap ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                diffPrefs.diffWordWrap ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          {/* lineDiffType */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Intra-line diff granularity</span>
+              <p className="text-xs text-muted-foreground mt-0.5">How finely to highlight changes within a single line</p>
+            </div>
+            <select
+              value={diffPrefs.lineDiffType}
+              onChange={(e) => updateDiffPrefs({ lineDiffType: e.target.value as 'word-alt' | 'word' | 'char' | 'none' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              <option value="word-alt">Word-alt (join adjacent)</option>
+              <option value="word">Word</option>
+              <option value="char">Character</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+
+          {/* diffIndicators */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Change indicators</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Classic +/- prefixes, colored bars, or none</p>
+            </div>
+            <select
+              value={diffPrefs.diffIndicators}
+              onChange={(e) => updateDiffPrefs({ diffIndicators: e.target.value as 'classic' | 'bars' | 'none' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              <option value="bars">Bars</option>
+              <option value="classic">Classic (+/-)</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+
+          {/* hunkSeparators */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Hunk separators</span>
+              <p className="text-xs text-muted-foreground mt-0.5">How collapsed hunks are displayed between change groups</p>
+            </div>
+            <select
+              value={diffPrefs.hunkSeparators}
+              onChange={(e) => updateDiffPrefs({ hunkSeparators: e.target.value as 'simple' | 'metadata' | 'line-info' | 'line-info-basic' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              <option value="line-info">Line info</option>
+              <option value="line-info-basic">Line info (basic)</option>
+              <option value="simple">Simple</option>
+              <option value="metadata">Metadata</option>
+            </select>
+          </div>
+
+          {/* expandUnchanged */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Expand unchanged</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Auto-expand all unchanged context lines</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={diffPrefs.expandUnchanged}
+              aria-label="Toggle expand unchanged"
+              onClick={() => updateDiffPrefs({ expandUnchanged: !diffPrefs.expandUnchanged })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                diffPrefs.expandUnchanged ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                diffPrefs.expandUnchanged ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          {/* collapsedContextThreshold */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Collapsed context threshold</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Lines of context before collapsing unchanged blocks</p>
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={20}
+              value={diffPrefs.collapsedContextThreshold}
+              onChange={(e) => updateDiffPrefs({ collapsedContextThreshold: Math.max(0, Math.min(20, Number(e.target.value))) })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary w-[80px]"
+            />
+          </div>
+
+          {/* lineHoverHighlight */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Line hover highlight</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Highlight lines on mouse hover</p>
+            </div>
+            <select
+              value={diffPrefs.lineHoverHighlight}
+              onChange={(e) => updateDiffPrefs({ lineHoverHighlight: e.target.value as 'disabled' | 'both' | 'number' | 'line' })}
+              className="bg-background border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:ring-1 focus:ring-primary max-w-[200px]"
+            >
+              <option value="disabled">Disabled</option>
+              <option value="both">Both (number + line)</option>
+              <option value="number">Number only</option>
+              <option value="line">Line only</option>
+            </select>
+          </div>
+
+          {/* disableLineNumbers */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Hide line numbers</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Remove line number columns from diff view</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={diffPrefs.disableLineNumbers}
+              aria-label="Toggle hide line numbers"
+              onClick={() => updateDiffPrefs({ disableLineNumbers: !diffPrefs.disableLineNumbers })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                diffPrefs.disableLineNumbers ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                diffPrefs.disableLineNumbers ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+
+          {/* enableLineSelection */}
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Enable line selection</span>
+              <p className="text-xs text-muted-foreground mt-0.5">Multi-line selection with shift-click</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={diffPrefs.enableLineSelection}
+              aria-label="Toggle enable line selection"
+              onClick={() => updateDiffPrefs({ enableLineSelection: !diffPrefs.enableLineSelection })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+                diffPrefs.enableLineSelection ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                diffPrefs.enableLineSelection ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
             </button>
           </div>
         </div>
       </section>
 
       {/* Maintenance */}
-      <section className="space-y-3 pb-20">
-        <h2 className="text-xl font-black text-content">Maintenance</h2>
-        <div className="bg-surface-emphasis rounded-xl border border-divider p-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-bold text-content flex items-center gap-2">
-                <Trash2 className="w-4 h-4 text-content-subtle" />
-                Issue Cache
-              </h3>
-              <p className="text-xs text-content-muted mt-1">
-                Clear cached issue data and re-fetch from all trackers. Use this if issue identifiers or data appear stale.
+      <section id="maintenance" className="py-6 scroll-mt-4">
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4">Maintenance</h2>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Issue cache</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Clear cached issue data and re-fetch from all trackers
               </p>
             </div>
             <button
@@ -1474,52 +2779,38 @@ export function SettingsPage() {
                 }
               }}
               disabled={clearingCache}
-              className="px-4 py-2 text-sm font-semibold rounded-lg border border-divider hover:border-warning/50 hover:bg-warning/10 text-content-muted hover:text-warning transition-all flex items-center gap-2 disabled:opacity-50"
+              className="px-3 py-1.5 text-xs font-medium rounded-md border border-border hover:border-warning/50 hover:bg-warning/10 text-muted-foreground hover:text-warning transition-all flex items-center gap-1.5 disabled:opacity-50"
             >
-              {clearingCache ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+              {clearingCache ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
               {clearingCache ? 'Clearing...' : 'Clear & Refresh'}
             </button>
           </div>
         </div>
       </section>
 
-
-      </div>{/* end max-w content */}
-
-      {/* Model Override Modal */}
-      {modalWorkType && (
-        <ModelOverrideModal
-          workType={modalWorkType}
-          currentModel={getEffectiveModelId(modalWorkType, formData.models.overrides)}
-          isOverride={!!formData.models.overrides[modalWorkType]}
-          enabledProviders={Object.entries(formData.models.providers)
-            .filter(([_, enabled]) => enabled)
-            .map(([provider]) => provider)}
-          openRouterFavorites={openRouterFavoriteModels}
-          onApply={(model) => handleSetOverride(modalWorkType, model)}
-          onRemove={() => handleRemoveOverride(modalWorkType)}
-          onClose={() => setModalWorkType(null)}
-        />
-      )}
+      {/* Desktop App settings — shown only inside Electron */}
+      <div id="desktop" className="py-6 scroll-mt-4">
+        <DesktopSettingsSection />
+      </div>
 
       {/* Provider Models Modal */}
       {modelsModalProvider && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-surface-raised border border-divider-strong rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
+          <div className="bg-card border border-border rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
             {/* Header */}
-            <div className="flex items-center justify-between p-4 border-b border-divider">
+            <div className="flex items-center justify-between p-4 border-b border-border">
               <div className="flex items-center gap-3">
                 {(() => {
                   const Icon = PROVIDERS.find(p => p.id === modelsModalProvider)?.icon;
                   return Icon ? <Icon className="w-5 h-5 text-primary" /> : null;
                 })()}
-                <h3 className="text-content text-lg font-bold">
+                <h3 className="text-foreground text-lg font-bold">
                   {PROVIDERS.find(p => p.id === modelsModalProvider)?.name} Models
                 </h3>
               </div>
               <button
                 onClick={() => setModelsModalProvider(null)}
-                className="text-content-muted hover:text-content transition-colors"
+                className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1534,8 +2825,8 @@ export function SettingsPage() {
                 if (!providerApiKey) {
                   return (
                     <div className="text-center py-8">
-                      <Key className="w-10 h-10 text-content-muted mb-2 mx-auto" />
-                      <p className="text-content-muted">Enter an API key to test models</p>
+                      <Key className="w-10 h-10 text-muted-foreground mb-2 mx-auto" />
+                      <p className="text-muted-foreground">Enter an API key to test models</p>
                     </div>
                   );
                 }
@@ -1545,10 +2836,10 @@ export function SettingsPage() {
                     <div className="text-center py-8">
                       <AlertTriangle className="w-10 h-10 text-warning mb-2 mx-auto" />
                       <p className="text-warning">API key configured via environment variable</p>
-                      <p className="text-content-muted text-sm mt-1">
-                        <code className="font-mono bg-surface-overlay px-1 rounded">{providerApiKey}</code> is not set
+                      <p className="text-muted-foreground text-sm mt-1">
+                        <code className="font-mono bg-popover px-1 rounded">{providerApiKey}</code> is not set
                       </p>
-                      <p className="text-content-muted text-xs mt-2">Set the environment variable or enter the key directly in Settings</p>
+                      <p className="text-muted-foreground text-xs mt-2">Set the environment variable or enter the key directly in Settings</p>
                     </div>
                   );
                 }
@@ -1563,16 +2854,16 @@ export function SettingsPage() {
                     return (
                       <div
                         key={model.id}
-                        className="bg-surface border border-divider rounded-lg p-4 hover:border-divider-strong transition-colors"
+                        className="bg-card border border-border rounded-lg p-4 hover:border-border transition-colors"
                       >
                         <div className="flex items-start justify-between gap-4">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 mb-1">
                               {/* Model icons are strings (Material Symbols names) - render as text fallback */}
-                              <div className="w-4 h-4 flex items-center justify-center text-content-muted text-[10px]">
+                              <div className="w-4 h-4 flex items-center justify-center text-muted-foreground text-[10px]">
                                 {typeof model.icon === 'string' ? model.icon[0] : '◆'}
                               </div>
-                              <h4 className="text-content font-semibold">{model.name}</h4>
+                              <h4 className="text-foreground font-semibold">{model.name}</h4>
                               {model.tier && (
                                 <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
                                   model.tier === 'premium' ? 'badge-bg-signal-review text-signal-review-foreground' :
@@ -1584,13 +2875,13 @@ export function SettingsPage() {
                               )}
                             </div>
                             {model.description && (
-                              <p className="text-xs text-content-muted mb-2">{model.description}</p>
+                              <p className="text-xs text-muted-foreground mb-2">{model.description}</p>
                             )}
                             <div className="flex flex-wrap gap-1">
                               {model.capabilities.map((cap) => (
                                 <span
                                   key={cap}
-                                  className="text-[9px] px-1.5 py-0.5 bg-surface-emphasis text-content-subtle rounded border border-divider"
+                                  className="text-[9px] px-1.5 py-0.5 bg-card text-muted-foreground rounded border border-border"
                                 >
                                   {cap}
                                 </span>
@@ -1633,8 +2924,8 @@ export function SettingsPage() {
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t border-divider bg-surface">
-              <p className="text-xs text-content-muted text-center">
+            <div className="p-4 border-t border-border bg-card">
+              <p className="text-xs text-muted-foreground text-center">
                 Test verifies API key and model availability by asking "What is 2+3?"
               </p>
             </div>
@@ -1642,8 +2933,72 @@ export function SettingsPage() {
         </div>
       )}
 
-      {/* Desktop App settings — shown only inside Electron */}
-      <DesktopSettingsSection />
-    </div>
+      {/* Experimental — research-preview features, must remain the LAST section on the page */}
+      <section
+        id="experimental"
+        data-testid="experimental-section"
+        aria-label="Experimental"
+        className="py-6 scroll-mt-4 border-t border-warning/30 mt-4"
+      >
+        <h2 className="text-foreground text-base font-semibold tracking-tight mb-4 flex items-center gap-2">
+          <Beaker className="w-4 h-4 text-warning" />
+          Experimental
+        </h2>
+        <p className="text-xs text-muted-foreground mb-3">
+          Research-preview features that may change or be removed without notice.
+        </p>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">RTK Bash compression</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Filters Bash command outputs through rtk-ai/rtk to reduce token consumption. Opt-in.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={Boolean(formData.agents?.rtk?.enabled)}
+              aria-label="Enable RTK Bash compression"
+              data-testid="experimental-rtk-toggle"
+              onClick={() => handleRtkToggle(!formData.agents?.rtk?.enabled)}
+              disabled={saveMutation.isPending}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:opacity-50 ${
+                formData.agents?.rtk?.enabled ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                formData.agents?.rtk?.enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+          <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-lg hover:bg-muted/30 transition-colors">
+            <div className="min-w-0">
+              <span className="text-sm font-medium text-foreground">Claude Code Channels</span>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Use Channels transport for conversation delivery; work-agent MCP wiring is YAML-only
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={Boolean(formData.experimental?.claudeCodeChannels)}
+              aria-label="Use Claude Code Channels for prompt delivery (work agents only)"
+              data-testid="experimental-claude-code-channels-toggle"
+              onClick={() => handleClaudeCodeChannelsToggle(!formData.experimental?.claudeCodeChannels)}
+              disabled={saveMutation.isPending}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:opacity-50 ${
+                formData.experimental?.claudeCodeChannels ? 'bg-primary' : 'bg-muted'
+              }`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                formData.experimental?.claudeCodeChannels ? 'translate-x-[18px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+        </div>
+      </section>
+
+    </SettingsLayout>
   );
 }

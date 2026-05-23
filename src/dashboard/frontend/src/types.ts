@@ -27,7 +27,7 @@ export interface Issue {
   project?: LinearProject;
   source?: IssueSource;
   sourceRepo?: string;
-  state?: string;  // Canonical issue state (e.g. 'canceled', 'done', 'in_review')
+  state?: CanonicalState;  // Canonical issue state (e.g. 'canceled', 'done', 'verifying_on_main')
   shadowStatus?: 'open' | 'in_progress' | 'closed';  // Shadow mode status tracking
   targetCanonicalState?: CanonicalState;  // Explicit column placement from drag-drop
   shadowedAt?: string;  // When shadow state was created
@@ -40,6 +40,12 @@ export interface Issue {
   completedChildCount?: number;  // Children in Done state
   inProgressChildCount?: number;  // Children in active work
   mergeStatus?: 'pending' | 'queued' | 'merging' | 'verifying' | 'merged' | 'failed';  // From review-status, set by specialist pipeline
+  // Planning-state (embedded from /api/issues via filesystem checks)
+  hasPlan?: boolean;
+  hasBeads?: boolean;
+  planningComplete?: boolean;
+  workspacePath?: string;
+  beadCounts?: { completed: number; total: number } | null;
 }
 
 export interface GitStatus {
@@ -48,7 +54,7 @@ export interface GitStatus {
   latestCommit: string;
 }
 
-export type AgentResolution = 'working' | 'done' | 'needs_input' | 'stuck' | 'completed' | 'unclear' | 'abandoned';
+export type AgentResolution = 'working' | 'done' | 'needs_input' | 'stuck' | 'completed' | 'unclear' | 'abandoned' | 'api_error';
 
 export interface WorkAgentLifecycle {
   agentId: string;
@@ -77,21 +83,46 @@ export interface Agent {
   id: string;
   issueId?: string;
   runtime: string;
+  harness?: 'claude-code' | 'pi' | null;
   model: string;
-  status: 'healthy' | 'warning' | 'stuck' | 'dead' | 'stopped' | 'starting' | 'failed';
+  status: 'healthy' | 'warning' | 'stuck' | 'dead' | 'stopped' | 'starting' | 'running' | 'failed' | 'error' | 'unknown';
   error?: string;
   pid?: number;
   startedAt: string;
   lastActivity?: string;
+  stoppedByUser?: boolean;
+  paused?: boolean;
+  pausedReason?: string;
+  pausedAt?: string;
+  troubled?: boolean;
+  troubledAt?: string;
   consecutiveFailures: number;
+  firstFailureInRunAt?: string;
+  lastFailureAt?: string;
+  lastFailureReason?: string;
+  lastFailureNextRetryAt?: string;
   killCount: number;
   workspace?: string;
   workspaceLocation?: 'local' | 'remote';
+  costSoFar?: number;
   git?: GitStatus;
   type?: 'agent';
+  /**
+   * PAN-1048 role primitive. Replaces the legacy agentPhase string.
+   * 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel'.
+   */
+  role?: 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel';
+  /**
+   * @deprecated PAN-1048 — server stopped emitting this; kept on the type
+   * temporarily so older test fixtures still compile while their references
+   * are removed. New code MUST consume `role` plus `lifecycle.hasLiveTmuxSession`
+   * instead of branching on this field.
+   */
   agentPhase?: 'planning' | 'implementation' | 'exploration' | string;
   hasPendingQuestion?: boolean;
   pendingQuestionCount?: number;
+  pendingQuestionPrompt?: string;
+  pendingQuestionReason?: string;
   resolution?: AgentResolution;  // Lifecycle completion signal (PAN-309)
   resolutionCount?: number;      // How many times this resolution was set
   runtimeState?: string;         // 'completed' when agent finished normally (not session lost)
@@ -123,6 +154,7 @@ export type CanonicalState =
   | 'todo'
   | 'in_progress'
   | 'in_review'
+  | 'verifying_on_main'
   | 'done'
   | 'canceled';
 
@@ -134,6 +166,7 @@ export const STATUS_ORDER: CanonicalState[] = [
   'todo',
   'in_progress',
   'in_review',
+  'verifying_on_main',
   'done'
 ];
 
@@ -153,6 +186,7 @@ export const STATUS_LABELS: Record<string, CanonicalState> = {
   // In Progress states
   'In Progress': 'in_progress',
   'In Planning': 'in_progress',
+  'Planning': 'in_progress',
   'Started': 'in_progress',
   'Active': 'in_progress',
 
@@ -161,6 +195,11 @@ export const STATUS_LABELS: Record<string, CanonicalState> = {
   'Review': 'in_review',
   'QA': 'in_review',
   'Testing': 'in_review',
+
+  // Verifying states
+  'Verifying': 'verifying_on_main',
+  'Verifying On Main': 'verifying_on_main',
+  'verifying-on-main': 'verifying_on_main',
 
   // Done states
   'Done': 'done',
@@ -183,6 +222,7 @@ export const STATE_TYPE_MAP: Record<CanonicalState, StateType> = {
   todo: 'unstarted',
   in_progress: 'started',
   in_review: 'started',
+  verifying_on_main: 'started',
   done: 'completed',
   canceled: 'canceled',
 };
@@ -232,6 +272,102 @@ export interface ResourcesSnapshot {
   containers: ContainerStats[];
   agents: Agent[];
   updatedAt: string;
+}
+
+export interface SystemHealthAgentProcess {
+  id: string;
+  issueId: string;
+  kind: 'work' | 'planning' | 'specialist' | 'other';
+  status: string;
+  tmuxActive: boolean;
+  memoryBytes: number;
+  memoryGb: number;
+  currentIssue?: string;
+}
+
+export interface SystemHealthLeakedSpecialist {
+  name: string;
+  currentIssue: string;
+  reason: string;
+}
+
+export interface SystemHealthConsumer {
+  id: string;
+  label: string;
+  type: 'agent' | 'specialist' | 'container';
+  memoryBytes: number;
+  memoryGb: number;
+  cpuPercent?: number;
+  issueId?: string;
+  currentIssue?: string;
+  leaked?: boolean;
+  killTarget?: {
+    kind: 'agent' | 'specialist' | 'container';
+    agentId?: string;
+    containerId?: string;
+    projectKey?: string;
+    issueId?: string;
+    specialistType?: string;
+  };
+}
+
+export interface SystemHealthSnapshot {
+  severity: 'normal' | 'warning' | 'critical';
+  updatedAt: string;
+  summary: {
+    cpuPercent: number;
+    loadAverage1m: number;
+    loadPerCore1m: number;
+    totalMemoryBytes: number;
+    usedMemoryBytes: number;
+    availableMemoryBytes: number;
+    memoryUsedPercent: number;
+    swapTotalBytes: number;
+    swapUsedBytes: number;
+    swapUsedPercent: number;
+    overcommitPercent: number;
+    agentCount: number;
+    workAgentCount: number;
+    planningAgentCount: number;
+    specialistSessionCount: number;
+    leakedSpecialistCount: number;
+    containerCount: number;
+    containerMemoryBytes: number;
+    panopticonMemoryBytes: number;
+    panopticonMemoryPercent: number;
+  };
+  thresholds: {
+    memoryAvailableWarningBytes: number;
+    memoryAvailableCriticalBytes: number;
+    swapUsedWarningPercent: number;
+    swapUsedCriticalPercent: number;
+    cpuLoadWarningPerCore: number;
+    cpuLoadCriticalPerCore: number;
+    overcommitWarningPercent: number;
+    overcommitCriticalPercent: number;
+  };
+  reasons: string[];
+  agents: SystemHealthAgentProcess[];
+  leakedSpecialists: SystemHealthLeakedSpecialist[];
+  topConsumers: SystemHealthConsumer[];
+}
+
+export interface StartAgentGuardrailWarning {
+  severity?: 'warning' | 'critical';
+  code?: string;
+  message: string;
+}
+
+export interface StartAgentResponse {
+  success?: boolean;
+  blocked?: boolean;
+  skipped?: boolean;
+  requiresAcknowledgement?: boolean;
+  error?: string;
+  hint?: string;
+  guardrails?: {
+    warnings?: StartAgentGuardrailWarning[];
+  };
 }
 
 // State transition result

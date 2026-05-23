@@ -5,9 +5,11 @@
  * multiple operations and return a WorkflowResult.
  */
 
-import { existsSync, readFileSync } from 'fs';
+import { existsSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import type { IssueTracker } from '../tracker/interface.js';
 
 export interface StepResult {
   step: string;
@@ -44,6 +46,10 @@ export interface LifecycleContext {
     workspace?: string;
     project?: string;
   };
+  /** Issue tracker abstraction used by lifecycle operations when available */
+  tracker?: IssueTracker;
+  /** True when lifecycle work was started by Deacon automation rather than an operator */
+  auto?: boolean;
 }
 
 /** Options for teardown-workspace */
@@ -92,6 +98,8 @@ export interface DeepWipeProgress {
 }
 
 export interface DeepWipeOptions {
+  /** IssueTracker instance for tracker-aware reset/cancel messages */
+  tracker?: IssueTracker;
   /** Delete workspace directory. Default: true */
   deleteWorkspace?: boolean;
   /** Delete git branches (local + remote). Default: true */
@@ -128,12 +136,16 @@ export function stepFailed(step: string, error: string, details?: string[]): Ste
 /**
  * Get LINEAR_API_KEY from environment or .panopticon.env.
  * Shared across lifecycle modules.
+ *
+ * Kept as a sync function (not Effect-wrapped) because external callers
+ * outside the lifecycle/ batch (src/lib/close-out.ts) consume it synchronously.
+ * Those callers will migrate in their own batches.
  */
-export function getLinearApiKey(): string | null {
+export async function getLinearApiKey(): Promise<string | null> {
   if (process.env.LINEAR_API_KEY) return process.env.LINEAR_API_KEY;
   const envFile = join(homedir(), '.panopticon.env');
   if (existsSync(envFile)) {
-    const content = readFileSync(envFile, 'utf-8');
+    const content = await readFile(envFile, 'utf-8');
     const match = content.match(/LINEAR_API_KEY=(.+)/);
     if (match) return match[1].trim();
   }

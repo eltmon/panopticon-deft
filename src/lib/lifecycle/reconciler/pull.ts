@@ -6,7 +6,7 @@
  */
 
 import { getDatabase } from '../../database/index.js';
-import { parseGitHubRepos } from '../../tracker-utils.js';
+import { parseGitHubReposSync } from '../../tracker-utils.js';
 import { recordAudit } from './audit.js';
 import type { GitHubClient } from './github-client.js';
 import type { CanonicalState, ReconcilerConfig } from './types.js';
@@ -47,7 +47,7 @@ function remoteToCanonical(
  * Resolve the issue prefix for the configured repo.
  */
 export function resolvePrefix(config: ReconcilerConfig): string | null {
-  const repos = parseGitHubRepos();
+  const repos = parseGitHubReposSync();
   const [owner, repo] = config.repo.split('/');
   const match = repos.find((r) => r.owner === owner && r.repo === repo);
   return match ? match.prefix : null;
