@@ -4,17 +4,17 @@
     "created": "2026-05-23T04:50:13.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1132: TLDR — fix broken status reporting + expose to work agents",
-    "updated": "2026-05-23T04:52:18.574Z"
+    "updated": "2026-05-23T17:50:19.281Z"
   },
   "plan": {
     "id": "pan-1132",
     "title": "TLDR: fix broken status reporting + expose to work agents",
-    "status": "proposed",
+    "status": "completed",
     "uid": "0c406d35-023b-455e-8d02-547d67ccc5ad",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T04:50:13.000Z",
-    "updated": "2026-05-23T04:52:18.574Z",
+    "updated": "2026-05-23T17:50:19.281Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1132",
@@ -325,5 +325,5 @@
       "canonicalFilename": "2026-05-23-PAN-1132-tldr-fix-broken-status-reporting-expose-to-work-agents.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
