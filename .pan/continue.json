@@ -1,0 +1,82 @@
+{
+  "version": "1",
+  "issueId": "PAN-1429",
+  "created": "2026-05-23T18:55:00.876Z",
+  "updated": "2026-05-23T18:56:43.000Z",
+  "gitState": { "branch": "feature/pan-1429", "sha": "0ac7ae801", "dirty": false },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Adopt sink-type-aware prepend (USB=600ms, HDMI/DisplayPort=1500ms, Bluetooth=1000ms, unknown=1500ms) over the PLAYER_IDLE_TIMEOUT bump alternative.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Probe sink kind from a single `pactl list sinks` (long-form) call that also yields the existing state, replacing the current short-form probe. Parse Driver/Description/device.bus/device.class/api.bluez5 keys to classify; fall back to 'unknown' on any parse error.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "On cold start (sink SUSPENDED), prepend silence based on detected sink kind; on warm pw-play reuse, retain the existing 50ms safety prepend with no probe overhead.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Unit tests live alongside the daemon at sync-sources/skills/pan-tts/tests/test_tts_daemon.py, use stdlib unittest.mock (no new dependency), and are run with `python -m unittest discover sync-sources/skills/pan-tts/tests`.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Edit sync-sources/skills/pan-tts/scripts/tts_daemon.py only — .claude/skills/pan-tts/scripts/tts_daemon.py is a sync mirror handled by `pan sync` and must not be edited directly.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    },
+    {
+      "id": "D6",
+      "summary": "Replace the PAN-1028 inline comment block (currently citing 600ms vs 1.5s) with a short reference to the kind→prepend table; keep the implementation self-documenting via a SINK_PREPEND_SECS constant.",
+      "recordedAt": "2026-05-23T18:56:43.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "pactl output format varies across PipeWire/PulseAudio versions; Driver/Description strings are not stable enough alone for sink classification.",
+      "mitigation": "Classify with a layered match — Driver substring (e.g. 'module-bluez5-device', 'module-alsa-card'), then Properties (device.bus=usb, device.class, api.bluez5.transport), then Description keywords ('HDMI', 'DisplayPort', 'USB'). Treat any unrecognised pattern as 'unknown' so the 1500ms safe default applies."
+    },
+    {
+      "id": "H2",
+      "summary": "`pactl list sinks` is slower than `pactl list short sinks`; calling it on every utterance would regress warm-path latency.",
+      "mitigation": "Only probe when spawning a fresh pw-play subprocess (existing `created` flag). Warm-path stays at 50ms with no pactl call. Keep the 2.0s subprocess timeout."
+    },
+    {
+      "id": "H3",
+      "summary": "DisplayPort sinks present as HDMI to ALSA — Description may say either 'HDMI' or 'DisplayPort' or only show the codec name.",
+      "mitigation": "Treat the HDMI sink-kind bucket as covering DisplayPort too. Detection MUST match on Driver=module-alsa-card AND (Description contains HDMI/DisplayPort/DP OR device.class=sound and alsa.long_card_name contains GPU vendor). Cover this in unit tests with at least one DisplayPort-shaped pactl fixture."
+    },
+    {
+      "id": "H4",
+      "summary": "Tests run under CI or workspace containers where `pactl` is absent — the production fallback path must not depend on pactl being installed.",
+      "mitigation": "Wrap subprocess.run in the existing try/except; on FileNotFoundError or non-zero return, return (state='SUSPENDED', kind='unknown') so the safe 1500ms default applies. Unit tests mock subprocess.run entirely; do not invoke the real pactl."
+    },
+    {
+      "id": "H5",
+      "summary": "Bluetooth latency varies wildly by codec/profile (A2DP-SBC vs LDAC vs HFP); 1000ms is the issue-specified default but may be insufficient for some headsets.",
+      "mitigation": "Use the issue-specified 1000ms in this fix. If real-world Bluetooth regressions surface, open a follow-up issue to lift Bluetooth into the 'unknown'/safe bucket (1500ms). Note this trade-off in SKILL.md."
+    },
+    {
+      "id": "H6",
+      "summary": "Two copies of tts_daemon.py exist in the worktree: sync-sources/skills/pan-tts/scripts/ (source) and .claude/skills/pan-tts/scripts/ (sync mirror).",
+      "mitigation": "Work agent must edit only sync-sources/. After implementation, run `pan sync` (or commit only sync-sources and let the host-side sync hook propagate) so the mirror stays consistent. Verify the mirror is unchanged-or-resynced before `pan done`."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-7",
+  "sessionHistory": [
+    {
+      "timestamp": "2026-05-23T18:55:00.876Z",
+      "reason": "planning",
+      "note": "Initial planning session (auto mode)",
+      "agentModel": "agent:claude-opus-4-7"
+    }
+  ]
+}
