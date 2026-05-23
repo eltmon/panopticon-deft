@@ -4,17 +4,17 @@
     "created": "2026-05-23T06:30:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1402: Work agent state.json.claudeSessionId stays null — heartbeat hook never records the Claude session",
-    "updated": "2026-05-23T06:15:37.990Z"
+    "updated": "2026-05-23T17:50:45.735Z"
   },
   "plan": {
     "id": "pan-1402",
     "title": "Restore PreToolUse/PostToolUse/Stop hook registration in global settings.json (revert PAN-982)",
-    "status": "proposed",
+    "status": "completed",
     "uid": "3a92961a-e967-4dab-9eb2-582bda8ea473",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T06:30:00.000Z",
-    "updated": "2026-05-23T06:15:37.990Z",
+    "updated": "2026-05-23T17:50:45.735Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1402",
@@ -325,5 +325,5 @@
       "canonicalFilename": "2026-05-23-PAN-1402-restore-pretooluse-posttooluse-stop-hook-registration-in-global-settings-json-revert-pan-982.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
