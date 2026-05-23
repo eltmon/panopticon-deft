@@ -4,17 +4,17 @@
     "created": "2026-05-23T04:45:20.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1370: Editor & file-navigation integration — wire up Open picker, port MarkdownFileLink chip menu, add file Quickview, expand editor registry",
-    "updated": "2026-05-23T04:49:52.083Z"
+    "updated": "2026-05-23T17:51:07.230Z"
   },
   "plan": {
     "id": "pan-1370",
     "title": "Editor & file-navigation integration: wire up Open picker, port MarkdownFileLink chip menu, add file Quickview, expand editor registry",
-    "status": "proposed",
+    "status": "completed",
     "uid": "81e8d36e-92b8-471a-a6b7-3e8b24ca11d6",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T04:45:20.000Z",
-    "updated": "2026-05-23T04:49:52.083Z",
+    "updated": "2026-05-23T17:51:07.230Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1370",
@@ -864,5 +864,5 @@
       "canonicalFilename": "2026-05-23-PAN-1370-editor-file-navigation-integration-wire-up-open-picker-port-markdownfilelink-chip-menu-add-file-quickview-expand-editor-registry.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
