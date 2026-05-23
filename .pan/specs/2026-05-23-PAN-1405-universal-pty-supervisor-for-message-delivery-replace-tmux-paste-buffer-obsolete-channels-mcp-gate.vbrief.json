@@ -4,17 +4,17 @@
     "created": "2026-05-23T06:55:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1405: Universal PTY supervisor for message delivery (replace tmux paste-buffer + obsolete channels MCP gate)",
-    "updated": "2026-05-23T06:49:10.591Z"
+    "updated": "2026-05-23T17:50:49.933Z"
   },
   "plan": {
     "id": "pan-1405",
     "title": "Universal PTY supervisor for message delivery (replace tmux paste-buffer + obsolete channels MCP gate)",
-    "status": "proposed",
+    "status": "completed",
     "uid": "c8f3e9b2-7a4d-4f1e-b8c5-9d2a3f6e1c4b",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T06:55:00.000Z",
-    "updated": "2026-05-23T06:49:10.591Z",
+    "updated": "2026-05-23T17:50:49.933Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1405",
@@ -922,5 +922,5 @@
       "canonicalFilename": "2026-05-23-PAN-1405-universal-pty-supervisor-for-message-delivery-replace-tmux-paste-buffer-obsolete-channels-mcp-gate.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
