@@ -1,0 +1,98 @@
+{
+  "version": "1",
+  "issueId": "PAN-1430",
+  "created": "2026-05-23T18:55:25.046Z",
+  "updated": "2026-05-23T19:10:00.000Z",
+  "gitState": {
+    "branch": "feature/pan-1430",
+    "sha": "0ac7ae801",
+    "dirty": false
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Three-bead decomposition: (1) patrol-scope filter in reconcileFalseMerged, (2) one-shot 401 retry in githubApi, (3) module-level circuit breaker with 5-min TTL and single actionable log.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "The patrol-scope filter uses the same cached `gh issue view --json state,labels` pattern as `getAutoCloseOutCanonicalState` in deacon.ts:3766. Skip issues whose canonical state is `done` or `canceled`. Reuse the existing `autoCloseOutCache` (10-min TTL) rather than introducing a parallel cache.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "The 401 retry is scoped to the private `githubApi<T>` helper in src/lib/github-app.ts only (3 in-file callers). Direct-fetch sites `mergePullRequestWithAppPromise` and `reportCommitStatus` are NOT modified — they are out of the reported symptom path (patrol false-merged check) and not part of the 60s patrol cadence that causes log spam.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Circuit breaker is module-level state in github-app.ts (`appDegradedUntil: number`, `appDegradedLogged: boolean`). 5-minute TTL = 5 patrol cycles. Self-clearing — no admin command required to reset for transient failures.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Diagnostic recovery command in the breaker's error message is `node scripts/create-github-app.mjs` (with the `PANOPTICON_DEV_WEBHOOKS=1` env gate the script enforces). The issue text suggests `pan admin github-app refresh` but no such CLI verb currently exists; pointing at the truthful, existing path is preferable to inventing a command.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D6",
+      "summary": "Only HTTP 401 triggers the retry — 403/404/5xx preserve the existing single-shot error path. Rationale: 401 specifically indicates token rejection; 403 means token is accepted but lacks permission (retry won't help); 404 means resource is gone (retry won't help); 5xx is a server issue (different retry policy, out of scope).",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    },
+    {
+      "id": "D7",
+      "summary": "Implementation and unit tests are bundled per bead (3 beads instead of 6). Splitting impl from tests would create un-shippable beads (impl with no coverage in main briefly). Each bead is independently mergeable as a complete impl+test unit.",
+      "recordedAt": "2026-05-23T19:10:00.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "`githubApi` is module-private with only 3 in-file callers — but tests must not accidentally exercise the network. Tests must mock the global `fetch` via `vi.stubGlobal('fetch', ...)` or similar, not hit api.github.com.",
+      "mitigation": "Vitest pattern: `vi.stubGlobal('fetch', vi.fn())` in beforeEach with returnValueOnce sequences for the 401 → retry → 200/401 paths. Also stub `loadGitHubAppConfig` to return a synthetic config so the JWT-signing path doesn't try to read ~/.panopticon/github-app/private-key.pem."
+    },
+    {
+      "id": "H2",
+      "summary": "The breaker's 5-min TTL and the log-once semantic interact with test isolation. If two tests in the same file open the breaker, the second test's 'first log' check will fail because module state persists across tests.",
+      "mitigation": "Add an internal `__resetGitHubAppBreakerForTests()` export (or a test-only hook), and call it in `beforeEach`. Project rule (CLAUDE.md): use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()` for the TTL-expiry test — NOT real setTimeout."
+    },
+    {
+      "id": "H3",
+      "summary": "`reconcileFalseMerged` runs every 60s. Adding a `gh issue view` shell-out per non-cached issue could be slow on first patrol after a server restart (the autoCloseOutCache is in-memory and cleared on restart). For a typical deployment with <100 merged-status issues, the worst case is ~100 sequential `gh issue view` calls — bounded but not free.",
+      "mitigation": "Reuse the existing `withConcurrencyLimit` pattern from `autoCloseOut` (deacon.ts:3839) if the per-patrol cost becomes noticeable. For the initial implementation, sequential is fine (matches `getAutoCloseOutCanonicalState`'s current call pattern). If the cache key matches `autoCloseOutCache`, both reconcilers share the cost on first miss."
+    },
+    {
+      "id": "H4",
+      "summary": "Modifying `githubApi` to retry on 401 could mask configuration bugs in development. If an operator's installation-id is wrong, the retry won't fix it — they need the breaker to surface the diagnostic.",
+      "mitigation": "The breaker's actionable log explicitly tells the operator how to recover. The retry only buys one transient-race recovery attempt; persistent 401s flow into the breaker exactly as intended."
+    },
+    {
+      "id": "H5",
+      "summary": "If `generateInstallationToken` itself throws (e.g. private-key.pem unreadable, App-id wrong), the 401-retry path never runs — the existing single-shot error path runs instead. That's fine for retry correctness, but means the breaker NEVER engages for that failure mode. The operator still sees errors but they look different (token-generation errors, not 401s).",
+      "mitigation": "Out of scope for this issue — the reported symptom is 401-after-token-issued. Token-generation errors would be a separate bug (different error message, different recovery path). If the team wants the breaker to also trip on token-generation failures, that's a follow-up. Note in the implementation that this is intentional."
+    },
+    {
+      "id": "H6",
+      "summary": "The circuit breaker is process-local. A multi-process setup (Cloister + auxiliary workers) would each have their own breaker — operator sees the diagnostic log multiple times.",
+      "mitigation": "Panopticon's deacon runs in a single dashboard server process. The 'Single Deacon Invariant' rule in CLAUDE.md confirms only one deacon exists per `~/.panopticon` state dir. So per-process is sufficient for the reported topology."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-7",
+  "sessionHistory": [
+    {
+      "reason": "planning",
+      "content": "[planning context — see initial entry]",
+      "note": "Planning session started for PAN-1430: Deacon runs false-merged check on closed-out issues, gets repeated 401s from GitHub App token (probably expired credential)",
+      "timestamp": "2026-05-23T18:55:25.046Z"
+    },
+    {
+      "timestamp": "2026-05-23T19:10:00.000Z",
+      "reason": "planning",
+      "note": "Auto planning complete. 3 beads: patrol-scope-filter (deacon.ts), token-retry-on-401 (github-app.ts), app-circuit-breaker (github-app.ts). app-circuit-breaker is blocked by token-retry-on-401. patrol-scope-filter is independent.",
+      "agentModel": "agent:claude-opus-4-7"
+    }
+  ],
+  "feedback": []
+}
