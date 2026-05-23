@@ -4,17 +4,17 @@
     "created": "2026-05-23T04:30:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1331: Restore the per-issue action surface — wire every `pan` verb into Board cards and the Issue Detail drawer (PAN-1148 §4.8)",
-    "updated": "2026-05-23T04:20:29.929Z"
+    "updated": "2026-05-23T17:50:23.748Z"
   },
   "plan": {
     "id": "pan-1331",
     "title": "Restore the per-issue action surface — wire every `pan` verb into Board cards and the Issue Detail drawer (PAN-1148 §4.8)",
-    "status": "proposed",
+    "status": "completed",
     "uid": "86eabc36-2861-4d24-a017-68368d817147",
     "author": "agent:claude-opus-4-7",
-    "sequence": 3,
+    "sequence": 4,
     "created": "2026-05-23T04:30:00.000Z",
-    "updated": "2026-05-23T04:20:29.929Z",
+    "updated": "2026-05-23T17:50:23.748Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1331",
@@ -881,5 +881,5 @@
       "canonicalFilename": "2026-05-23-PAN-1331-restore-the-per-issue-action-surface-wire-every-pan-verb-into-board-cards-and-the-issue-detail-drawer-pan-1148-4-8.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
