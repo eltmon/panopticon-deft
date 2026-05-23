@@ -4,17 +4,17 @@
     "created": "2026-05-23T04:51:24.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1389: Activity feed sidebar — time-bucketed session/observation history panel",
-    "updated": "2026-05-23T04:54:52.346Z"
+    "updated": "2026-05-23T17:50:32.790Z"
   },
   "plan": {
     "id": "pan-1389",
     "title": "Activity feed sidebar: time-bucketed session/observation history panel",
-    "status": "proposed",
+    "status": "completed",
     "uid": "e2b4173a-5273-454c-aa06-4c0152757c75",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T04:51:24.000Z",
-    "updated": "2026-05-23T04:54:52.346Z",
+    "updated": "2026-05-23T17:50:32.790Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1389",
@@ -871,5 +871,5 @@
       "canonicalFilename": "2026-05-23-PAN-1389-activity-feed-sidebar-time-bucketed-session-observation-history-panel.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
