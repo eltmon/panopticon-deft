@@ -2660,10 +2660,9 @@ export async function checkUndispatchedShip(): Promise<string[]> {
       shipEligibleKeys.add(key);
     }
 
-    for (const key of new Set([...shipDispatchCooldowns.keys(), ...shipDispatchCounts.keys()])) {
+    for (const key of shipDispatchCooldowns.keys()) {
       if (!shipEligibleKeys.has(key)) {
         shipDispatchCooldowns.delete(key);
-        shipDispatchCounts.delete(key);
       }
     }
 

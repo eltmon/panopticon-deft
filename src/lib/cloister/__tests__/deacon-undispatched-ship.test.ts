@@ -286,7 +286,7 @@ describe('checkUndispatchedShip — undispatched-ship safety-net', () => {
     }
   });
 
-  it('drops re-dispatch counters when issues leave the ship-eligible state', async () => {
+  it('keeps re-dispatch counters when issues leave the ship-eligible state', async () => {
     const now = new Date('2026-05-23T14:00:00.000Z');
     vi.setSystemTime(now);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -337,7 +337,7 @@ describe('checkUndispatchedShip — undispatched-ship safety-net', () => {
       await checkUndispatchedShip();
       expect(mockOnIssueStateChange).toHaveBeenCalledTimes(1);
       expect(logSpy).toHaveBeenCalledWith(
-        '[deacon] Ship re-dispatched (1 total for issue PAN-1414-PRUNE)',
+        '[deacon] Ship re-dispatched (2 total for issue PAN-1414-PRUNE)',
       );
     } finally {
       logSpy.mockRestore();
