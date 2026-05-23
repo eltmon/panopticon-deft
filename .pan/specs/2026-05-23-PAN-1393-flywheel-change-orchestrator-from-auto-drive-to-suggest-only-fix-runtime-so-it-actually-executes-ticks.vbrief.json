@@ -4,17 +4,17 @@
     "created": "2026-05-23T04:30:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1393: Flywheel: change orchestrator from auto-drive to suggest-only + fix runtime so it actually executes ticks",
-    "updated": "2026-05-23T04:31:37.275Z"
+    "updated": "2026-05-23T17:50:41.324Z"
   },
   "plan": {
     "id": "pan-1393",
     "title": "Flywheel: change orchestrator from auto-drive to suggest-only + fix runtime so it actually executes ticks",
-    "status": "proposed",
+    "status": "completed",
     "uid": "f9c4e1d2-3a6b-4f7e-8b1c-2d5e6f7a8b9c",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-23T04:30:00.000Z",
-    "updated": "2026-05-23T04:31:37.275Z",
+    "updated": "2026-05-23T17:50:41.324Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1393",
@@ -624,5 +624,5 @@
       "canonicalFilename": "2026-05-23-PAN-1393-flywheel-change-orchestrator-from-auto-drive-to-suggest-only-fix-runtime-so-it-actually-executes-ticks.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
