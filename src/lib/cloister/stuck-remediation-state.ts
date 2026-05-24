@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { getPanopticonHome } from '../paths.js';
 
@@ -18,25 +18,31 @@ function statePath(agentId: string): string {
   return join(agentStateDir(agentId), 'stuck-remediation.json');
 }
 
-export function readStuckRemediationState(agentId: string): StuckRemediationState | null {
+function isMissingFile(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
+}
+
+export async function readStuckRemediationState(agentId: string): Promise<StuckRemediationState | null> {
   const filePath = statePath(agentId);
-  if (!existsSync(filePath)) return null;
 
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as StuckRemediationState;
+    return JSON.parse(await readFile(filePath, 'utf-8')) as StuckRemediationState;
   } catch (error) {
+    if (isMissingFile(error)) return null;
     console.warn(`Failed to read stuck-remediation state for ${agentId}:`, error);
     return null;
   }
 }
 
-export function writeStuckRemediationState(agentId: string, state: StuckRemediationState): void {
-  mkdirSync(agentStateDir(agentId), { recursive: true });
-  writeFileSync(statePath(agentId), `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
+export async function writeStuckRemediationState(agentId: string, state: StuckRemediationState): Promise<void> {
+  await mkdir(agentStateDir(agentId), { recursive: true });
+  await writeFile(statePath(agentId), `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
 }
 
-export function clearStuckRemediationState(agentId: string): void {
-  const filePath = statePath(agentId);
-  if (!existsSync(filePath)) return;
-  unlinkSync(filePath);
+export async function clearStuckRemediationState(agentId: string): Promise<void> {
+  try {
+    await unlink(statePath(agentId));
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
 }

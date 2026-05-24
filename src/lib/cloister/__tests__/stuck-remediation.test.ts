@@ -155,6 +155,7 @@ describe('checkStuckAgentRemediation', () => {
 
     expect(actions).toEqual([]);
     expectNoStage();
+    expect(mocks.execFile).not.toHaveBeenCalled();
     expect(mocks.logDeaconEventSync).not.toHaveBeenCalled();
   });
 
@@ -244,6 +245,7 @@ describe('checkStuckAgentRemediation', () => {
 
     expect(actions).toEqual([]);
     expectNoStage();
+    expect(mocks.execFile).not.toHaveBeenCalled();
     expect(mocks.logDeaconEventSync).not.toHaveBeenCalled();
   });
 
@@ -285,7 +287,7 @@ describe('checkStuckAgentRemediation', () => {
 
     expect(actions).toEqual([]);
     expectNoStage();
-    expect(mocks.readStuckRemediationState).not.toHaveBeenCalled();
+    expect(mocks.readStuckRemediationState).toHaveBeenCalledWith('agent-pan-1415');
   });
 
   it.each([

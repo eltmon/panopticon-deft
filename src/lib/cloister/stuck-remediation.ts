@@ -87,7 +87,6 @@ async function evaluateAgent(
   const reviewStatus = getReviewStatusSync(issueId);
   if (shouldSkipReviewStatus(reviewStatus)) return;
   if (!isAgentIdleForNudge(agentId, 5 * 60 * 1000, now)) return;
-  if (await hasReadyBeads(agent, issueId.toLowerCase())) return;
 
   const runtime = getAgentRuntimeStateSync(agentId);
   if (!runtime?.lastActivity) return;
@@ -95,11 +94,11 @@ async function evaluateAgent(
   const lastActivityMs = new Date(runtime.lastActivity).getTime();
   if (!Number.isFinite(lastActivityMs)) return;
 
-  const stuckState = readStuckRemediationState(agentId);
+  const stuckState = await readStuckRemediationState(agentId);
   if (stuckState) {
     const firstStuckMs = new Date(stuckState.firstStuckAt).getTime();
     if (Number.isFinite(firstStuckMs) && lastActivityMs > firstStuckMs) {
-      clearStuckRemediationState(agentId);
+      await clearStuckRemediationState(agentId);
       return;
     }
   }
@@ -107,19 +106,30 @@ async function evaluateAgent(
   const idleMinutes = Math.floor((now - lastActivityMs) / 60_000);
   const lastStage = stuckState?.lastStage ?? 0;
   const firstStuck = firstStuckAt(runtime.lastActivity, stuckState);
+  const nextStage =
+    idleMinutes >= config.stage3_minutes && lastStage < 3
+      ? 3
+      : idleMinutes >= config.stage2_minutes && lastStage < 2
+        ? 2
+        : idleMinutes >= config.stage1_minutes && lastStage < 1
+          ? 1
+          : null;
 
-  if (idleMinutes >= config.stage3_minutes && lastStage < 3) {
+  if (nextStage === null) return;
+  if (await hasReadyBeads(agent, issueId.toLowerCase())) return;
+
+  if (nextStage === 3) {
     markAgentTroubled(agentId);
-    writeStuckRemediationState(agentId, stageState(3, now, firstStuck));
+    await writeStuckRemediationState(agentId, stageState(3, now, firstStuck));
     logAction(actions, transitionAction(3, issueId, idleMinutes, 'marked-troubled'));
     return;
   }
 
-  if (idleMinutes >= config.stage2_minutes && lastStage < 2) {
+  if (nextStage === 2) {
     const message = `Resuming after auto-detected stall (${idleMinutes} min idle). Review your last work and decide whether to continue or signal done with \`pan done ${issueId}\`.`;
     const result = await resumeAgent(agentId, message);
     if (result.success) {
-      writeStuckRemediationState(agentId, stageState(2, now, firstStuck));
+      await writeStuckRemediationState(agentId, stageState(2, now, firstStuck));
       logAction(actions, transitionAction(2, issueId, idleMinutes, 'resumed'));
     } else {
       const action = transitionAction(2, issueId, idleMinutes, 'resume-failed');
@@ -129,12 +139,10 @@ async function evaluateAgent(
     return;
   }
 
-  if (idleMinutes >= config.stage1_minutes && lastStage < 1) {
-    const message = `You appear stuck — no tool calls for ${idleMinutes} min. If your implementation is complete, run \`pan done ${issueId}\`. Otherwise reply with a one-line summary of what you're waiting on, then continue.`;
-    await messageAgent(agentId, message);
-    writeStuckRemediationState(agentId, stageState(1, now, firstStuck));
-    logAction(actions, transitionAction(1, issueId, idleMinutes, 'poked'));
-  }
+  const message = `You appear stuck — no tool calls for ${idleMinutes} min. If your implementation is complete, run \`pan done ${issueId}\`. Otherwise reply with a one-line summary of what you're waiting on, then continue.`;
+  await messageAgent(agentId, message);
+  await writeStuckRemediationState(agentId, stageState(1, now, firstStuck));
+  logAction(actions, transitionAction(1, issueId, idleMinutes, 'poked'));
 }
 
 export async function checkStuckAgentRemediation(opts: StuckRemediationOptions = {}): Promise<string[]> {
