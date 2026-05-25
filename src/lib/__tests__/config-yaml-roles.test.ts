@@ -9,6 +9,7 @@ import {
   resolveModel,
   stripProjectTtsEndpoint,
   type NormalizedConfig,
+  type WorkhorsesConfig,
 } from '../config-yaml.js';
 import type { Role } from '../agents.js';
 
@@ -93,13 +94,11 @@ describe('role model configuration', () => {
   // role schema only knows the canonical three.
   it('rejects unknown workhorse slot keys with a precise field-path error', () => {
     expect(() => mergeConfigs({
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      workhorses: { tiny: 'claude-haiku-4-5' } as any,
+      workhorses: { tiny: 'claude-haiku-4-5' } as unknown as WorkhorsesConfig,
     })).toThrow('config.yaml: unknown workhorse slot workhorses.tiny. Valid slots: expensive, mid, cheap.');
 
     expect(() => mergeConfigs({
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      workhorses: { tiny: 'claude-haiku-4-5', huge: 'claude-opus-4-7' } as any,
+      workhorses: { tiny: 'claude-haiku-4-5', huge: 'claude-opus-4-7' } as unknown as WorkhorsesConfig,
     })).toThrow('config.yaml: unknown workhorse slots workhorses.tiny, workhorses.huge. Valid slots: expensive, mid, cheap.');
   });
 
@@ -160,6 +159,7 @@ describe('role model configuration', () => {
           harness: 'pi',
           model: 'claude-sonnet-4-6',
           effort: 'medium',
+          minAgents: 2,
           maxAgents: 4,
           scope: 'all-tracked-projects',
         },
@@ -170,6 +170,7 @@ describe('role model configuration', () => {
       harness: 'pi',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
+      minAgents: 2,
       maxAgents: 4,
       scope: 'all-tracked-projects',
     });
