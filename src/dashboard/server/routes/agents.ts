@@ -1649,10 +1649,8 @@ const postAgentSuspendRoute = HttpRouter.add(
 
 // ─── Route: POST /api/agents/:id/pause ────────────────────────────────────────
 
-const postAgentPauseRoute = HttpRouter.add(
-  'POST',
-  '/api/agents/:id/pause',
-  httpHandler(Effect.gen(function* () {
+export function createAgentPauseHandler() {
+  return httpHandler(Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const originCheck = validateOrigin(request);
     if (!originCheck.ok) {
@@ -1697,6 +1695,22 @@ const postAgentPauseRoute = HttpRouter.add(
       }));
     }
 
+    if (stoppedByPause) {
+      yield* Effect.promise(async () => {
+        try {
+          const dockerResult = await Effect.runPromise(stopWorkspaceDocker(
+            stateBeforePause.workspace,
+            stateBeforePause.issueId.toLowerCase(),
+          ));
+          if (dockerResult.containersFound) {
+            console.log(`[agents] ✓ Stopped Docker stack for ${id}: ${dockerResult.steps.join('; ')}`);
+          }
+        } catch (err) {
+          console.warn(`[agents] Docker teardown failed for ${id} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+    }
+
     yield* Effect.promise(() => appendAgentLifecycleLog(id, 'agent.pause_requested', { reason }));
     yield* eventStore.appendAsync(operatorInterventionEvent({
       issueId: updatedState.issueId || stateBeforePause.issueId || id.replace(/^agent-/, '').toUpperCase(),
@@ -1711,7 +1725,13 @@ const postAgentPauseRoute = HttpRouter.add(
 
     invalidateAgentsCache();
     return jsonResponse({ success: true, agent: updatedState });
-  })),
+  }));
+}
+
+const postAgentPauseRoute = HttpRouter.add(
+  'POST',
+  '/api/agents/:id/pause',
+  createAgentPauseHandler(),
 );
 
 // ─── Route: POST /api/agents/:id/unpause ──────────────────────────────────────
