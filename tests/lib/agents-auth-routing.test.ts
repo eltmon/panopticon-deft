@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -19,6 +20,7 @@ vi.mock('../../src/lib/config-yaml.js', async (importOriginal) => {
   return {
     ...actual,
     loadConfig: mockLoadYamlConfig,
+    loadConfigSync: mockLoadYamlConfig,
   };
 });
 
@@ -27,17 +29,21 @@ vi.mock('../../src/lib/providers.js', async (importOriginal) => {
   return {
     ...actual,
     getProviderForModel: mockGetProviderForModel,
+    getProviderForModelSync: mockGetProviderForModel,
     getProviderEnv: mockGetProviderEnv,
+    getProviderEnvSync: mockGetProviderEnv,
   };
 });
 
 vi.mock('../../src/lib/openai-auth.js', () => ({
   getOpenAIAuthStatusSync: mockOpenAIAuthStatus,
-  getOpenAIAuthStatus: (...args: unknown[]) => Promise.resolve(mockOpenAIAuthStatus(...args)),
+  getOpenAIAuthStatus: (...args: unknown[]) => Effect.succeed(mockOpenAIAuthStatus(...args)),
 }));
 
 vi.mock('../../src/lib/cliproxy.js', () => ({
-  bridgeGeminiAuthToCliproxyAsync: mockBridgeGeminiAuth,
+  CLIPROXY_BASE_URL: 'http://127.0.0.1:8317',
+  bridgeGeminiAuthToCliproxy: (...args: Parameters<typeof mockBridgeGeminiAuth>) => Effect.promise(() => mockBridgeGeminiAuth(...args)),
+  bridgeGeminiAuthToCliproxyProgram: (...args: Parameters<typeof mockBridgeGeminiAuth>) => Effect.promise(() => mockBridgeGeminiAuth(...args)),
   getCliproxyClientEnv: () => ({
     ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317',
     ANTHROPIC_AUTH_TOKEN: 'panopticon-local-cliproxy-key',

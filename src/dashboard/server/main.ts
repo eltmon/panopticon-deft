@@ -12,23 +12,24 @@ import { startSharedIssueService, getSharedIssueService } from './services/issue
 import { startAgentEnrichmentService, stopAgentEnrichmentService } from './services/agent-enrichment-service.js';
 import { startAgentOutputService, stopAgentOutputService } from './services/agent-output-service.js';
 import { startConversationLifecycleService, stopConversationLifecycleService } from './services/conversation-lifecycle.js';
+import { startSubstrateBugPoller, stopSubstrateBugPoller } from './services/substrate-bug-poller.js';
 import { startTtsSummarizer, stopTtsSummarizer } from './services/tts-summarizer.js';
 import { startTtsPlayback, stopTtsPlayback } from './services/tts-playback.js';
 import { refreshTtsRuntimeConfig } from './services/tts-runtime-config.js';
 import { initTrackerConfigCache } from './services/tracker-config.js';
 import { processPendingLifecycle } from './pending-lifecycle.js';
 import { processPendingFeedbackDeliveries } from './pending-feedback.js';
-import { setPipelineHandler } from '../../lib/pipeline-notifier.js';
-import { ensureInternalToken } from '../../lib/internal-token.js';
-import { clearStuckMergeStatuses, fixStuckReadyForMerge, fixStuckCommentedReviews, getReviewStatus, loadReviewStatuses, clearReviewStatus } from '../../lib/review-status.js';
+import { setPipelineHandlerSync } from '../../lib/pipeline-notifier.js';
+import { ensureInternalTokenSync } from '../../lib/internal-token.js';
+import { clearStuckMergeStatuses, fixStuckReadyForMerge, fixStuckCommentedReviews, getReviewStatusSync, loadReviewStatuses, clearReviewStatus } from '../../lib/review-status.js';
 import { enrichReviewStatus } from '../../lib/review-status-enrichment.js';
 import { clearStuckForks } from '../../lib/database/conversations-db.js';
-import { getEventStore } from './event-store.js';
-import { emitActivityEntry, emitActivityTts } from '../../lib/activity-logger.js';
+import { getEventStore, initEventStore } from './event-store.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../lib/activity-logger.js';
 import { getCloisterService } from '../../lib/cloister/service.js';
 import { shouldAutoStart } from '../../lib/cloister/config.js';
 import { setAgentStoppedNotifier, setAgentStatusChangedNotifier, setMergeReadyNotifier } from '../../lib/cloister/deacon.js';
-import { getAgentStateAsync, type AgentState } from '../../lib/agents.js';
+import { getAgentState, type AgentState } from '../../lib/agents.js';
 import { resumeQueuedMerges } from './services/merge-queue-service.js';
 import { mkdir } from 'node:fs/promises';
 import { getPanopticonHome } from '../../lib/paths.js';
@@ -36,6 +37,12 @@ import { ensureManagedTmuxContextOnce } from '../../lib/tmux.js';
 import { startCliproxyWatchdog } from './routes/cliproxy.js';
 import { resumeSwarmAutoAdvanceLoopOnStartup } from './routes/swarm.js';
 import { cleanupOrphanedConversationAttachments } from './services/conversation-attachments.js';
+import { closeMemoryFtsDatabases } from '../../lib/memory/fts-db.js';
+import { startTranscriptPoller, stopTranscriptPoller, syncTranscriptPollerRegistry } from '../../lib/memory/poller.js';
+import { reconcileAgentMemory, reconcileStaleTranscriptCheckpoints } from '../../lib/memory/reconciliation.js';
+import { clearQueryExpansionCache } from '../../lib/memory/query-expansion.js';
+import { cleanupClosedIssueAgentDirectories } from '../../lib/agent-directory-cleanup.js';
+import { startAutoMergeExecutor, stopAutoMergeExecutor } from './services/auto-merge-executor.js';
 
 declare const Bun: unknown;
 
@@ -45,7 +52,7 @@ await mkdir(getPanopticonHome(), { recursive: true });
 // Ensure the internal token exists before any in-process CLI sender resolves it (PAN-891).
 // Generates and persists a random token at <PANOPTICON_HOME>/internal-token (mode 0600)
 // on first start; reused on subsequent starts. Used by /api/internal/pipeline/notify.
-ensureInternalToken();
+ensureInternalTokenSync();
 
 
 // Prepare the managed tmux context exactly once, before any code path can spawn
@@ -74,6 +81,19 @@ void startSharedIssueService().then(() => {
   void pruneClosedIssueReviewStatuses().catch((err) => {
     console.warn('[panopticon] pruneClosedIssueReviewStatuses failed:', err?.message ?? err);
   });
+  void Effect.runPromise(cleanupClosedIssueAgentDirectories({
+    issues: getSharedIssueService().getIssues({ cycle: 'all', includeCompleted: true }),
+    force: true,
+  })).then((result) => {
+    if (result.removed.length > 0) {
+      console.log(`[panopticon] Removed ${result.removed.length} old closed-issue agent dir${result.removed.length === 1 ? '' : 's'}: ${result.removed.join(', ')}`);
+    }
+    if (result.protected.length > 0) {
+      console.warn(`[panopticon] Protected ${result.protected.length} old closed-issue agent dir${result.protected.length === 1 ? '' : 's'} because it has a live tmux session or JSONL file: ${result.protected.join(', ')}`);
+    }
+  }).catch((err) => {
+    console.warn('[panopticon] cleanupClosedIssueAgentDirectories failed:', err?.message ?? err);
+  });
 });
 console.log('[panopticon] IssueDataService started (non-blocking)');
 
@@ -90,7 +110,7 @@ console.log('[panopticon] AgentOutputService started');
 // Wire up pipeline notifier → domain events.
 // Library code (review-status.ts) calls notifyPipeline() on every status change.
 // This handler converts those into domain events so the frontend Zustand store updates.
-setPipelineHandler((event) => {
+setPipelineHandlerSync((event) => {
   switch (event.type) {
     case 'status_changed': {
       // Enrich async — fire-and-forget so the notifier stays sync.
@@ -99,7 +119,7 @@ setPipelineHandler((event) => {
       // needed for the TerminalTabs UI, not for DB state transitions.
       void (async () => {
         try {
-          const enriched = await enrichReviewStatus(event.issueId, event.status);
+          const enriched = await Effect.runPromise(enrichReviewStatus(event.issueId, event.status));
           const es = getEventStore();
           es.append({
             type: 'review.status_changed',
@@ -110,6 +130,21 @@ setPipelineHandler((event) => {
           console.error('[pipeline] Failed to append status_changed event:', err);
         }
       })();
+      return;
+    }
+
+    case 'review.approved':
+    case 'test.passed': {
+      try {
+        const es = getEventStore();
+        es.append({
+          type: event.type,
+          timestamp: new Date().toISOString(),
+          payload: { issueId: event.issueId },
+        } as any);
+      } catch (err) {
+        console.error(`[pipeline] Failed to append ${event.type} event:`, err);
+      }
       return;
     }
 
@@ -231,8 +266,12 @@ function toAgentStatusPayload(status: AgentState['status'] | undefined) {
     : 'unknown';
 }
 
-function buildAgentStatusChangedPayload(state: AgentState, previousStatus?: AgentState['status']) {
-  return {
+function buildAgentStatusChangedPayload(
+  state: AgentState,
+  previousStatus?: AgentState['status'],
+  hasLiveTmuxSession?: boolean,
+) {
+  const payload = {
     agentId: state.id,
     issueId: state.issueId,
     status: toAgentStatusPayload(state.status),
@@ -248,6 +287,7 @@ function buildAgentStatusChangedPayload(state: AgentState, previousStatus?: Agen
     lastFailureReason: state.lastFailureReason ?? null,
     lastFailureNextRetryAt: state.lastFailureNextRetryAt ?? null,
   };
+  return hasLiveTmuxSession === undefined ? payload : { ...payload, hasLiveTmuxSession };
 }
 
 // Wire up deacon → domain events for orphaned agent recovery.
@@ -256,8 +296,13 @@ setAgentStoppedNotifier((agentId) => {
   void (async () => {
     try {
       const es = getEventStore();
-      const state = await getAgentStateAsync(agentId);
+      const state = await Effect.runPromise(getAgentState(agentId));
       if (state) {
+        es.append({
+          type: 'agent.heartbeat_dead',
+          timestamp: new Date().toISOString(),
+          payload: { agentId, issueId: state.issueId, sessionId: state.sessionId },
+        } as any);
         es.append({
           type: 'agent.status_changed',
           timestamp: new Date().toISOString(),
@@ -266,7 +311,7 @@ setAgentStoppedNotifier((agentId) => {
         return;
       }
       es.append({
-        type: 'agent.stopped',
+        type: 'agent.heartbeat_dead',
         timestamp: new Date().toISOString(),
         payload: { agentId },
       } as any);
@@ -275,13 +320,13 @@ setAgentStoppedNotifier((agentId) => {
     }
   })();
 });
-setAgentStatusChangedNotifier((state, previousStatus) => {
+setAgentStatusChangedNotifier((state, previousStatus, hasLiveTmuxSession) => {
   try {
     const es = getEventStore();
     es.append({
       type: 'agent.status_changed',
       timestamp: new Date().toISOString(),
-      payload: buildAgentStatusChangedPayload(state, previousStatus),
+      payload: buildAgentStatusChangedPayload(state, previousStatus, hasLiveTmuxSession),
     } as any);
   } catch (err) {
     console.error('[pipeline] Failed to append agent.status_changed event:', err);
@@ -292,11 +337,11 @@ console.log('[panopticon] Agent stopped/status notifiers → domain events wired
 // Wire deacon merge-ready reminder → domain events so the frontend re-reads the
 // Awaiting Merge list when deacon fires its 1h staleness reminder.
 setMergeReadyNotifier((issueId) => {
-  const status = getReviewStatus(issueId);
+  const status = getReviewStatusSync(issueId);
   if (!status) return;
   void (async () => {
     try {
-      const enriched = await enrichReviewStatus(issueId, status);
+      const enriched = await Effect.runPromise(enrichReviewStatus(issueId, status));
       const es = getEventStore();
       es.append({
         type: 'review.status_changed',
@@ -314,6 +359,8 @@ console.log('[panopticon] Merge-ready notifier → domain events wired');
 startConversationLifecycleService();
 console.log('[panopticon] ConversationLifecycleService started');
 
+startSubstrateBugPoller();
+
 // Start cleanup for orphaned conversation attachments (1 min interval)
 const attachmentCleanupTimer = setInterval(() => {
   void cleanupOrphanedConversationAttachments();
@@ -326,6 +373,33 @@ await refreshTtsRuntimeConfig();
 void startTtsSummarizer().catch(err => console.warn('[tts-summarizer] start failed:', err));
 void startTtsPlayback().catch(err => console.warn('[tts-playback] start failed:', err));
 
+void syncTranscriptPollerRegistry().catch(err => console.warn('[memory-poller] initial registry sync failed:', err?.message ?? err));
+void reconcileStaleTranscriptCheckpoints({ log: (message) => console.log(message) })
+  .catch(err => console.warn('[memory-reconciliation] startup sweep failed:', err?.message ?? err));
+startTranscriptPoller();
+console.log('[panopticon] Memory transcript poller started');
+
+void (async () => {
+  const store = await initEventStore();
+  store.subscribe((event) => {
+    if (event.type === 'agent.stopped' || event.type === 'agent.heartbeat_dead') {
+      const agentId = typeof (event.payload as { agentId?: unknown }).agentId === 'string'
+        ? (event.payload as { agentId: string }).agentId
+        : null;
+      if (agentId) {
+        void reconcileAgentMemory(agentId).catch(err => console.warn('[memory-reconciliation] agent sweep failed:', err?.message ?? err));
+      }
+      const sessionId = typeof (event.payload as { sessionId?: unknown }).sessionId === 'string'
+        ? (event.payload as { sessionId: string }).sessionId
+        : null;
+      if (sessionId) clearQueryExpansionCache(sessionId);
+    }
+    if (event.type === 'agent.started' || event.type === 'agent.stopped' || event.type === 'agent.heartbeat_dead') {
+      void syncTranscriptPollerRegistry().catch(err => console.warn('[memory-poller] lifecycle registry sync failed:', err?.message ?? err));
+    }
+  });
+})().catch(err => console.warn('[memory-poller] lifecycle subscription failed:', err?.message ?? err));
+
 // Start CLIProxy watchdog — auto-restarts the sidecar if it crashes
 startCliproxyWatchdog();
 console.log('[panopticon] CLIProxy watchdog started (30s interval)');
@@ -333,12 +407,12 @@ console.log('[panopticon] CLIProxy watchdog started (30s interval)');
 // Clean up pollers on graceful shutdown
 const emitShutdownActivity = () => {
   try {
-    emitActivityEntry({
+    emitActivityEntrySync({
       source: 'dashboard',
       level: 'info',
       message: 'Dashboard stopping',
     });
-    emitActivityTts({
+    emitActivityTtsSync({
       utterance: 'Dashboard stopping',
       priority: 2,
       source: 'dashboard',
@@ -353,8 +427,12 @@ const handleShutdownSignal = (signal: NodeJS.Signals) => {
   stopAgentEnrichmentService();
   stopAgentOutputService();
   stopConversationLifecycleService();
+  stopSubstrateBugPoller();
   stopTtsSummarizer();
   stopTtsPlayback();
+  stopAutoMergeExecutor();
+  stopTranscriptPoller();
+  closeMemoryFtsDatabases();
   process.exit(0);
 };
 process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
@@ -363,11 +441,11 @@ process.once('SIGHUP', () => handleShutdownSignal('SIGHUP'));
 
 // Clear any mergeStatus stuck at 'merging'/'verifying' from before the restart (PAN-490).
 clearStuckMergeStatuses();
-emitActivityEntry({ source: 'dashboard', level: 'info', message: 'Cleared stuck merge statuses on startup' });
+emitActivityEntrySync({ source: 'dashboard', level: 'info', message: 'Cleared stuck merge statuses on startup' });
 // Mark any in-progress forks as failed — they were interrupted by the restart.
 { const n = clearStuckForks(); if (n) {
   console.log(`[panopticon] Marked ${n} stuck fork(s) as failed`);
-  emitActivityEntry({ source: 'dashboard', level: 'warn', message: `Marked ${n} stuck fork(s) as failed on startup` });
+  emitActivityEntrySync({ source: 'dashboard', level: 'warn', message: `Marked ${n} stuck fork(s) as failed on startup` });
 } }
 // Restore readyForMerge for issues where review+test passed but readyForMerge is stuck false.
 fixStuckReadyForMerge();
@@ -381,7 +459,7 @@ try {
   const resetCount = resetProcessingToQueued();
   if (resetCount > 0) {
     console.log(`[panopticon] Reset ${resetCount} stuck merge queue entries to queued`);
-    emitActivityEntry({ source: 'dashboard', level: 'warn', message: `Reset ${resetCount} stuck merge queue entries to queued on startup` });
+    emitActivityEntrySync({ source: 'dashboard', level: 'warn', message: `Reset ${resetCount} stuck merge queue entries to queued on startup` });
   }
   await resumeQueuedMerges();
 } catch (err: any) {
@@ -403,7 +481,7 @@ if (process.env.PANOPTICON_DISABLE_DEACON !== '1') {
     .then(({ logNonCanonicalStashesOnStartup }) => logNonCanonicalStashesOnStartup())
     .then((findings) => {
       if (findings.length > 0) {
-        emitActivityEntry({ source: 'dashboard', level: 'warn', message: `Detected ${findings.length} non-canonical stash(es) on startup; audit recommended` });
+        emitActivityEntrySync({ source: 'dashboard', level: 'warn', message: `Detected ${findings.length} non-canonical stash(es) on startup; audit recommended` });
       }
     })
     .catch((err: any) => {
@@ -421,16 +499,23 @@ if (process.env.PANOPTICON_DISABLE_DEACON !== '1') {
 // HTTP server from accepting connections (the "Bad Gateway after pan up"
 // failure mode). The dashboard comes up clean; start cloister manually from
 // the UI once the workspace backlog is cleaned up.
+if (process.env.PANOPTICON_DISABLE_AUTO_MERGE === '1') {
+  console.log('[panopticon] Auto-merge executor SKIPPED (PANOPTICON_DISABLE_AUTO_MERGE=1)');
+} else {
+  startAutoMergeExecutor();
+  console.log('[panopticon] Auto-merge executor started');
+}
+
 if (process.env.PANOPTICON_DISABLE_DEACON === '1') {
   console.log('[panopticon] Cloister auto-start SKIPPED (PANOPTICON_DISABLE_DEACON=1)');
-  emitActivityEntry({ source: 'dashboard', level: 'warn', message: 'Cloister auto-start skipped via PANOPTICON_DISABLE_DEACON — deacon is not running' });
+  emitActivityEntrySync({ source: 'dashboard', level: 'warn', message: 'Cloister auto-start skipped via PANOPTICON_DISABLE_DEACON — deacon is not running' });
 } else if (shouldAutoStart()) {
   getCloisterService().start().catch((err) => {
     console.error('[panopticon] Cloister auto-start failed:', err);
-    emitActivityEntry({ source: 'dashboard', level: 'error', message: `Cloister auto-start failed: ${err instanceof Error ? err.message : String(err)}` });
+    emitActivityEntrySync({ source: 'dashboard', level: 'error', message: `Cloister auto-start failed: ${err instanceof Error ? err.message : String(err)}` });
   });
   console.log('[panopticon] Cloister auto-starting (startup.auto_start=true)');
-  emitActivityEntry({ source: 'dashboard', level: 'info', message: 'Cloister auto-starting on dashboard boot' });
+  emitActivityEntrySync({ source: 'dashboard', level: 'info', message: 'Cloister auto-starting on dashboard boot' });
 }
 
 /**

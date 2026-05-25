@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 /**
  * Tests for PAN-464: workspace container health monitoring.
  *
@@ -54,19 +55,39 @@ vi.mock('child_process', () => ({
   execFile: vi.fn(),
 }));
 
-vi.mock('../../../src/lib/tmux.js', () => ({
-  sessionExists: vi.fn().mockReturnValue(true),
-  sessionExistsAsync: vi.fn().mockResolvedValue(true),
-  sendKeysAsync: mockSendKeysAsync,
-  buildTmuxCommandString: vi.fn().mockReturnValue(''),
-  capturePaneAsync: vi.fn().mockResolvedValue(''),
-  createSessionAsync: vi.fn().mockResolvedValue(undefined),
-  killSession: vi.fn(),
-  killSessionAsync: vi.fn().mockResolvedValue(undefined),
-  listPaneValues: vi.fn().mockReturnValue([]),
-  listPaneValuesAsync: vi.fn().mockResolvedValue([]),
-  listSessionNamesAsync: vi.fn().mockResolvedValue([]),
-}));
+vi.mock('../../../src/lib/tmux.js', async () => {
+  const { Effect } = await import('effect');
+  const effectMock = (initial?: unknown) => {
+    const wrap = (value: unknown) => {
+      if (value && typeof value === 'object' && 'pipe' in value) return value;
+      return Effect.succeed(value);
+    };
+    const fn: any = vi.fn(() => wrap(typeof initial === 'function' ? (initial as () => unknown)() : initial));
+    fn.mockResolvedValue = (value: unknown) => fn.mockReturnValue(Effect.succeed(value));
+    fn.mockRejectedValue = (error: unknown) => fn.mockReturnValue(Effect.fail(error));
+    fn.mockResolvedValueOnce = (value: unknown) => fn.mockReturnValueOnce(Effect.succeed(value));
+    fn.mockRejectedValueOnce = (error: unknown) => fn.mockReturnValueOnce(Effect.fail(error));
+    return fn;
+  };
+  return {
+    sessionExists: vi.fn().mockReturnValue(true),
+    sessionExistsSync: vi.fn().mockReturnValue(true),
+    sessionExists: effectMock(true),
+    sessionExistsSync: effectMock(true),
+    sendKeys: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    sendKeysProgram: (...args: unknown[]) => Effect.promise(() => Promise.resolve(mockSendKeysAsync(...args))),
+    buildTmuxCommandString: vi.fn().mockReturnValue(''),
+    capturePane: effectMock(''),
+    createSession: effectMock(undefined),
+    isPaneDead: effectMock(false),
+    killSession: vi.fn(),
+  killSessionSync: vi.fn(),
+    killSession: effectMock(undefined),
+    listPaneValues: vi.fn().mockReturnValue([]),
+    listPaneValues: effectMock([]),
+    listSessionNames: effectMock([]),
+  };
+});
 
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
   getEnabledSpecialists: vi.fn().mockReturnValue([]),
@@ -87,21 +108,29 @@ vi.mock('os', async (importOriginal) => {
 
 vi.mock('../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: vi.fn().mockReturnValue(null),
+  getAgentRuntimeStateSync: vi.fn().mockReturnValue(null),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
   listRunningAgents: vi.fn().mockResolvedValue([]),
+  listRunningAgentsSync: vi.fn().mockResolvedValue([]),
   getAgentDir: vi.fn().mockReturnValue('/tmp'),
   getAgentState: vi.fn().mockReturnValue(null),
+  getAgentStateSync: vi.fn().mockReturnValue(null),
   saveAgentState: vi.fn(),
+  saveAgentStateSync: vi.fn(),
 }));
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: vi.fn().mockReturnValue(null),
+  resolveProjectFromIssueSync: vi.fn().mockReturnValue(null),
   findProjectByPath: vi.fn().mockReturnValue(null),
+  findProjectByPathSync: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock('../../../src/lib/review-status.js', () => ({
+  getReviewStatusSync: vi.fn().mockReturnValue(null),
   setReviewStatus: vi.fn(),
+  setReviewStatusSync: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -113,7 +142,7 @@ import {
   checkWorkspaceContainerHealth,
   type DeaconState,
 } from '../../../src/lib/cloister/deacon.js';
-import { sessionExistsAsync } from '../../../src/lib/tmux.js';
+import { sessionExists } from '../../../src/lib/tmux.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -364,7 +393,7 @@ describe('checkWorkspaceContainerHealth', () => {
     setupExec({
       'docker ps -a': { stdout: `${CONTAINER}|Exited (1) 2 minutes ago\n` },
     });
-    vi.mocked(sessionExistsAsync).mockResolvedValueOnce(false);
+    vi.mocked(sessionExists).mockResolvedValueOnce(false);
 
     const actions = await checkWorkspaceContainerHealth();
 

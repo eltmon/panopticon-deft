@@ -30,7 +30,6 @@ describe('role definitions', () => {
     });
     expect(frontmatter.model).toBeUndefined();
     expect(frontmatter.description).toEqual(expect.any(String));
-    expect(frontmatter.hooks).toEqual(expect.any(Object));
     expect(body).toContain('Read the issue and the PRD draft');
     expect(body).toContain('.pan/drafts/');
     expect(body).toContain('AskUserQuestion');
@@ -54,7 +53,6 @@ describe('role definitions', () => {
       effort: 'high',
     });
     expect(frontmatter.model).toBeUndefined();
-    expect(frontmatter.hooks).toEqual(expect.any(Object));
     expect(body).toContain('## Per-Bead Workflow');
     expect(body).toContain('metadata.requiresInspection === true');
     expect(body).toContain('inspectionDepth: "deep"');
@@ -69,6 +67,22 @@ describe('role definitions', () => {
       expect(body.toLowerCase()).not.toContain(phase);
     }
   });
+
+  it.each(['flywheel', 'work', 'plan'] as const)(
+    'wires gh issue trailer hook before RTK Bash filtering for %s role',
+    (role) => {
+      const { frontmatter } = splitFrontmatter(readRepoFile(`roles/${role}.md`));
+      const hooks = frontmatter.hooks as {
+        PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }>;
+      };
+      const bashMatcher = hooks.PreToolUse.find((entry) => entry.matcher === 'Bash');
+
+      expect(bashMatcher?.hooks.map((hook) => hook.command)).toEqual([
+        '$HOME/.panopticon/bin/gh-issue-trailer-hook',
+        '$HOME/.panopticon/bin/rtk-bash-filter',
+      ]);
+    },
+  );
 
   it('ships a workflow-injected inspect prompt with the Jidoka sentinels', () => {
     // Sub-roles work.inspect and work.inspect-deep both inline this single
@@ -94,7 +108,6 @@ describe('role definitions', () => {
     // intentionally absent from the tools list.
     expect(frontmatter.tools).toEqual(expect.arrayContaining(['Read', 'Grep', 'Glob', 'Bash']));
     expect((frontmatter.tools as string[])).not.toContain('Agent');
-    expect(frontmatter.hooks).toEqual(expect.any(Object));
     expect(body).toContain('You are the review synthesis agent');
     expect(body).toContain('pan review spawn-reviewer');
     expect(body.toLowerCase()).toContain('poll');
@@ -113,7 +126,6 @@ describe('role definitions', () => {
     });
     expect(frontmatter.model).toBeUndefined();
     expect(frontmatter.tools).toEqual(expect.arrayContaining(['Read', 'Grep', 'Glob', 'Bash']));
-    expect(frontmatter.hooks).toEqual(expect.any(Object));
     expect(frontmatter.mcpServers).toEqual(expect.any(Array));
     expect(body).toContain('There is no separate UAT role');
     expect(body).toContain('Playwright MCP tools');
@@ -134,7 +146,6 @@ describe('role definitions', () => {
     });
     expect(frontmatter.model).toBeUndefined();
     expect(frontmatter.tools).toEqual(expect.arrayContaining(['Read', 'Grep', 'Glob', 'Bash', 'Edit']));
-    expect(frontmatter.hooks).toEqual(expect.any(Object));
     expect(body).toContain('Ship NEVER merges');
     expect(body).toContain('ready-to-merge');
     expect(body).toContain('gh pr merge');
@@ -146,14 +157,14 @@ describe('role definitions', () => {
   });
 
   it('keeps legacy pan plan/work/review/inspect/test/uat/merge agent definitions until spawn migration deletes them', () => {
-    // Check agents/ (the committed source); .claude/agents/ is gitignored and populated by pan install.
-    expect(existsSync(join(process.cwd(), 'agents/pan-planning-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-work-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-review-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-inspect-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-test-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-uat-agent.md'))).toBe(true);
-    expect(existsSync(join(process.cwd(), 'agents/pan-merge-agent.md'))).toBe(true);
+    // Check sync-sources/agents/ (the committed source); .claude/agents/ is gitignored and populated by pan install.
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-planning-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-work-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-review-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-inspect-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-test-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-uat-agent.md'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'sync-sources/agents/pan-merge-agent.md'))).toBe(true);
   });
 
   // Convoy sub-role prompt templates are harness-agnostic — no YAML frontmatter,

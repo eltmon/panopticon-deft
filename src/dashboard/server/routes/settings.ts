@@ -27,11 +27,11 @@ import {
 } from '../../../lib/settings-api.js';
 import { getClaudeAuthStatus } from '../../../lib/claude-auth.js';
 import { getOpenAIAuthStatus } from '../../../lib/openai-auth.js';
-import { getProviderForModel, PROVIDERS } from '../../../lib/providers.js';
+import { getProviderForModelSync, PROVIDERS } from '../../../lib/providers.js';
 import { OpenRouterService } from '../services/openrouter-service.js';
 import { httpHandler } from './http-handler.js';
 import { getProviderAuthMode, getProviderEnvForModel } from '../../../lib/agents.js';
-import { canUseHarness } from '../../../lib/harness-policy.js';
+import { canUseHarnessSync } from '../../../lib/harness-policy.js';
 import {
   detectProviderEnvConflicts,
 } from '../../../lib/claude-settings-overlay.js';
@@ -52,7 +52,7 @@ const readJsonBody = Effect.gen(function* () {
 });
 
 /** Model ID to API model ID mapping */
-const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
+export const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
   // OpenAI models — gpt-5.x are real OpenAI model IDs (identity map).
   // Codex sign-in routes through CLIProxy; API key routes direct.
   'gpt-5.5-pro': { apiModel: 'gpt-5.5-pro' },
@@ -91,6 +91,11 @@ const MODEL_API_IDS: Record<string, { apiModel: string; endpoint?: string }> = {
   'mimo-v2.5': { apiModel: 'mimo-v2.5' },
   // Nous Portal models
   'qwen/qwen3.6-plus': { apiModel: 'qwen/qwen3.6-plus' },
+  // Alibaba DashScope models
+  'qwen3-max': { apiModel: 'qwen3-max' },
+  'qwen3-coder-plus': { apiModel: 'qwen3-coder-plus' },
+  'qwen3-plus': { apiModel: 'qwen3-plus' },
+  'qwen3.7-max': { apiModel: 'qwen3.7-max' },
 };
 
 // ─── Route: GET /api/settings ─────────────────────────────────────────────────
@@ -154,7 +159,7 @@ const getOpenAIAuthRoute = HttpRouter.add(
   'GET',
   '/api/settings/openai-auth',
   httpHandler(Effect.gen(function* () {
-    const status = yield* Effect.promise(() => getOpenAIAuthStatus());
+    const status = yield* getOpenAIAuthStatus();
     return jsonResponse(status);
   })),
 );
@@ -417,6 +422,38 @@ const postTestApiKeyRoute = HttpRouter.add(
           break;
         }
 
+        case 'dashscope': {
+          const apiModel = model ? (MODEL_API_IDS[model]?.apiModel || 'qwen3-max') : 'qwen3-max';
+          try {
+            const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: apiModel, messages: [{ role: 'user', content: testPrompt }], max_tokens: 10 }),
+            });
+            latencyMs = Date.now() - startTime;
+            const responseText = await resp.text();
+            if (resp.ok) {
+              try {
+                const data = JSON.parse(responseText) as { choices?: Array<{ message?: { content?: string | null } }> };
+                response = data.choices?.[0]?.message?.content?.trim() || '';
+                success = response.includes(expectedAnswer);
+                if (!success) error = `Model returned: ${response} (expected ${expectedAnswer})`;
+              } catch {
+                error = `DashScope returned non-JSON response: ${responseText.slice(0, 100)}`;
+              }
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 404) {
+              error = `Model not found: ${apiModel}`;
+            } else {
+              error = `HTTP ${resp.status}: ${responseText.slice(0, 100)}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
+
         default:
           error = `Unknown provider: ${provider}`;
       }
@@ -439,7 +476,7 @@ const postValidateApiKeyRoute = HttpRouter.add(
       return jsonResponse({ error: 'Provider and apiKey are required' }, { status: 400 });
     }
 
-    if (!['openai', 'google', 'kimi', 'minimax', 'zai', 'mimo', 'nous'].includes(provider)) {
+    if (!['openai', 'google', 'kimi', 'minimax', 'zai', 'mimo', 'nous', 'dashscope'].includes(provider)) {
       return jsonResponse({ error: `Unsupported provider: ${provider}` }, { status: 400 });
     }
 
@@ -609,6 +646,28 @@ const postValidateApiKeyRoute = HttpRouter.add(
           }
           break;
         }
+
+        case 'dashscope': {
+          try {
+            const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models', {
+              headers: { 'Authorization': `Bearer ${apiKey}` },
+            });
+            if (resp.ok) {
+              const data = await resp.json() as { data?: Array<{ id: string }> };
+              valid = true;
+              models = data.data?.map(m => m.id) || ['qwen3-max', 'qwen3-coder-plus', 'qwen3-plus', 'qwen3.7-max'];
+            } else if (resp.status === 401) {
+              error = 'Invalid API key';
+            } else if (resp.status === 429) {
+              error = 'Rate limit exceeded';
+            } else {
+              error = `HTTP error: ${resp.status}`;
+            }
+          } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          break;
+        }
       }
 
       return jsonResponse({ valid, provider, models: valid ? models : undefined, error: error || undefined });
@@ -631,7 +690,7 @@ const putSettingsRoute = HttpRouter.add(
         if (!validation.valid) {
           return jsonResponse({ error: validation.errors.join('; ') }, { status: 400 });
         }
-        await saveSettingsApi(newSettings);
+        await Effect.runPromise(saveSettingsApi(newSettings));
         await refreshTtsRuntimeConfig();
         await syncTtsPlaybackWithConfig();
         return jsonResponse({
@@ -675,7 +734,7 @@ const putOpenRouterFavoritesRoute = HttpRouter.add(
     const modelIds = favorites.filter((f): f is string => typeof f === 'string');
     return yield* Effect.promise(async () => {
       try {
-        await saveOpenRouterFavorites(modelIds);
+        await Effect.runPromise(saveOpenRouterFavorites(modelIds));
         return jsonResponse({ success: true, favorites: modelIds });
       } catch (err) {
         throw new Error(err instanceof Error ? err.message : String(err));
@@ -699,7 +758,7 @@ const putOpenRouterApiKeyRoute = HttpRouter.add(
 
     return yield* Effect.promise(async () => {
       try {
-        const settings = await updateProviderApiKey('openrouter', apiKey?.trim() || undefined);
+        const settings = await Effect.runPromise(updateProviderApiKey('openrouter', apiKey?.trim() || undefined));
         return jsonResponse({
           success: true,
           apiKey: settings.api_keys.openrouter,
@@ -760,15 +819,15 @@ const getHarnessPolicyRoute = HttpRouter.add(
       const decisions: Record<string, Record<string, { allowed: boolean; reason?: string }>> = {};
       const authModeByProvider = new Map<string, Awaited<ReturnType<typeof getProviderAuthMode>>>();
       for (const model of Array.from(new Set(models))) {
-        const providerName = getProviderForModel(model).name;
+        const providerName = getProviderForModelSync(model).name;
         let authMode = authModeByProvider.get(providerName);
         if (!authModeByProvider.has(providerName)) {
           authMode = await getProviderAuthMode(model);
           authModeByProvider.set(providerName, authMode);
         }
         decisions[model] = {
-          'claude-code': canUseHarness('claude-code', model, authMode),
-          pi: canUseHarness('pi', model, authMode),
+          'claude-code': canUseHarnessSync('claude-code', model, authMode),
+          pi: canUseHarnessSync('pi', model, authMode),
         };
       }
       return jsonResponse({ decisions });

@@ -1,10 +1,14 @@
+import { Effect } from 'effect';
 import chalk from 'chalk';
-import { stopAgent, getAgentState } from '../../lib/agents.js';
-import { sessionExists } from '../../lib/tmux.js';
+import { stopAgentSync, getAgentStateSync } from '../../lib/agents.js';
+import { sessionExistsSync } from '../../lib/tmux.js';
 import { isRemoteAvailable } from '../../lib/remote/index.js';
 import { killRemoteAgent } from '../../lib/remote/remote-agents.js';
-import { resolveIssueId } from '../../lib/issue-id.js';
+import { resolveIssueIdSync } from '../../lib/issue-id.js';
 import { stopWorkspaceDocker } from '../../lib/workspace-manager.js';
+import { resolveProjectFromIssueSync } from '../../lib/projects.js';
+import { findWorkspacePath } from '../../lib/lifecycle/archive-planning.js';
+import { appendOperatorInterventionEvent } from '../../lib/operator-interventions.js';
 
 interface KillOptions {
   force?: boolean;
@@ -12,12 +16,12 @@ interface KillOptions {
 
 export async function killCommand(id: string, options: KillOptions): Promise<void> {
   // Support "agent-xxx" prefix, or just the issue ID
-  const issueId = resolveIssueId(id);
+  const issueId = resolveIssueIdSync(id);
   const agentId = `agent-${issueId.toLowerCase()}`;
 
   // Check if exists
-  const state = getAgentState(agentId) as any;
-  const isRunning = sessionExists(agentId);
+  const state = getAgentStateSync(agentId) as any;
+  const isRunning = sessionExistsSync(agentId);
 
   if (!state && !isRunning) {
     console.log(chalk.yellow(`Agent ${agentId} not found.`));
@@ -34,7 +38,8 @@ export async function killCommand(id: string, options: KillOptions): Promise<voi
         console.log(chalk.green(`Killed remote agent: ${agentId}`));
 
         // Update local state file
-        stopAgent(agentId);
+        stopAgentSync(agentId);
+        await appendOperatorInterventionEvent({ issueId, kind: 'pause', source: 'pan kill' });
         return;
       } else {
         console.log(chalk.yellow(`Remote not available: ${availability.reason}`));
@@ -52,21 +57,33 @@ export async function killCommand(id: string, options: KillOptions): Promise<voi
   }
 
   try {
-    stopAgent(agentId);
+    stopAgentSync(agentId);
+    await appendOperatorInterventionEvent({ issueId, kind: 'pause', source: 'pan kill' });
     console.log(chalk.green(`Killed agent: ${agentId}`));
   } catch (error: any) {
     console.error(chalk.red('Error: ' + error.message));
     process.exit(1);
   }
 
-  // PAN-1316: tear down the workspace Docker stack so dev-server containers
-  // don't outlive their owning agent. Restart goes through a different path
-  // that re-asserts stack health, so this is safe for user-initiated kills only.
-  if (state?.workspace && state?.issueId) {
+  // PAN-1316/PAN-1326: tear down the workspace Docker stack so dev-server
+  // containers don't outlive their owning agent. Restart goes through a
+  // different path that re-asserts stack health, so this is safe for
+  // user-initiated kills only.
+  //
+  // Resolve the workspace from the issue (not from the agent's own state) so
+  // killing a specialist (review/test/ship) — whose state.workspace may not
+  // point at the work agent's workspace — still tears down the right stack.
+  if (state?.issueId) {
     try {
-      const dockerResult = await stopWorkspaceDocker(state.workspace, state.issueId.toLowerCase());
-      if (dockerResult.containersFound) {
-        console.log(chalk.gray(`Stopped Docker stack: ${dockerResult.steps.join('; ')}`));
+      const issueLower = state.issueId.toLowerCase();
+      const project = resolveProjectFromIssueSync(state.issueId);
+      const projectPath = project?.projectPath ?? process.cwd();
+      const workspacePath = findWorkspacePath(projectPath, issueLower);
+      if (workspacePath) {
+        const dockerResult = await Effect.runPromise(stopWorkspaceDocker(workspacePath, issueLower));
+        if (dockerResult.containersFound) {
+          console.log(chalk.gray(`Stopped Docker stack: ${dockerResult.steps.join('; ')}`));
+        }
       }
     } catch (err: any) {
       console.warn(chalk.yellow(`Docker teardown warning: ${err?.message ?? err}`));

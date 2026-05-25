@@ -18,12 +18,13 @@
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { WebSocketServer, WebSocket } from 'ws';
+import { Effect } from 'effect';
 import * as pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { activePtyHubs, addClientToHub, broadcastToHub, removeClientFromHub, setClientReady, type PtyHub } from './pty-hub.js';
-import { buildTmuxArgs, capturePaneAsync, getWindowDimensionsAsync, listSessionNamesAsync, resizeWindowAsync, sessionExistsAsync } from '../../lib/tmux.js';
+import { buildTmuxArgs, capturePane, getWindowDimensions, listSessionNames, resizeWindow, sessionExists } from '../../lib/tmux.js';
 import { consumeReauthTerminalToken } from './routes/codex-auth.js';
 import { validateOriginHeaders } from './routes/origin-validation.js';
-import { buildChildEnvWithoutTmux } from '../../lib/child-env.js';
+import { buildChildEnvWithoutTmuxSync } from '../../lib/child-env.js';
 import { isRespawnPending, waitForSessionRespawn } from './services/pending-respawn.js';
 
 // Worst-case respawn window for switch-model / resume / restart-all is
@@ -37,6 +38,7 @@ type ClientControlMessage =
   | { type: 'resize'; cols: number; rows: number };
 
 const ATTACH_TIMEOUT_MS = 5000;
+const READY_TIMEOUT_MS = 10_000;
 const PRE_ATTACH_MAX_MESSAGES = 32;
 const PRE_ATTACH_MAX_BYTES = 64 * 1024;
 
@@ -63,6 +65,24 @@ function sendControl(ws: WebSocket, payload: unknown): void {
 function rejectUpgrade(socket: import('net').Socket, status: number, message: string): void {
   socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   socket.destroy();
+}
+
+function armReadyTimeout(hub: PtyHub, ws: WebSocket, sessionName: string): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(() => {
+    const state = hub.clientStates.get(ws);
+    if (ws.readyState === WebSocket.OPEN && state && !state.ready) {
+      console.warn(`[ws-terminal] Closing unready terminal client for ${sessionName}`);
+      ws.close(1008, 'terminal-ready-timeout');
+    }
+  }, READY_TIMEOUT_MS);
+  ws.once('close', () => clearTimeout(timer));
+  ws.once('error', () => clearTimeout(timer));
+  return timer;
+}
+
+function markClientReady(hub: PtyHub, ws: WebSocket, readyTimer: ReturnType<typeof setTimeout>): void {
+  clearTimeout(readyTimer);
+  setClientReady(hub, ws);
 }
 
 function authorizeTerminalUpgrade(request: http.IncomingMessage): { ok: true } | { ok: false; status: number; message: string } {
@@ -108,11 +128,11 @@ async function captureFreshSnapshot(
   requestedCols: number,
   requestedRows: number,
 ): Promise<{ cols: number; rows: number; data: string }> {
-  const dims = await getWindowDimensionsAsync(sessionName);
+  const dims = await Effect.runPromise(getWindowDimensions(sessionName));
   if (!dims) {
     return { cols: requestedCols, rows: requestedRows, data: '' };
   }
-  const data = await capturePaneAsync(sessionName, SNAPSHOT_SCROLLBACK_LINES, { escapeSequences: true });
+  const data = await Effect.runPromise(capturePane(sessionName, SNAPSHOT_SCROLLBACK_LINES, { escapeSequences: true }));
   return { cols: dims.cols, rows: dims.rows, data };
 }
 
@@ -124,7 +144,7 @@ async function captureFreshSnapshot(
  * naturally covers it. `-S 0` starts capture from the first visible line.
  */
 async function captureViewportSnapshot(sessionName: string): Promise<string> {
-  return capturePaneAsync(sessionName, 0, { escapeSequences: true });
+  return Effect.runPromise(capturePane(sessionName, 0, { escapeSequences: true }));
 }
 
 /**
@@ -238,7 +258,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
     // Check if tmux session exists and set up PTY (async)
     (async () => {
       try {
-        const sessions = await listSessionNamesAsync();
+        const sessions = await Effect.runPromise(listSessionNames());
         if (!sessions.includes(sessionName)) {
           // The session may legitimately be gone, OR it may be in the
           // middle of a switch-model / resume / restart-all kill→spawn
@@ -354,7 +374,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
           } catch {
             // PTY may be mid-teardown; subsequent operations will notice.
           }
-          resizeWindowAsync(sessionName, requestedCols, requestedRows).catch(() => {});
+          Effect.runPromise(resizeWindow(sessionName, requestedCols, requestedRows)).catch(() => {});
           for (const client of existingHub.clients) {
             if (client !== ws) {
               sendControl(client, { type: 'size', cols: requestedCols, rows: requestedRows });
@@ -363,10 +383,11 @@ export function setupTerminalWebSocket(server: http.Server): void {
           sendControl(ws, { type: 'snapshot', cols: requestedCols, rows: requestedRows, data: '' });
         }
 
+        const readyTimer = armReadyTimeout(existingHub, ws, sessionName);
         const handleJoinMessage = (message: string) => {
           const parsed = parseControlMessage(message);
           if (parsed?.type === 'ready') {
-            setClientReady(existingHub, ws);
+            markClientReady(existingHub, ws, readyTimer);
             return;
           }
           if (parsed?.type === 'resize') {
@@ -382,7 +403,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
             } catch {
               return;
             }
-            resizeWindowAsync(sessionName, parsed.cols, parsed.rows)
+            Effect.runPromise(resizeWindow(sessionName, parsed.cols, parsed.rows))
               .catch(() => {});
             for (const client of existingHub.clients) {
               sendControl(client, { type: 'size', cols: parsed.cols, rows: parsed.rows });
@@ -444,7 +465,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
       const startLocalPty = async () => {
         if (ptyStarted) return;
         try {
-          let exists = await sessionExistsAsync(sessionName);
+          let exists = await Effect.runPromise(sessionExists(sessionName));
           // Mirror the upfront 4404 guard: tolerate the kill→spawn gap of
           // an in-progress respawn rather than emitting fatal 4404 the
           // client won't retry.
@@ -477,7 +498,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
           cols: hub.cols,
           rows: hub.rows,
           cwd: homedir(),
-          env: buildChildEnvWithoutTmux(process.env, {
+          env: buildChildEnvWithoutTmuxSync(process.env, {
             TERM: 'xterm-256color',
             COLORTERM: 'truecolor',
             LANG: 'en_US.UTF-8',
@@ -530,17 +551,13 @@ export function setupTerminalWebSocket(server: http.Server): void {
         return;
       }
       sendControl(ws, { type: 'snapshot', cols: snapshot.cols, rows: snapshot.rows, data: snapshot.data });
-      // Start PTY immediately — don't wait for client 'ready'. The hub buffers
-      // live data for not-yet-ready clients (pty-hub.ts broadcastToHub), so data
-      // that arrives before the client finishes processing its snapshot is queued
-      // and flushed when setClientReady fires. This eliminates the visible black
-      // screen gap between snapshot delivery and first live byte.
+      const readyTimer = armReadyTimeout(hub, ws, sessionName);
       void startLocalPty();
 
       const handleLocalMessage = (message: string) => {
         const parsed = parseControlMessage(message);
         if (parsed?.type === 'ready') {
-          setClientReady(hub, ws);
+          markClientReady(hub, ws, readyTimer);
           return;
         }
         if (parsed?.type === 'resize') {
@@ -553,7 +570,7 @@ export function setupTerminalWebSocket(server: http.Server): void {
           hub.rows = parsed.rows;
           if (ptyProcess) {
             ptyProcess.resize(parsed.cols, parsed.rows);
-            resizeWindowAsync(sessionName, parsed.cols, parsed.rows)
+            Effect.runPromise(resizeWindow(sessionName, parsed.cols, parsed.rows))
               .catch(() => {});
             for (const client of hub.clients) {
               sendControl(client, { type: 'size', cols: parsed.cols, rows: parsed.rows });

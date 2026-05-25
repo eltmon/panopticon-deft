@@ -10,8 +10,13 @@ import { Effect } from 'effect';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { closeOut, type WorkflowResult } from '../../lib/lifecycle/index.js';
-import { resolveProjectFromIssue, extractTeamPrefix, findProjectByTeam } from '../../lib/projects.js';
+import { resolveProjectFromIssueSync, extractTeamPrefix, findProjectByTeamSync } from '../../lib/projects.js';
+import { mapGitHubStateToCanonical, type CanonicalState } from '../../core/state-mapping.js';
+
+const execFileAsync = promisify(execFile);
 
 interface CloseOutOptions {
   force?: boolean;
@@ -38,6 +43,23 @@ function getGitHubConfig(): { owner: string; repo: string; prefix: string } | nu
   return { owner, repo, prefix: prefix || repo.toUpperCase().replace(/-CLI$/, '').replace(/-/g, '') };
 }
 
+async function readGitHubCanonicalState(owner: string, repo: string, number: number): Promise<CanonicalState> {
+  const { stdout } = await execFileAsync('gh', [
+    'issue',
+    'view',
+    String(number),
+    '--repo',
+    `${owner}/${repo}`,
+    '--json',
+    'state,labels',
+  ], { encoding: 'utf-8' });
+  const parsed = JSON.parse(stdout) as { state?: string; labels?: Array<string | { name?: string }> };
+  const labels = (parsed.labels ?? [])
+    .map(label => typeof label === 'string' ? label : label.name)
+    .filter((label): label is string => typeof label === 'string');
+  return mapGitHubStateToCanonical(parsed.state ?? 'open', labels);
+}
+
 export async function closeOutCommand(issueId: string, options: CloseOutOptions): Promise<void> {
   // Human-only guard: reject if running as an agent
   if (process.env.PANOPTICON_AGENT_ID) {
@@ -50,13 +72,13 @@ export async function closeOutCommand(issueId: string, options: CloseOutOptions)
 
   // Resolve project
   const teamPrefix = extractTeamPrefix(issueId);
-  const projectConfig = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+  const projectConfig = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
   let projectPath = '';
 
   if (projectConfig) {
     projectPath = projectConfig.path;
   } else {
-    const resolved = resolveProjectFromIssue(issueId);
+    const resolved = resolveProjectFromIssueSync(issueId);
     if (resolved) {
       projectPath = resolved.projectPath;
     }
@@ -87,9 +109,26 @@ export async function closeOutCommand(issueId: string, options: CloseOutOptions)
     }
   }
 
+  let canonicalState: CanonicalState | null = null;
+  let canonicalStateError: string | null = null;
+  if (isGitHub && owner && repo && number) {
+    try {
+      canonicalState = await readGitHubCanonicalState(owner, repo, number);
+    } catch (error) {
+      canonicalStateError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   // Confirmation
   if (!options.force) {
     console.log(chalk.yellow(`\nClose-out ceremony for ${issueUpper}\n`));
+    console.log(chalk.gray(`Issue should normally be in 'verifying-on-main' before close-out.`));
+    if (canonicalState && canonicalState !== 'verifying_on_main') {
+      console.log(chalk.yellow(`Warning: current canonical state is '${canonicalState}', not 'verifying_on_main'.`));
+    } else if (canonicalStateError) {
+      console.log(chalk.yellow(`Warning: could not read current canonical state: ${canonicalStateError}`));
+    }
+    console.log();
     console.log(chalk.gray('This will:'));
     console.log(chalk.gray('  1. Verify PRD is preserved'));
     console.log(chalk.gray('  2. Verify branch is fully merged'));

@@ -10,9 +10,11 @@
 import { readdir, readFile, stat, watch, open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { ChatMessage, CompactBoundary, ProposedPlan, WorkLogEntry } from '@panctl/contracts';
-import { calculateCost, getPricing, type AIProvider } from '../../../lib/cost.js';
+import type { ChatMessage, CompactBoundary, ContextUsage, ProposedPlan, WorkLogEntry } from '@panctl/contracts';
+import { calculateCostSync, getPricingSync, type AIProvider } from '../../../lib/cost.js';
+import { MODEL_CAPABILITIES, resolveModelIdSync } from '../../../lib/model-capabilities.js';
 import { encodeClaudeProjectDir } from '../../../lib/paths.js';
+import { summarizeToolInputForWorkLog } from './format-tool-input.js';
 
 /** Detect AI provider from model name */
 function providerFromModel(model: string): AIProvider {
@@ -442,9 +444,9 @@ export async function parseConversationMessages(
 
       // Accumulate cost from usage data
       if (msg.usage && msg.model) {
-        const pricing = getPricing(providerFromModel(msg.model), msg.model);
+        const pricing = getPricingSync(providerFromModel(msg.model), msg.model);
         if (pricing) {
-          totalCost += calculateCost({
+          totalCost += calculateCostSync({
             inputTokens: msg.usage.input_tokens ?? 0,
             outputTokens: msg.usage.output_tokens ?? 0,
             cacheReadTokens: msg.usage.cache_read_input_tokens ?? 0,
@@ -514,14 +516,23 @@ export async function parseConversationMessages(
                 }
               }
             }
-            // WorkLogEntry for the tool call
+            // WorkLogEntry for the tool call. We pass the raw input dict
+            // through as `toolInput` so the frontend can render per-tool
+            // (Bash command as a fenced shell block, file tools as chips,
+            // etc.) and pre-compute a short one-line summary for the
+            // collapsed row via summarizeToolInputForWorkLog. See PAN-1459.
+            const inputDict =
+              block.input && typeof block.input === 'object' && !Array.isArray(block.input)
+                ? (block.input as Record<string, unknown>)
+                : undefined;
             const toolEntry: WorkLogEntry = {
               id: block.id,
               createdAt: entry.timestamp ?? new Date().toISOString(),
               label: block.name ?? 'tool',
               tone: 'tool',
               toolTitle: block.name,
-              detail: block.input ? JSON.stringify(block.input) : undefined,
+              detail: summarizeToolInputForWorkLog(block.name, inputDict),
+              toolInput: inputDict,
               sequence: lineSequence,
             };
             const unresolved = unresolvedResults.get(block.id);
@@ -1026,6 +1037,31 @@ export async function findLastCompactBoundary(sessionFile: string): Promise<numb
  * the most recent compaction. For sessions that have never been compacted,
  * returns all messages.
  */
+export async function computeContextUsage(sessionFile: string, model: string | null): Promise<ContextUsage | null> {
+  const normalizedModel = model?.trim();
+  if (!normalizedModel) return null;
+
+  const resolvedModel = resolveModelIdSync(normalizedModel);
+  const capability = Object.prototype.hasOwnProperty.call(MODEL_CAPABILITIES, resolvedModel)
+    ? MODEL_CAPABILITIES[resolvedModel as keyof typeof MODEL_CAPABILITIES]
+    : undefined;
+  if (!capability) return null;
+
+  const boundaryOffset = await findLastCompactBoundary(sessionFile);
+  const fileStats = await stat(sessionFile);
+  const activeBytes = Math.max(0, fileStats.size - boundaryOffset);
+  // Pressure gauge only: bytes/4 is a rough provider-agnostic token heuristic.
+  const estimatedTokens = Math.ceil(activeBytes / 4);
+  const percentUsed = Math.min(100, Math.max(0, (estimatedTokens / capability.contextWindow) * 100));
+
+  return {
+    activeBytes,
+    estimatedTokens,
+    contextWindow: capability.contextWindow,
+    percentUsed,
+  };
+}
+
 export async function parseFromLastCompactBoundary(
   sessionFile: string,
   priorState?: ParseState,

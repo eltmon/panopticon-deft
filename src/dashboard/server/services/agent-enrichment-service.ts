@@ -12,15 +12,18 @@
  * restored here via the event-driven projection pipeline.
  */
 
-import { listRunningAgentsAsync } from '../../../lib/agents.js'
+import { Effect } from 'effect'
+import { listRunningAgents, type AgentState } from '../../../lib/agents.js'
 import { computeAgentEnrichment, getAgentJsonlMtime, type AgentEnrichment } from '../../../lib/agent-enrichment.js'
-import { getReviewStatus } from '../../../lib/review-status.js'
+import { getReviewStatusSync } from '../../../lib/review-status.js'
 import { withConcurrencyLimit } from '../../../lib/concurrency.js'
 import { getEventStore } from '../event-store.js'
 import type { AgentEnrichmentChangedEvent, AgentCreatedEvent, AgentStatusChangedEvent } from '@panctl/contracts'
 import { toAgentStatus, toRole, toAgentResolution } from '../read-model.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+type RunningAgent = AgentState & { tmuxActive: boolean }
 
 interface EnrichmentServiceState {
   timer: ReturnType<typeof setInterval> | null
@@ -51,9 +54,9 @@ function enrichmentChanged(prev: AgentEnrichment | undefined, next: AgentEnrichm
 // ─── Poller ───────────────────────────────────────────────────────────────────
 
 async function pollOnce(state: EnrichmentServiceState): Promise<void> {
-  let runningAgents: Awaited<ReturnType<typeof listRunningAgentsAsync>>
+  let runningAgents: RunningAgent[]
   try {
-    runningAgents = await listRunningAgentsAsync()
+    runningAgents = await Effect.runPromise(listRunningAgents())
   } catch {
     return
   }
@@ -64,8 +67,8 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
   // Stopped agents have no changing state — their enrichment is static.
   const activeAgents = runningAgents.filter(a => a.tmuxActive)
 
-  await withConcurrencyLimit(
-    activeAgents.map((agent) => async () => {
+  await Effect.runPromise(withConcurrencyLimit(
+    activeAgents.map((agent) => Effect.promise(async () => {
       const { id: agentId, issueId, startedAt } = agent
 
       // If this agent hasn't been seen since server start, emit agent.created so the
@@ -92,6 +95,7 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
                 costSoFar: agent.costSoFar,
                 sessionId: agent.sessionId || undefined,
                 role: toRole(agent.role) ?? 'work',
+                hasLiveTmuxSession: agent.tmuxActive,
                 hasPendingQuestion: undefined,
                 pendingQuestionCount: undefined,
                 pendingQuestionPrompt: undefined,
@@ -119,6 +123,7 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
               agentId,
               status: 'running',
               previousStatus: 'stopped',
+              hasLiveTmuxSession: true,
             },
           }
           await eventStore.appendAsync(statusEvent as never)
@@ -130,7 +135,7 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
       // Determine if the agent's issue has an active specialist
       let hasActiveSpecialist = false
       if (issueId) {
-        const reviewStatus = getReviewStatus(issueId)
+        const reviewStatus = getReviewStatusSync(issueId)
         hasActiveSpecialist =
           reviewStatus?.reviewStatus === 'reviewing' ||
           reviewStatus?.testStatus === 'testing' ||
@@ -180,9 +185,9 @@ async function pollOnce(state: EnrichmentServiceState): Promise<void> {
       } catch {
         // Non-fatal — event store may not be initialized yet at startup
       }
-    }),
+    })),
     4,
-  )
+  ))
 
   // Clean up stale entries for agents that have stopped
   const activeIds = new Set(activeAgents.map(a => a.id))

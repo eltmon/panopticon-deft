@@ -25,6 +25,8 @@ export interface WorkLogEntry {
   changedFiles?: readonly string[];
   tone: 'thinking' | 'tool' | 'info' | 'error';
   toolTitle?: string;
+  /** Raw tool_use input dict — drives per-tool expanded rendering (PAN-1459). */
+  toolInput?: Record<string, unknown>;
   sequence?: number;
 }
 
@@ -45,8 +47,15 @@ export interface CompactBoundary {
   model?: string;
 }
 
+export interface ContextUsage {
+  activeBytes: number;
+  estimatedTokens: number;
+  contextWindow: number;
+  percentUsed: number;
+}
+
 export type ConversationEvent =
-  | { kind: 'messages'; messages: ChatMessage[]; workLog: WorkLogEntry[]; streaming: boolean; proposedPlan?: ProposedPlan; compactBoundaries?: CompactBoundary[] }
+  | { kind: 'messages'; messages: ChatMessage[]; workLog: WorkLogEntry[]; streaming: boolean; proposedPlan?: ProposedPlan; compactBoundaries?: CompactBoundary[]; contextUsage?: ContextUsage | null }
   | { kind: 'discovering' };
 
 // ─── Turn Diff Types ─────────────────────────────────────────────────────────

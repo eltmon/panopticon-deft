@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -6,13 +7,16 @@ import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Command } from 'commander';
-import type { FlywheelStatus } from '@panctl/contracts';
+import type { FlywheelStats, FlywheelStatus } from '@panctl/contracts';
 import { getFlywheelRunDir, readFlywheelLaunchMetadata, subscribeLatestFlywheelStatus, writeFlywheelLaunchMetadata, writeLatestFlywheelStatus } from '../../../dashboard/server/services/flywheel-run-state.js';
 
 const flywheelLifecycleMocks = vi.hoisted(() => ({
   paused: false,
   activeRunId: null as string | null,
+  autoPickupBacklog: false,
+  requireUatBeforeMerge: true,
   sessionExists: false,
+  sessionExistsSync: false,
   stoppedAgents: [] as string[],
   pauseFlywheel: vi.fn(async () => {
     flywheelLifecycleMocks.paused = true;
@@ -30,9 +34,7 @@ const flywheelLifecycleMocks = vi.hoisted(() => ({
     status: 'running',
     startedAt: '2026-05-18T12:00:00.000Z',
   })),
-  stopAgentAsync: vi.fn(async (agentId: string) => {
-    flywheelLifecycleMocks.stoppedAgents.push(agentId);
-  }),
+  stopAgentProgram: vi.fn(),
 }));
 
 vi.mock('../../../lib/cloister/flywheel.js', () => ({
@@ -43,50 +45,78 @@ vi.mock('../../../lib/cloister/flywheel.js', () => ({
 }));
 
 vi.mock('../../../lib/database/app-settings.js', () => ({
+  FLYWHEEL_AUTO_PICKUP_BACKLOG_KEY: 'flywheel.auto_pickup_backlog',
+  FLYWHEEL_REQUIRE_UAT_BEFORE_MERGE_KEY: 'flywheel.require_uat_before_merge',
   getFlywheelActiveRunId: () => flywheelLifecycleMocks.activeRunId,
   isFlywheelGloballyPaused: () => flywheelLifecycleMocks.paused,
+  isFlywheelAutoPickupBacklog: () => flywheelLifecycleMocks.autoPickupBacklog,
+  isFlywheelRequireUatBeforeMerge: () => flywheelLifecycleMocks.requireUatBeforeMerge,
   setFlywheelActiveRunId: (runId: string | null) => {
     flywheelLifecycleMocks.activeRunId = runId;
+  },
+  setFlywheelAutoPickupBacklog: (enabled: boolean) => {
+    flywheelLifecycleMocks.autoPickupBacklog = enabled;
   },
   setFlywheelGloballyPaused: (paused: boolean) => {
     flywheelLifecycleMocks.paused = paused;
   },
+  setFlywheelRequireUatBeforeMerge: (required: boolean) => {
+    flywheelLifecycleMocks.requireUatBeforeMerge = required;
+  },
 }));
 
-vi.mock('../../../lib/tmux.js', () => ({
-  sessionExistsAsync: vi.fn(async () => flywheelLifecycleMocks.sessionExists),
-}));
+vi.mock('../../../lib/tmux.js', async () => {
+  const { Effect } = await import('effect');
+  return {
+    sessionExists: vi.fn(() => Effect.succeed(flywheelLifecycleMocks.sessionExists)),
+    sessionExistsSync: vi.fn(() => Effect.succeed(flywheelLifecycleMocks.sessionExists)),
+  };
+});
 
-vi.mock('../../../lib/agents.js', () => ({
-  stopAgentAsync: flywheelLifecycleMocks.stopAgentAsync,
+vi.mock('../../../lib/agents.js', async () => {
+  const { Effect } = await import('effect');
+  flywheelLifecycleMocks.stopAgentProgram.mockImplementation((agentId: string) => Effect.sync(() => {
+    flywheelLifecycleMocks.stoppedAgents.push(agentId);
+  }));
+  return {
+    stopAgent: flywheelLifecycleMocks.stopAgentProgram,
+    stopAgentProgram: flywheelLifecycleMocks.stopAgentProgram,
+  };
+});
+
+const mockLoadConfig = vi.hoisted(() => () => ({
+  config: {
+    roles: {
+      flywheel: {
+        harness: 'pi',
+        model: 'claude-sonnet-4-6',
+        effort: 'low',
+        maxAgents: 3,
+        scope: 'all-tracked-projects',
+      },
+    },
+    workhorses: {},
+  },
 }));
 
 vi.mock('../../../lib/config-yaml.js', () => ({
-  loadConfig: () => ({
-    config: {
-      roles: {
-        flywheel: {
-          harness: 'pi',
-          model: 'claude-sonnet-4-6',
-          effort: 'low',
-          maxAgents: 3,
-          scope: 'all-tracked-projects',
-        },
-      },
-      workhorses: {},
-    },
-  }),
+  loadConfig: mockLoadConfig,
+  loadConfigSync: mockLoadConfig,
   resolveModel: () => 'claude-sonnet-4-6',
 }));
 
 import {
   emitStatusCommand,
   flywheelAbortCommand,
+  flywheelConfigCommand,
   flywheelPauseCommand,
   flywheelReportCommand,
   flywheelResumeCommand,
+  formatFlywheelStateReport,
   flywheelStartCommand,
+  flywheelStatsCommand,
   flywheelStatusCommand,
+  formatFlywheelStats,
   parseFlywheelStatusJson,
   readFlywheelStatusJson,
   registerFlywheelCommands,
@@ -115,6 +145,7 @@ const validStatus: FlywheelStatus = {
   substrateBugs: [],
   agents: [],
   parked: [],
+  suggestions: [],
   system: {
     mainHead: 'abc1234',
     ramUsedMb: 1024,
@@ -127,6 +158,20 @@ const validStatus: FlywheelStatus = {
   openQuestions: [],
   ticks: 1,
   lastTickAt: '2026-05-18T12:00:00.000Z',
+};
+
+const validStats: FlywheelStats = {
+  window: '30d',
+  generatedAt: '2026-05-25T10:00:00.000Z',
+  criteria: {
+    c1_bugRate: { label: 'Substrate-bug discovery rate', value: 0.01, target: 0.02, status: 'green', trend: 'down', sampleSize: 120, dataSufficient: true },
+    c2_p0Bugs: { label: 'Critical/P0 substrate bugs', value: 0, target: 0, status: 'green', sampleSize: 120, dataSufficient: true },
+    c3_passRate: { label: 'Pipeline pass success rate', value: 0.995, target: 0.99, status: 'green', trend: 'up', sampleSize: 120, dataSufficient: true },
+    c4_mttr: { label: 'MTTR for filed substrate bugs', value: { medianMs: 3_600_000, p95Ms: 86_400_000 }, target: { medianMs: 86_400_000, p95Ms: 604_800_000 }, status: 'yellow', trend: 'flat', sampleSize: 12, dataSufficient: true },
+    c5_intervention: { label: 'Operator intervention rate', value: 0.02, target: 0.05, status: 'green', sampleSize: 120, dataSufficient: true },
+    c6_timeConsistency: { label: 'Time-in-pipeline consistency', value: { simple: 1.1, medium: 1.4, complex: 1.8 }, target: { maxRatio: 2 }, status: 'green', sampleSize: 87, dataSufficient: true },
+    c7_flake: { label: 'Substrate-attributable flake rate', value: 0.03, target: 0.05, status: 'red', sampleSize: 20, dataSufficient: true },
+  },
 };
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -144,6 +189,32 @@ async function createReportRepo(root: string): Promise<string> {
   return repoDir;
 }
 
+describe('formatFlywheelStateReport', () => {
+  it('renders populated suggestions before the active pipeline and escapes table cells', () => {
+    const report = formatFlywheelStateReport({
+      ...validStatus,
+      suggestions: [
+        {
+          priority: 'urgent',
+          action: 'investigate',
+          issueId: 'PAN-9',
+          rationale: 'Route | gate\nneeds root-cause fix',
+        },
+      ],
+    });
+
+    expect(report.indexOf('## Suggestions')).toBeLessThan(report.indexOf('## Active Pipeline'));
+    expect(report).toContain('| Priority | Action | Issue | Rationale |');
+    expect(report).toContain('| urgent | investigate | PAN-9 | Route \\| gate needs root-cause fix |');
+  });
+
+  it('renders an empty suggestions message', () => {
+    const report = formatFlywheelStateReport({ ...validStatus, suggestions: [] });
+
+    expect(report).toContain('## Suggestions\n\nNo suggestions emitted this run.');
+  });
+});
+
 describe('flywheel CLI commands', () => {
   let tempDir: string;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -160,12 +231,14 @@ describe('flywheel CLI commands', () => {
     vi.stubEnv('GIT_COMMITTER_EMAIL', 'test@example.com');
     flywheelLifecycleMocks.paused = false;
     flywheelLifecycleMocks.activeRunId = null;
+    flywheelLifecycleMocks.autoPickupBacklog = false;
+    flywheelLifecycleMocks.requireUatBeforeMerge = true;
     flywheelLifecycleMocks.sessionExists = false;
     flywheelLifecycleMocks.stoppedAgents = [];
     flywheelLifecycleMocks.pauseFlywheel.mockClear();
     flywheelLifecycleMocks.resumeFlywheel.mockClear();
     flywheelLifecycleMocks.spawnFlywheel.mockClear();
-    flywheelLifecycleMocks.stopAgentAsync.mockClear();
+    flywheelLifecycleMocks.stopAgentProgram.mockClear();
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
@@ -249,11 +322,94 @@ describe('flywheel CLI commands', () => {
     expect(JSON.parse(output)).toEqual(validStatus);
   });
 
+  it('prints a seven-row stats table with the default 30-day window', async () => {
+    const fetchMock = vi.fn(async () => Response.json(validStats));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await flywheelStatsCommand({});
+
+    expect(fetchMock).toHaveBeenCalledWith('http://dashboard.test/api/flywheel/stats?window=30d', expect.objectContaining({
+      headers: expect.objectContaining({ 'x-panopticon-internal-token': expect.any(String) }),
+    }));
+    const output = logSpy.mock.calls[0][0] as string;
+    expect(output).toContain('Flywheel stats (30d)');
+    expect(output).toContain('| Criterion | Value | Target | Status | Trend | Sample |');
+    expect(output).toContain('| Substrate-bug discovery rate | 1.0% | 2.0% | ● green | ↘ down | 120 |');
+    expect(output).toContain('| Substrate-attributable flake rate | 3.0% | 5.0% | ● red | — | 20 |');
+    expect(output.split('\n').filter(line => line.startsWith('| ') && !line.startsWith('|---') && !line.startsWith('| Criterion'))).toHaveLength(7);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('queries stats with an explicit window', async () => {
+    const fetchMock = vi.fn(async () => Response.json({ ...validStats, window: '7d' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await flywheelStatsCommand({ window: '7d' });
+
+    expect(fetchMock).toHaveBeenCalledWith('http://dashboard.test/api/flywheel/stats?window=7d', expect.any(Object));
+    expect(logSpy.mock.calls[0][0]).toContain('Flywheel stats (7d)');
+  });
+
+  it('emits raw FlywheelStats JSON with --json', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(validStats)));
+
+    await flywheelStatsCommand({ json: true });
+
+    const output = logSpy.mock.calls[0][0] as string;
+    expect(JSON.parse(output)).toEqual(validStats);
+  });
+
+  it('colors stats status glyphs when formatting for a TTY', () => {
+    const output = formatFlywheelStats(validStats, { color: true });
+
+    expect(output).toContain('\x1b[32m●\x1b[0m green');
+    expect(output).toContain('\x1b[31m●\x1b[0m red');
+  });
+
   it('exits 1 when no active run exists', async () => {
     await flywheelStatusCommand({});
 
     expect(process.exitCode).toBe(1);
     expect(errorSpy).toHaveBeenCalledWith('no active flywheel run');
+  });
+
+  it('prints all flywheel config values', async () => {
+    await flywheelConfigCommand({ get: true });
+
+    expect(logSpy).toHaveBeenCalledWith([
+      'flywheel.auto_pickup_backlog=false',
+      'flywheel.require_uat_before_merge=true',
+    ].join('\n'));
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('prints one flywheel config value', async () => {
+    await flywheelConfigCommand({ get: 'flywheel.require_uat_before_merge' });
+
+    expect(logSpy).toHaveBeenCalledWith('flywheel.require_uat_before_merge=true');
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('sets one flywheel config value', async () => {
+    await flywheelConfigCommand({ set: 'flywheel.auto_pickup_backlog=true' });
+
+    expect(flywheelLifecycleMocks.autoPickupBacklog).toBe(true);
+    expect(logSpy).toHaveBeenCalledWith('flywheel.auto_pickup_backlog=true');
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('rejects unknown flywheel config keys', async () => {
+    await flywheelConfigCommand({ set: 'unknown.key=true' });
+
+    expect(process.exitCode).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith('Unknown flywheel config key: unknown.key');
+  });
+
+  it('rejects non-boolean flywheel config values', async () => {
+    await flywheelConfigCommand({ set: 'flywheel.auto_pickup_backlog=maybe' });
+
+    expect(process.exitCode).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith('Boolean value required for flywheel.auto_pickup_backlog: maybe');
   });
 
   it('starts a flywheel run with the default brief and writes initial state', async () => {
@@ -271,6 +427,8 @@ describe('flywheel CLI commands', () => {
       effort: 'low',
       maxAgents: 3,
       scope: 'all-tracked-projects',
+      autoPickupBacklog: false,
+      requireUatBeforeMerge: true,
     }));
     const latest = JSON.parse(await readFile(join(tempDir, 'flywheel', 'runs', 'RUN-1', 'latest.json'), 'utf8')) as FlywheelStatus;
     const launch = await readFlywheelLaunchMetadata('RUN-1');
@@ -382,6 +540,8 @@ describe('flywheel CLI commands', () => {
       effort: 'low',
       maxAgents: 3,
       scope: 'all-tracked-projects',
+      autoPickupBacklog: false,
+      requireUatBeforeMerge: true,
     }));
     expect(logSpy).toHaveBeenCalledWith('Flywheel resumed: before paused=true active_run_id=RUN-1; after paused=false active_run_id=RUN-1');
     expect(process.exitCode).toBeUndefined();
@@ -488,6 +648,48 @@ describe('flywheel CLI commands', () => {
     expect(await readFile(join(repoDir, 'docs', 'FLYWHEEL-STATE.md'), 'utf8')).toContain('Second observation.');
   });
 
+  // Guard: pan flywheel report finalizes the run (writes report.md, clears
+  // the active-run gate, flips deriveRunStatus to 'complete'). Running it
+  // mid-flight silently terminates a live run, which surprised an operator
+  // who invoked it expecting a read-only snapshot. The guard refuses when
+  // the orchestrator session is alive; the orchestrator's own end-of-run
+  // call passes --force.
+  it('refuses to write a report while the orchestrator session is alive', async () => {
+    const repoDir = await createReportRepo(tempDir);
+    flywheelLifecycleMocks.activeRunId = 'RUN-1';
+    flywheelLifecycleMocks.paused = false;
+    flywheelLifecycleMocks.sessionExists = true;
+    await writeLatestFlywheelStatus(validStatus);
+
+    await flywheelReportCommand({ cwd: repoDir });
+
+    expect(process.exitCode).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Refusing to write report'));
+    // Gate must NOT have been cleared.
+    expect(flywheelLifecycleMocks.activeRunId).toBe('RUN-1');
+    // report.md must NOT have been written.
+    await expect(readFile(join(tempDir, 'flywheel', 'runs', 'RUN-1', 'report.md'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+
+    process.exitCode = undefined;
+  });
+
+  it('writes the report under --force even when the orchestrator session is alive', async () => {
+    const repoDir = await createReportRepo(tempDir);
+    flywheelLifecycleMocks.activeRunId = 'RUN-1';
+    flywheelLifecycleMocks.paused = false;
+    flywheelLifecycleMocks.sessionExists = true;
+    await writeLatestFlywheelStatus(validStatus);
+
+    await flywheelReportCommand({ cwd: repoDir, force: true });
+
+    expect(process.exitCode).toBeUndefined();
+    const runReport = await readFile(join(tempDir, 'flywheel', 'runs', 'RUN-1', 'report.md'), 'utf8');
+    expect(runReport).toContain('# Flywheel Run 1 Report');
+    // Gate cleared as before.
+    expect(flywheelLifecycleMocks.activeRunId).toBeNull();
+  });
+
   // PAN-1245: report must clear the gate even when the cwd is not a git
   // repo. Previously isFlywheelStateDirty threw on non-git cwd and the gate
   // stayed stuck, blocking the next pan flywheel start.
@@ -541,14 +743,18 @@ describe('flywheel CLI commands', () => {
     const flywheel = program.commands.find(command => command.name() === 'flywheel');
     const start = flywheel?.commands.find(command => command.name() === 'start');
     const emitStatus = flywheel?.commands.find(command => command.name() === 'emit-status');
+    const config = flywheel?.commands.find(command => command.name() === 'config');
     const status = flywheel?.commands.find(command => command.name() === 'status');
+    const stats = flywheel?.commands.find(command => command.name() === 'stats');
     const pause = flywheel?.commands.find(command => command.name() === 'pause');
     const resume = flywheel?.commands.find(command => command.name() === 'resume');
     const report = flywheel?.commands.find(command => command.name() === 'report');
     const abort = flywheel?.commands.find(command => command.name() === 'abort');
     expect(start?.options.map(option => option.long)).toContain('--brief');
     expect(emitStatus?.options.map(option => option.long)).toContain('--file');
+    expect(config?.options.map(option => option.long)).toEqual(expect.arrayContaining(['--get', '--set']));
     expect(status?.options.map(option => option.long)).toContain('--json');
+    expect(stats?.options.map(option => option.long)).toEqual(expect.arrayContaining(['--window', '--json']));
     expect(pause).toBeDefined();
     expect(resume).toBeDefined();
     expect(report).toBeDefined();

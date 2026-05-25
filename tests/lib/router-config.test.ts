@@ -110,14 +110,11 @@ describe('router-config', () => {
       expect(openaiProvider?.apiKey).toBe('sk-test-key');
       expect(openaiProvider?.models).toEqual([
         'gpt-5.5',
-        'gpt-5.5-pro',
         'gpt-5.4',
         'gpt-5.4-mini',
-        'gpt-5.4-pro',
         'gpt-5.3-codex',
+        'gpt-5.3-codex-spark',
         'gpt-5.2',
-        'o3',
-        'o4-mini',
       ]);
     });
 
@@ -352,7 +349,7 @@ describe('router-config', () => {
 
   describe('writeRouterConfig', () => {
     it('should write config to ~/.claude-code-router/config.json', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [
@@ -368,7 +365,7 @@ describe('router-config', () => {
         },
       };
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       const configPath = getRouterConfigPath();
       expect(existsSync(configPath)).toBe(true);
@@ -380,7 +377,7 @@ describe('router-config', () => {
     });
 
     it('should create directory if it does not exist', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [],
@@ -392,7 +389,7 @@ describe('router-config', () => {
       const configDir = join(tempDir, '.claude-code-router');
       expect(existsSync(configDir)).toBe(false);
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       // Directory should now exist
       expect(existsSync(configDir)).toBe(true);
@@ -400,7 +397,7 @@ describe('router-config', () => {
     });
 
     it('should write pretty-formatted JSON', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config = {
         providers: [
@@ -416,7 +413,7 @@ describe('router-config', () => {
         },
       };
 
-      writeRouterConfig(config);
+      writeRouterConfigSync(config);
 
       const configPath = getRouterConfigPath();
       const content = readFileSync(configPath, 'utf8');
@@ -427,7 +424,7 @@ describe('router-config', () => {
     });
 
     it('should overwrite existing config', async () => {
-      const { writeRouterConfig, getRouterConfigPath } = await import('../../src/lib/router-config.js');
+      const { writeRouterConfigSync, getRouterConfigPath } = await import('../../src/lib/router-config.js');
 
       const config1 = {
         providers: [],
@@ -439,8 +436,8 @@ describe('router-config', () => {
         router: { test: { model: 'model2' } },
       };
 
-      writeRouterConfig(config1);
-      writeRouterConfig(config2);
+      writeRouterConfigSync(config1);
+      writeRouterConfigSync(config2);
 
       const configPath = getRouterConfigPath();
       const content = readFileSync(configPath, 'utf8');

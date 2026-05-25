@@ -39,46 +39,53 @@ vi.mock('child_process', async (importActual) => {
   return {
     ...actual,
     exec: (...args: unknown[]) => {
+      // exec(cmd, opts, callback) or exec(cmd, callback)
       const command = String(args[0]);
       const callback = args[args.length - 1] as (err: null, result: { stdout: string; stderr: string }) => void;
-      const stdout = command.includes('^{tree}')
-        ? command.includes('oldsha1') ? `${mockOldTreeSha}\n` : `${mockNewTreeSha}\n`
-        : `${mockExecHeadSha}\n`;
       mockExecCallback(...args);
-      callback(null, { stdout, stderr: '' });
+      const treeMatch = command.match(/^git rev-parse (.+)\^\{tree\}$/);
+      const stdout = treeMatch
+        ? mockTreeShaByCommit.get(treeMatch[1]!) ?? `${treeMatch[1]}-tree`
+        : mockExecHeadSha;
+      callback(null, { stdout: `${stdout}\n`, stderr: '' });
       return {} as ReturnType<typeof actual.exec>;
     },
   };
 });
 
 let mockExecHeadSha = 'defaultsha';
-let mockOldTreeSha = 'old-tree';
-let mockNewTreeSha = 'new-tree';
+const mockTreeShaByCommit = new Map<string, string>();
 
 // ─── Stub modules that deacon imports ────────────────────────────────────────
 
 const mockResolveProject = vi.fn();
 vi.mock('../../../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: (...args: unknown[]) => mockResolveProject(...args),
+  resolveProjectFromIssueSync: (...args: unknown[]) => mockResolveProject(...args),
 }));
 
 vi.mock('../../../../../src/lib/activity-logger.js', () => ({
   emitActivityEntry: vi.fn(),
+  emitActivityEntrySync: vi.fn(),
   emitActivityTts: vi.fn(),
+  emitActivityTtsSync: vi.fn(),
 }));
 
 vi.mock('../../../../../src/lib/pipeline-notifier.js', () => ({
   notifyPipeline: vi.fn(),
+  notifyPipelineSync: vi.fn(),
 }));
 
 vi.mock('../../../../../src/lib/tmux.js', () => ({
   sessionExists: vi.fn(),
+  sessionExistsSync: vi.fn(),
   sendKeysAsync: vi.fn(),
   sessionExistsAsync: vi.fn().mockResolvedValue(false),
   buildTmuxCommandString: vi.fn(),
   capturePaneAsync: vi.fn(),
   createSessionAsync: vi.fn(),
   killSession: vi.fn(),
+  killSessionSync: vi.fn(),
   killSessionAsync: vi.fn(),
   listPaneValues: vi.fn(),
   listPaneValuesAsync: vi.fn(),
@@ -96,11 +103,14 @@ vi.mock('../../../../../src/lib/cloister/specialists.js', () => ({
 
 vi.mock('../../../../../src/lib/agents.js', () => ({
   getAgentRuntimeState: vi.fn().mockReturnValue(null),
+  getAgentRuntimeStateSync: vi.fn().mockReturnValue(null),
   saveAgentRuntimeState: vi.fn(),
   saveSessionId: vi.fn(),
   listRunningAgents: vi.fn().mockResolvedValue([]),
+  listRunningAgentsSync: vi.fn().mockResolvedValue([]),
   getAgentDir: vi.fn().mockReturnValue('/tmp'),
   getAgentState: vi.fn().mockReturnValue(null),
+  getAgentStateSync: vi.fn().mockReturnValue(null),
   messageAgent: vi.fn(),
   spawnAgent: vi.fn(),
   transitionIssueToInReview: vi.fn(),
@@ -128,8 +138,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   (existsSync as ReturnType<typeof vi.fn>).mockReturnValue(true);
   mockExecHeadSha = 'defaultsha';
-  mockOldTreeSha = 'old-tree';
-  mockNewTreeSha = 'new-tree';
+  mockTreeShaByCommit.clear();
   mockResolveProject.mockReturnValue({ projectPath: '/fake/project' });
 });
 
@@ -139,8 +148,8 @@ afterEach(() => {
 
 // ─── Imports after mocks ──────────────────────────────────────────────────────
 
-import { setReviewStatus, getReviewStatus } from '../../../../../src/lib/review-status.js';
-import { getReviewStatusFromDb } from '../../../../../src/lib/database/review-status-db.js';
+import { setReviewStatusSync, getReviewStatusSync } from '../../../../../src/lib/review-status.js';
+import { getReviewStatusFromDbSync } from '../../../../../src/lib/database/review-status-db.js';
 import { checkPostReviewCommits } from '../../../../../src/lib/cloister/deacon.js';
 
 // ─── 1. DB persistence ───────────────────────────────────────────────────────
@@ -148,35 +157,35 @@ import { checkPostReviewCommits } from '../../../../../src/lib/cloister/deacon.j
 describe('reviewedAtCommit DB persistence (specialists/done snapshot layer)', () => {
   it('persists reviewedAtCommit via setReviewStatus and loads it back from SQLite', () => {
     const sha = 'abc1234def5678901234567890123456789012ab';
-    setReviewStatus('PAN-RAC1', {
+    setReviewStatusSync('PAN-RAC1', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       reviewedAtCommit: sha,
     });
 
-    const row = getReviewStatusFromDb('PAN-RAC1');
+    const row = getReviewStatusFromDbSync('PAN-RAC1');
     expect(row?.reviewedAtCommit).toBe(sha);
   });
 
   it('reviewedAtCommit survives a subsequent partial update (not clobbered)', () => {
-    setReviewStatus('PAN-RAC2', {
+    setReviewStatusSync('PAN-RAC2', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       reviewedAtCommit: 'sha111',
     });
 
     // Simulate readyForMerge flip — must not erase reviewedAtCommit
-    setReviewStatus('PAN-RAC2', { readyForMerge: true });
+    setReviewStatusSync('PAN-RAC2', { readyForMerge: true });
 
-    const row = getReviewStatusFromDb('PAN-RAC2');
+    const row = getReviewStatusFromDbSync('PAN-RAC2');
     expect(row?.reviewedAtCommit).toBe('sha111');
   });
 
   it('reviewedAtCommit=undefined removes the field from DB', () => {
-    setReviewStatus('PAN-RAC3', { reviewStatus: 'passed', reviewedAtCommit: 'sha222' });
-    setReviewStatus('PAN-RAC3', { reviewedAtCommit: undefined });
+    setReviewStatusSync('PAN-RAC3', { reviewStatus: 'passed', reviewedAtCommit: 'sha222' });
+    setReviewStatusSync('PAN-RAC3', { reviewedAtCommit: undefined });
 
-    const row = getReviewStatusFromDb('PAN-RAC3');
+    const row = getReviewStatusFromDbSync('PAN-RAC3');
     expect(row?.reviewedAtCommit).toBeUndefined();
   });
 });
@@ -185,7 +194,7 @@ describe('reviewedAtCommit DB persistence (specialists/done snapshot layer)', ()
 
 describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCommit', () => {
   it('resets review pipeline when HEAD has moved since review passed', async () => {
-    setReviewStatus('PAN-900', {
+    setReviewStatusSync('PAN-900', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       readyForMerge: true,
@@ -193,12 +202,14 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
     });
 
     mockExecHeadSha = 'newsha99';
+    mockTreeShaByCommit.set('oldsha1', 'oldtree');
+    mockTreeShaByCommit.set('newsha99', 'newtree');
 
     const actions = await checkPostReviewCommits();
 
     expect(actions.some((a) => a.includes('PAN-900'))).toBe(true);
 
-    const after = getReviewStatus('PAN-900');
+    const after = getReviewStatusSync('PAN-900');
     expect(after?.reviewStatus).toBe('pending');
     expect(after?.testStatus).toBe('pending');
     expect(after?.readyForMerge).toBe(false);
@@ -206,7 +217,7 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
   });
 
   it('preserves review when HEAD changed but the tree did not', async () => {
-    setReviewStatus('PAN-904', {
+    setReviewStatusSync('PAN-904', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       readyForMerge: true,
@@ -214,14 +225,14 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
     });
 
     mockExecHeadSha = 'newsha99';
-    mockOldTreeSha = 'sametree';
-    mockNewTreeSha = 'sametree';
+    mockTreeShaByCommit.set('oldsha1', 'sametree');
+    mockTreeShaByCommit.set('newsha99', 'sametree');
 
     const actions = await checkPostReviewCommits();
 
     expect(actions.filter((a) => a.includes('PAN-904'))).toHaveLength(0);
 
-    const after = getReviewStatus('PAN-904');
+    const after = getReviewStatusSync('PAN-904');
     expect(after?.reviewStatus).toBe('passed');
     expect(after?.testStatus).toBe('passed');
     expect(after?.readyForMerge).toBe(true);
@@ -229,7 +240,7 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
   });
 
   it('does not reset review when HEAD matches reviewedAtCommit', async () => {
-    setReviewStatus('PAN-901', {
+    setReviewStatusSync('PAN-901', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       readyForMerge: true,
@@ -242,13 +253,13 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
 
     expect(actions.filter((a) => a.includes('PAN-901'))).toHaveLength(0);
 
-    const after = getReviewStatus('PAN-901');
+    const after = getReviewStatusSync('PAN-901');
     expect(after?.reviewStatus).toBe('passed');
     expect(after?.readyForMerge).toBe(true);
   });
 
   it('skips issues without reviewedAtCommit (not yet reviewed)', async () => {
-    setReviewStatus('PAN-902', {
+    setReviewStatusSync('PAN-902', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       readyForMerge: true,
@@ -260,11 +271,11 @@ describe('checkPostReviewCommits — deacon detects new commits via reviewedAtCo
     const actions = await checkPostReviewCommits();
 
     expect(actions.filter((a) => a.includes('PAN-902'))).toHaveLength(0);
-    expect(getReviewStatus('PAN-902')?.reviewStatus).toBe('passed');
+    expect(getReviewStatusSync('PAN-902')?.reviewStatus).toBe('passed');
   });
 
   it('skips issues that are already merged', async () => {
-    setReviewStatus('PAN-903', {
+    setReviewStatusSync('PAN-903', {
       reviewStatus: 'passed',
       testStatus: 'passed',
       mergeStatus: 'merged',

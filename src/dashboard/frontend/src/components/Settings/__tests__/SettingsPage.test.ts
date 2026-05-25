@@ -15,8 +15,10 @@ const MINIMAX_DEFAULTS: SettingsConfig = {
       minimax: true,
       zai: false,
       kimi: false,
+      mimo: false,
       openrouter: false,
       nous: false,
+      dashscope: false,
     },
     overrides: {
       'legacy.route': 'minimax-m2.7-highspeed',
@@ -97,6 +99,26 @@ describe('SettingsPage role model routing panels', () => {
     expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ rate: Number(e.target.value) }, { debounce: true })');
     expect(SETTINGS_PAGE_SOURCE).toContain('handleTtsConfigChange({ maxChars: Number(e.target.value) }, { debounce: true })');
   });
+
+  it('surfaces memory settings, feature toggles, and environment override precedence', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain("{ id: 'memory', label: 'Memory'");
+    expect(SETTINGS_PAGE_SOURCE).toContain('PANOPTICON_MEMORY_PROVIDER and PANOPTICON_MEMORY_MODEL override these UI values');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Extraction provider');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Fallback provider');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Daily cost cap');
+    expect(SETTINGS_PAGE_SOURCE).toContain('0 disables the cap');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Disable memory observations"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Toggle prompt-time memory injection"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Rollup threshold');
+    expect(SETTINGS_PAGE_SOURCE).toContain('Sidebar refresh interval');
+  });
+
+  it('surfaces the RTK Bash compression toggle in experimental settings', () => {
+    expect(SETTINGS_PAGE_SOURCE).toContain('RTK Bash compression');
+    expect(SETTINGS_PAGE_SOURCE).toContain('aria-label="Enable RTK Bash compression"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('data-testid="experimental-rtk-toggle"');
+    expect(SETTINGS_PAGE_SOURCE).toContain('handleRtkToggle(!formData.agents?.rtk?.enabled)');
+  });
 });
 
 describe('MODELS_BY_PROVIDER', () => {
@@ -155,6 +177,15 @@ describe('buildMiniMaxFormData', () => {
     expect(result.tmux?.config_mode).toBe('inherit-user');
   });
 
+  it('preserves existing memory settings from formData', () => {
+    const existing: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      memory: { provider: 'cliproxy', model: 'gpt-4.1-nano', per_day_cost_cap_usd: 0 },
+    };
+    const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
+    expect(result.memory).toEqual({ provider: 'cliproxy', model: 'gpt-4.1-nano', per_day_cost_cap_usd: 0 });
+  });
+
   it('preserves existing openrouter settings from formData', () => {
     const existing: SettingsConfig = {
       ...MINIMAX_DEFAULTS,
@@ -171,6 +202,15 @@ describe('buildMiniMaxFormData', () => {
     };
     const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
     expect(result.tts).toEqual(existing.tts);
+  });
+
+  it('preserves existing agent settings from formData', () => {
+    const existing: SettingsConfig = {
+      ...MINIMAX_DEFAULTS,
+      agents: { rtk: { enabled: true } },
+    };
+    const result = buildMiniMaxFormData(existing, MINIMAX_DEFAULTS);
+    expect(result.agents?.rtk?.enabled).toBe(true);
   });
 
   it('preserves gemini_thinking_level from formData, not from defaults', () => {

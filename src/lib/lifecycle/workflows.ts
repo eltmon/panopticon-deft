@@ -7,8 +7,8 @@
  * deepWipe() — Destructive: teardown(deleteBranches) + delete agent state + reset issue
  */
 
-import { existsSync, readFileSync } from 'fs';
-import { copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { copyFile, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -27,7 +27,9 @@ import { archivePlanning, findWorkspacePath } from './archive-planning.js';
 import { closeIssue, type CloseIssueOptions } from './close-issue.js';
 import { teardownWorkspace } from './teardown-workspace.js';
 import { compactBeads } from './compact-beads.js';
-import { extractNumber, extractPrefix } from '../issue-id.js';
+import { loadCloisterConfig } from '../cloister/config.js';
+import { extractNumberSync, extractPrefixSync } from '../issue-id.js';
+import { recordFeatureRegistryLifecycle } from '../registry/feature-registry-population.js';
 
 const execAsync = promisify(exec);
 
@@ -52,6 +54,10 @@ function buildResult(
     steps,
     duration: Date.now() - startTime,
   };
+}
+
+function hasBlockingFailure(steps: StepResult[]): boolean {
+  return steps.some(s => !s.success && !s.skipped);
 }
 
 /**
@@ -135,6 +141,18 @@ export function close(
 
 /**
  * closeOut() — Full close-out ceremony.
+ *
+ * This is the human-gated verification and cleanup workflow.
+ * Replaces the monolithic executeCloseOut() function.
+ *
+ * 1. Verify branch merged (hard fail if not — must pass before any cleanup)
+ * 2. Move PRD + archive workspace artifacts (hard fail if archiving fails)
+ * 3. Mark vBRIEF completed
+ * 4. Clean up workspace (tmux, TLDR, Docker, worktree)
+ * 5. Clean up agent state
+ * 6. Close issue on tracker
+ * 7. Apply closed-out label
+ * 8. Clear review status
  */
 export function closeOut(
   ctx: LifecycleContext,
@@ -162,21 +180,44 @@ export function closeOut(
       return buildResult('close-out', ctx.issueId, allSteps, start);
     }
 
+    // 3. Mark the vBRIEF completed on main before teardown removes local state.
+    const vbriefStep = yield* Effect.promise(() => completeVBriefStep(ctx));
+    allSteps.push(vbriefStep);
+    if (!vbriefStep.success && !vbriefStep.skipped) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — vBRIEF completion failed, workspace preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
+
     // 4+5. Teardown workspace + agent state
-    const teardownSteps = yield* teardownWorkspace(ctx, { deleteBranches: true });
+    const closeOutConfig = (yield* Effect.promise(() => Effect.runPromise(loadCloisterConfig()))).close_out;
+    const teardownSteps = yield* teardownWorkspace(ctx, {
+      deleteWorkspace: closeOutConfig?.remove_workspace ?? false,
+      deleteBranches: closeOutConfig?.delete_feature_branch ?? false,
+    });
     allSteps.push(...teardownSteps);
+    if (hasBlockingFailure(teardownSteps)) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — teardown failed, tracker issue and review status preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
 
     // 6+7. Close issue + apply label
     const closeSteps = yield* closeIssue(ctx, {
       tracker: opts.tracker,
-      comment: 'Closed via close-out ceremony',
+      comment: ctx.auto ? 'Closed via automatic close-out ceremony' : 'Closed via close-out ceremony',
       applyLabel: true,
     });
     allSteps.push(...closeSteps);
+    if (hasBlockingFailure(closeSteps)) {
+      allSteps.push(stepFailed('close-out:abort', 'Stopped — issue close failed, review status preserved'));
+      return buildResult('close-out', ctx.issueId, allSteps, start);
+    }
 
     // 8. Clear review status
     const clearResult = yield* clearReviewStatusStep(ctx.issueId);
     allSteps.push(clearResult);
+
+    yield* Effect.promise(() => resetPostMergeStateForIssue(ctx.issueId));
+    yield* Effect.promise(() => recordFeatureRegistryLifecycle({ issueId: ctx.issueId, status: 'archived' }));
 
     return buildResult('close-out', ctx.issueId, allSteps, start);
   });
@@ -303,6 +344,33 @@ export function cancelIssueWorkflow(
 }
 
 // --- Internal helpers ---
+
+async function completeVBriefStep(ctx: LifecycleContext): Promise<StepResult> {
+  const step = 'close-out:vbrief-completed';
+  try {
+    const { transitionVBriefOnMain } = await import('../vbrief/lifecycle-io.js');
+    const result = await Effect.runPromise(transitionVBriefOnMain(
+      ctx.projectPath,
+      ctx.issueId,
+      'completed',
+      'completed',
+      `scope: complete ${ctx.issueId.toUpperCase()} vBRIEF`,
+    ));
+    const details = [
+      result.moved ? 'Updated vBRIEF lifecycle to completed' : 'vBRIEF lifecycle already completed',
+      result.statusUpdated ? 'Updated plan.status to completed' : 'plan.status already completed',
+    ];
+    if (result.committed) details.push('Committed vBRIEF completion on main');
+    return stepOk(step, details);
+  } catch (err) {
+    const cause = (err as { cause?: unknown }).cause ?? err;
+    const message = cause instanceof Error ? cause.message : String(cause);
+    if (message.includes('No vBRIEF found')) {
+      return stepSkipped(step, [`No vBRIEF found for ${ctx.issueId}`]);
+    }
+    return stepFailed(step, `vBRIEF completion failed: ${message}`);
+  }
+}
 
 /**
  * Verify feature branch is merged into main.
@@ -484,12 +552,12 @@ async function resetIssueToTodoImpl(ctx: LifecycleContext): Promise<StepResult> 
     }
 
     // Linear: reopen to Todo
-    const linearApiKey = getLinearApiKey();
+    const linearApiKey = await getLinearApiKey();
     if (linearApiKey) {
       const { LinearClient } = await import('@linear/sdk');
       const client = new LinearClient({ apiKey: linearApiKey });
-      const issueNum = extractNumber(ctx.issueId);
-      const teamKey = extractPrefix(ctx.issueId);
+      const issueNum = extractNumberSync(ctx.issueId);
+      const teamKey = extractPrefixSync(ctx.issueId);
       if (issueNum === null || teamKey === null) {
         return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
       }
@@ -524,6 +592,16 @@ async function resetIssueToTodoImpl(ctx: LifecycleContext): Promise<StepResult> 
 /**
  * Clear review status for an issue.
  */
+async function resetPostMergeStateForIssue(issueId: string): Promise<void> {
+  try {
+    const { resetPostMergeState } = await import('../cloister/merge-agent.js');
+    resetPostMergeState(issueId);
+    resetPostMergeState(issueId.toUpperCase());
+  } catch {
+    return;
+  }
+}
+
 function clearReviewStatusStep(issueId: string): Effect.Effect<StepResult> {
   return Effect.tryPromise({
     try: () => clearReviewStatusStepImpl(issueId),
@@ -546,12 +624,11 @@ async function clearReviewStatusStepImpl(issueId: string): Promise<StepResult> {
     try {
       const statusFile = join(PANOPTICON_HOME, 'review-status.json');
       if (existsSync(statusFile)) {
-        const data = JSON.parse(readFileSync(statusFile, 'utf-8'));
+        const data = JSON.parse(await readFile(statusFile, 'utf-8'));
         const upperKey = issueId.toUpperCase();
         if (data[upperKey]) {
           delete data[upperKey];
-          const { writeFileSync } = await import('fs');
-          writeFileSync(statusFile, JSON.stringify(data, null, 2));
+          await writeFile(statusFile, JSON.stringify(data, null, 2));
         }
       }
       return stepOk(step, ['Review status cleared (direct)']);
@@ -562,6 +639,7 @@ async function clearReviewStatusStepImpl(issueId: string): Promise<StepResult> {
 }
 
 export const __testInternals = {
+  completeVBriefStep,
   verifyBranchMerged,
 };
 
@@ -588,12 +666,12 @@ async function resetIssueToCanceledImpl(ctx: LifecycleContext): Promise<StepResu
       return stepOk(step, [`Marked GitHub issue #${number} as canceled/wontfix`]);
     }
 
-    const linearApiKey = getLinearApiKey();
+    const linearApiKey = await getLinearApiKey();
     if (linearApiKey) {
       const { LinearClient } = await import('@linear/sdk');
       const client = new LinearClient({ apiKey: linearApiKey });
-      const issueNum = extractNumber(ctx.issueId);
-      const teamKey = extractPrefix(ctx.issueId);
+      const issueNum = extractNumberSync(ctx.issueId);
+      const teamKey = extractPrefixSync(ctx.issueId);
       if (issueNum === null || teamKey === null) {
         return stepFailed(step, `Could not parse issue ID: ${ctx.issueId}`);
       }

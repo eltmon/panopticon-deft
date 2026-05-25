@@ -1,7 +1,11 @@
 import chalk from 'chalk';
-import { existsSync, readdirSync, readFileSync } from 'fs';
-import { execSync } from 'child_process';
-import { listSessionNames } from '../../lib/tmux.js';
+import { Effect } from 'effect';
+import type { AgentStatus } from '@panctl/contracts';
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
+import { exec, execSync } from 'child_process';
+import { promisify } from 'util';
+import { getAgentSessionsSync, listSessionNamesSync } from '../../lib/tmux.js';
+import { listProjectsSync } from '../../lib/projects.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
@@ -12,10 +16,16 @@ import {
   CLAUDE_DIR,
   packageRoot,
 } from '../../lib/paths.js';
+import { cleanupClosedIssueAgentDirectories } from '../../lib/agent-directory-cleanup.js';
+import { getDashboardApiUrlSync } from '../../lib/config.js';
+import { CacheService } from '../../dashboard/server/services/cache-service.js';
+import { classifyDashboardAgent } from '../../dashboard/frontend/src/lib/agent-classifier.js';
 
 // Minimum supported Pi binary version for the Pi harness (PAN-636).
 // Bump in lockstep with packages/pi-extension API surface compatibility.
 export const SUPPORTED_PI_VERSION_MIN = '0.73.0';
+
+const execAsync = promisify(exec);
 
 function compareSemver(a: string, b: string): number {
   const pa = a.split('.').map((n) => parseInt(n, 10));
@@ -112,6 +122,54 @@ function checkDirectory(path: string): boolean {
   return existsSync(path);
 }
 
+export async function checkGraphifyFreshness(projectPath: string): Promise<CheckResult | null> {
+  const summaryPath = join(projectPath, 'graphify-out', 'GRAPH_SUMMARY.md');
+  if (!existsSync(summaryPath)) {
+    return null;
+  }
+
+  let headTimeMs: number;
+  try {
+    const { stdout } = await execAsync('git log -1 --format=%ct', { cwd: projectPath, encoding: 'utf-8' });
+    headTimeMs = Number(stdout.trim()) * 1000;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: 'Graphify graph freshness',
+      status: 'warn',
+      message: `Could not read HEAD timestamp: ${message}`,
+      fix: `Run: git status from ${projectPath}`,
+    };
+  }
+
+  if (!Number.isFinite(headTimeMs)) {
+    return {
+      name: 'Graphify graph freshness',
+      status: 'warn',
+      message: 'Could not parse HEAD timestamp',
+      fix: `Run: git log -1 --format=%ct from ${projectPath}`,
+    };
+  }
+
+  const summaryMtimeMs = statSync(summaryPath).mtimeMs;
+  if (summaryMtimeMs >= headTimeMs) {
+    return {
+      name: 'Graphify graph freshness',
+      status: 'ok',
+      message: 'Fresh — updated since HEAD',
+    };
+  }
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  const days = Math.max(1, Math.ceil((headTimeMs - summaryMtimeMs) / dayMs));
+  return {
+    name: 'Graphify graph freshness',
+    status: 'warn',
+    message: `Stale — ${days} day${days === 1 ? '' : 's'} older than HEAD`,
+    fix: `Run: graphify update . from ${projectPath}; or wait for the next merge to refresh automatically`,
+  };
+}
+
 interface ComposeDriftEntry {
   container: string;
   missingPath: string;
@@ -155,6 +213,194 @@ function countItems(path: string): number {
   } catch {
     return 0;
   }
+}
+
+function getCachedIssueRowsForDoctor(): unknown[] {
+  try {
+    const cache = new CacheService();
+    return ['github', 'linear', 'rally'].flatMap((tracker) => {
+      const entry = cache.getStale(tracker, 'issues');
+      return Array.isArray(entry?.data) ? entry.data : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function checkClosedIssueOrphanAgentDirs(
+  issues: unknown[],
+  agentsDir: string = AGENTS_DIR,
+): Promise<CheckResult> {
+  const result = await Effect.runPromise(cleanupClosedIssueAgentDirectories({
+    issues,
+    agentsDir,
+    dryRun: true,
+  }));
+
+  if (result.totalCandidates === 0) {
+    return {
+      name: 'Closed-Issue Agent Dirs',
+      status: 'ok',
+      message: 'No old closed-issue agent dirs detected',
+    };
+  }
+
+  const removable = result.wouldRemove.slice(0, 8).join(', ');
+  const protectedDirs = result.protected.slice(0, 8).join(', ');
+  const details = [
+    result.wouldRemove.length > 0 ? `removable: ${removable}` : null,
+    result.protected.length > 0 ? `protected: ${protectedDirs}` : null,
+  ].filter(Boolean).join('; ');
+
+  return {
+    name: 'Closed-Issue Agent Dirs',
+    status: 'warn',
+    message: `${result.totalCandidates} old closed-issue agent dir${result.totalCandidates === 1 ? '' : 's'} detected`,
+    fix: details
+      ? `Restart pan up to run the startup sweep. ${details}`
+      : 'Restart pan up to run the startup sweep.',
+  };
+}
+
+type DoctorAgentState = {
+  id?: unknown;
+  issueId?: unknown;
+  status?: unknown;
+  startedAt?: unknown;
+  lastActivity?: unknown;
+};
+
+type DoctorDashboardAgent = {
+  id?: unknown;
+  issueId?: unknown;
+  status?: unknown;
+  startedAt?: unknown;
+  lastActivity?: unknown;
+  hasLiveTmuxSession?: unknown;
+};
+
+function normalizeDoctorAgentId(agentId: string): string {
+  return /^(agent|planning|conv)-/.test(agentId) ? agentId : `agent-${agentId.toLowerCase()}`;
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readDoctorAgentStates(agentsDir: string): DoctorAgentState[] {
+  if (!existsSync(agentsDir)) return [];
+
+  const states: DoctorAgentState[] = [];
+  for (const dir of readdirSync(agentsDir, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    const statePath = join(agentsDir, dir.name, 'state.json');
+    if (!existsSync(statePath)) continue;
+    try {
+      const state = JSON.parse(readFileSync(statePath, 'utf8')) as DoctorAgentState;
+      states.push({ ...state, id: stringField(state.id) ?? dir.name });
+    } catch {
+      // Ignore unreadable agent state; other doctor checks surface broader FS health.
+    }
+  }
+  return states;
+}
+
+async function getDashboardAgentRowsForDoctor(): Promise<DoctorDashboardAgent[] | null> {
+  try {
+    const response = await fetch(`${getDashboardApiUrlSync().replace(/\/$/, '')}/api/agents`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return Array.isArray(data) ? data as DoctorDashboardAgent[] : null;
+  } catch {
+    return null;
+  }
+}
+
+export function checkStoppedListClassification(options: {
+  agentsDir?: string;
+  dashboardAgents: DoctorDashboardAgent[] | null;
+  tmuxSessionNames?: string[];
+  nowMs?: number;
+}): CheckResult {
+  const agentsDir = options.agentsDir ?? AGENTS_DIR;
+  const tmuxSessionNames = options.tmuxSessionNames
+    ?? getAgentSessionsSync().map((session) => session.name);
+  const tmuxSessions = new Set(tmuxSessionNames);
+  const liveRunningAgents = readDoctorAgentStates(agentsDir).filter((state) => {
+    const id = stringField(state.id);
+    return state.status === 'running' && id && tmuxSessions.has(normalizeDoctorAgentId(id));
+  });
+
+  if (liveRunningAgents.length === 0) {
+    return {
+      name: 'Stopped-List Classification',
+      status: 'ok',
+      message: 'No running agent state disagrees with tmux liveness',
+    };
+  }
+
+  if (options.dashboardAgents === null) {
+    return {
+      name: 'Stopped-List Classification',
+      status: 'warn',
+      message: 'Dashboard /api/agents unavailable; could not verify stopped-list classification',
+      fix: 'Start pan up and rerun pan doctor. PAN-1419 guards running+tmux agents from stopped lists.',
+    };
+  }
+
+  const dashboardById = new Map(
+    options.dashboardAgents
+      .map((agent) => [stringField(agent.id), agent] as const)
+      .filter((entry): entry is readonly [string, DoctorDashboardAgent] => entry[0] !== undefined),
+  );
+  const misclassified: string[] = [];
+
+  for (const state of liveRunningAgents) {
+    const id = normalizeDoctorAgentId(stringField(state.id)!);
+    const dashboardAgent = dashboardById.get(id);
+    if (!dashboardAgent) {
+      misclassified.push(id);
+      continue;
+    }
+
+    const issueId = stringField(dashboardAgent.issueId) ?? stringField(state.issueId);
+    const status = stringField(dashboardAgent.status);
+    if (!issueId || !status) {
+      misclassified.push(id);
+      continue;
+    }
+
+    const classification = classifyDashboardAgent({
+      issueId,
+      status: status as AgentStatus,
+      hasLiveTmuxSession: typeof dashboardAgent.hasLiveTmuxSession === 'boolean'
+        ? dashboardAgent.hasLiveTmuxSession
+        : undefined,
+      lastActivity: stringField(dashboardAgent.lastActivity),
+      startedAt: stringField(dashboardAgent.startedAt) ?? stringField(state.startedAt),
+    }, options.nowMs);
+
+    if (classification !== 'active') {
+      misclassified.push(id);
+    }
+  }
+
+  if (misclassified.length === 0) {
+    return {
+      name: 'Stopped-List Classification',
+      status: 'ok',
+      message: 'Running agents with live tmux classify as active',
+    };
+  }
+
+  return {
+    name: 'Stopped-List Classification',
+    status: 'warn',
+    message: `${misclassified.length} running agent${misclassified.length === 1 ? '' : 's'} with live tmux would not classify as active: ${misclassified.join(', ')}`,
+    fix: 'PAN-1419: ensure /api/agents and read-model snapshots preserve hasLiveTmuxSession for live tmux agents.',
+  };
 }
 
 export interface DoctorOptions {
@@ -284,7 +530,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<void> 
 
   // Check tmux sessions
   try {
-    const agentSessions = listSessionNames().filter((s) => s.includes('agent-')).length;
+    const agentSessions = listSessionNamesSync().filter((s) => s.includes('agent-')).length;
     checks.push({
       name: 'Running Agents',
       status: 'ok',
@@ -298,9 +544,14 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<void> 
     });
   }
 
+  checks.push(await checkClosedIssueOrphanAgentDirs(getCachedIssueRowsForDoctor()));
+  checks.push(checkStoppedListClassification({
+    dashboardAgents: await getDashboardAgentRowsForDoctor(),
+  }));
+
   // Check smee-client webhook relay
   try {
-    const { isSmeeProcessRunning } = await import('../../lib/smee.js');
+    const { isSmeeProcessRunningSync } = await import('../../lib/smee.js');
     const smeeUrlPath = join(homedir(), '.panopticon', 'github-app', 'smee-url');
     if (!existsSync(smeeUrlPath)) {
       checks.push({
@@ -309,7 +560,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<void> 
         message: 'Not configured (optional)',
         fix: 'Create ~/.panopticon/github-app/smee-url with your smee.io channel URL',
       });
-    } else if (isSmeeProcessRunning()) {
+    } else if (isSmeeProcessRunningSync()) {
       checks.push({
         name: 'smee-client Webhook Relay',
         status: 'ok',
@@ -329,6 +580,13 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<void> 
       status: 'warn',
       message: 'Status check failed',
     });
+  }
+
+  for (const { config } of listProjectsSync()) {
+    const graphifyCheck = await checkGraphifyFreshness(config.path);
+    if (graphifyCheck) {
+      checks.push(graphifyCheck);
+    }
   }
 
   // Check Docker compose label drift (PAN-956)

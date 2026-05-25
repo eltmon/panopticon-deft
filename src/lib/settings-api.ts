@@ -11,7 +11,8 @@ import { Data, Effect } from 'effect';
 import {
   DEFAULT_ROLES,
   DEFAULT_WORKHORSES,
-  loadConfig,
+  PARENT_MODEL_REF,
+  loadConfigSync,
   getGlobalConfigPath,
   clearConfigCache,
   mergeConfigs,
@@ -26,7 +27,7 @@ import {
 import { ModelId } from './settings.js';
 import type { Role } from './agents.js';
 import type { RuntimeName } from './runtimes/types.js';
-import { MODEL_CAPABILITIES, getModelCapability, MODEL_DEPRECATIONS, resolveModelId } from './model-capabilities.js';
+import { MODEL_CAPABILITIES, hasModelCapabilitySync, MODEL_DEPRECATIONS, resolveModelIdSync } from './model-capabilities.js';
 
 /**
  * Deprecation warning in API format
@@ -124,6 +125,7 @@ export interface ApiSettingsConfig {
       mimo: boolean;
       openrouter: boolean;
       nous: boolean;
+      dashscope: boolean;
     };
     /** Legacy model-route overrides are no longer surfaced by GET /api/settings. */
     overrides?: Partial<Record<string, ModelId>>;
@@ -148,6 +150,19 @@ export interface ApiSettingsConfig {
       cost_confirm_threshold?: number;
     };
   };
+  memory?: {
+    provider?: 'anthropic' | 'cliproxy';
+    model?: string;
+    per_day_cost_cap_usd?: number;
+    fallback_provider?: 'anthropic' | 'cliproxy' | '';
+    fallback_model?: string;
+    fallback_chain?: Array<{ provider: 'anthropic' | 'cliproxy'; model: string }>;
+    observations_enabled?: boolean;
+    prompt_time_injection_enabled?: boolean;
+    rollup_pending_threshold?: number;
+    sidebar_refresh_interval_ms?: number;
+    worker_concurrency?: number;
+  };
   api_keys: {
     openai?: string;
     voyage?: string;
@@ -158,6 +173,12 @@ export interface ApiSettingsConfig {
     mimo?: string;
     openrouter?: string;
     nous?: string;
+    dashscope?: string;
+  };
+  agents?: {
+    rtk?: {
+      enabled?: boolean;
+    };
   };
   tts?: ApiTtsConfig;
   openrouter?: {
@@ -173,8 +194,10 @@ export interface ApiSettingsConfig {
     rally?: string;
   };
   experimental?: {
-    /** Use Claude Code Channels for prompt delivery to eligible work agents. */
+    /** Use Claude Code Channels delivery for conversations/messages. */
     claudeCodeChannels?: boolean;
+    /** Enable legacy Claude Code Channels MCP wiring for new eligible work agents. */
+    claudeCodeChannelsMcp?: boolean;
   };
   /**
    * Permission mode for spawned Claude Code agents.
@@ -197,22 +220,23 @@ export interface ApiSettingsConfig {
  * Also detects deprecated model IDs in current overrides and returns warnings.
  */
 export function getDefaultConversationModelApi(): ModelId {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
-  if (config.defaultConversationModel) return resolveModelId(config.defaultConversationModel);
+  if (config.defaultConversationModel) return resolveModelIdSync(config.defaultConversationModel);
 
-  if (config.enabledProviders.has('openai')) return resolveModelId('gpt-5.5');
-  if (config.enabledProviders.has('minimax')) return resolveModelId('minimax-m2.7-highspeed');
-  if (config.enabledProviders.has('google')) return resolveModelId('gemini-3.1-pro-preview');
-  if (config.enabledProviders.has('kimi')) return resolveModelId('kimi-k2.5');
-  if (config.enabledProviders.has('zai')) return resolveModelId('glm-5.1');
-  if (config.enabledProviders.has('mimo')) return resolveModelId('mimo-v2.5-pro');
-  if (config.enabledProviders.has('nous')) return resolveModelId('qwen/qwen3.6-plus');
+  if (config.enabledProviders.has('openai')) return resolveModelIdSync('gpt-5.5');
+  if (config.enabledProviders.has('minimax')) return resolveModelIdSync('minimax-m2.7-highspeed');
+  if (config.enabledProviders.has('google')) return resolveModelIdSync('gemini-3.1-pro-preview');
+  if (config.enabledProviders.has('kimi')) return resolveModelIdSync('kimi-k2.5');
+  if (config.enabledProviders.has('zai')) return resolveModelIdSync('glm-5.1');
+  if (config.enabledProviders.has('mimo')) return resolveModelIdSync('mimo-v2.5-pro');
+  if (config.enabledProviders.has('nous')) return resolveModelIdSync('qwen/qwen3.6-plus');
+  if (config.enabledProviders.has('dashscope')) return resolveModelIdSync('qwen3-coder-plus');
   if (config.enabledProviders.has('openrouter')) {
     const fav = config.openrouterFavorites[0];
-    if (fav) return resolveModelId(fav);
+    if (fav) return resolveModelIdSync(fav);
   }
-  return resolveModelId('claude-sonnet-4-6');
+  return resolveModelIdSync('claude-sonnet-4-6');
 }
 
 const ROLE_NAMES: readonly Role[] = ['plan', 'work', 'review', 'test', 'ship', 'flywheel'];
@@ -221,11 +245,11 @@ const ALLOWED_SUB_ROLES: Partial<Record<Role, readonly string[]>> = {
   work: ['inspect', 'inspect-deep'],
   review: ['security', 'performance', 'correctness', 'requirements', 'synthesis'],
 };
-function seededWorkhorses(config: Pick<ReturnType<typeof loadConfig>['config'], 'workhorses'>): WorkhorsesConfig {
+function seededWorkhorses(config: Pick<ReturnType<typeof loadConfigSync>['config'], 'workhorses'>): WorkhorsesConfig {
   return { ...DEFAULT_WORKHORSES, ...(config.workhorses ?? {}) };
 }
 
-function seededRoles(config: Pick<ReturnType<typeof loadConfig>['config'], 'roles'>): RolesConfig {
+function seededRoles(config: Pick<ReturnType<typeof loadConfigSync>['config'], 'roles'>): RolesConfig {
   const roles: RolesConfig = {};
   for (const role of ROLE_NAMES) {
     const defaultRole = DEFAULT_ROLES[role];
@@ -243,7 +267,7 @@ function seededRoles(config: Pick<ReturnType<typeof loadConfig>['config'], 'role
   return roles;
 }
 
-function toApiTtsConfig(config: ReturnType<typeof loadConfig>['config']['tts']): ApiTtsConfig {
+function toApiTtsConfig(config: ReturnType<typeof loadConfigSync>['config']['tts']): ApiTtsConfig {
   return {
     enabled: config.enabled,
     voice: config.voice,
@@ -308,9 +332,17 @@ function validateModelRef(
   errors: string[],
   warnings: string[],
   allowWorkhorseRef: boolean,
+  allowParentRef = false,
 ): void {
   if (typeof ref !== 'string' || ref.trim() === '') {
     errors.push(`${fieldPath} must be a non-empty model reference`);
+    return;
+  }
+
+  if (ref === PARENT_MODEL_REF) {
+    if (!allowParentRef) {
+      errors.push(`${fieldPath} cannot be ${PARENT_MODEL_REF}; ${PARENT_MODEL_REF} is valid only for sub-role models`);
+    }
     return;
   }
 
@@ -335,8 +367,8 @@ function validateModelRef(
     return;
   }
 
-  const resolved = resolveModelId(ref);
-  if (!MODEL_CAPABILITIES[resolved]) {
+  const resolved = resolveModelIdSync(ref);
+  if (!hasModelCapabilitySync(resolved)) {
     errors.push(`Invalid model reference "${ref}" at ${fieldPath}`);
   }
 }
@@ -420,6 +452,7 @@ function validateWorkhorsesAndRoles(settings: ApiSettingsConfig, errors: string[
                 errors,
                 warnings,
                 true,
+                true,
               );
             }
           }
@@ -438,7 +471,7 @@ function validateWorkhorsesAndRoles(settings: ApiSettingsConfig, errors: string[
 }
 
 export function loadSettingsApi(): ApiSettingsConfig {
-  const { config } = loadConfig();
+  const { config } = loadConfigSync();
 
   // Detect deprecated models in current overrides. Overrides are no longer
   // surfaced by GET /api/settings, but warnings help users clean stale config.
@@ -472,6 +505,15 @@ export function loadSettingsApi(): ApiSettingsConfig {
     }) : undefined,
   });
 
+  const memory = config.memory ?? {
+    extraction: { fallbackChain: [] },
+    observationsEnabled: true,
+    promptTimeInjectionEnabled: true,
+    rollupPendingThreshold: 4,
+    sidebarRefreshIntervalMs: 10_000,
+    workerConcurrency: 4,
+  };
+
   return {
     workhorses: seededWorkhorses(config),
     roles: seededRoles(config),
@@ -486,11 +528,17 @@ export function loadSettingsApi(): ApiSettingsConfig {
         mimo: config.enabledProviders.has('mimo'),
         openrouter: config.enabledProviders.has('openrouter'),
         nous: config.enabledProviders.has('nous'),
+        dashscope: config.enabledProviders.has('dashscope'),
       },
       gemini_thinking_level: config.geminiThinkingLevel,
       default_conversation_model: getDefaultConversationModelApi(),
     },
     api_keys: config.apiKeys,
+    agents: {
+      rtk: {
+        enabled: config.rtk?.enabled ?? false,
+      },
+    },
     tts: toApiTtsConfig(config.tts),
     openrouter: {
       favorites: config.openrouterFavorites,
@@ -499,9 +547,23 @@ export function loadSettingsApi(): ApiSettingsConfig {
       config_mode: config.tmux.configMode,
     },
     conversations: conversationSettings,
+    memory: {
+      provider: memory.extraction.provider,
+      model: memory.extraction.model,
+      per_day_cost_cap_usd: memory.extraction.perDayCostCapUsd,
+      fallback_provider: memory.extraction.fallbackChain[0]?.provider ?? '',
+      fallback_model: memory.extraction.fallbackChain[0]?.model,
+      fallback_chain: memory.extraction.fallbackChain,
+      observations_enabled: memory.observationsEnabled,
+      prompt_time_injection_enabled: memory.promptTimeInjectionEnabled,
+      rollup_pending_threshold: memory.rollupPendingThreshold,
+      sidebar_refresh_interval_ms: memory.sidebarRefreshIntervalMs,
+      worker_concurrency: memory.workerConcurrency,
+    },
     tracker_keys: config.trackerKeys,
     experimental: {
       claudeCodeChannels: config.experimental?.claudeCodeChannels ?? false,
+      claudeCodeChannelsMcp: config.experimental?.claudeCodeChannelsMcp ?? false,
     },
     claude: {
       // Defensive — older test mocks of loadConfig may not include `claude`;
@@ -552,6 +614,7 @@ async function writeYamlConfigPreservingComments(yamlConfig: YamlConfig): Promis
     ['openrouter', config.openrouter],
     ['tmux', config.tmux],
     ['conversations', config.conversations],
+    ['memory', config.memory],
     ['tracker_keys', config.tracker_keys],
     ['experimental', config.experimental],
     ['claude', config.claude],
@@ -565,6 +628,10 @@ async function writeYamlConfigPreservingComments(yamlConfig: YamlConfig): Promis
     }
   }
 
+  if (config.agents?.rtk !== undefined) {
+    doc.setIn(['agents', 'rtk'], config.agents.rtk);
+  }
+
   if (config.tts !== undefined) {
     for (const [key, value] of Object.entries(config.tts)) {
       doc.setIn(['tts', key], value);
@@ -574,11 +641,8 @@ async function writeYamlConfigPreservingComments(yamlConfig: YamlConfig): Promis
   await writeFile(configPath, doc.toString({ lineWidth: 120 }), 'utf-8');
 }
 
-/**
- * Save settings from API format (for PUT /api/settings)
- */
-export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void> {
-  const { config: currentConfig } = loadConfig();
+async function saveSettingsApiPromise(settings: ApiSettingsConfig): Promise<void> {
+  const { config: currentConfig } = loadConfigSync();
   const providerAuth = currentConfig.providerAuth ?? {};
   const providerPlan = currentConfig.providerPlan ?? {};
 
@@ -609,6 +673,7 @@ export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void
         mimo: settings.models.providers.mimo,
         openrouter: settings.models.providers.openrouter,
         nous: settings.models.providers.nous,
+        dashscope: settings.models.providers.dashscope,
       },
       gemini_thinking_level: settings.models.gemini_thinking_level as 1 | 2 | 3 | 4,
       default_conversation_model: settings.models.default_conversation_model,
@@ -623,14 +688,40 @@ export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void
       mimo: settings.api_keys.mimo,
       openrouter: settings.api_keys.openrouter,
       nous: settings.api_keys.nous,
+      dashscope: settings.api_keys.dashscope,
     },
+    agents: settings.agents?.rtk !== undefined
+      ? { rtk: { enabled: settings.agents.rtk.enabled ?? false } }
+      : undefined,
     tts: sanitizeApiTtsConfig(settings.tts),
     openrouter: settings.openrouter,
     tmux: settings.tmux,
     conversations: settings.conversations,
+    memory: settings.memory
+      ? {
+          extraction: {
+            provider: settings.memory.provider || undefined,
+            model: settings.memory.model || undefined,
+            per_day_cost_cap_usd: settings.memory.per_day_cost_cap_usd,
+            fallback_chain: settings.memory.fallback_chain ?? (settings.memory.fallback_provider && settings.memory.fallback_model
+              ? [{ provider: settings.memory.fallback_provider, model: settings.memory.fallback_model }]
+              : undefined),
+          },
+          features: {
+            observations: settings.memory.observations_enabled,
+            prompt_time_injection: settings.memory.prompt_time_injection_enabled,
+          },
+          rollup_pending_threshold: settings.memory.rollup_pending_threshold,
+          sidebar_refresh_interval_ms: settings.memory.sidebar_refresh_interval_ms,
+          worker_concurrency: settings.memory.worker_concurrency,
+        }
+      : undefined,
     tracker_keys: settings.tracker_keys,
     experimental: settings.experimental
-      ? { claudeCodeChannels: settings.experimental.claudeCodeChannels }
+      ? {
+          claudeCodeChannels: settings.experimental.claudeCodeChannels,
+          claudeCodeChannelsMcp: settings.experimental.claudeCodeChannelsMcp,
+        }
       : undefined,
     claude: settings.claude?.permissionMode
       ? { permissionMode: settings.claude.permissionMode }
@@ -644,10 +735,7 @@ export async function saveSettingsApi(settings: ApiSettingsConfig): Promise<void
   clearConfigCache();
 }
 
-/**
- * Update specific settings (partial update)
- */
-export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Promise<ApiSettingsConfig> {
+async function updateSettingsApiPromise(updates: Partial<ApiSettingsConfig>): Promise<ApiSettingsConfig> {
   const current = loadSettingsApi();
 
   // Merge updates
@@ -670,6 +758,14 @@ export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Pr
       ...current.api_keys,
       ...updates.api_keys,
     },
+    agents: {
+      ...current.agents,
+      ...updates.agents,
+      rtk: {
+        ...current.agents?.rtk,
+        ...updates.agents?.rtk,
+      },
+    },
     tts: {
       ...current.tts,
       ...sanitizeApiTtsConfig(updates.tts),
@@ -686,6 +782,10 @@ export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Pr
       ...current.conversations,
       ...updates.conversations,
     },
+    memory: {
+      ...current.memory,
+      ...updates.memory,
+    },
     tracker_keys: {
       ...current.tracker_keys,
       ...updates.tracker_keys,
@@ -701,7 +801,7 @@ export async function updateSettingsApi(updates: Partial<ApiSettingsConfig>): Pr
   };
 
   // Save and return
-  await saveSettingsApi(merged);
+  await Effect.runPromise(saveSettingsApi(merged));
   return merged;
 }
 
@@ -709,19 +809,19 @@ export function getRoleConfig(role: Role): RoleConfig | undefined {
   return loadSettingsApi().roles?.[role];
 }
 
-export async function setRoleConfig(role: Role, roleConfig: RoleConfig): Promise<ApiSettingsConfig> {
-  return updateSettingsApi({ roles: { [role]: roleConfig } });
+async function setRoleConfigPromise(role: Role, roleConfig: RoleConfig): Promise<ApiSettingsConfig> {
+  return Effect.runPromise(updateSettingsApi({ roles: { [role]: roleConfig } }));
 }
 
-export async function updateProviderApiKey(
-  provider: 'openai' | 'voyage' | 'google' | 'minimax' | 'zai' | 'kimi' | 'mimo' | 'openrouter' | 'nous',
+async function updateProviderApiKeyPromise(
+  provider: 'openai' | 'voyage' | 'google' | 'minimax' | 'zai' | 'kimi' | 'mimo' | 'openrouter' | 'nous' | 'dashscope',
   apiKey?: string
 ): Promise<ApiSettingsConfig> {
-  return updateSettingsApi({
+  return Effect.runPromise(updateSettingsApi({
     api_keys: {
       [provider]: apiKey,
     },
-  });
+  }));
 }
 
 /**
@@ -782,14 +882,44 @@ export function validateSettingsApi(settings: ApiSettingsConfig): ValidationResu
     }
   }
 
+  if (settings.agents !== undefined) {
+    if (!isRecord(settings.agents)) {
+      errors.push('agents must be an object');
+    } else if (settings.agents.rtk !== undefined) {
+      if (!isRecord(settings.agents.rtk)) {
+        errors.push('agents.rtk must be an object');
+      } else if (settings.agents.rtk.enabled !== undefined && typeof settings.agents.rtk.enabled !== 'boolean') {
+        errors.push('agents.rtk.enabled must be a boolean');
+      }
+    }
+  }
+
+  if (settings.memory !== undefined) {
+    if (settings.memory.per_day_cost_cap_usd !== undefined && settings.memory.per_day_cost_cap_usd < 0) {
+      errors.push('memory.per_day_cost_cap_usd must be greater than or equal to 0');
+    }
+    if (settings.memory.rollup_pending_threshold !== undefined && (!Number.isInteger(settings.memory.rollup_pending_threshold) || settings.memory.rollup_pending_threshold < 1)) {
+      errors.push('memory.rollup_pending_threshold must be a positive integer');
+    }
+    if (settings.memory.sidebar_refresh_interval_ms !== undefined && (!Number.isInteger(settings.memory.sidebar_refresh_interval_ms) || settings.memory.sidebar_refresh_interval_ms < 1)) {
+      errors.push('memory.sidebar_refresh_interval_ms must be a positive integer');
+    }
+    if (settings.memory.worker_concurrency !== undefined && (!Number.isInteger(settings.memory.worker_concurrency) || settings.memory.worker_concurrency < 1)) {
+      errors.push('memory.worker_concurrency must be a positive integer');
+    }
+  }
+
   // Validate experimental flags — every flag must be a boolean if present.
   if (settings.experimental !== undefined) {
     if (typeof settings.experimental !== 'object' || settings.experimental === null) {
       errors.push('experimental must be an object');
     } else {
-      const ccc = (settings.experimental as { claudeCodeChannels?: unknown }).claudeCodeChannels;
-      if (ccc !== undefined && typeof ccc !== 'boolean') {
+      const experimental = settings.experimental as { claudeCodeChannels?: unknown; claudeCodeChannelsMcp?: unknown };
+      if (experimental.claudeCodeChannels !== undefined && typeof experimental.claudeCodeChannels !== 'boolean') {
         errors.push('experimental.claudeCodeChannels must be a boolean');
+      }
+      if (experimental.claudeCodeChannelsMcp !== undefined && typeof experimental.claudeCodeChannelsMcp !== 'boolean') {
+        errors.push('experimental.claudeCodeChannelsMcp must be a boolean');
       }
     }
   }
@@ -822,6 +952,7 @@ export function getAvailableModelsApi(): {
   mimo: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   openrouter: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   nous: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+  dashscope: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
 } {
   const result: {
     anthropic: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
@@ -833,6 +964,7 @@ export function getAvailableModelsApi(): {
     mimo: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
     openrouter: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
     nous: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
+    dashscope: Array<{ id: ModelId; name: string; costPer1MTokens: number }>;
   } = {
     anthropic: [],
     openai: [],
@@ -843,11 +975,17 @@ export function getAvailableModelsApi(): {
     mimo: [],
     openrouter: [],
     nous: [],
+    dashscope: [],
   };
 
   for (const [modelId, capability] of Object.entries(MODEL_CAPABILITIES)) {
     // Skip deprecated models — they should not appear in user-facing pickers.
+    // MODEL_DEPRECATIONS is the single source of truth for "this model has
+    // been retired and remapped to a current one"; capability entries are kept
+    // for back-compat (cost/capability lookups for old configs and historical
+    // conversations), but they must not surface in dropdowns.
     if (capability.displayName.includes('(deprecated)')) continue;
+    if (modelId in MODEL_DEPRECATIONS) continue;
     const entry = { id: modelId as ModelId, name: capability.displayName, costPer1MTokens: capability.costPer1MTokens };
     switch (capability.provider) {
       case 'anthropic':
@@ -876,6 +1014,9 @@ export function getAvailableModelsApi(): {
         break;
       case 'nous':
         result.nous.push(entry);
+        break;
+      case 'dashscope':
+        result.dashscope.push(entry);
         break;
     }
   }
@@ -912,6 +1053,7 @@ export function getOptimalDefaultsApi(): ApiSettingsConfig {
         mimo: false,
         openrouter: false,
         nous: false,
+        dashscope: false,
       },
       gemini_thinking_level: 3,
     },
@@ -942,6 +1084,7 @@ export function getMiniMaxDefaultsApi(): ApiSettingsConfig {
         mimo: false,
         openrouter: false,
         nous: false,
+        dashscope: false,
       },
       gemini_thinking_level: 3,
     },
@@ -950,15 +1093,12 @@ export function getMiniMaxDefaultsApi(): ApiSettingsConfig {
   };
 }
 
-/**
- * Save OpenRouter favorites to config.yaml
- */
-export async function saveOpenRouterFavorites(favorites: string[]): Promise<void> {
+async function saveOpenRouterFavoritesPromise(favorites: string[]): Promise<void> {
   const current = loadSettingsApi();
-  await saveSettingsApi({
+  await Effect.runPromise(saveSettingsApi({
     ...current,
     openrouter: { ...current.openrouter, favorites },
-  });
+  }));
 }
 
 /**
@@ -984,11 +1124,11 @@ export class SettingsApiError extends Data.TaggedError('SettingsApiError')<{
 }> {}
 
 /** Effect variant of `saveSettingsApi`. */
-export const saveSettingsApiEffect = (
+export const saveSettingsApi = (
   settings: ApiSettingsConfig,
 ): Effect.Effect<void, SettingsApiError> =>
   Effect.tryPromise({
-    try: () => saveSettingsApi(settings),
+    try: () => saveSettingsApiPromise(settings),
     catch: (cause) =>
       new SettingsApiError({
         operation: 'saveSettingsApi',
@@ -998,11 +1138,11 @@ export const saveSettingsApiEffect = (
   });
 
 /** Effect variant of `updateSettingsApi`. */
-export const updateSettingsApiEffect = (
+export const updateSettingsApi = (
   updates: Partial<ApiSettingsConfig>,
 ): Effect.Effect<ApiSettingsConfig, SettingsApiError> =>
   Effect.tryPromise({
-    try: () => updateSettingsApi(updates),
+    try: () => updateSettingsApiPromise(updates),
     catch: (cause) =>
       new SettingsApiError({
         operation: 'updateSettingsApi',
@@ -1012,12 +1152,12 @@ export const updateSettingsApiEffect = (
   });
 
 /** Effect variant of `setRoleConfig`. */
-export const setRoleConfigEffect = (
+export const setRoleConfig = (
   role: Role,
   roleConfig: RoleConfig,
 ): Effect.Effect<ApiSettingsConfig, SettingsApiError> =>
   Effect.tryPromise({
-    try: () => setRoleConfig(role, roleConfig),
+    try: () => setRoleConfigPromise(role, roleConfig),
     catch: (cause) =>
       new SettingsApiError({
         operation: 'setRoleConfig',
@@ -1027,11 +1167,11 @@ export const setRoleConfigEffect = (
   });
 
 /** Effect variant of `updateProviderApiKey`. */
-export const updateProviderApiKeyEffect = (
-  ...args: Parameters<typeof updateProviderApiKey>
-): Effect.Effect<Awaited<ReturnType<typeof updateProviderApiKey>>, SettingsApiError> =>
+export const updateProviderApiKey = (
+  ...args: Parameters<typeof updateProviderApiKeyPromise>
+): Effect.Effect<Awaited<ReturnType<typeof updateProviderApiKeyPromise>>, SettingsApiError> =>
   Effect.tryPromise({
-    try: () => updateProviderApiKey(...args),
+    try: () => updateProviderApiKeyPromise(...args),
     catch: (cause) =>
       new SettingsApiError({
         operation: 'updateProviderApiKey',
@@ -1041,11 +1181,11 @@ export const updateProviderApiKeyEffect = (
   });
 
 /** Effect variant of `saveOpenRouterFavorites`. */
-export const saveOpenRouterFavoritesEffect = (
+export const saveOpenRouterFavorites = (
   favorites: string[],
 ): Effect.Effect<void, SettingsApiError> =>
   Effect.tryPromise({
-    try: () => saveOpenRouterFavorites(favorites),
+    try: () => saveOpenRouterFavoritesPromise(favorites),
     catch: (cause) =>
       new SettingsApiError({
         operation: 'saveOpenRouterFavorites',

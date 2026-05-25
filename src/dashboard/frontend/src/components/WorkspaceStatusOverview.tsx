@@ -23,7 +23,7 @@ import type { ReviewStatus, WorkspaceInfo } from '../lib/workspace-types';
 import { ReviewPipelineSection } from './CommandDeck/ZoneCOverviewTabs/ReviewPipelineSection';
 import { isReviewPipelineStuck } from '../lib/pipeline-state';
 import { getFriendlyModelName } from '../lib/dashboard-utils';
-import { COMMAND_DECK_SURFACE_REGISTRY } from '../lib/commandDeckSurfaceRegistry';
+import { VerifyingOnMainBadge } from './VerifyingOnMainBadge';
 
 export interface WorkspaceStatusOverviewProps {
   issue: Issue;
@@ -63,8 +63,6 @@ export interface WorkspaceStatusOverviewProps {
   onResumeMessageChange?: (msg: string) => void;
   isSelected?: boolean;
 }
-
-void COMMAND_DECK_SURFACE_REGISTRY;
 
 const STUCK_MERGE_MS = 2 * 60 * 1000;
 
@@ -108,10 +106,11 @@ export function WorkspaceStatusOverview({
     return () => clearInterval(interval);
   }, [reviewStatus?.mergeStatus]);
 
-  const canonical = STATUS_LABELS[issue.status] || 'backlog';
+  const canonical = issue.state ?? STATUS_LABELS[issue.status] ?? 'backlog';
+  const isVerifyingOnMain = canonical === 'verifying_on_main';
   const isMerged = reviewStatus?.mergeStatus === 'merged' || issue.mergeStatus === 'merged' || issue.labels?.some(l => l.toLowerCase() === 'merged');
-  const isTerminal = isMerged || canonical === 'done' || canonical === 'canceled';
-  const isReadyToMerge = !isMerged && reviewStatus?.readyForMerge === true;
+  const isTerminal = (isMerged && !isVerifyingOnMain) || canonical === 'done' || canonical === 'canceled';
+  const isReadyToMerge = !isMerged && !isVerifyingOnMain && reviewStatus?.readyForMerge === true;
   const isPipelineStuck = !isTerminal && canonical === 'in_review' && isReviewPipelineStuck(reviewStatus);
   const hasVerificationState = !!reviewStatus?.verificationStatus && reviewStatus.verificationStatus !== 'pending';
   const showPipelineStatus = !!reviewStatus && (
@@ -158,6 +157,7 @@ export function WorkspaceStatusOverview({
 
     return (
       <div className="space-y-2">
+        {isVerifyingOnMain && <VerifyingOnMainBadge compact />}
         {/* Pipeline status */}
         {showPipelineStatus && reviewStatus && (
           <div className="mt-2">
@@ -401,6 +401,7 @@ export function WorkspaceStatusOverview({
   // ─── Full layout (inspector panel) ───
   return (
     <div className="space-y-2">
+      {isVerifyingOnMain && <VerifyingOnMainBadge />}
       {/* Pipeline status */}
       {showPipelineStatus && reviewStatus && (
         <ReviewPipelineSection reviewStatus={reviewStatus} />

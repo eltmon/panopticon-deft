@@ -1,11 +1,12 @@
+import { Effect } from 'effect';
 import chalk from 'chalk';
 import { existsSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { createBeadsFromVBrief } from '../../lib/vbrief/beads.js';
-import { findPlan, findWorkspaceDraftPlan, readPlan } from '../../lib/vbrief/io.js';
+import { findPlanSync, findWorkspaceDraftPlanSync, readPlanSync } from '../../lib/vbrief/io.js';
 import { generateVBriefFilename, slugify } from '../../lib/vbrief/lifecycle.js';
-import { emitActivityEntry, emitActivityTts } from '../../lib/activity-logger.js';
-import { getDashboardApiUrl } from '../../lib/config.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../lib/activity-logger.js';
+import { getDashboardApiUrlSync } from '../../lib/config.js';
 import { PAN_DIRNAME, PAN_SPEC_FILENAME } from '../../lib/pan-dir/index.js';
 import type { VBriefDocument } from '../../lib/vbrief/types.js';
 
@@ -18,7 +19,7 @@ interface PlanFinalizeOptions {
 function findWorkspaceRoot(start: string): string | null {
   let dir = resolve(start);
   while (true) {
-    if (findPlan(dir)) return dir;
+    if (findPlanSync(dir)) return dir;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -36,7 +37,7 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
     process.exit(1);
   }
 
-  const planPath = findWorkspaceDraftPlan(workspacePath) ?? findPlan(workspacePath);
+  const planPath = findWorkspaceDraftPlanSync(workspacePath) ?? findPlanSync(workspacePath);
   if (!planPath) {
     const msg = `vBRIEF plan not readable at ${workspacePath}/.pan/spec.vbrief.json`;
     if (options.json) console.log(JSON.stringify({ success: false, error: msg }));
@@ -58,7 +59,7 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
   // vBRIEF before beads creation. Atomic temp+rename.
   const canonicalFilename = stampPlanForFinalization(planPath, issueId);
 
-  const result = await createBeadsFromVBrief(workspacePath);
+  const result = await Effect.runPromise(createBeadsFromVBrief(workspacePath));
 
   if (!result.success || result.created.length === 0) {
     const errors = result.errors.length > 0 ? result.errors : ['Beads creation produced no tasks'];
@@ -71,13 +72,13 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
     process.exit(2);
   }
 
-  emitActivityEntry({
+  emitActivityEntrySync({
     source: 'plan',
     level: 'info',
     message: `${issueId} planning finalized — awaiting your approval`,
     issueId,
   });
-  emitActivityTts({
+  emitActivityTtsSync({
     utterance: `${issueId} planning is done, awaiting your approval`,
     priority: 1,
     issueId,
@@ -88,12 +89,26 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
   let promoted = false;
   let promoteMessage: string | null = null;
   let promoteError: string | null = null;
+  let workAgentSpawned = false;
+  let workAgentMessage: string | null = null;
+  let workAgentError: string | null = null;
 
   if (!options.noPromote) {
     const promotion = await promotePlanning(issueId);
     promoted = promotion.success;
     promoteMessage = promotion.message;
     promoteError = promotion.error;
+
+    // After successful promotion, chain through to spawning the work agent.
+    // Auto-planned issues should run end-to-end without waiting for a human
+    // Done click or a separate Start Agent click. --no-promote opts out of
+    // both the spec promotion AND the work-agent spawn.
+    if (promoted) {
+      const spawn = await spawnWorkAgent(issueId);
+      workAgentSpawned = spawn.success;
+      workAgentMessage = spawn.message;
+      workAgentError = spawn.error;
+    }
   }
 
   if (options.json) {
@@ -104,8 +119,11 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
       canonicalFilename,
       planStatus: 'proposed',
       promoted,
+      workAgentSpawned,
       ...(promoteMessage ? { promoteMessage } : {}),
       ...(promoteError ? { promoteError } : {}),
+      ...(workAgentMessage ? { workAgentMessage } : {}),
+      ...(workAgentError ? { workAgentError } : {}),
     }));
   } else {
     console.log(chalk.green(`✓ Created ${result.created.length} beads task${result.created.length === 1 ? '' : 's'}`));
@@ -118,6 +136,14 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
     } else if (promoted) {
       console.log(chalk.green('✓ Planning promoted to main — issue is ready for implementation.'));
       if (promoteMessage) console.log(chalk.dim('  ' + promoteMessage));
+      if (workAgentSpawned) {
+        console.log(chalk.green('✓ Work agent spawned — implementation in progress.'));
+        if (workAgentMessage) console.log(chalk.dim('  ' + workAgentMessage));
+      } else {
+        console.log(chalk.yellow('⚠ Auto-promoted but work agent spawn failed.'));
+        if (workAgentError) console.log(chalk.dim('  ' + workAgentError));
+        console.log(chalk.dim('Run `pan start ' + issueId + '` to spawn the work agent.'));
+      }
     } else {
       console.log(chalk.yellow('⚠ Planning finalized but auto-promotion failed.'));
       if (promoteError) console.log(chalk.dim('  ' + promoteError));
@@ -135,7 +161,7 @@ export async function planFinalizeCommand(options: PlanFinalizeOptions = {}): Pr
  */
 async function promotePlanning(issueId: string): Promise<{ success: boolean; message: string | null; error: string | null }> {
   try {
-    const url = `${getDashboardApiUrl()}/api/issues/${issueId}/complete-planning`;
+    const url = `${getDashboardApiUrlSync()}/api/issues/${issueId}/complete-planning`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30_000);
     let response: Response;
@@ -164,6 +190,46 @@ async function promotePlanning(issueId: string): Promise<{ success: boolean; mes
 }
 
 /**
+ * Spawn the work agent for the just-promoted issue. Auto-planned issues should
+ * run end-to-end (plan → work → review → test → ship) without a separate human
+ * click. Mirrors promotePlanning's error-shape so the caller can format
+ * consistently.
+ */
+async function spawnWorkAgent(issueId: string): Promise<{ success: boolean; message: string | null; error: string | null }> {
+  try {
+    const url = `${getDashboardApiUrlSync()}/api/agents`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issueId, role: 'work', auto: true, guardrailAcknowledged: true }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    const text = await response.text();
+    let parsed: any = null;
+    try { parsed = JSON.parse(text); } catch { /* non-JSON */ }
+    if (!response.ok) {
+      const err = (parsed && (parsed.error || parsed.message)) || text.slice(0, 200) || `HTTP ${response.status}`;
+      return { success: false, message: null, error: String(err) };
+    }
+    return {
+      success: true,
+      message: parsed?.sessionName ? `Session: ${parsed.sessionName}` : (parsed?.message ?? null),
+      error: null,
+    };
+  } catch (err: any) {
+    const message = err?.message ? String(err.message) : String(err);
+    return { success: false, message: null, error: `Dashboard unreachable: ${message}` };
+  }
+}
+
+/**
  * Set plan.status to 'proposed' and stamp the canonical filename on the plan.
  * Atomically writes back via temp+rename. Returns the canonical filename.
  *
@@ -173,7 +239,7 @@ async function promotePlanning(issueId: string): Promise<{ success: boolean; mes
  * Exported for tests.
  */
 export function stampPlanForFinalization(planPath: string, issueId: string): string {
-  const doc: VBriefDocument = readPlan(planPath);
+  const doc: VBriefDocument = readPlanSync(planPath);
   const slugSource = doc.plan.title || doc.plan.id || issueId;
   const slug = slugify(slugSource);
 

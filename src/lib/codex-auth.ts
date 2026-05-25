@@ -46,15 +46,7 @@ interface CliproxyCodexCredentials {
   access_token?: string;
   email?: string;
   type?: string;
-}
-
-/**
- * Check whether the Codex OAuth credentials stored for CLIProxy are still valid.
- *
- * Reads ~/.panopticon/cliproxy/auth/codex-primary.json, decodes the JWT
- * access_token exp claim, and compares it to the current time.
- */
-export async function checkCodexAuthStatus(options: CheckCodexAuthOptions = {}): Promise<CodexAuthStatus> {
+}async function checkCodexAuthStatusPromise(options: CheckCodexAuthOptions = {}): Promise<CodexAuthStatus> {
   const credPath = join(getCliproxyAuthDir(), 'codex-primary.json');
 
   let raw: string;
@@ -180,7 +172,11 @@ async function applyBurnedTokenOverride(
   // A successful LLM call came AFTER the burn line → auto-retry worked.
   if (lastSuccessIdx > lastBurnIdx) return baseStatus;
 
-  if (lastBurnTimestamp !== null && options.ignoreBurnBefore !== undefined && lastBurnTimestamp < options.ignoreBurnBefore) {
+  // Burn log lines carry second-precision timestamps. If credentials are written
+  // later in the same second as the burn line, the second-boundary timestamp can
+  // appear stale against ignoreBurnBefore. Pad by 1000ms so a same-second burn is
+  // still considered "current" relative to a credential-write cutoff.
+  if (lastBurnTimestamp !== null && options.ignoreBurnBefore !== undefined && lastBurnTimestamp + 1000 <= options.ignoreBurnBefore) {
     return baseStatus;
   }
 
@@ -201,11 +197,11 @@ async function applyBurnedTokenOverride(
  * with CodexAuthCheckError if the underlying call itself throws unexpectedly
  * (i.e., not from the documented "missing/unknown" branches).
  */
-export const checkCodexAuthStatusEffect = (
+export const checkCodexAuthStatus = (
   options: { ignoreBurnBefore?: number } = {},
 ): Effect.Effect<CodexAuthStatus, CodexAuthCheckError> =>
   Effect.tryPromise({
-    try: () => checkCodexAuthStatus(options),
+    try: () => checkCodexAuthStatusPromise(options),
     catch: (cause) =>
       new CodexAuthCheckError({
         message: cause instanceof Error ? cause.message : String(cause),

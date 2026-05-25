@@ -22,11 +22,14 @@ import React, {
   useMemo,
   type ReactNode,
 } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CheckIcon, CopyIcon } from 'lucide-react';
 import type { Components } from 'react-markdown';
 import type { DiffsThemeNames } from '@pierre/diffs';
+import { resolveMarkdownFileLinkMeta, shouldPreserveMarkdownFileLinkHref, splitMarkdownTextFileLinks, type MarkdownFileLinkMeta } from '../../markdown-links';
+import { MarkdownFileLink } from './MarkdownFileLink';
+import { useFilePathExists } from '../../hooks/useFilePathExists';
 import styles from '../CommandDeck/styles/command-deck.module.css';
 
 // ─── LRU Cache for syntax highlighting ───────────────────────────────────────
@@ -249,7 +252,79 @@ function CodeBlock({ code, lang, isStreaming }: CodeBlockProps) {
 
 // ─── Custom markdown components ───────────────────────────────────────────────
 
-function makeComponents(isStreaming: boolean): Components {
+function transformMarkdownUrl(url: string): string {
+  return shouldPreserveMarkdownFileLinkHref(url) ? url : defaultUrlTransform(url);
+}
+
+type ReactMarkdownRemarkPlugins = React.ComponentProps<typeof ReactMarkdown>['remarkPlugins'];
+
+interface MarkdownNode {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: string | null;
+  children?: MarkdownNode[];
+}
+
+const TEXT_LINK_SKIP_NODE_TYPES = new Set(['code', 'inlineCode', 'link', 'linkReference', 'definition']);
+
+/**
+ * Gates MarkdownFileLink chip rendering on a server-side existence check
+ * (PAN-1457). The regex heuristic in markdown-links.ts decides whether a
+ * token looks path-shaped; this component asks the server whether the
+ * candidate actually resolves to a file or directory under cwd. Phantom
+ * paths like `conv/2209` render as plain text via the fallback prop;
+ * confirmed files and directories render as the full chip.
+ */
+function MaybeFileLinkChip({
+  meta,
+  cwd,
+  issueId,
+  fallback,
+}: {
+  meta: MarkdownFileLinkMeta;
+  cwd?: string;
+  issueId?: string | null;
+  fallback: ReactNode;
+}) {
+  const { state } = useFilePathExists(cwd, meta.filePath) as { state: string };
+  if (state === 'exists') {
+    return <MarkdownFileLink {...meta} issueId={issueId} />;
+  }
+  return <>{fallback}</>;
+}
+
+function remarkBareFileTextLinks(options: { cwd?: string } = {}) {
+  return (tree: MarkdownNode) => {
+    const visit = (node: MarkdownNode) => {
+      if (!node.children || TEXT_LINK_SKIP_NODE_TYPES.has(node.type)) return;
+
+      const children: MarkdownNode[] = [];
+      for (const child of node.children) {
+        if (child.type === 'text' && child.value !== undefined) {
+          for (const segment of splitMarkdownTextFileLinks(child.value, options.cwd)) {
+            children.push(segment.href
+              ? {
+                type: 'link',
+                url: segment.href,
+                title: null,
+                children: [{ type: 'text', value: segment.text }],
+              }
+              : { type: 'text', value: segment.text });
+          }
+        } else {
+          visit(child);
+          children.push(child);
+        }
+      }
+      node.children = children;
+    };
+
+    visit(tree);
+  };
+}
+
+function makeComponents(isStreaming: boolean, cwd: string | undefined, issueId: string | null | undefined): Components {
   return {
     pre({ children }) {
       // Extract code block contents
@@ -278,9 +353,22 @@ function makeComponents(isStreaming: boolean): Components {
       );
     },
     a({ href, children }) {
+      const fileLinkMeta = resolveMarkdownFileLinkMeta(href, cwd);
+      if (fileLinkMeta) {
+        return (
+          <MaybeFileLinkChip
+            meta={fileLinkMeta}
+            cwd={cwd}
+            issueId={issueId}
+            fallback={children}
+          />
+        );
+      }
+
       // Block javascript: and data: URIs to prevent XSS from assistant markdown
       const safeHref =
         typeof href === 'string' &&
+        href.trim().length > 0 &&
         !/^(javascript|data|vbscript):/i.test(href.trim())
           ? href
           : undefined;
@@ -303,18 +391,26 @@ function makeComponents(isStreaming: boolean): Components {
 interface ChatMarkdownProps {
   text: string;
   isStreaming?: boolean;
+  cwd?: string;
+  issueId?: string | null;
 }
 
 export const ChatMarkdown = memo(function ChatMarkdown({
   text,
   isStreaming = false,
+  cwd,
+  issueId,
 }: ChatMarkdownProps) {
-  const components = useMemo(() => makeComponents(isStreaming), [isStreaming]);
+  const components = useMemo(() => makeComponents(isStreaming, cwd, issueId), [isStreaming, cwd, issueId]);
+  const remarkPlugins = useMemo(
+    () => [remarkGfm, [remarkBareFileTextLinks, { cwd }]] as ReactMarkdownRemarkPlugins,
+    [cwd],
+  );
 
   return (
     <ChatMarkdownErrorBoundary fallback={<pre className={styles.mdFallback}>{text}</pre>}>
       <div className={styles.chatMarkdown}>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={transformMarkdownUrl}>
           {text}
         </ReactMarkdown>
       </div>

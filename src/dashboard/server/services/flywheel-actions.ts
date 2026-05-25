@@ -4,10 +4,11 @@ import { freemem, totalmem } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { FlywheelStatus } from '@panctl/contracts';
-import { loadConfigAsyncNoMigration, resolveModel, type FlywheelScope, type RoleEffort } from '../../../lib/config-yaml.js';
+import { Effect } from 'effect';
+import { loadConfigNoMigration, resolveModel, type FlywheelScope, type RoleEffort } from '../../../lib/config-yaml.js';
 import { FLYWHEEL_ORCHESTRATOR_AGENT_ID, isFlywheelDevcontainerRuntime, loadResumeSessionId, saveResumeSessionId, spawnFlywheelAgent } from '../../../lib/cloister/flywheel.js';
 import { FLYWHEEL_ACTIVE_RUN_ID_KEY, FLYWHEEL_GLOBAL_PAUSE_KEY } from '../../../lib/database/app-settings.js';
-import { sessionExistsAsync } from '../../../lib/tmux.js';
+import { sessionExists } from '../../../lib/tmux.js';
 import {
   abortFlywheelRun,
   getFlywheelRunDetail,
@@ -39,6 +40,7 @@ interface ResolvedFlywheelRoleConfig {
   harness: 'claude-code' | 'pi';
   model: string;
   effort: RoleEffort;
+  minAgents: number;
   maxAgents: number;
   scope: FlywheelScope;
 }
@@ -117,13 +119,14 @@ async function readGateSnapshot(): Promise<FlywheelGateSnapshot> {
 }
 
 async function resolveFlywheelRoleConfig(): Promise<ResolvedFlywheelRoleConfig> {
-  const { config } = await loadConfigAsyncNoMigration();
+  const { config } = await Effect.runPromise(loadConfigNoMigration());
   const flywheel = config.roles?.flywheel;
   return {
     harness: flywheel?.harness ?? 'claude-code',
     model: resolveModel('flywheel', undefined, config),
     effort: flywheel?.effort ?? 'high',
-    maxAgents: flywheel?.maxAgents ?? 8,
+    minAgents: flywheel?.minAgents ?? 20,
+    maxAgents: flywheel?.maxAgents ?? 30,
     scope: flywheel?.scope ?? 'pan-only',
   };
 }
@@ -169,6 +172,7 @@ async function createInitialFlywheelStatus(
       model: agentModel,
     }],
     parked: [],
+    suggestions: [],
     system: {
       mainHead: await gitOutput('git rev-parse --short HEAD', cwd).catch(() => 'unknown'),
       ramUsedMb: Math.max(0, ramTotalMb - mb(freemem())),
@@ -214,6 +218,7 @@ export async function startFlywheelRunForDashboard(options: StartOptions = {}): 
     model: roleConfig.model,
     harness: roleConfig.harness,
     effort: roleConfig.effort,
+    minAgents: roleConfig.minAgents,
     maxAgents: roleConfig.maxAgents,
     scope: roleConfig.scope,
   });
@@ -244,7 +249,7 @@ export async function pauseFlywheelRunForDashboard(): Promise<{ before: Flywheel
     } catch { /* non-fatal: resume falls back to fresh if session.id is missing */ }
   }
   await setPaused(true);
-  await import('../../../lib/agents.js').then(({ stopAgentAsync }) => stopAgentAsync(FLYWHEEL_ORCHESTRATOR_AGENT_ID));
+  await import('../../../lib/agents.js').then(({ stopAgent }) => Effect.runPromise(stopAgent(FLYWHEEL_ORCHESTRATOR_AGENT_ID)));
   return { before, after: await readGateSnapshot(), changed: true };
 }
 
@@ -258,15 +263,15 @@ export async function abortFlywheelRunForDashboard(): Promise<{ aborted: string 
     const stale = await resolveLiveFlywheelRunId();
     return { aborted: stale ?? null };
   }
-  const { stopAgentAsync } = await import('../../../lib/agents.js');
-  await stopAgentAsync(FLYWHEEL_ORCHESTRATOR_AGENT_ID);
+  const { stopAgent } = await import('../../../lib/agents.js');
+  await Effect.runPromise(stopAgent(FLYWHEEL_ORCHESTRATOR_AGENT_ID));
   await abortFlywheelRun(candidate);
   return { aborted: candidate };
 }
 
 export async function resumeFlywheelRunForDashboard(): Promise<{ before: FlywheelGateSnapshot; after: FlywheelGateSnapshot; changed: boolean }> {
   const before = await readGateSnapshot();
-  if (!before.paused && await sessionExistsAsync(FLYWHEEL_ORCHESTRATOR_AGENT_ID)) {
+  if (!before.paused && await Effect.runPromise(sessionExists(FLYWHEEL_ORCHESTRATOR_AGENT_ID))) {
     return { before, after: before, changed: false };
   }
   if (!before.activeRunId) throw new Error('No active flywheel run to resume');
@@ -284,6 +289,7 @@ export async function resumeFlywheelRunForDashboard(): Promise<{ before: Flywhee
     model: roleConfig.model,
     harness: roleConfig.harness,
     effort: roleConfig.effort,
+    minAgents: roleConfig.minAgents,
     maxAgents: roleConfig.maxAgents,
     scope: roleConfig.scope,
     resumeSessionId,

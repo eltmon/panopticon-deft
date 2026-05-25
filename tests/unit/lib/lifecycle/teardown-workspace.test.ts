@@ -19,9 +19,19 @@ vi.mock('util', async (importOriginal) => {
   };
 });
 
-vi.mock('../../../../src/lib/tmux.js', () => ({
-  sessionExists: vi.fn().mockReturnValue(false),
-}));
+vi.mock('../../../../src/lib/tmux.js', async () => {
+  const { Effect } = await import('effect');
+  return {
+    sessionExistsAsync: vi.fn().mockResolvedValue(false),
+    killSessionAsync: vi.fn().mockResolvedValue(undefined),
+    listSessionNamesAsync: vi.fn().mockResolvedValue([]),
+    sessionExists: vi.fn(() => Effect.succeed(false)),
+    sessionExistsSync: vi.fn(() => Effect.succeed(false)),
+    killSession: vi.fn(() => Effect.succeed(undefined)),
+    killSessionSync: vi.fn(() => Effect.succeed(undefined)),
+    listSessionNames: vi.fn(() => Effect.succeed([])),
+  };
+});
 
 vi.mock('../../../../src/lib/paths.js', () => ({
   AGENTS_DIR: join(tmpdir(), 'panopticon-test-agents'),
@@ -37,12 +47,12 @@ vi.mock('../../../../src/lib/shadow-state.js', () => ({
 }));
 
 import { Effect } from 'effect';
-import { teardownWorkspace as teardownWorkspaceEffect } from '../../../../src/lib/lifecycle/teardown-workspace.js';
+import { teardownWorkspace as teardownWorkspaceProgram } from '../../../../src/lib/lifecycle/teardown-workspace.js';
 import { sessionExists } from '../../../../src/lib/tmux.js';
 import { AGENTS_DIR } from '../../../../src/lib/paths.js';
 
-const teardownWorkspace = (...args: Parameters<typeof teardownWorkspaceEffect>) =>
-  Effect.runPromise(teardownWorkspaceEffect(...args));
+const teardownWorkspace = (...args: Parameters<typeof teardownWorkspaceProgram>) =>
+  Effect.runPromise(teardownWorkspaceProgram(...args));
 
 describe('teardown-workspace', () => {
   let testDir: string;
@@ -68,7 +78,7 @@ describe('teardown-workspace', () => {
   });
 
   it('should kill tmux sessions when they exist', async () => {
-    vi.mocked(sessionExists).mockReturnValue(true);
+    vi.mocked(sessionExists).mockReturnValue(Effect.succeed(true));
     mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' });
 
     const results = await teardownWorkspace({
@@ -82,7 +92,7 @@ describe('teardown-workspace', () => {
   });
 
   it('should skip tmux sessions when none exist', async () => {
-    vi.mocked(sessionExists).mockReturnValue(false);
+    vi.mocked(sessionExists).mockReturnValue(Effect.succeed(false));
 
     const results = await teardownWorkspace({
       issueId: 'PAN-100',

@@ -3,8 +3,9 @@ import { Effect } from 'effect';
 import { homedir } from 'os';
 import { join } from 'path';
 import { readFileSync, existsSync } from 'fs';
-import { extractPrefix } from '../../lib/issue-id.js';
+import { extractPrefixSync } from '../../lib/issue-id.js';
 import { getIssuePrefix } from '../../lib/projects.js';
+import { appendOperatorInterventionEvent } from '../../lib/operator-interventions.js';
 
 interface WipeOptions {
   workspace?: boolean;
@@ -36,7 +37,7 @@ export async function wipeCommand(issueId: string, options: WipeOptions): Promis
     }
   }
 
-  const prefix = extractPrefix(issueId);
+  const prefix = extractPrefixSync(issueId);
   if (!prefix) {
     console.log(chalk.red('  ✗ Could not extract prefix from issue ID'));
     return;
@@ -107,6 +108,7 @@ export async function wipeCommand(issueId: string, options: WipeOptions): Promis
   }
 
   if (result.success) {
+    await appendOperatorInterventionEvent({ issueId, kind: 'deep_wipe', source: 'pan wipe' });
     console.log(chalk.green(`\n✓ Reset completed for ${issueId}`));
   } else {
     console.log(chalk.yellow(`\n⚠ Reset completed with errors for ${issueId}`));

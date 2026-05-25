@@ -4,7 +4,7 @@ import { MoreHorizontal } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import VerbBadge, { type VerbBadgeProps } from './VerbBadge';
 
-export type AgentCardRole = 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel';
+export type AgentCardRole = 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel' | 'strike';
 
 export type AgentCardIssue = {
   id: string;
@@ -30,6 +30,8 @@ export type AgentCardProps = {
   stuckMessage?: ReactNode;
   onOpenIssue?: () => void;
   onStop?: () => void;
+  actionMenu?: ReactNode;
+  actionMenuDisabledTitle?: string;
   className?: string;
 };
 
@@ -40,6 +42,8 @@ const ROLE_ACCENTS = {
   test: 'var(--success)',
   ship: 'var(--signal-review)',
   flywheel: 'var(--primary)',
+  // Strike: bright orange — distinct from work blue, review amber, ship purple.
+  strike: '#ff6a00',
 } satisfies Record<AgentCardRole, string>;
 
 function AgentCard({
@@ -54,6 +58,8 @@ function AgentCard({
   stuckMessage,
   onOpenIssue,
   onStop,
+  actionMenu,
+  actionMenuDisabledTitle = 'No issue ID available for this agent',
   className,
 }: AgentCardProps) {
   const style = {
@@ -81,14 +87,20 @@ function AgentCard({
           </div>
           <p className="mt-[6px] truncate font-mono text-[10px] leading-none text-muted-foreground">{id}</p>
         </div>
-        <button
-          type="button"
-          aria-label={`Open ${id} menu`}
-          className="rounded-[var(--radius-sm)] border border-border bg-muted p-[5px] text-muted-foreground transition-colors hover:text-foreground"
-          onClick={(event) => event.stopPropagation()}
-        >
-          <MoreHorizontal className="h-[14px] w-[14px]" />
-        </button>
+        <div onClick={(event) => event.stopPropagation()}>
+          {actionMenu ?? (
+            <button
+              type="button"
+              aria-label={`Open ${id} menu`}
+              data-testid="agent-card-menu-button"
+              className="rounded-[var(--radius-sm)] border border-border bg-muted p-[5px] text-muted-foreground opacity-50"
+              title={actionMenuDisabledTitle}
+              disabled
+            >
+              <MoreHorizontal className="h-[14px] w-[14px]" />
+            </button>
+          )}
+        </div>
       </div>
 
       {issue && (
@@ -116,7 +128,7 @@ function AgentCard({
         ))}
       </div>
 
-      <div className="relative mt-[14px] max-h-[84px] overflow-hidden rounded-[12px] border border-border bg-background/80 px-[12px] py-[10px] font-mono text-[10px] leading-[16px] text-muted-foreground after:pointer-events-none after:absolute after:bottom-0 after:left-0 after:h-[24px] after:w-full after:bg-gradient-to-b after:from-transparent after:to-card">
+      <div className="relative mt-[14px] max-h-[176px] overflow-hidden rounded-[12px] border border-border bg-background/80 px-[12px] py-[10px] font-mono text-[10px] leading-[16px] text-muted-foreground after:pointer-events-none after:absolute after:bottom-0 after:left-0 after:h-[24px] after:w-full after:bg-gradient-to-b after:from-transparent after:to-card">
         {streamLines.length > 0 ? (
           streamLines.map((line, index) => <div key={index} className="truncate">{line}</div>)
         ) : (

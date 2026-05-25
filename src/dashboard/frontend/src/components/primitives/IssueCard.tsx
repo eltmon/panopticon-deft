@@ -1,4 +1,4 @@
-import { forwardRef, type ReactNode } from 'react';
+import { forwardRef, type MouseEvent, type ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
 
@@ -15,6 +15,7 @@ export type IssueCardProps = {
   unhealthyCard?: boolean;
   sessionLostCard?: boolean;
   onClick?: () => void;
+  onContextMenu?: (event: MouseEvent<HTMLDivElement>) => void;
   children: ReactNode;
   className?: string;
   testId?: string;
@@ -39,17 +40,11 @@ const IssueCard = forwardRef<HTMLDivElement, IssueCardProps>(function IssueCard(
   unhealthyCard = false,
   sessionLostCard = false,
   onClick,
+  onContextMenu,
   children,
   className,
   testId,
 }, ref) {
-  const tone = unhealthyCard || stuckCard
-    ? 'from-destructive/12 via-destructive/5 to-transparent'
-    : mergeReadyCard
-      ? 'from-success/20 via-success/6 to-transparent'
-      : runningCard
-        ? 'from-primary/16 via-primary/6 to-transparent'
-        : 'from-surface-overlay/60 via-surface/40 to-transparent';
   const accent = unhealthyCard || stuckCard
     ? 'bg-destructive'
     : mergeReadyCard
@@ -68,23 +63,23 @@ const IssueCard = forwardRef<HTMLDivElement, IssueCardProps>(function IssueCard(
       data-merge-ready-card={mergeReadyCard ? 'true' : 'false'}
       data-testid={testId}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={cn(
-        'group relative overflow-hidden rounded-2xl border cursor-pointer bg-card shadow-sm transition-all',
+        'group relative overflow-hidden rounded-2xl border cursor-pointer issue-card-surface shadow-sm transition-all',
         sessionLostCard && 'border-warning/50',
         selected
           ? 'ring-2 ring-warning/70 shadow-lg'
           : unhealthyCard || stuckCard
             ? 'border-destructive/60 bg-destructive/10 shadow-md'
             : mergeReadyCard
-              ? 'border-success/60 bg-success/10 shadow-md'
+              ? 'badge-border-success bg-success/10 shadow-md'
               : bulkSelected
                 ? 'border-primary/50 bg-primary/10 shadow-sm'
                 : 'hover:-translate-y-0.5 border-border/70 hover:border-border hover:shadow-md',
         className,
       )}
     >
-      <div className={cn('pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-br', tone)} />
-      <div className={cn('absolute bottom-[12px] left-0 top-[12px] w-1.5 rounded-r-[2px]', accent)} />
+      <div className={cn('absolute bottom-[12px] left-0 top-[12px] w-0.5 rounded-r-[2px]', accent)} />
       {children}
     </div>
   );

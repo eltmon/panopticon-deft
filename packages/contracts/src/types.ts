@@ -18,7 +18,7 @@ export type SequenceNumber = typeof SequenceNumber.Type
 export const AgentStatus = Schema.Literals(["starting", "running", "stopped", "error", "unknown"])
 export type AgentStatus = typeof AgentStatus.Type
 
-export const Role = Schema.Literals(["plan", "work", "review", "test", "ship", "flywheel"])
+export const Role = Schema.Literals(["plan", "work", "review", "test", "ship", "flywheel", "strike"])
 export type Role = typeof Role.Type
 
 export const AgentResolution = Schema.Literals(["working", "done", "needs_input", "stuck", "completed", "unclear", "abandoned", "api_error"])
@@ -272,6 +272,7 @@ export const AgentSnapshot = Schema.Struct({
   costSoFar: Schema.optional(Schema.Number),
   sessionId: Schema.optional(Schema.String),
   role: Schema.optional(Role),
+  hasLiveTmuxSession: Schema.optional(Schema.Boolean),
   stoppedByUser: Schema.optional(Schema.Boolean),
   paused: Schema.optional(Schema.Boolean),
   pausedReason: Schema.optional(Schema.String),
@@ -428,6 +429,8 @@ export const EmbedProgressSnapshot = Schema.Struct({
 })
 export type EmbedProgressSnapshot = typeof EmbedProgressSnapshot.Type
 
+// ─── Dashboard Snapshot ──────────────────────────────────────────────────────
+
 export const DashboardSnapshot = Schema.Struct({
   sequence: SequenceNumber,
   agents: Schema.Array(AgentSnapshot),
@@ -435,6 +438,7 @@ export const DashboardSnapshot = Schema.Struct({
   reviewStatuses: Schema.Array(ReviewStatusSnapshot),
   issues: Schema.Array(Schema.Unknown),  // Issues are complex — pass through unvalidated
   resources: Schema.optional(Schema.Unknown),
+  memory: Schema.optional(Schema.Unknown),
   agentRuntimeById: Schema.optional(Schema.Record(Schema.String, AgentRuntimeSnapshot)),
   channelPermissionRequests: Schema.optional(Schema.Array(ChannelPermissionRequestSnapshot)),
   scanProgress: Schema.optional(Schema.NullOr(ScanProgressSnapshot)),

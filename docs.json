@@ -6,8 +6,10 @@
   "colors": {
     "primary": "#D4A27F",
     "light": "#E5C4A8",
-    "dark": "#B8886A",
-    "background": {
+    "dark": "#B8886A"
+  },
+  "background": {
+    "color": {
       "light": "#FFFFFF",
       "dark": "#0c0a09"
     }
@@ -38,6 +40,17 @@
               "introduction",
               "quickstart",
               "concepts"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Vision",
+        "groups": [
+          {
+            "group": "Vision",
+            "pages": [
+              "vision"
             ]
           }
         ]
@@ -81,6 +94,7 @@
             "group": "Configuration",
             "pages": [
               "configuration/projects",
+              "configuration/harnesses",
               "configuration/issue-trackers",
               "configuration/polyrepo"
             ]
@@ -107,8 +121,11 @@
             "group": "Reference",
             "pages": [
               "reference/architecture",
+              "reference/harness-landscape",
+              "reference/template-conversations",
               "reference/prompts",
-              "reference/troubleshooting"
+              "reference/troubleshooting",
+              "reference/token-spend-report"
             ]
           }
         ]
@@ -116,7 +133,7 @@
     ]
   },
   "metadata": {
-    "og:image": "/docs/screenshot-board.png",
+    "og:image": "/docs/screenshot-board-light.png",
     "og:type": "website"
   },
   "footerSocials": {
@@ -125,11 +142,5 @@
   "feedback": {
     "thumbsRating": true,
     "suggestEdit": true
-  },
-  "analytics": {
-    "posthog": {
-      "apiKey": "",
-      "host": "https://us.i.posthog.com"
-    }
   }
 }

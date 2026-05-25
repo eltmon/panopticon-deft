@@ -13,7 +13,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync } from 'fs';
 // PAN-1249: readFile / writeFile / unlink are consumed by the additive Effect
-// helpers below (`readFileEffect`, `writeFileEffect`, `unlinkEffect`).
+// helpers below (`readFileOp`, `writeFileOp`, `unlinkPath`).
 import { readdir, readFile, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { exec, execFile } from 'child_process';
@@ -39,7 +39,7 @@ const execFileAsync = promisify(execFile);
  * internally so callers can keep their Promise-returning signatures while the
  * implementation drifts towards Effect.
  */
-const execAsyncEffect = (
+const execCommand = (
   command: string,
   options?: Parameters<typeof execAsync>[1],
 ): Effect.Effect<{ stdout: string; stderr: string }, ProcessSpawnError> =>
@@ -61,7 +61,7 @@ const execAsyncEffect = (
   });
 
 /** Wrap `execFileAsync` in Effect with a typed error. */
-const execFileAsyncEffect = (
+const execFileCommand = (
   command: string,
   args: readonly string[],
   options?: Parameters<typeof execFileAsync>[2],
@@ -84,7 +84,7 @@ const execFileAsyncEffect = (
   });
 
 /** Wrap a fs/promises read in Effect with a typed FsError. */
-const readFileEffect = (path: string): Effect.Effect<string, FsError> =>
+const readFileOp = (path: string): Effect.Effect<string, FsError> =>
   Effect.tryPromise({
     try: () => readFile(path, 'utf-8'),
     catch: (cause) =>
@@ -96,7 +96,7 @@ const readFileEffect = (path: string): Effect.Effect<string, FsError> =>
   });
 
 /** Wrap a fs/promises write in Effect with a typed FsError. */
-const writeFileEffect = (path: string, data: string): Effect.Effect<void, FsError> =>
+const writeFileOp = (path: string, data: string): Effect.Effect<void, FsError> =>
   Effect.tryPromise({
     try: () => writeFile(path, data, 'utf-8'),
     catch: (cause) =>
@@ -108,7 +108,7 @@ const writeFileEffect = (path: string, data: string): Effect.Effect<void, FsErro
   });
 
 /** Wrap a fs/promises unlink in Effect with a typed FsError. */
-const unlinkEffect = (path: string): Effect.Effect<void, FsError> =>
+const unlinkPath = (path: string): Effect.Effect<void, FsError> =>
   Effect.tryPromise({
     try: () => unlink(path),
     catch: (cause) =>
@@ -123,15 +123,17 @@ const unlinkEffect = (path: string): Effect.Effect<void, FsError> =>
 export { GitError, ProcessTimeoutError };
 
 import { PANOPTICON_HOME, AGENTS_DIR } from '../paths.js';
-import { loadCloisterConfig } from './config.js';
+import { loadCloisterConfigSync, loadCloisterConfig } from './config.js';
 import { getNoResumeMode } from './no-resume-mode.js';
-import { setReviewStatus, loadReviewStatuses, getReviewStatus, type ReviewStatus } from '../review-status.js';
+import { setReviewStatusSync, loadReviewStatuses, getReviewStatusSync, type ReviewStatus } from '../review-status.js';
 import { markWorkspaceStuck } from '../database/review-status-db.js';
 import { isDeaconGloballyPaused } from '../database/app-settings.js';
 import { findWorkspacePath } from '../lifecycle/archive-planning.js';
-import { resolveProjectFromIssue, listProjects, getProject } from '../projects.js';
-import { logDeaconEvent, logAgentLifecycle } from '../persistent-logger.js';
-import { emitActivityTts } from '../activity-logger.js';
+import { resolveProjectFromIssueSync, listProjectsSync, getProjectSync } from '../projects.js';
+import { resolveGitHubIssueSync } from '../tracker-utils.js';
+import { mapGitHubStateToCanonical } from '../../core/state-mapping.js';
+import { logDeaconEventSync, logAgentLifecycleSync } from '../persistent-logger.js';
+import { emitActivityTtsSync } from '../activity-logger.js';
 import { getShadowState } from '../shadow-state.js';
 import type { TrackerConfig } from '../tracker/factory.js';
 
@@ -143,11 +145,14 @@ import {
   isRunning,
   getAllProjectSpecialistStatuses,
 } from './specialists.js';
-import { getAgentRuntimeState, saveAgentRuntimeState, saveSessionId, listRunningAgents, getAgentDir, getAgentState, getAgentStateAsync, saveAgentState, saveAgentStateAsync, resumeAgent, recordAgentFailureAsync, type AgentState } from '../agents.js';
+import { getAgentRuntimeStateSync, saveAgentRuntimeState, saveSessionId, listRunningAgentsSync, getAgentDir, getAgentStateSync, getAgentState, saveAgentStateSync, saveAgentState, resumeAgent, recordAgentFailure, markAgentRunningState, type AgentState } from '../agents.js';
 import { dropStash, isOlderThanDays, listStashes } from '../stashes.js';
-import { emitActivityEntry } from '../activity-logger.js';
-import { buildTmuxCommandString, capturePaneAsync, createSessionAsync, isPaneDeadAsync, killSession, killSessionAsync, listPaneValues, listPaneValuesAsync, listSessionNamesAsync, sessionExists, sessionExistsAsync, sendKeysAsync } from '../tmux.js';
+import { emitActivityEntrySync } from '../activity-logger.js';
+import { buildTmuxCommandString, capturePane, createSession, isPaneDead, killSessionSync, killSession, listPaneValuesSync, listPaneValues, listSessionNames, sessionExistsSync, sessionExists, sendKeys } from '../tmux.js';
+import { withConcurrencyLimit } from '../concurrency.js';
 import { BLANKED_PROVIDER_ENV } from '../child-env.js';
+import { isAgentIdleForNudge } from './agent-idle.js';
+import { checkStuckAgentRemediation } from './stuck-remediation.js';
 
 // ============================================================================
 // Configuration
@@ -266,7 +271,7 @@ export function loadConfig(): DeaconConfig {
     console.error('[deacon] Failed to load config:', error);
   }
 
-  const cloisterConfig = loadCloisterConfig();
+  const cloisterConfig = loadCloisterConfigSync();
   const configuredJanitorCycles = cloisterConfig.monitoring.stash_janitor_every_cycles;
   if (typeof configuredJanitorCycles === 'number' && configuredJanitorCycles >= 0) {
     config.stashJanitorEveryCycles = configuredJanitorCycles;
@@ -470,7 +475,7 @@ export async function checkSpecialistHealth(
   // (no tool calls = no hook-based heartbeat updates). Don't count idle specialists
   // as failures — only escalate when the specialist should be actively working.
   const tmuxSession = getTmuxSessionName(name);
-  const runtimeState = getAgentRuntimeState(tmuxSession);
+  const runtimeState = getAgentRuntimeStateSync(tmuxSession);
   const isIdle = !runtimeState || runtimeState.state === 'idle';
 
   if (isIdle) {
@@ -533,7 +538,7 @@ export async function forceKillSpecialist(
 
   try {
     // Kill the tmux session (non-blocking)
-    await killSessionAsync(tmuxSession);
+    await Effect.runPromise(killSession(tmuxSession));
 
     // Update state
     healthState.lastForceKillTime = new Date().toISOString();
@@ -699,11 +704,8 @@ const ACTIVE_STATUS_PATTERNS = [
  * — capture errors collapse to `false`. The public Promise function is a
  * thin `Effect.runPromise` wrapper.
  */
-const isAgentActiveInTmuxEffect = (sessionName: string): Effect.Effect<boolean, never> =>
-  Effect.tryPromise({
-    try: () => capturePaneAsync(sessionName, 5),
-    catch: () => 'capture-failed' as const,
-  }).pipe(
+const isAgentActiveInTmuxProgram = (sessionName: string): Effect.Effect<boolean, never> =>
+  capturePane(sessionName, 5).pipe(
     Effect.map((stdout) => {
       if (!stdout.trim()) return false;
 
@@ -733,40 +735,7 @@ const isAgentActiveInTmuxEffect = (sessionName: string): Effect.Effect<boolean, 
   );
 
 export async function isAgentActiveInTmux(sessionName: string): Promise<boolean> {
-  return Effect.runPromise(isAgentActiveInTmuxEffect(sessionName));
-}
-
-/**
- * Determine if an agent is idle based on its runtime.json hook state.
- *
- * The Stop hook (fired by Claude Code's Stop lifecycle event) writes state='idle'
- * to runtime.json whenever Claude finishes a turn and returns to the prompt. This
- * is the authoritative idle signal — no pane parsing needed.
- *
- * Stale-active fallback: if Stop hook never fired (state='active' persists), treat
- * the agent as idle once the heartbeat is older than staleActiveThresholdMs. The
- * heartbeat-hook fires on PostToolUse, so a stale heartbeat means no tool calls
- * and therefore no active computation.
- *
- * Returns false if: no runtime state, suspended, completed, or recently active.
- */
-function isAgentIdleForNudge(agentId: string, staleActiveThresholdMs = 5 * 60 * 1000): boolean {
-  const runtimeState = getAgentRuntimeState(agentId);
-  if (!runtimeState) {
-    console.log(`[deacon] ${agentId}: no runtime.json — skipping (hook not yet fired)`);
-    return false;
-  }
-  if (runtimeState.state === 'suspended' || runtimeState.state === 'stopped') return false;
-  if (runtimeState.state === 'idle') return true;
-  // Stale-active fallback: only fires for 'uninitialized' agents — never for
-  // 'active'. An 'active' state means the pre-tool-hook fired and Stop hasn't,
-  // which by definition is mid-turn work. Nudging an active agent injects
-  // text into the pane mid-Bash and surfaces as `Interrupted · What should
-  // Claude do instead?` (PAN-1024 reproduced this with slow gpt-5 runtimes
-  // where the heartbeat between tool calls easily exceeds 5min).
-  if (runtimeState.state !== 'uninitialized') return false;
-  const ageMs = Date.now() - new Date(runtimeState.lastActivity).getTime();
-  return ageMs > staleActiveThresholdMs;
+  return Effect.runPromise(isAgentActiveInTmuxProgram(sessionName));
 }
 
 // ============================================================================
@@ -818,7 +787,7 @@ function parseThinkingDuration(tmuxOutput: string): number | null {
  */
 export async function checkStuckWorkAgents(): Promise<string[]> {
   const actions: string[] = [];
-  const agents = listRunningAgents();
+  const agents = listRunningAgentsSync();
   // Specialist sessions (global or per-project) use the specialist tmux prefix.
   const isSpecialistSession = (id: string) => id.startsWith('specialist-');
   const now = Date.now();
@@ -839,7 +808,7 @@ export async function checkStuckWorkAgents(): Promise<string[]> {
     // Capture tmux output to check for stuck thinking
     let tmuxOutput: string;
     try {
-      tmuxOutput = await capturePaneAsync(agent.id, 10);
+      tmuxOutput = await Effect.runPromise(capturePane(agent.id, 10));
     } catch {
       continue;
     }
@@ -880,7 +849,7 @@ export async function checkStuckWorkAgents(): Promise<string[]> {
     // PAN-653: If the workspace is marked stuck (e.g. main diverged during approve),
     // skip all recovery actions — Deacon must not respawn a stuck workspace.
     const agentIssueId = (agent.issueId || agent.id.replace('agent-', '')).toUpperCase();
-    const agentReviewStatus = getReviewStatus(agentIssueId);
+    const agentReviewStatus = getReviewStatusSync(agentIssueId);
     if (agentReviewStatus?.stuck) {
       console.log(`[deacon] Skipping stuck-thinking recovery for ${agent.id} (${agentIssueId}): workspace is stuck`);
       continue;
@@ -904,7 +873,7 @@ export async function checkStuckWorkAgents(): Promise<string[]> {
       } else {
         // Third+ attempt: kill and respawn
         const launcherPath = join(AGENTS_DIR, agent.id, 'launcher.sh');
-        const agentState = getAgentState(agent.id);
+        const agentState = getAgentStateSync(agent.id);
         const workspace = agentState?.workspace;
 
         if (!existsSync(launcherPath) || !workspace) {
@@ -914,17 +883,17 @@ export async function checkStuckWorkAgents(): Promise<string[]> {
         }
 
         // Kill the stuck tmux session
-        await killSessionAsync(agent.id).catch(() => { /* no stale session */ });
+        await Effect.runPromise(killSession(agent.id)).catch(() => { /* no stale session */ });
 
         // Small delay to let tmux clean up
         await new Promise(r => setTimeout(r, 1000));
 
         // Respawn in a new tmux session with the same launcher
         // Kill stale session first to prevent "duplicate session" error (PAN-430)
-        await killSessionAsync(agent.id).catch(() => { /* no stale session */ });
-        await createSessionAsync(agent.id, workspace, `bash ${launcherPath}`, {
+        await Effect.runPromise(killSession(agent.id)).catch(() => { /* no stale session */ });
+        await Effect.runPromise(createSession(agent.id, workspace, `bash ${launcherPath}`, {
           env: BLANKED_PROVIDER_ENV,
-        });
+        }));
 
         // Reset recovery state since we respawned fresh
         stuckRecoveryState.set(agent.id, { lastAttempt: now, attempts: 0 });
@@ -994,9 +963,9 @@ export async function checkApiErrorAgents(): Promise<string[]> {
 
   // Check all tmux sessions — not just listRunningAgents() — because
   // specialist sessions aren't always in the agents registry.
-  let sessionNames: string[];
+  let sessionNames: readonly string[];
   try {
-    sessionNames = await listSessionNamesAsync();
+    sessionNames = await Effect.runPromise(listSessionNames());
   } catch {
     return actions;
   }
@@ -1013,7 +982,7 @@ export async function checkApiErrorAgents(): Promise<string[]> {
 
     let tmuxOutput: string;
     try {
-      tmuxOutput = await capturePaneAsync(sessionName, 100);
+      tmuxOutput = await Effect.runPromise(capturePane(sessionName, 100));
     } catch {
       continue;
     }
@@ -1029,7 +998,7 @@ export async function checkApiErrorAgents(): Promise<string[]> {
     // For work agents, respect stuck/deacon-ignored flags
     if (sessionName.startsWith('agent-')) {
       const agentIssueId = (sessionName.replace('agent-', '')).toUpperCase();
-      const agentReviewStatus = getReviewStatus(agentIssueId);
+      const agentReviewStatus = getReviewStatusSync(agentIssueId);
       if (agentReviewStatus?.stuck || agentReviewStatus?.deaconIgnored) {
         continue;
       }
@@ -1039,7 +1008,7 @@ export async function checkApiErrorAgents(): Promise<string[]> {
 
     try {
       const continueMsg = 'You stopped due to a transient API error. This is a temporary server issue, not a problem with your work. Continue from where you left off. Do NOT start over — pick up exactly where you stopped.';
-      await sendKeysAsync(sessionName, continueMsg);
+      await Effect.runPromise(sendKeys(sessionName, continueMsg));
       apiErrorRecoveryState.set(sessionName, { lastAttempt: now });
       actions.push(`API error recovery: nudged ${sessionName} to retry`);
     } catch (err) {
@@ -1062,7 +1031,7 @@ export async function checkApiErrorAgents(): Promise<string[]> {
  */
 export async function cleanupStaleAgentState(): Promise<string[]> {
   const actions: string[] = [];
-  const cloisterConfig = loadCloisterConfig();
+  const cloisterConfig = loadCloisterConfigSync();
   // Default retention for work / planning agent state. These are kept for a
   // short debugging window post-completion; event-driven cleanup in
   // postMergeLifecycle and executeCloseOut deletes them at the actual event
@@ -1093,7 +1062,7 @@ export async function cleanupStaleAgentState(): Promise<string[]> {
       try {
         // Check if tmux session is active — never clean up running agents
         try {
-          const exists = await sessionExistsAsync(dir.name);
+          const exists = await Effect.runPromise(sessionExists(dir.name));
           if (exists) {
             continue; // Session exists, skip
           }
@@ -1165,7 +1134,7 @@ export async function cleanupStaleAgentState(): Promise<string[]> {
  * retention. See docs/REVIEW-AGENT-ARCHITECTURE.md.
  */
 function listFeatureWorkspaces(): Array<{ issueId: string; workspacePath: string }> {
-  const projects = listProjects();
+  const projects = listProjectsSync();
   const workspaces: Array<{ issueId: string; workspacePath: string }> = [];
 
   for (const { config: projectConfig } of projects) {
@@ -1195,7 +1164,7 @@ function listFeatureWorkspaces(): Array<{ issueId: string; workspacePath: string
 export async function cleanupAbandonedFeedback(): Promise<string[]> {
   const actions: string[] = [];
 
-  const { getReviewStatus } = await import('../review-status.js');
+  const { getReviewStatusSync } = await import('../review-status.js');
   const { clearFeedbackFiles } = await import('./feedback-writer.js');
 
   for (const { issueId, workspacePath } of listFeatureWorkspaces()) {
@@ -1207,7 +1176,7 @@ export async function cleanupAbandonedFeedback(): Promise<string[]> {
     // Gate 1: work agent tmux session active? If yes, feedback may be current.
     const agentSession = `agent-${issueLower}`;
     try {
-      if (await sessionExistsAsync(agentSession)) continue;
+      if (await Effect.runPromise(sessionExists(agentSession))) continue;
     } catch {
       // Treat lookup error as "session might exist" — skip out of caution.
       continue;
@@ -1215,7 +1184,7 @@ export async function cleanupAbandonedFeedback(): Promise<string[]> {
 
     // Gate 2: review in flight? If yes, feedback is about to be consumed.
     try {
-      const status = getReviewStatus(issueId);
+      const status = getReviewStatusSync(issueId);
       if (status?.reviewStatus === 'reviewing') continue;
     } catch {
       // No status entry → safe to clean.
@@ -1228,7 +1197,7 @@ export async function cleanupAbandonedFeedback(): Promise<string[]> {
         : 0;
       const before = countFeedbackFiles(panFeedbackDir);
       if (before === 0) continue;
-      await clearFeedbackFiles(workspacePath);
+      await Effect.runPromise(clearFeedbackFiles(workspacePath));
       actions.push(
         `Cleared ${before} abandoned feedback file(s) in feature-${issueLower} (agent stopped, no in-flight review)`,
       );
@@ -1289,7 +1258,7 @@ export async function cleanupOrphanReviewerSessions(): Promise<string[]> {
     return actions;
   }
 
-  const { getReviewStatus } = await import('../review-status.js');
+  const { getReviewStatusSync } = await import('../review-status.js');
   const { parseReviewerSessionName } = await import('./specialists.js');
 
   for (const sessionName of sessions) {
@@ -1328,7 +1297,7 @@ export async function cleanupOrphanReviewerSessions(): Promise<string[]> {
 
     // Gate 2: review in flight for this issue?
     try {
-      const status = getReviewStatus(issueId);
+      const status = getReviewStatusSync(issueId);
       if (status?.reviewStatus === 'reviewing') continue;
     } catch {
       // No status entry → safe to clean
@@ -1336,7 +1305,7 @@ export async function cleanupOrphanReviewerSessions(): Promise<string[]> {
 
     // Both gates passed — session is an orphan, kill it
     try {
-      await killSessionAsync(sessionName);
+      await Effect.runPromise(killSession(sessionName));
       const ageMin = Math.round((now - createdMs) / 60000);
       const msg = `Killed orphan reviewer session ${sessionName} (${ageMin}m old)`;
       actions.push(msg);
@@ -1429,7 +1398,7 @@ async function recoverUnhealthyTestStack(
     if (!record.escalated) {
       record.escalated = true;
       testStackRebuildState.set(key, record);
-      emitActivityEntry({
+      emitActivityEntrySync({
         source: 'cloister',
         level: 'error',
         issueId: key,
@@ -1468,7 +1437,7 @@ async function recoverUnhealthyTestStack(
   );
   if (!result.success) {
     console.warn(`[deacon] Test stack rebuild failed for ${key}: ${result.error}`);
-    emitActivityEntry({
+    emitActivityEntrySync({
       source: 'cloister',
       level: 'error',
       issueId: key,
@@ -1498,8 +1467,8 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
     // Check global specialists
     for (const type of ['review-agent', 'test-agent'] as const) {
       const session = getTmuxSessionName(type);
-      if (sessionExists(session)) {
-        const rState = getAgentRuntimeState(session);
+      if (sessionExistsSync(session)) {
+        const rState = getAgentRuntimeStateSync(session);
         if (rState?.state === 'active' && rState.currentIssue) {
           (type === 'review-agent' ? activeReviewSessions : activeTestSessions).add(rState.currentIssue.toUpperCase());
         }
@@ -1510,7 +1479,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
     const projectStatuses = await getAllProjectSpecialistStatuses();
     for (const projSpec of projectStatuses) {
       if (!projSpec.isRunning) continue;
-      const rState = getAgentRuntimeState(projSpec.tmuxSession);
+      const rState = getAgentRuntimeStateSync(projSpec.tmuxSession);
       const isWorking = rState?.state === 'active';
       if (isWorking && rState.currentIssue) {
         if (projSpec.specialistType === 'review-agent') {
@@ -1527,8 +1496,8 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
     // helper that scanned for review-coordinator-* / review-<id>-<role>
     // sessions spawned by dispatchParallelReview (now retired).
     try {
-      const { listRunningAgentsAsync } = await import('../agents.js');
-      const agents = await listRunningAgentsAsync();
+      const { listRunningAgents } = await import('../agents.js');
+      const agents = await Effect.runPromise(listRunningAgents());
       for (const agent of agents) {
         if (agent.status === 'stopped' || agent.status === 'error') continue;
         const issueId = (agent.issueId ?? '').trim().toUpperCase();
@@ -1608,8 +1577,8 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
           // checkPostReviewCommits both go blind, and the issue can jam at
           // passed-but-no-commit-anchor (PAN-977).
           try {
-            const { resolveProjectFromIssue } = await import('../projects.js');
-            const project = resolveProjectFromIssue(issueId);
+            const { resolveProjectFromIssueSync } = await import('../projects.js');
+            const project = resolveProjectFromIssueSync(issueId);
             if (project) {
               const workspacePath = join(
                 project.projectPath,
@@ -1644,7 +1613,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
               reviewUpdate['mergeStatus'] = 'pending';
             }
           }
-          setReviewStatus(issueId, reviewUpdate as Parameters<typeof setReviewStatus>[1]);
+          setReviewStatusSync(issueId, reviewUpdate as Parameters<typeof setReviewStatusSync>[1]);
           status.reviewStatus = latestTerminalReview.status;
           if (latestTerminalTest) {
             status.testStatus = latestTerminalTest.status as typeof status.testStatus;
@@ -1664,7 +1633,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
           const nextRetry = (status.reviewRetryCount ?? 0) + 1;
           const recoveryStart = status.recoveryStartedAt ?? new Date().toISOString();
           // Use setReviewStatus (not direct JSON write) so SQLite is updated too
-          setReviewStatus(issueId, {
+          setReviewStatusSync(issueId, {
             reviewStatus: 'pending',
             reviewRetryCount: nextRetry,
             recoveryStartedAt: recoveryStart,
@@ -1719,11 +1688,11 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
         const agentIdForCheck = `agent-${issueId.toLowerCase()}`;
         const completedProcessedFile = join(AGENTS_DIR, agentIdForCheck, 'completed.processed');
         if (existsSync(completedProcessedFile)) {
-          const agentState = getAgentState(agentIdForCheck);
+          const agentState = getAgentStateSync(agentIdForCheck);
           // A completed.processed marker means the work agent intentionally handed off;
           // review recovery does not require that work session to still be running.
-          const { resolveProjectFromIssue } = await import('../projects.js');
-          const resolved = resolveProjectFromIssue(issueId);
+          const { resolveProjectFromIssueSync } = await import('../projects.js');
+          const resolved = resolveProjectFromIssueSync(issueId);
           const issueLower = issueId.toLowerCase();
           const workspace = agentState?.workspace || (resolved ? findWorkspacePath(resolved.projectPath, issueLower) : null);
 
@@ -1732,7 +1701,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
             // PAN-1048 R4: deacon recovery routes through the role primitive.
             const { spawnReviewRoleForIssue } = await import('./review-agent.js');
             try {
-              await spawnReviewRoleForIssue({ issueId, workspace, branch });
+              await Effect.runPromise(spawnReviewRoleForIssue({ issueId, workspace, branch }));
               // spawnReviewRoleForIssue sets reviewStatus='reviewing' internally;
               // keep local status in sync so this patrol doesn't re-process the issue.
               status.reviewStatus = 'reviewing';
@@ -1771,9 +1740,9 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
 
         // Re-dispatch through the unified test role runner (no specialist queue fallback)
         const agentId = `agent-${issueId.toLowerCase()}`;
-        const agentState = getAgentState(agentId);
-        const { resolveProjectFromIssue } = await import('../projects.js');
-        const resolved = resolveProjectFromIssue(issueId);
+        const agentState = getAgentStateSync(agentId);
+        const { resolveProjectFromIssueSync } = await import('../projects.js');
+        const resolved = resolveProjectFromIssueSync(issueId);
         const issueLower = issueId.toLowerCase();
         const workspace = agentState?.workspace || (resolved ? findWorkspacePath(resolved.projectPath, issueLower) : null);
 
@@ -1789,7 +1758,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
           // cooling down, and stop entirely once the rebuild cap is exhausted.
           const stackRecovery = await recoverUnhealthyTestStack(issueId, workspace);
           if (stackRecovery === 'cooldown' || stackRecovery === 'exhausted') {
-            setReviewStatus(issueId, { testStatus: 'dispatch_failed' });
+            setReviewStatusSync(issueId, { testStatus: 'dispatch_failed' });
             status.testStatus = 'dispatch_failed';
             actions.push(
               stackRecovery === 'exhausted'
@@ -1803,7 +1772,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
                 prompt: buildTestRolePrompt({ issueId, workspace, branch }),
               });
               testStackRebuildState.delete(issueId.toUpperCase());
-              setReviewStatus(issueId, { testStatus: 'testing' });
+              setReviewStatusSync(issueId, { testStatus: 'testing' });
               status.testStatus = 'testing';
               actions.push(
                 `Re-dispatched orphaned test for ${issueId} via test role ${run.id} (deacon-orphan-recovery)`,
@@ -1814,12 +1783,12 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               if (msg.includes('already running')) {
-                setReviewStatus(issueId, { testStatus: 'testing' });
+                setReviewStatusSync(issueId, { testStatus: 'testing' });
                 status.testStatus = 'testing';
                 actions.push(`Orphaned test for ${issueId}: test role already running`);
                 console.log(`[deacon] Test role already running for ${issueId}`);
               } else {
-                setReviewStatus(issueId, { testStatus: 'dispatch_failed' });
+                setReviewStatusSync(issueId, { testStatus: 'dispatch_failed' });
                 status.testStatus = 'dispatch_failed';
                 actions.push(`Orphaned test role dispatch failed for ${issueId}: ${msg}`);
                 console.log(`[deacon] Orphaned test role dispatch failed for ${issueId}: ${msg}`);
@@ -1828,7 +1797,7 @@ export async function checkOrphanedReviewStatuses(): Promise<string[]> {
           }
         } else {
           // Cannot derive workspace/project — reset to pending so the pipeline can re-trigger cleanly
-          setReviewStatus(issueId, { testStatus: 'pending' });
+          setReviewStatusSync(issueId, { testStatus: 'pending' });
           status.testStatus = 'pending';
           actions.push(
             !resolved
@@ -1884,8 +1853,8 @@ export async function checkMissingReviewStatuses(): Promise<string[]> {
       if (!existsSync(completedFile) && !existsSync(processedFile)) continue;
 
       // Work is done but no status row — auto-trigger review
-      const { resolveProjectFromIssue } = await import('../projects.js');
-      const resolved = resolveProjectFromIssue(issueId);
+      const { resolveProjectFromIssueSync } = await import('../projects.js');
+      const resolved = resolveProjectFromIssueSync(issueId);
       if (!resolved) {
         actions.push(`Skipped missing-status review for ${issueId}: no project configured`);
         continue;
@@ -1901,11 +1870,11 @@ export async function checkMissingReviewStatuses(): Promise<string[]> {
       // PAN-1048 R4: deacon auto-trigger routes through the role primitive.
       const { spawnReviewRoleForIssue } = await import('./review-agent.js');
       try {
-        await spawnReviewRoleForIssue({
+        await Effect.runPromise(spawnReviewRoleForIssue({
           issueId,
           workspace,
           branch: `feature/${issueLower}`,
-        });
+        }));
         actions.push(`Auto-triggered review for ${issueId} (missing status entry)`);
         console.log(`[deacon] Auto-triggered review for ${issueId} (missing status entry)`);
       } catch (err) {
@@ -1938,7 +1907,7 @@ export async function checkPendingTestDispatch(): Promise<string[]> {
   const actions: string[] = [];
 
   try {
-    const { loadReviewStatuses, setReviewStatus } = await import('../review-status.js');
+    const { loadReviewStatuses, setReviewStatusSync } = await import('../review-status.js');
     const statuses = loadReviewStatuses();
     const now = Date.now();
 
@@ -1959,13 +1928,13 @@ export async function checkPendingTestDispatch(): Promise<string[]> {
         }
       }
 
-      const { resolveProjectFromIssue } = await import('../projects.js');
-      const resolved = resolveProjectFromIssue(issueId);
+      const { resolveProjectFromIssueSync } = await import('../projects.js');
+      const resolved = resolveProjectFromIssueSync(issueId);
       if (!resolved) continue;
 
       const issueLower = issueId.toLowerCase();
       const workAgentId = `agent-${issueLower}`;
-      const agentState = getAgentState(workAgentId);
+      const agentState = getAgentStateSync(workAgentId);
       const workspace = agentState?.workspace || findWorkspacePath(resolved.projectPath, issueLower);
       const branch = `feature/${issueLower}`;
 
@@ -1981,16 +1950,16 @@ export async function checkPendingTestDispatch(): Promise<string[]> {
           workspace,
           prompt: buildTestRolePrompt({ issueId, workspace, branch }),
         });
-        setReviewStatus(issueId, { testStatus: 'testing', testRetryCount: retryCount + 1 });
+        setReviewStatusSync(issueId, { testStatus: 'testing', testRetryCount: retryCount + 1 });
         actions.push(`Dispatched test role ${run.id} for ${issueId} (retry ${retryCount + 1})`);
         console.log(`[deacon] Dispatched test role for ${issueId} (retry ${retryCount + 1})`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('already running')) {
-          setReviewStatus(issueId, { testStatus: 'testing', testRetryCount: retryCount + 1 });
+          setReviewStatusSync(issueId, { testStatus: 'testing', testRetryCount: retryCount + 1 });
           actions.push(`Test role already running for ${issueId} (retry ${retryCount + 1})`);
         } else {
-          setReviewStatus(issueId, {
+          setReviewStatusSync(issueId, {
             testStatus: 'dispatch_failed',
             testNotes: msg,
             testRetryCount: retryCount + 1,
@@ -2031,7 +2000,7 @@ export async function checkStuckReviewing(): Promise<string[]> {
   const REVIEW_STUCK_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
   try {
-    const { loadReviewStatuses, setReviewStatus } = await import('../review-status.js');
+    const { loadReviewStatuses, setReviewStatusSync } = await import('../review-status.js');
     const statuses = loadReviewStatuses();
     const now = Date.now();
 
@@ -2040,15 +2009,15 @@ export async function checkStuckReviewing(): Promise<string[]> {
     const projectStatuses = await getAllProjectSpecialistStatuses();
     for (const projSpec of projectStatuses) {
       if (!projSpec.isRunning) continue;
-      const rState = getAgentRuntimeState(projSpec.tmuxSession);
+      const rState = getAgentRuntimeStateSync(projSpec.tmuxSession);
       if (rState?.state === 'active' && rState.currentIssue && projSpec.specialistType === 'review-agent') {
         activeReviewIssues.add(rState.currentIssue.toUpperCase());
       }
     }
     // Also check global review-agent
     const globalReviewSession = getTmuxSessionName('review-agent');
-    if (sessionExists(globalReviewSession)) {
-      const rState = getAgentRuntimeState(globalReviewSession);
+    if (sessionExistsSync(globalReviewSession)) {
+      const rState = getAgentRuntimeStateSync(globalReviewSession);
       if (rState?.state === 'active' && rState.currentIssue) {
         activeReviewIssues.add(rState.currentIssue.toUpperCase());
       }
@@ -2056,8 +2025,8 @@ export async function checkStuckReviewing(): Promise<string[]> {
     // Detect active review runs: agent-<id>-review (synthesis) and
     // agent-<id>-review-<subRole> (PAN-1059 convoy).
     try {
-      const { listRunningAgentsAsync } = await import('../agents.js');
-      const agents = await listRunningAgentsAsync();
+      const { listRunningAgents } = await import('../agents.js');
+      const agents = await Effect.runPromise(listRunningAgents());
       for (const agent of agents) {
         if (agent.status === 'stopped' || agent.status === 'error') continue;
         const role = agent.role ?? (agent.id.endsWith('-review') ? 'review' : null);
@@ -2077,7 +2046,7 @@ export async function checkStuckReviewing(): Promise<string[]> {
       const spawnedAt = new Date(status.reviewSpawnedAt).getTime();
       if (now - spawnedAt < REVIEW_STUCK_THRESHOLD_MS) continue;
 
-      setReviewStatus(issueId, {
+      setReviewStatusSync(issueId, {
         reviewStatus: 'pending',
         reviewNotes: `Review reset by deacon: no active review session after ${Math.round((now - spawnedAt) / 60000)}min`,
       });
@@ -2164,7 +2133,7 @@ export async function checkCompletedButUnsignaledReviews(): Promise<string[]> {
     for (const [issueId, status] of Object.entries(statuses)) {
       if (status.reviewStatus !== 'reviewing') continue;
 
-      const resolved = resolveProjectFromIssue(issueId);
+      const resolved = resolveProjectFromIssueSync(issueId);
       if (!resolved) continue;
       const wsPath = findWorkspacePath(resolved.projectPath, issueId.toLowerCase());
       if (!wsPath) continue;
@@ -2197,9 +2166,9 @@ export async function checkCompletedButUnsignaledReviews(): Promise<string[]> {
       if (lastNudged && now - lastNudged < 30 * 60 * 1000) continue;
 
       const reviewSession = `agent-${issueId.toLowerCase()}-review`;
-      const sessionAlive = sessionExists(reviewSession);
-      const paneDead = sessionAlive ? await isPaneDeadAsync(reviewSession).catch(() => true) : true;
-      const activeReviewState = sessionAlive && !paneDead ? getAgentState(reviewSession) : null;
+      const sessionAlive = sessionExistsSync(reviewSession);
+      const paneDead = sessionAlive ? await Effect.runPromise(isPaneDead(reviewSession)).catch(() => true) : true;
+      const activeReviewState = sessionAlive && !paneDead ? getAgentStateSync(reviewSession) : null;
       if (activeReviewState?.reviewRunId && latestDir !== join(reviewBaseDir, activeReviewState.reviewRunId)) {
         continue;
       }
@@ -2227,7 +2196,7 @@ export async function checkCompletedButUnsignaledReviews(): Promise<string[]> {
         // If we already nudged once and 30+ min have passed with no signal,
         // the agent is unresponsive — auto-complete so the pipeline isn't blocked.
         if (lastNudged) {
-          setReviewStatus(issueId, {
+          setReviewStatusSync(issueId, {
             reviewStatus: verdict,
             reviewNotes: topBlocker || `Review auto-completed by deacon: ${verdict} (agent alive but unresponsive after nudge, synthesis exists)`,
           });
@@ -2250,7 +2219,7 @@ export async function checkCompletedButUnsignaledReviews(): Promise<string[]> {
         }
       } else {
         // Session is dead — auto-complete so the pipeline isn't blocked
-        setReviewStatus(issueId, {
+        setReviewStatusSync(issueId, {
           reviewStatus: verdict,
           reviewNotes: topBlocker || `Review auto-completed by deacon: ${verdict} (agent dead, synthesis exists)`,
         });
@@ -2273,8 +2242,8 @@ export async function checkCompletedButUnsignaledReviews(): Promise<string[]> {
 export async function checkVerificationReviewContradiction(): Promise<string[]> {
   const actions: string[] = [];
   try {
-    const { loadReviewStatuses, setReviewStatus } = await import('../review-status.js');
-    const { resolveProjectFromIssue } = await import('../projects.js');
+    const { loadReviewStatuses, setReviewStatusSync } = await import('../review-status.js');
+    const { resolveProjectFromIssueSync } = await import('../projects.js');
     const statuses = loadReviewStatuses();
 
     for (const [issueId, status] of Object.entries(statuses)) {
@@ -2289,7 +2258,7 @@ export async function checkVerificationReviewContradiction(): Promise<string[]> 
         // issue jammed at passed-but-stuck forever (PAN-977).
         let reviewedAtCommit: string | undefined;
         try {
-          const project = resolveProjectFromIssue(issueId);
+          const project = resolveProjectFromIssueSync(issueId);
           if (project) {
             const workspacePath = join(
               project.projectPath,
@@ -2306,7 +2275,7 @@ export async function checkVerificationReviewContradiction(): Promise<string[]> 
         // Clearing the stuck marker is mandatory: the bypass *resolves* the
         // review-infra failure, so the issue must no longer be skipped by the
         // deacon's stuck-issue guards or it deadlocks at passed+stuck.
-        setReviewStatus(issueId, {
+        setReviewStatusSync(issueId, {
           reviewStatus: 'passed',
           reviewNotes: 'Review bypassed: verification passed but review infrastructure repeatedly failed.',
           ...(reviewedAtCommit ? { reviewedAtCommit } : {}),
@@ -2357,7 +2326,7 @@ export async function checkPostReviewCommits(): Promise<string[]> {
 
   try {
     const statuses = loadReviewStatuses();
-    const { resolveProjectFromIssue } = await import('../projects.js');
+    const { resolveProjectFromIssueSync } = await import('../projects.js');
 
     for (const [issueId, status] of Object.entries(statuses)) {
       // Only check passed reviews not yet merged
@@ -2366,7 +2335,7 @@ export async function checkPostReviewCommits(): Promise<string[]> {
       if (status.reviewStatus !== 'passed' && !status.readyForMerge) continue;
 
       // Resolve workspace path
-      const project = resolveProjectFromIssue(issueId);
+      const project = resolveProjectFromIssueSync(issueId);
       if (!project) continue;
       const workspacePath = join(
         project.projectPath,
@@ -2401,7 +2370,7 @@ export async function checkPostReviewCommits(): Promise<string[]> {
           // Tree-identical rebase: advance reviewedAtCommit to the new HEAD so
           // we stop comparing against a SHA the workspace no longer carries,
           // but preserve review/test/readyForMerge.
-          setReviewStatus(issueId, { reviewedAtCommit: currentHead });
+          setReviewStatusSync(issueId, { reviewedAtCommit: currentHead });
           console.log(
             `[deacon] Tree-identical rebase for ${issueId}: ` +
             `${status.reviewedAtCommit.substring(0, 8)} → ${currentHead.substring(0, 8)} ` +
@@ -2418,7 +2387,7 @@ export async function checkPostReviewCommits(): Promise<string[]> {
         `[deacon] Post-review commit detected for ${issueId}: ` +
         `was ${status.reviewedAtCommit.substring(0, 8)}, now ${currentHead.substring(0, 8)} — resetting review`,
       );
-      setReviewStatus(issueId, {
+      setReviewStatusSync(issueId, {
         reviewStatus: 'pending',
         testStatus: 'pending',
         readyForMerge: false,
@@ -2445,16 +2414,16 @@ export async function checkPostReviewCommits(): Promise<string[]> {
       // Redispatch a fresh review convoy. Re-read status to guard against races
       // with other dispatch paths (HTTP request-review, manual CLI) that may have
       // already picked up the work between the reset above and now.
-      const freshStatus = getReviewStatus(issueId);
+      const freshStatus = getReviewStatusSync(issueId);
       if (freshStatus?.reviewStatus === 'pending') {
         const { spawnReviewRoleForIssue } = await import('./review-agent.js');
         const branch = `feature/${issueId.toLowerCase()}`;
-        const dispatchResult = await spawnReviewRoleForIssue({
+        const dispatchResult = await Effect.runPromise(spawnReviewRoleForIssue({
           issueId,
           workspace: workspacePath,
           branch,
           force: true,
-        });
+        }));
         if (dispatchResult.success) {
           actions.push(`Re-dispatched review for ${issueId}`);
           console.log(`[deacon] Re-dispatched review convoy for ${issueId} after post-review commit reset`);
@@ -2493,7 +2462,7 @@ const mergeStuckCooldowns = new Map<string, number>();
 // Callback set by the server layer to emit domain events when agents are stopped.
 // Deacon is a library module and does not own the event store directly.
 let agentStoppedNotifier: ((agentId: string) => void) | null = null;
-let agentStatusChangedNotifier: ((state: AgentState, previousStatus?: AgentState['status']) => void) | null = null;
+let agentStatusChangedNotifier: ((state: AgentState, previousStatus?: AgentState['status'], hasLiveTmuxSession?: boolean) => void) | null = null;
 const orphanFailureRecordedForAutoResume = new Set<string>();
 
 /**
@@ -2506,13 +2475,13 @@ export function setAgentStoppedNotifier(fn: (agentId: string) => void): void {
 }
 
 /** Register a callback for Deacon-owned AgentState changes that must reach live clients. */
-export function setAgentStatusChangedNotifier(fn: (state: AgentState, previousStatus?: AgentState['status']) => void): void {
+export function setAgentStatusChangedNotifier(fn: (state: AgentState, previousStatus?: AgentState['status'], hasLiveTmuxSession?: boolean) => void): void {
   agentStatusChangedNotifier = fn;
 }
 
-function notifyAgentStatusChanged(state: AgentState, previousStatus?: AgentState['status']): void {
+function notifyAgentStatusChanged(state: AgentState, previousStatus?: AgentState['status'], hasLiveTmuxSession?: boolean): void {
   if (!agentStatusChangedNotifier) return;
-  try { agentStatusChangedNotifier(state, previousStatus); } catch { /* non-fatal */ }
+  try { agentStatusChangedNotifier(state, previousStatus, hasLiveTmuxSession); } catch { /* non-fatal */ }
 }
 
 // Callback set by the server layer to emit Socket.io merge:ready notifications.
@@ -2612,12 +2581,13 @@ export async function checkReadyForMergeStuck(): Promise<string[]> {
 // Wait this long after the review/test status last changed before the patrol
 // steps in — long enough that the reactive scheduler's primary
 // onIssueStateChange('shipping') trigger has had every chance to fire first.
-const SHIP_DISPATCH_STALENESS_MS = 2 * 60 * 1000; // 2 min
+const SHIP_DISPATCH_STALENESS_MS = 30 * 1000; // 30 s
 // Per-issue cooldown between successive re-dispatch attempts. onIssueStateChange
 // is already idempotent (activeRoleRunExists skips a live, current ship run),
 // so this is purely to keep the patrol log quiet while a ship run is in flight.
-const SHIP_DISPATCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+const SHIP_DISPATCH_COOLDOWN_MS = 90 * 1000; // 90 s
 const shipDispatchCooldowns = new Map<string, number>();
+const shipDispatchCounts = new Map<string, number>();
 
 /**
  * Safety-net patrol: re-dispatch the ship role for issues where review and
@@ -2639,8 +2609,8 @@ const shipDispatchCooldowns = new Map<string, number>();
  * Guards:
  *   - review + test both 'passed', not yet readyForMerge
  *   - skip merging/merged/failed (checkFailedMergeRetry owns the failed path)
- *   - staleness: status at least 2 min old (don't race the primary trigger)
- *   - per-issue cooldown: 5 min between re-dispatch attempts
+ *   - staleness: status at least 30 s old (don't race the primary trigger)
+ *   - per-issue cooldown: 90 s between re-dispatch attempts
  */
 export async function checkUndispatchedShip(): Promise<string[]> {
   const actions: string[] = [];
@@ -2648,16 +2618,31 @@ export async function checkUndispatchedShip(): Promise<string[]> {
   try {
     const statuses = loadReviewStatuses();
     const now = Date.now();
+    const shipEligibleKeys = new Set<string>();
 
     for (const [key, status] of Object.entries(statuses)) {
       if (status.reviewStatus !== 'passed') continue;
       if (status.testStatus !== 'passed') continue;
       if (status.readyForMerge) continue;
       if (status.mergeStatus === 'merging' || status.mergeStatus === 'merged' || status.mergeStatus === 'failed') continue;
+      if (!status.updatedAt) continue;
+      shipEligibleKeys.add(key);
+    }
+
+    for (const key of new Set([...shipDispatchCooldowns.keys(), ...shipDispatchCounts.keys()])) {
+      if (!shipEligibleKeys.has(key)) {
+        shipDispatchCooldowns.delete(key);
+        shipDispatchCounts.delete(key);
+      }
+    }
+
+    for (const [key, status] of Object.entries(statuses)) {
+      if (!shipEligibleKeys.has(key)) continue;
 
       // Give the reactive scheduler's primary trigger time to land first.
-      if (!status.updatedAt) continue;
-      if (now - new Date(status.updatedAt).getTime() < SHIP_DISPATCH_STALENESS_MS) continue;
+      const updatedAt = status.updatedAt;
+      if (!updatedAt) continue;
+      if (now - new Date(updatedAt).getTime() < SHIP_DISPATCH_STALENESS_MS) continue;
 
       // Per-issue cooldown — keeps the log quiet while a ship run is in flight.
       const lastAttempt = shipDispatchCooldowns.get(key);
@@ -2672,7 +2657,10 @@ export async function checkUndispatchedShip(): Promise<string[]> {
 
       try {
         const { onIssueStateChange } = await import('./service.js');
-        await onIssueStateChange(issueId, 'shipping');
+        await Effect.runPromise(onIssueStateChange(issueId, 'shipping'));
+        const dispatchCount = (shipDispatchCounts.get(key) ?? 0) + 1;
+        shipDispatchCounts.set(key, dispatchCount);
+        console.log(`[deacon] Ship re-dispatched (${dispatchCount} total for issue ${issueId})`);
         actions.push(`Re-dispatched ship for ${issueId} (review+test passed but never reached readyForMerge)`);
       } catch (err) {
         console.error(
@@ -2706,7 +2694,7 @@ export async function reconcileStaleMergeStatus(): Promise<string[]> {
       if (status.mergeStatus === 'merged') continue;
       if (staleMergeReconciled.has(issueId)) continue;
 
-      const project = resolveProjectFromIssue(issueId);
+      const project = resolveProjectFromIssueSync(issueId);
       if (!project) continue;
 
       const branch = `feature/${issueId.toLowerCase()}`;
@@ -2730,7 +2718,7 @@ export async function reconcileStaleMergeStatus(): Promise<string[]> {
       // unrelated commits landed on main with `(PAN-977)` references and the
       // deacon trusted them. GitHub's API is the only authoritative source.
       if (!isMerged) {
-        const { resolveGitHubIssue: _resolveGitHubIssue } = await import('../tracker-utils.js');
+        const { resolveGitHubIssueSync: _resolveGitHubIssue } = await import('../tracker-utils.js');
         const ghResolved = _resolveGitHubIssue(issueId);
         if (ghResolved.isGitHub) {
           try {
@@ -2750,12 +2738,12 @@ export async function reconcileStaleMergeStatus(): Promise<string[]> {
       }
 
       if (isMerged) {
-        setReviewStatus(issueId, { mergeStatus: 'merged', readyForMerge: false });
+        setReviewStatusSync(issueId, { mergeStatus: 'merged', readyForMerge: false });
         staleMergeReconciled.add(issueId);
         const msg = `Reconciled stale mergeStatus for ${issueId} — branch ${branch} is merged to main`;
         actions.push(msg);
         console.log(`[deacon] ${msg}`);
-        // PAN-1027: also run the post-merge cleanup so labels get cleaned, work agent
+        // PAN-1027: also run the post-merge handoff so labels get cleaned, work agent
         // tmux session is killed, beads compacted, etc. Without this the dashboard knows
         // the issue is merged but the GitHub labels stay stale ("in-progress"/"in-review")
         // and orphaned tmux sessions leak memory. skipDeploy avoids respawning the server
@@ -2814,8 +2802,8 @@ export async function detectMergedSwarmSlots(): Promise<string[]> {
   const actions: string[] = [];
   try {
     const { parseSlotBranch, postMergeLifecycle } = await import('./merge-agent.js');
-    const { resolveGitHubIssue } = await import('../tracker-utils.js');
-    const { readContinueStateAsync } = await import('../vbrief/continue-state.js');
+    const { resolveGitHubIssueSync } = await import('../tracker-utils.js');
+    const { readContinueState } = await import('../vbrief/continue-state.js');
 
     const now = Date.now();
     // Drop cooldown entries that can no longer suppress anything, so the map
@@ -2830,7 +2818,7 @@ export async function detectMergedSwarmSlots(): Promise<string[]> {
 
       let runtime;
       try {
-        const cont = await readContinueStateAsync(workspacePath, issueId);
+        const cont = await Effect.runPromise(readContinueState(workspacePath, issueId));
         runtime = cont?.swarmRuntime;
       } catch {
         continue; // unreadable / malformed continue file — skip this workspace
@@ -2843,9 +2831,9 @@ export async function detectMergedSwarmSlots(): Promise<string[]> {
       const runningSlots = runtime.slots.filter(slot => slot.status === 'running');
       if (runningSlots.length === 0) continue;
 
-      const gh = resolveGitHubIssue(issueId);
+      const gh = resolveGitHubIssueSync(issueId);
       if (!gh.isGitHub) continue;
-      const project = resolveProjectFromIssue(issueId);
+      const project = resolveProjectFromIssueSync(issueId);
       if (!project) continue;
 
       const issueLower = issueId.toLowerCase();
@@ -2931,13 +2919,13 @@ export async function reconcileFalseMerged(): Promise<string[]> {
       if (!prRef) continue;
 
       try {
-        const prState = await getPullRequestState(prRef[1], prRef[2], Number.parseInt(prRef[3], 10));
+        const prState = await Effect.runPromise(getPullRequestState(prRef[1], prRef[2], Number.parseInt(prRef[3], 10)));
         if (!prState.merged) {
           // GitHub says not merged but our DB says merged — reset internal state.
           // Leave reviewStatus alone (it may legitimately be passed/failed/blocked from
           // the prior cycle); the issue can proceed through the pipeline once mergeStatus
           // is no longer blocking.
-          setReviewStatus(issueId, { mergeStatus: 'pending' });
+          setReviewStatusSync(issueId, { mergeStatus: 'pending' });
           falseMergedReset.add(issueId);
           const msg = `Reset stale mergeStatus=merged for ${issueId} — PR ${status.prUrl} is not merged on GitHub`;
           actions.push(msg);
@@ -3011,11 +2999,11 @@ export async function reconcileClosedPrReadyForMerge(): Promise<string[]> {
       if (!Number.isFinite(prNumber)) continue;
 
       try {
-        const prState = await getPullRequestState(owner, repo, prNumber);
+        const prState = await Effect.runPromise(getPullRequestState(owner, repo, prNumber));
         if (prState.state === 'OPEN' && !prState.merged) continue;
 
         if (prState.merged) {
-          setReviewStatus(issueId, {
+          setReviewStatusSync(issueId, {
             readyForMerge: false,
             mergeStatus: 'merged',
             mergeNotes: undefined,
@@ -3024,7 +3012,7 @@ export async function reconcileClosedPrReadyForMerge(): Promise<string[]> {
           actions.push(msg);
           console.log(`[deacon] ${msg}`);
         } else {
-          setReviewStatus(issueId, {
+          setReviewStatusSync(issueId, {
             readyForMerge: false,
             mergeStatus: 'failed',
             mergeNotes: `PR #${prNumber} was closed without merging — reopen the PR or reset review state to re-queue this issue`,
@@ -3063,7 +3051,7 @@ export async function reconcileMergedButReviewing(): Promise<string[]> {
       // Set BOTH review and test to 'passed' atomically. Setting only review='passed'
       // trips the canSkipTests dispatch path in setReviewStatus and spawns a test-agent
       // for an already-merged issue — pure waste. The merge is terminal, no test needed.
-      setReviewStatus(issueId, {
+      setReviewStatusSync(issueId, {
         reviewStatus: 'passed',
         testStatus: 'passed',
         testNotes: status.testNotes ?? 'Skipped: issue is already merged',
@@ -3144,23 +3132,23 @@ export async function checkFailedMergeRetry(): Promise<string[]> {
             console.log(`[deacon] CI check failure for ${issueId} — retries exhausted, notifying work agent`);
             const ciNotes = status.mergeNotes || 'CI checks are failing on the PR';
             const { writeFeedbackFile } = await import('./feedback-writer.js');
-            const ciFileResult = await writeFeedbackFile({
+            const ciFileResult = await Effect.runPromise(writeFeedbackFile({
               issueId,
               specialist: 'merge-agent',
               outcome: 'ci-failure',
               summary: 'CI checks still failing after 5 transient retries — merge blocked',
               markdownBody: `## CI Check Failure — Merge Blocked\n\n${ciNotes}\n\n### Action Required\n\nFix the failing CI checks, commit, and push. Panopticon will detect the new commits and re-run the review pipeline automatically.\n\nAlternatively:\n\n\`\`\`\npan done ${issueId}\n\`\`\``,
-            }).catch((err: Error) => {
+            }).pipe(Effect.catch((err) => {
               console.error(`[deacon] Failed to write CI failure feedback for ${issueId}:`, err.message);
-              return { success: false, error: err.message };
-            });
+              return Effect.succeed({ success: false, error: err.message });
+            })));
             const agentSession = `agent-${issueId.toLowerCase()}`;
-            if (sessionExists(agentSession)) {
+            if (sessionExistsSync(agentSession)) {
               const ciPath = (ciFileResult as any)?.filePath;
               const ciMsg = ciPath
                 ? `CI checks are failing on the PR after 5 retries.\n\nMUST READ: ${ciPath}\n\nFix the failures, commit, then run: pan done ${issueId}`
                 : `CI checks are failing on the PR after 5 retries. Fix the failures, commit, then run: pan done ${issueId}`;
-              await sendKeysAsync(agentSession, ciMsg);
+              await Effect.runPromise(sendKeys(agentSession, ciMsg));
             }
             ciEntry.count++; // increment past 5 so this block only fires once
             ciRetryMap.set(issueId, ciEntry);
@@ -3184,23 +3172,23 @@ export async function checkFailedMergeRetry(): Promise<string[]> {
         console.log(`[deacon] CI check failure for ${issueId} — notifying agent to re-submit (attempt ${ciEntry.count}/5)`);
         const ciNotes = status.mergeNotes || 'CI checks are failing on the PR';
         const { writeFeedbackFile } = await import('./feedback-writer.js');
-        const ciFileResult2 = await writeFeedbackFile({
+        const ciFileResult2 = await Effect.runPromise(writeFeedbackFile({
           issueId,
           specialist: 'merge-agent',
           outcome: 'ci-failure',
           summary: 'CI checks failed at merge — re-submit to re-enter merge queue',
           markdownBody: `## CI Check Failure\n\n${ciNotes}\n\nCI checks failed at merge time. This may be transient (pending checks, GitHub status lag). Re-submit to re-enter the merge queue:\n\n\`\`\`\npan done ${issueId}\n\`\`\``,
-        }).catch((err: Error) => {
+        }).pipe(Effect.catch((err) => {
           console.error(`[deacon] Failed to write CI failure feedback for ${issueId}:`, err.message);
-          return { success: false, error: err.message };
-        });
+          return Effect.succeed({ success: false, error: err.message });
+        })));
         const agentSessionCi = `agent-${issueId.toLowerCase()}`;
-        if (sessionExists(agentSessionCi)) {
+        if (sessionExistsSync(agentSessionCi)) {
           const ciPath2 = (ciFileResult2 as any)?.filePath;
           const ciMsg2 = ciPath2
             ? `CI checks failed on the PR for ${issueId}. This may be transient.\n\nMUST READ: ${ciPath2}\n\nFix any failures, commit, then run: pan done ${issueId}`
             : `CI checks failed on the PR for ${issueId}. This may be transient. Fix any failures, commit, then run: pan done ${issueId}`;
-          await sendKeysAsync(agentSessionCi, ciMsg2);
+          await Effect.runPromise(sendKeys(agentSessionCi, ciMsg2));
         }
         actions.push(`CI failure notification for ${issueId} (attempt ${ciEntry.count}/5)`);
         continue;
@@ -3217,18 +3205,21 @@ export async function checkFailedMergeRetry(): Promise<string[]> {
         if (!lastNudge || (now - lastNudge) >= TIMEOUT_NUDGE_COOLDOWN_MS) {
           const timeoutNotes = status.mergeNotes!;
           const { writeFeedbackFile } = await import('./feedback-writer.js');
-          await writeFeedbackFile({
+          await Effect.runPromise(writeFeedbackFile({
             issueId: issueIdForFb,
             specialist: 'merge-agent',
             outcome: 'timeout',
             summary: 'Merge timed out waiting for rebase — please rebase and push',
             markdownBody: `## Merge Timed Out — Rebase Required\n\n${timeoutNotes}\n\n### Action Required\n\nThe merge was requested but the rebased branch was not pushed in time. Please:\n\n1. Run \`git fetch origin\` and \`git rebase origin/main\` (or the target branch)\n2. Resolve any conflicts\n3. Run \`git push --force-with-lease\`\n4. Run \`pan done ${issueIdForFb}\`\n\nAfter pushing, the merge will be retried automatically.`,
-          }).catch((err: Error) => console.error(`[deacon] Failed to write timeout feedback for ${issueIdForFb}:`, err.message));
+          }).pipe(Effect.catch((err) => {
+            console.error(`[deacon] Failed to write timeout feedback for ${issueIdForFb}:`, err.message);
+            return Effect.void;
+          })));
           const agentSession = `agent-${issueIdForFb.toLowerCase()}`;
-          if (sessionExists(agentSession)) {
-            await sendKeysAsync(agentSession,
+          if (sessionExistsSync(agentSession)) {
+            await Effect.runPromise(sendKeys(agentSession,
               `Merge timed out — the rebased branch was not pushed in time. Please rebase onto the target branch, resolve any conflicts, push with --force-with-lease, then run "pan done ${issueIdForFb}". After pushing, the merge will proceed automatically.`
-            );
+            ));
           }
           timeoutNudgeCooldowns.set(issueIdForFb, now);
           actions.push(`Timeout failure for ${issueIdForFb} — wrote feedback, nudged work agent`);
@@ -3259,7 +3250,7 @@ export async function checkFailedMergeRetry(): Promise<string[]> {
       const nextRetry = retryCount + 1;
       console.log(`[deacon] Auto-retrying failed merge for ${issueId} (attempt ${nextRetry}/${FAILED_MERGE_MAX_RETRIES})`);
 
-      setReviewStatus(issueId, {
+      setReviewStatusSync(issueId, {
         mergeStatus: 'pending',
         readyForMerge: true,
         mergeRetryCount: nextRetry,
@@ -3286,8 +3277,8 @@ export async function checkFailedMergeRetry(): Promise<string[]> {
  */
 async function clearStaleCiFeedback(issueId: string): Promise<void> {
   const { readdir, rm } = await import('fs/promises');
-  const { resolveProjectFromIssue } = await import('../projects.js');
-  const projectConfig = resolveProjectFromIssue(issueId);
+  const { resolveProjectFromIssueSync } = await import('../projects.js');
+  const projectConfig = resolveProjectFromIssueSync(issueId);
   if (!projectConfig) return;
 
   const repoDir = projectConfig.projectPath;
@@ -3389,7 +3380,7 @@ export async function checkDeadEndAgents(): Promise<string[]> {
       const issueId = key;
       const agentSessionName = `agent-${issueId.toLowerCase()}`;
 
-      if (!sessionExists(agentSessionName)) {
+      if (!sessionExistsSync(agentSessionName)) {
         // No agent session — nothing to recover
         continue;
       }
@@ -3421,7 +3412,7 @@ export async function checkDeadEndAgents(): Promise<string[]> {
       // For merge CI-blocked: clear the stale merge failure, clean up stale
       // CI-failure feedback files, and set readyForMerge so the merge flow can re-enter.
       if (isMergeCiFailed) {
-        setReviewStatus(issueId, {
+        setReviewStatusSync(issueId, {
           mergeStatus: 'pending',
           readyForMerge: true,
         });
@@ -3438,7 +3429,7 @@ export async function checkDeadEndAgents(): Promise<string[]> {
       // Resolve latest feedback file for targeted nudge
       let latestFeedbackPath: string | undefined;
       try {
-        const resolved = resolveProjectFromIssue(issueId);
+        const resolved = resolveProjectFromIssueSync(issueId);
         if (resolved) {
           const wsPath = findWorkspacePath(resolved.projectPath, issueId.toLowerCase());
           if (wsPath) {
@@ -3468,7 +3459,7 @@ export async function checkDeadEndAgents(): Promise<string[]> {
               ? `Verification failed for ${issueId} while review is pending.${feedbackPart}\n\nFix the failing verification check, commit every change, push your branch, then request a new review with: pan review request ${issueId} -m "Fixed verification failure". Do NOT stop until pan review request completes successfully.`
               : `Tests failed for your changes.${feedbackPart}\n\nFix the failures, commit, then run: pan review request ${issueId} -m "Fixed test failures". Do NOT stop until pan review request completes successfully.`;
 
-        await sendKeysAsync(agentSessionName, nudgeMessage);
+        await Effect.runPromise(sendKeys(agentSessionName, nudgeMessage));
         actions.push(`Dead-end recovery: nudged ${agentSessionName} (${statusType}, idle for ${Math.round((now - new Date(status.updatedAt || '').getTime()) / 60000)}m)`);
         console.log(`[deacon] Sent dead-end recovery nudge to ${agentSessionName}`);
       } catch (error: unknown) {
@@ -3492,12 +3483,12 @@ export async function logNonCanonicalStashesOnStartup(): Promise<string[]> {
     if (!existsSync(workspacePath)) continue;
 
     try {
-      const stashes = await listStashes(workspacePath);
+      const stashes = await Effect.runPromise(listStashes(workspacePath));
       for (const stash of stashes) {
         if (stash.kind !== 'unknown') continue;
         const message = `Non-canonical stash in ${issueId} (${workspacePath}): ${stash.ref} ${stash.message} — audit recommended`;
         console.warn(`[deacon] ${message}`);
-        emitActivityEntry({ source: 'dashboard', level: 'warn', message });
+        emitActivityEntrySync({ source: 'dashboard', level: 'warn', message });
         actions.push(message);
       }
     } catch (error) {
@@ -3521,7 +3512,7 @@ async function reconcileAndCheckIfMerged(
     return result;
   };
 
-  const reviewStatus = getReviewStatus(issueId);
+  const reviewStatus = getReviewStatusSync(issueId);
   if (reviewStatus?.mergeStatus === 'merged') {
     return remember(true);
   }
@@ -3532,14 +3523,14 @@ async function reconcileAndCheckIfMerged(
       try {
         const { getPullRequestState, isGitHubAppConfigured } = await import('../github-app.js');
         if (isGitHubAppConfigured()) {
-          const prState = await getPullRequestState(prRef[1], prRef[2], Number.parseInt(prRef[3], 10));
+          const prState = await Effect.runPromise(getPullRequestState(prRef[1], prRef[2], Number.parseInt(prRef[3], 10)));
           if (prState.merged) {
-            setReviewStatus(issueId, { mergeStatus: 'merged', readyForMerge: false, mergeNotes: undefined });
-            // PAN-1027: also run the post-merge cleanup so labels get cleaned and the
+            setReviewStatusSync(issueId, { mergeStatus: 'merged', readyForMerge: false, mergeNotes: undefined });
+            // PAN-1027: also run the post-merge handoff so labels get cleaned and the
             // work-agent tmux session is killed. Without this, GitHub-detected merges
             // leave stale "in-progress" / "in-review" labels and leaked tmux sessions.
             try {
-              const resolved = resolveProjectFromIssue(issueId);
+              const resolved = resolveProjectFromIssueSync(issueId);
               if (resolved) {
                 const branch = `feature/${issueId.toLowerCase()}`;
                 const { postMergeLifecycle } = await import('./merge-agent.js');
@@ -3548,7 +3539,7 @@ async function reconcileAndCheckIfMerged(
                 );
               }
             } catch (err) {
-              console.warn(`[deacon] Could not run post-merge cleanup for ${issueId}: ${err}`);
+              console.warn(`[deacon] Could not run post-merge handoff for ${issueId}: ${err}`);
             }
             return remember(true);
           }
@@ -3560,12 +3551,12 @@ async function reconcileAndCheckIfMerged(
     }
   }
 
-  const resolved = resolveProjectFromIssue(issueId);
+  const resolved = resolveProjectFromIssueSync(issueId);
   if (!resolved) {
     return remember(false);
   }
 
-  const project = getProject(resolved.projectKey);
+  const project = getProjectSync(resolved.projectKey);
   if (!project?.tracker) {
     return remember(false);
   }
@@ -3573,7 +3564,7 @@ async function reconcileAndCheckIfMerged(
   try {
     const { createTracker } = await import('../tracker/factory.js');
     const panopticonConfig = await import('../config.js');
-    const globalTrackerConfig = panopticonConfig.loadConfig().trackers;
+    const globalTrackerConfig = panopticonConfig.loadConfigSync().trackers;
 
     let trackerConfig: TrackerConfig | null = null;
     if (project.tracker === 'github' && project.github_repo) {
@@ -3633,10 +3624,10 @@ export async function cleanupSpawnAndOrphanedStashes(now = new Date()): Promise<
   const actions: string[] = [];
 
   try {
-    const agents = listRunningAgents();
+    const agents = listRunningAgentsSync();
     for (const agent of agents) {
       if (!agent.id.startsWith('agent-')) continue;
-      const agentState = getAgentState(agent.id);
+      const agentState = getAgentStateSync(agent.id);
       if (!agentState?.workspace || !agentState.preSpawnStashRef) continue;
       if (!existsSync(agentState.workspace)) continue;
       if (!agentState.preSpawnBaselineHead) {
@@ -3665,11 +3656,11 @@ export async function cleanupSpawnAndOrphanedStashes(now = new Date()): Promise<
       if (!hasCommitsAhead) continue;
 
       try {
-        await dropStash(agentState.workspace, agentState.preSpawnStashRef);
+        await Effect.runPromise(dropStash(agentState.workspace, agentState.preSpawnStashRef));
         agentState.preSpawnStashRef = undefined;
         agentState.preSpawnStashMessage = undefined;
         agentState.preSpawnBaselineHead = undefined;
-        saveAgentState(agentState);
+        saveAgentStateSync(agentState);
         actions.push(`Dropped pre-spawn stash for ${agentState.issueId}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -3680,7 +3671,7 @@ export async function cleanupSpawnAndOrphanedStashes(now = new Date()): Promise<
         agentState.preSpawnStashRef = undefined;
         agentState.preSpawnStashMessage = undefined;
         agentState.preSpawnBaselineHead = undefined;
-        saveAgentState(agentState);
+        saveAgentStateSync(agentState);
       }
     }
 
@@ -3690,7 +3681,7 @@ export async function cleanupSpawnAndOrphanedStashes(now = new Date()): Promise<
       if (!existsSync(workspacePath)) continue;
 
       try {
-        const stashes = await listStashes(workspacePath);
+        const stashes = await Effect.runPromise(listStashes(workspacePath));
         const matchingPreMergeStashes = stashes.filter(
           (stash) => stash.kind === 'pre-merge' && stash.issueId === issueId.toUpperCase(),
         );
@@ -3718,7 +3709,7 @@ export async function cleanupSpawnAndOrphanedStashes(now = new Date()): Promise<
         const stashesWithoutStackRef = dedupedStashesToDrop.filter((stash) => !stash.stackRef);
         const stashesToDrop = [...stashesWithStackRef, ...stashesWithoutStackRef];
         for (const stash of stashesToDrop) {
-          await dropStash(workspacePath, stash.ref, stash.stackRef);
+          await Effect.runPromise(dropStash(workspacePath, stash.ref, stash.stackRef));
           const reason = mergedPreMergeStashes.some((entry) => entry.ref === stash.ref)
             ? 'merged issue'
             : 'stale';
@@ -3742,6 +3733,155 @@ const firstCompletionCooldowns = new Map<string, number>();
 const FIRST_COMPLETION_IDLE_MS = 10 * 60 * 1000; // 10 minutes idle before nudging
 const FIRST_COMPLETION_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes between nudges
 
+function isVerifyPausedAgentState(state: Pick<AgentState, 'issueId' | 'paused'>): boolean {
+  if (state.paused !== true || !state.issueId) return false;
+  return getReviewStatusSync(state.issueId)?.mergeStatus === 'merged';
+}
+
+// Cache for auto-close-out canonical state queries to avoid N+1 shell execs on patrol
+const autoCloseOutCache = new Map<string, { state: string | null; timestamp: number }>();
+const AUTO_CLOSE_OUT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function sweepAutoCloseOutCache(): void {
+  const now = Date.now();
+  for (const [issueId, entry] of autoCloseOutCache.entries()) {
+    if (now - entry.timestamp > AUTO_CLOSE_OUT_CACHE_TTL_MS) {
+      autoCloseOutCache.delete(issueId);
+    }
+  }
+}
+
+async function getAutoCloseOutCanonicalState(issueId: string): Promise<string | null> {
+  const cached = autoCloseOutCache.get(issueId);
+  if (cached && Date.now() - cached.timestamp < AUTO_CLOSE_OUT_CACHE_TTL_MS) {
+    return cached.state;
+  }
+
+  const ghResolved = resolveGitHubIssueSync(issueId);
+  if (!ghResolved.isGitHub) {
+    autoCloseOutCache.set(issueId, { state: null, timestamp: Date.now() });
+    return null;
+  }
+
+  try {
+    const { stdout } = await execFileAsync('gh', [
+      'issue',
+      'view',
+      String(ghResolved.number),
+      '--repo',
+      `${ghResolved.owner}/${ghResolved.repo}`,
+      '--json',
+      'state,labels',
+    ], { encoding: 'utf-8' });
+    const parsed = JSON.parse(stdout) as { state?: string; labels?: Array<string | { name?: string }> };
+    const labels = (parsed.labels ?? [])
+      .map(label => typeof label === 'string' ? label : label.name)
+      .filter((label): label is string => typeof label === 'string');
+    const result = mapGitHubStateToCanonical(parsed.state ?? 'open', labels);
+    autoCloseOutCache.set(issueId, { state: result, timestamp: Date.now() });
+    return result;
+  } catch {
+    autoCloseOutCache.set(issueId, { state: null, timestamp: Date.now() });
+    return null;
+  }
+}
+
+function recordAutoCloseOutFailure(issueId: string, message: string): void {
+  console.warn(`[deacon] Auto close-out failed for ${issueId}: ${message}`);
+  setReviewStatusSync(issueId, {
+    mergeNotes: `Auto close-out failed: ${message}`,
+    updatedAt: new Date().toISOString(),
+  });
+  emitActivityEntrySync({
+    source: 'cloister',
+    level: 'warn',
+    issueId,
+    message: `Auto close-out failed for ${issueId}: ${message}`,
+  });
+}
+
+export async function autoCloseOut(now = new Date()): Promise<string[]> {
+  const closeOutConfig = (await Effect.runPromise(loadCloisterConfig())).close_out;
+  if (closeOutConfig?.auto !== true) return [];
+
+  // Evict stale cache entries before each patrol cycle
+  sweepAutoCloseOutCache();
+
+  const delayMinutes = Math.max(0, closeOutConfig.auto_delay_minutes ?? 60);
+  const cutoff = now.getTime() - delayMinutes * 60 * 1000;
+  const actions: string[] = [];
+  const statuses = loadReviewStatuses();
+
+  const candidates: Array<{ issueId: string }> = [];
+  for (const [key, status] of Object.entries(statuses)) {
+    const issueId = (status.issueId || key).toUpperCase();
+    if (status.mergeStatus !== 'merged') continue;
+    if (status.stuck || status.deaconIgnored) continue;
+
+    const updatedAt = Date.parse(status.updatedAt || '');
+    if (!Number.isFinite(updatedAt) || updatedAt > cutoff) continue;
+
+    candidates.push({ issueId });
+  }
+
+  const tasks = candidates.map(({ issueId }) => Effect.tryPromise({
+    try: async () => {
+    let canonicalState: string | null;
+    try {
+      canonicalState = await getAutoCloseOutCanonicalState(issueId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordAutoCloseOutFailure(issueId, message);
+      return `Auto close-out failed for ${issueId}: ${message}`;
+    }
+    if (canonicalState !== 'verifying_on_main') return null;
+
+    const resolvedProject = resolveProjectFromIssueSync(issueId);
+    if (!resolvedProject) {
+      const message = 'no project configured';
+      recordAutoCloseOutFailure(issueId, message);
+      return `Auto close-out failed for ${issueId}: ${message}`;
+    }
+
+    const ghResolved = resolveGitHubIssueSync(issueId);
+    const ctx = {
+      issueId,
+      projectPath: resolvedProject.projectPath,
+      auto: true,
+      ...(ghResolved.isGitHub
+        ? { github: { owner: ghResolved.owner, repo: ghResolved.repo, number: ghResolved.number } }
+        : {}),
+    };
+
+    try {
+      const { closeOut } = await import('../lifecycle/workflows.js');
+      // PAN-1249: closeOut returns Effect<WorkflowResult>; bridge to Promise.
+      const result = await Effect.runPromise(closeOut(ctx));
+      if (!result.success) {
+        const failed = result.steps.find(step => !step.success && !step.skipped);
+        throw new Error(failed?.error ?? 'closeOut workflow failed');
+      }
+      const message = `Auto close-out completed for ${issueId}`;
+      console.log(`[deacon] ${message}`);
+      emitActivityEntrySync({ source: 'cloister', level: 'info', issueId, message });
+      return message;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordAutoCloseOutFailure(issueId, message);
+      return `Auto close-out failed for ${issueId}: ${message}`;
+    }
+    },
+    catch: (cause) => cause,
+  }));
+
+  const results = await Effect.runPromise(withConcurrencyLimit(tasks, 5));
+  for (const result of results) {
+    if (result !== null) actions.push(result);
+  }
+
+  return actions;
+}
+
 /**
  * Detect work agents that finished implementation but never called `pan done`.
  *
@@ -3757,7 +3897,7 @@ export async function checkFirstCompletionAgents(): Promise<string[]> {
   const actions: string[] = [];
 
   try {
-    const agents = listRunningAgents();
+    const agents = listRunningAgentsSync();
     const now = Date.now();
 
     for (const agent of agents) {
@@ -3777,7 +3917,7 @@ export async function checkFirstCompletionAgents(): Promise<string[]> {
       // if the agent's heartbeat is older than the idle minimum, it's safe to treat as idle.
       if (!isAgentIdleForNudge(agent.id, FIRST_COMPLETION_IDLE_MS)) continue;
 
-      const runtimeState = getAgentRuntimeState(agent.id)!;
+      const runtimeState = getAgentRuntimeStateSync(agent.id)!;
       const lastActivity = new Date(runtimeState.lastActivity);
       const idleMs = now - lastActivity.getTime();
       if (idleMs < FIRST_COMPLETION_IDLE_MS) continue;
@@ -3805,7 +3945,7 @@ export async function checkFirstCompletionAgents(): Promise<string[]> {
       // HARD GATE: Also check for review feedback files in the workspace.
       // If a feedback directory exists and is non-empty, a review agent has already
       // processed this workspace — never send a "pan done" nudge.
-      const agentStateForGate = getAgentState(agent.id);
+      const agentStateForGate = getAgentStateSync(agent.id);
       if (agentStateForGate?.workspace) {
         const feedbackDir = join(agentStateForGate.workspace, '.pan', 'feedback');
         if (existsSync(feedbackDir)) {
@@ -3829,7 +3969,7 @@ export async function checkFirstCompletionAgents(): Promise<string[]> {
       }
 
       // Check if the agent has commits (sign that work was done)
-      const agentState = getAgentState(agent.id);
+      const agentState = getAgentStateSync(agent.id);
       if (!agentState?.workspace || !existsSync(agentState.workspace)) continue;
 
       // For polyrepo workspaces, check inside sub-repos (fe/, api/, etc.)
@@ -3870,7 +4010,7 @@ export async function checkFirstCompletionAgents(): Promise<string[]> {
 
       try {
         const nudgeMessage = `You appear to have stopped working without calling \`pan done\`. If your implementation is complete, run this now:\n\npan done ${issueId} -c "Implementation complete"\n\nIf you still have remaining tasks, continue working on them.`;
-        await sendKeysAsync(agent.id, nudgeMessage);
+        await Effect.runPromise(sendKeys(agent.id, nudgeMessage));
         actions.push(`First-completion nudge: ${agent.id} (idle ${idleMinutes}m)`);
         console.log(`[deacon] Sent first-completion nudge to ${agent.id}`);
       } catch (error: unknown) {
@@ -3905,14 +4045,14 @@ export async function patrolWorkAgentResolutions(): Promise<string[]> {
   const actions: string[] = [];
 
   try {
-    const agents = listRunningAgents();
+    const agents = listRunningAgentsSync();
     // Specialist sessions (global or per-project) use the specialist tmux prefix.
     const isSpecialistSession = (id: string) => id.startsWith('specialist-');
 
     for (const agent of agents) {
       if (!agent.id.startsWith('agent-') || isSpecialistSession(agent.id)) continue;
 
-      const runtimeState = getAgentRuntimeState(agent.id);
+      const runtimeState = getAgentRuntimeStateSync(agent.id);
       if (!runtimeState?.resolution || runtimeState.resolution === 'working' || runtimeState.resolution === 'completed' || runtimeState.resolution === 'abandoned') continue;
 
       const resolution = runtimeState.resolution;
@@ -3921,7 +4061,7 @@ export async function patrolWorkAgentResolutions(): Promise<string[]> {
 
       // PAN-653: Skip workspaces marked stuck — Deacon must not poke/respawn them.
       // Keyed by issueId (not agentId) so respawned agents with new IDs still match.
-      const resolutionReviewStatus = getReviewStatus(issueId);
+      const resolutionReviewStatus = getReviewStatusSync(issueId);
       if (resolutionReviewStatus?.stuck) {
         console.log(`[deacon] Skipping stuck workspace ${issueId} in patrolWorkAgentResolutions`);
         continue;
@@ -3989,7 +4129,7 @@ export async function patrolWorkAgentResolutions(): Promise<string[]> {
 
         try {
           const pokeMsg = `Deacon health check (${pokeState.pokes + 1}/${STUCK_POKE_MAX}): you appear stuck. Please check your current task status, review any errors, and continue working. If work is complete, run: pan done ${issueId} -c "Implementation complete"`;
-          await sendKeysAsync(agent.id, pokeMsg);
+          await Effect.runPromise(sendKeys(agent.id, pokeMsg));
           stuckPokeState.set(agent.id, { lastPoke: now, pokes: pokeState.pokes + 1 });
           actions.push(`Deacon poked stuck agent ${agent.id} (${issueId}) [${pokeState.pokes + 1}/${STUCK_POKE_MAX}]`);
           addLog('action', `Poked stuck agent ${issueId} (poke ${pokeState.pokes + 1}/${STUCK_POKE_MAX})`, undefined);
@@ -4036,11 +4176,11 @@ async function killOrphanedWorkspaceProcesses(workspacePath: string): Promise<vo
     // 1. Collect tmux pane PIDs for agent sessions in this workspace
     const protectedPids = new Set<string>([String(process.pid)]);
     try {
-      const sessions = await listSessionNamesAsync();
+      const sessions = await Effect.runPromise(listSessionNames());
       const agentSessions = sessions.filter(s => s.startsWith('agent-') || s.startsWith('planning-'));
       for (const session of agentSessions) {
         try {
-          const pid = (await listPaneValuesAsync(session, '#{pane_pid}'))[0]?.trim();
+          const pid = (await Effect.runPromise(listPaneValues(session, '#{pane_pid}')))[0]?.trim();
           if (pid && /^\d+$/.test(pid)) {
             // Add the pane PID and all its descendants to protected list
             protectedPids.add(pid);
@@ -4150,7 +4290,7 @@ export async function checkWorkspaceContainerHealth(sharedState?: DeaconState): 
       const agentId = `agent-${issueLower}`;
 
       // Only restart if the agent is active (has a tmux session)
-      const agentRunning = await sessionExistsAsync(agentId);
+      const agentRunning = await Effect.runPromise(sessionExists(agentId));
       if (!agentRunning) {
         // Agent not running — skip restart
         continue;
@@ -4181,11 +4321,11 @@ export async function checkWorkspaceContainerHealth(sharedState?: DeaconState): 
             actions.push(msg);
             // PAN-464: Alert agent that the container gave up — manual intervention required
             try {
-              await sendKeysAsync(
+              await Effect.runPromise(sendKeys(
                 agentId,
                 `⚠️  Deacon alert: container "${name}" has crashed ${CONTAINER_RESTART_MAX_COUNT} times and auto-restart gave up. The UAT environment at feature-${issueLower}.pan.localhost may be broken. Manual intervention required — check docker logs or re-containerize.`,
                 'deacon:container-gave-up',
-              );
+              ));
             } catch {
               // Agent may not be interactive (e.g., waiting for input) — non-fatal
             }
@@ -4202,9 +4342,9 @@ export async function checkWorkspaceContainerHealth(sharedState?: DeaconState): 
 
       // Kill orphaned host processes (Vite, node) before restarting to fix inotify root cause
       try {
-        const { resolveProjectFromIssue } = await import('../projects.js');
+        const { resolveProjectFromIssueSync } = await import('../projects.js');
         const issueUpper = issueLower.toUpperCase();
-        const resolved = resolveProjectFromIssue(issueUpper);
+        const resolved = resolveProjectFromIssueSync(issueUpper);
         if (resolved) {
           const workspacePath = `${resolved.projectPath}/workspaces/feature-${issueLower}`;
           await killOrphanedWorkspaceProcesses(workspacePath);
@@ -4229,11 +4369,11 @@ export async function checkWorkspaceContainerHealth(sharedState?: DeaconState): 
         actions.push(msg);
         // PAN-464: Alert agent that its container crashed and was restarted
         try {
-          await sendKeysAsync(
+          await Effect.runPromise(sendKeys(
             agentId,
             `ℹ️  Deacon: container "${name}" crashed and was auto-restarted (attempt ${count}/${CONTAINER_RESTART_MAX_COUNT}). The UAT environment should recover in ~30s. No action needed unless this keeps happening.`,
             'deacon:container-restarted',
-          );
+          ));
         } catch {
           // Agent may not be interactive — non-fatal
         }
@@ -4241,11 +4381,11 @@ export async function checkWorkspaceContainerHealth(sharedState?: DeaconState): 
         console.warn(`[deacon] Failed to restart ${name}: ${restartErr.message}`);
         // PAN-464: Alert agent that restart failed
         try {
-          await sendKeysAsync(
+          await Effect.runPromise(sendKeys(
             agentId,
             `⚠️  Deacon alert: container "${name}" crashed and restart failed (${(restartErr as Error).message}). The UAT environment at feature-${issueLower}.pan.localhost is likely broken.`,
             'deacon:container-restart-failed',
-          );
+          ));
         } catch {
           // Non-fatal
         }
@@ -4371,15 +4511,15 @@ export async function runPatrol(): Promise<PatrolResult> {
   // Clear readyForMerge for issues whose workspace no longer exists.
   // Prevents MERGE button showing for issues that can't actually merge.
   try {
-    const { resolveProjectFromIssue } = await import('../projects.js');
+    const { resolveProjectFromIssueSync } = await import('../projects.js');
     const allStatuses = loadReviewStatuses();
     for (const [issueId, status] of Object.entries(allStatuses)) {
       if (!status.readyForMerge || status.mergeStatus === 'merged') continue;
-      const project = resolveProjectFromIssue(issueId);
+      const project = resolveProjectFromIssueSync(issueId);
       if (!project) continue;
       const wsPath = join(project.projectPath, 'workspaces', `feature-${issueId.toLowerCase()}`);
       if (!existsSync(wsPath)) {
-        setReviewStatus(issueId, { readyForMerge: false, mergeStatus: 'failed', mergeNotes: 'Workspace does not exist' });
+        setReviewStatusSync(issueId, { readyForMerge: false, mergeStatus: 'failed', mergeNotes: 'Workspace does not exist' });
         const msg = `Cleared readyForMerge for ${issueId} (workspace deleted)`;
         actions.push(msg);
         console.log(`[deacon] ${msg}`);
@@ -4496,6 +4636,10 @@ export async function runPatrol(): Promise<PatrolResult> {
   actions.push(...mergedReviewingActions);
   for (const a of mergedReviewingActions) addLog('action', a, state.patrolCycle);
 
+  const autoCloseOutActions = await autoCloseOut();
+  actions.push(...autoCloseOutActions);
+  for (const a of autoCloseOutActions) addLog('action', a, state.patrolCycle);
+
   // Closed-PR readyForMerge reconciler: stops the "Awaiting Merge" view from
   // listing issues whose PR was closed without merging (PAN-1111-style stale
   // state). Best-effort against the forge; 10-min per-issue cooldown.
@@ -4533,6 +4677,10 @@ export async function runPatrol(): Promise<PatrolResult> {
   const apiErrorActions = await checkApiErrorAgents();
   actions.push(...apiErrorActions);
   for (const a of apiErrorActions) addLog('action', a, state.patrolCycle);
+
+  const stuckRemediationActions = await checkStuckAgentRemediation();
+  actions.push(...stuckRemediationActions);
+  for (const a of stuckRemediationActions) addLog('action', a, state.patrolCycle);
 
   const configuredStashJanitorEveryCycles = config.stashJanitorEveryCycles
     ?? Math.round((60 * 60 * 1000) / config.patrolIntervalMs);
@@ -4586,7 +4734,7 @@ export async function runPatrol(): Promise<PatrolResult> {
       if (!projSpec.isRunning) {
         // Session is dead — reset any stale active runtime state so the next
         // merge request is not blocked by a phantom busy signal.
-        const runtimeState = getAgentRuntimeState(projSpec.tmuxSession);
+        const runtimeState = getAgentRuntimeStateSync(projSpec.tmuxSession);
         if (runtimeState?.state === 'active') {
           saveAgentRuntimeState(projSpec.tmuxSession, { state: 'idle', lastActivity: new Date().toISOString() });
           const msg = `Dead-session reset: per-project ${projSpec.specialistType} (${projSpec.projectKey}) was active but session is gone`;
@@ -4598,10 +4746,10 @@ export async function runPatrol(): Promise<PatrolResult> {
           if (projSpec.specialistType === 'merge-agent' && runtimeState.currentIssue) {
             const issueId = runtimeState.currentIssue;
             try {
-              const currentStatus = getReviewStatus(issueId);
+              const currentStatus = getReviewStatusSync(issueId);
               if (currentStatus?.mergeStatus === 'merging') {
-                const { resolveProjectFromIssue } = await import('../projects.js');
-                const resolved = resolveProjectFromIssue(issueId);
+                const { resolveProjectFromIssueSync } = await import('../projects.js');
+                const resolved = resolveProjectFromIssueSync(issueId);
                 if (resolved) {
                   const branch = `feature/${issueId.toLowerCase()}`;
                   const { stdout } = await execAsync(
@@ -4610,7 +4758,7 @@ export async function runPatrol(): Promise<PatrolResult> {
                   );
                   if (stdout.trim()) {
                     console.log(`[deacon] PAN-375: merge specialist died but ${issueId} IS merged (${stdout.trim()}). Auto-completing.`);
-                    setReviewStatus(issueId, { mergeStatus: 'merged', readyForMerge: false });
+                    setReviewStatusSync(issueId, { mergeStatus: 'merged', readyForMerge: false });
                     const { postMergeLifecycle } = await import('./merge-agent.js');
                     postMergeLifecycle(issueId, resolved.projectPath).catch(err =>
                       console.warn(`[deacon] postMergeLifecycle failed for ${issueId}: ${err}`)
@@ -4618,7 +4766,7 @@ export async function runPatrol(): Promise<PatrolResult> {
                     actions.push(`Auto-completed stale merge for ${issueId}`);
                   } else {
                     console.log(`[deacon] Merge specialist died and ${issueId} NOT merged. Resetting to readyForMerge.`);
-                    setReviewStatus(issueId, { mergeStatus: 'pending' });
+                    setReviewStatusSync(issueId, { mergeStatus: 'pending' });
                   }
                 }
               }
@@ -4630,7 +4778,7 @@ export async function runPatrol(): Promise<PatrolResult> {
         continue;
       }
 
-      const runtimeState = getAgentRuntimeState(projSpec.tmuxSession);
+      const runtimeState = getAgentRuntimeStateSync(projSpec.tmuxSession);
       // A running ephemeral specialist with no runtime state, or active for more than
       // the max specialist timeout (ephemeral specialist spawn uses 15 min), is considered stuck.
       const isStuck = runtimeState?.state === 'active' && runtimeState.lastActivity
@@ -4641,7 +4789,7 @@ export async function runPatrol(): Promise<PatrolResult> {
         addLog('warn', `Per-project ${projSpec.specialistType} (${projSpec.projectKey}) stuck, force-killing`, state.patrolCycle);
         console.log(`[deacon] Per-project ${projSpec.specialistType} (${projSpec.projectKey}) stuck, force-killing ${projSpec.tmuxSession}`);
         try {
-          await killSessionAsync(projSpec.tmuxSession);
+          await Effect.runPromise(killSession(projSpec.tmuxSession));
           // Preserve Claude JSONL/session artifacts; only reset Panopticon runtime state.
           saveAgentRuntimeState(projSpec.tmuxSession, { state: 'idle', lastActivity: new Date().toISOString() });
           actions.push(`Force-killed stuck per-project ${projSpec.specialistType} (${projSpec.projectKey})`);
@@ -4664,7 +4812,7 @@ export async function runPatrol(): Promise<PatrolResult> {
         const msg = `Killed lingering idle specialist ${projSpec.specialistType} (${projSpec.projectKey}) — idle ${ageMin}min`;
         console.log(`[deacon] ${msg}`);
         try {
-          await killSessionAsync(projSpec.tmuxSession);
+          await Effect.runPromise(killSession(projSpec.tmuxSession));
           actions.push(msg);
           addLog('action', msg, state.patrolCycle);
         } catch {
@@ -4774,12 +4922,12 @@ async function checkThinkingSignatureCorruption(): Promise<string[]> {
     if (state.status !== 'running') continue;
 
     // Check if the tmux session is alive
-    if (!sessionExists(agentId)) continue;
+    if (!sessionExistsSync(agentId)) continue;
 
     // Capture recent output and scan for signature corruption
     let output: string;
     try {
-      output = await capturePaneAsync(agentId, 100);
+      output = await Effect.runPromise(capturePane(agentId, 100));
     } catch {
       continue;
     }
@@ -4789,12 +4937,12 @@ async function checkThinkingSignatureCorruption(): Promise<string[]> {
     // Corruption detected — recover the agent
     const issueId = (state.issueId as string | undefined) ?? agentId;
     console.error(`[deacon] SIGNATURE CORRUPTION detected in ${agentId} (${issueId}) — recovering`);
-    logDeaconEvent(`checkThinkingSignatureCorruption: corruption detected in ${agentId} (${issueId})`);
-    logAgentLifecycle(agentId, 'signature corruption detected — recovering: killed session, cleared session.id');
+    logDeaconEventSync(`checkThinkingSignatureCorruption: corruption detected in ${agentId} (${issueId})`);
+    logAgentLifecycleSync(agentId, 'signature corruption detected — recovering: killed session, cleared session.id');
 
     // Kill the tmux session
     try {
-      await killSessionAsync(agentId);
+      await Effect.runPromise(killSession(agentId));
     } catch { /* non-fatal */ }
 
     // Delete session.id so resumeAgent won't --resume the corrupted session
@@ -4818,7 +4966,7 @@ async function checkThinkingSignatureCorruption(): Promise<string[]> {
     const msg = `Recovered ${agentId} (${issueId}) from thinking-block signature corruption — session killed, will start fresh on next resume`;
     actions.push(msg);
     console.log(`[deacon] ${msg}`);
-    logDeaconEvent(`checkThinkingSignatureCorruption: ${msg}`);
+    logDeaconEventSync(`checkThinkingSignatureCorruption: ${msg}`);
   }
 
   return actions;
@@ -4836,7 +4984,7 @@ let recoverOrphanedAgentsInFlight: Promise<string[]> | null = null;
  */
 export async function recoverOrphanedAgents(context?: string): Promise<string[]> {
   if (recoverOrphanedAgentsInFlight) {
-    logDeaconEvent(`recoverOrphanedAgents coalesced${context ? ` (${context})` : ''}: scan already in flight`);
+    logDeaconEventSync(`recoverOrphanedAgents coalesced${context ? ` (${context})` : ''}: scan already in flight`);
     return recoverOrphanedAgentsInFlight;
   }
 
@@ -4854,7 +5002,7 @@ export async function recoverOrphanedAgents(context?: string): Promise<string[]>
 async function recoverOrphanedAgentsOnce(context?: string): Promise<string[]> {
   const noResumeMode = getNoResumeMode();
   if (noResumeMode.active) {
-    logDeaconEvent(`PANOPTICON_NO_RESUME=1 — skipping recoverOrphanedAgents${context ? ` (${context})` : ''}`);
+    logDeaconEventSync(`PANOPTICON_NO_RESUME=1 — skipping recoverOrphanedAgents${context ? ` (${context})` : ''}`);
     return [];
   }
 
@@ -4863,7 +5011,7 @@ async function recoverOrphanedAgentsOnce(context?: string): Promise<string[]> {
   try { dirs = readdirSync(AGENTS_DIR).filter(d => d.startsWith('agent-') || d.startsWith('planning-')); }
   catch { return []; }
 
-  logDeaconEvent(`recoverOrphanedAgents started${context ? ` (${context})` : ''}: scanning ${dirs.length} directorie(s)`);
+  logDeaconEventSync(`recoverOrphanedAgents started${context ? ` (${context})` : ''}: scanning ${dirs.length} directorie(s)`);
   const actions: string[] = [];
   for (const dir of dirs) {
     const stateFile = join(AGENTS_DIR, dir, 'state.json');
@@ -4871,6 +5019,10 @@ async function recoverOrphanedAgentsOnce(context?: string): Promise<string[]> {
     try {
       const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
       if (state.status !== 'running' && state.status !== 'starting') continue;
+      if (isVerifyPausedAgentState(state)) {
+        logDeaconEventSync(`recoverOrphanedAgents: ${dir} skipped — verify-paused (mergeStatus=merged, tmux session intentionally absent)`);
+        continue;
+      }
 
       // PAN-977: headless review sub-role agents run via `claude --print` in a
       // detached, HUP-immune launcher with NO tmux session. "No tmux session"
@@ -4902,16 +5054,16 @@ async function recoverOrphanedAgentsOnce(context?: string): Promise<string[]> {
         }
         // Launcher pid is gone (or never appeared past the grace window) — the
         // headless reviewer process has exited. Fall through to mark stopped.
-      } else if (sessionExists(dir)) {
+      } else if (sessionExistsSync(dir)) {
         // Planning sessions use remain-on-exit, so the tmux session persists after
         // Claude exits. Check if the pane's process is actually dead.
         if (dir.startsWith('planning-')) {
           try {
-            const result = (await listPaneValuesAsync(dir, '#{pane_dead}'))[0]?.trim() ?? '';
+            const result = (await Effect.runPromise(listPaneValues(dir, '#{pane_dead}')))[0]?.trim() ?? '';
             if (result !== '1') continue; // pane is alive — truly still running
             // Pane is dead — kill the zombie tmux session and fall through to recovery
-            try { await killSessionAsync(dir); } catch { /* ignore */ }
-            logDeaconEvent(`recoverOrphanedAgents: killed dead planning pane ${dir}`);
+            try { await Effect.runPromise(killSession(dir)); } catch { /* ignore */ }
+            logDeaconEventSync(`recoverOrphanedAgents: killed dead planning pane ${dir}`);
           } catch {
             continue; // can't check — assume alive
           }
@@ -4938,33 +5090,33 @@ async function recoverOrphanedAgentsOnce(context?: string): Promise<string[]> {
       const oldStatus = state.status;
       state.status = 'stopped';
       state.stoppedAt = new Date().toISOString();
-      await saveAgentStateAsync(state);
+      await Effect.runPromise(saveAgentState(state));
       if (state.stoppedByUser !== true) {
-        const failedState = await recordAgentFailureAsync(dir, `orphaned: tmux session missing (${context ?? 'patrol'})`);
+        const failedState = await Effect.runPromise(recordAgentFailure(dir, `orphaned: tmux session missing (${context ?? 'patrol'})`));
         if (failedState) {
-          notifyAgentStatusChanged(failedState, oldStatus);
+          notifyAgentStatusChanged(failedState, oldStatus, false);
           orphanFailureRecordedForAutoResume.add(dir);
         }
       }
       const msg = `Recovered orphaned agent ${dir} (${oldStatus}→stopped)`;
       actions.push(msg);
       console.log(`[deacon] ${msg}`);
-      logDeaconEvent(`recoverOrphanedAgents: ${msg} — tmux session missing, state.json reset`);
-      logAgentLifecycle(dir, `status changed: ${oldStatus} → stopped (orphaned: tmux session missing at boot)`);
+      logDeaconEventSync(`recoverOrphanedAgents: ${msg} — tmux session missing, state.json reset`);
+      logAgentLifecycleSync(dir, `status changed: ${oldStatus} → stopped (orphaned: tmux session missing at boot)`);
       // Notify server layer so the read model and frontend update
       if (agentStoppedNotifier) {
         try { agentStoppedNotifier(dir); } catch { /* non-fatal */ }
       }
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
-      logDeaconEvent(`recoverOrphanedAgents: error processing ${dir}: ${reason}`);
+      logDeaconEventSync(`recoverOrphanedAgents: error processing ${dir}: ${reason}`);
     }
   }
   if (actions.length > 0 && context) {
     console.log(`[deacon] ${context}: ${actions.length} orphaned agent(s) reset to stopped`);
-    logDeaconEvent(`recoverOrphanedAgents completed (${context}): ${actions.length} orphaned agent(s) reset to stopped`);
+    logDeaconEventSync(`recoverOrphanedAgents completed (${context}): ${actions.length} orphaned agent(s) reset to stopped`);
   } else {
-    logDeaconEvent(`recoverOrphanedAgents completed: no orphaned agents found`);
+    logDeaconEventSync(`recoverOrphanedAgents completed: no orphaned agents found`);
   }
   return actions;
 }
@@ -4980,24 +5132,24 @@ async function cleanupOrphanedPlanningSessions(): Promise<string[]> {
   const actions: string[] = [];
   let planningSessions: string[];
   try {
-    planningSessions = (await listSessionNamesAsync())
+    planningSessions = (await Effect.runPromise(listSessionNames()))
       .filter(s => s.startsWith('planning-'));
   } catch {
     return actions;
   }
 
-  logDeaconEvent(`cleanupOrphanedPlanningSessions started: found ${planningSessions.length} planning session(s)`);
+  logDeaconEventSync(`cleanupOrphanedPlanningSessions started: found ${planningSessions.length} planning session(s)`);
 
   for (const planningSession of planningSessions) {
     // planning-pan-596 → agent-pan-596
     const workAgentSession = planningSession.replace(/^planning-/, 'agent-');
-    if (!sessionExists(workAgentSession)) {
-      logDeaconEvent(`cleanupOrphanedPlanningSessions: ${planningSession} kept — work agent ${workAgentSession} not running`);
+    if (!sessionExistsSync(workAgentSession)) {
+      logDeaconEventSync(`cleanupOrphanedPlanningSessions: ${planningSession} kept — work agent ${workAgentSession} not running`);
       continue;
     }
 
     try {
-      await killSessionAsync(planningSession).catch(() => {});
+      await Effect.runPromise(killSession(planningSession)).catch(() => {});
     } catch { /* non-fatal */ }
 
     // Mark planning agent state as stopped so the UI doesn't show a "running" pill.
@@ -5013,23 +5165,23 @@ async function cleanupOrphanedPlanningSessions(): Promise<string[]> {
           if (agentStoppedNotifier) {
             try { agentStoppedNotifier(planningSession); } catch { /* non-fatal */ }
           }
-          logAgentLifecycle(planningSession, `status changed: ${oldStatus} → stopped (orphaned planning session killed)`);
+          logAgentLifecycleSync(planningSession, `status changed: ${oldStatus} → stopped (orphaned planning session killed)`);
         }
       }
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
-      logDeaconEvent(`cleanupOrphanedPlanningSessions: error updating state for ${planningSession}: ${reason}`);
+      logDeaconEventSync(`cleanupOrphanedPlanningSessions: error updating state for ${planningSession}: ${reason}`);
     }
 
     const msg = `Killed orphaned ${planningSession} (work agent ${workAgentSession} is running)`;
     actions.push(msg);
     console.log(`[deacon] ${msg}`);
-    logDeaconEvent(`cleanupOrphanedPlanningSessions: ${msg}`);
+    logDeaconEventSync(`cleanupOrphanedPlanningSessions: ${msg}`);
   }
   if (actions.length > 0) {
-    logDeaconEvent(`cleanupOrphanedPlanningSessions completed: killed ${actions.length} orphaned session(s)`);
+    logDeaconEventSync(`cleanupOrphanedPlanningSessions completed: killed ${actions.length} orphaned session(s)`);
   } else {
-    logDeaconEvent(`cleanupOrphanedPlanningSessions completed: no orphaned sessions found`);
+    logDeaconEventSync(`cleanupOrphanedPlanningSessions completed: no orphaned sessions found`);
   }
 
   return actions;
@@ -5047,7 +5199,7 @@ export async function monitorReviewConvoySignals(): Promise<string[]> {
   }
 
   for (const agentId of agentDirs) {
-    const state = getAgentState(agentId);
+    const state = getAgentStateSync(agentId);
     if (!state) continue;
     if (state.role !== 'review') continue;
     if (!state.reviewSubRole || !state.reviewSynthesisAgentId) continue;
@@ -5081,7 +5233,7 @@ export async function monitorReviewConvoySignals(): Promise<string[]> {
     const deadlineMs = state.reviewDeadlineAt ? Date.parse(state.reviewDeadlineAt) : Number.NaN;
 
     // The synthesis agent must be alive to receive any signal.
-    const synthesisAlive = await sessionExistsAsync(state.reviewSynthesisAgentId);
+    const synthesisAlive = await Effect.runPromise(sessionExists(state.reviewSynthesisAgentId));
     if (!synthesisAlive) continue;
 
     // PAN-977: the review sub-role launcher is HUP-immune and intentionally
@@ -5146,19 +5298,19 @@ export async function monitorReviewConvoySignals(): Promise<string[]> {
       const { messageAgent } = await import('../agents.js');
       await messageAgent(state.reviewSynthesisAgentId, message);
       state.reviewMonitorSignaled = signal;
-      saveAgentState(state);
+      saveAgentStateSync(state);
       const action = `Signaled ${message} to ${state.reviewSynthesisAgentId}`;
       actions.push(action);
-      logDeaconEvent(`monitorReviewConvoySignals: ${action}`);
+      logDeaconEventSync(`monitorReviewConvoySignals: ${action}`);
       if (signal === 'ready') {
         try {
-          const { notifyPipeline } = await import('../pipeline-notifier.js');
-          notifyPipeline({ type: 'reviewer_completed', issueId: state.issueId, role: state.reviewSubRole });
+          const { notifyPipelineSync } = await import('../pipeline-notifier.js');
+          notifyPipelineSync({ type: 'reviewer_completed', issueId: state.issueId, role: state.reviewSubRole });
         } catch { /* non-fatal */ }
       } else if (signal === 'timeout') {
         try {
-          const { notifyPipeline } = await import('../pipeline-notifier.js');
-          notifyPipeline({
+          const { notifyPipelineSync } = await import('../pipeline-notifier.js');
+          notifyPipelineSync({
             type: 'reviewer_timed_out',
             issueId: state.issueId,
             role: state.reviewSubRole,
@@ -5171,7 +5323,7 @@ export async function monitorReviewConvoySignals(): Promise<string[]> {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      logDeaconEvent(`monitorReviewConvoySignals: failed to signal ${state.reviewSynthesisAgentId} for ${agentId}: ${errMsg}`);
+      logDeaconEventSync(`monitorReviewConvoySignals: failed to signal ${state.reviewSynthesisAgentId} for ${agentId}: ${errMsg}`);
     }
   }
 
@@ -5193,7 +5345,7 @@ export async function cleanupOrphanedReviewSessions(): Promise<string[]> {
   const actions: string[] = [];
   let reviewSessions: string[];
   try {
-    const allSessions = await listSessionNamesAsync();
+    const allSessions = await Effect.runPromise(listSessionNames());
     const convoyReviewSessions = allSessions.filter(s => /^agent-.*-review-(?:security|correctness|performance|requirements)$/.test(s));
     const legacyReviewSessions = allSessions.filter(s => /^review-/.test(s));
     const canonicalReviewSessions = allSessions.filter(s => /^specialist-.*-review-/.test(s));
@@ -5202,7 +5354,7 @@ export async function cleanupOrphanedReviewSessions(): Promise<string[]> {
     return actions;
   }
 
-  logDeaconEvent(`cleanupOrphanedReviewSessions started: found ${reviewSessions.length} review session(s)`);
+  logDeaconEventSync(`cleanupOrphanedReviewSessions started: found ${reviewSessions.length} review session(s)`);
 
   for (const reviewSession of reviewSessions) {
     let issueId: string | null = null;
@@ -5226,7 +5378,7 @@ export async function cleanupOrphanedReviewSessions(): Promise<string[]> {
     }
 
     if (!issueId) {
-      logDeaconEvent(`cleanupOrphanedReviewSessions: ${reviewSession} skipped — unparseable session name`);
+      logDeaconEventSync(`cleanupOrphanedReviewSessions: ${reviewSession} skipped — unparseable session name`);
       continue;
     }
 
@@ -5235,31 +5387,31 @@ export async function cleanupOrphanedReviewSessions(): Promise<string[]> {
     // then fall back to work agent for legacy review sessions.
     const synthesisAgentSession = `agent-${issueId.toLowerCase()}-review`;
     const workAgentSession = `agent-${issueId.toLowerCase()}`;
-    if (sessionExists(synthesisAgentSession)) {
-      logDeaconEvent(`cleanupOrphanedReviewSessions: ${reviewSession} kept — synthesis agent ${synthesisAgentSession} exists`);
+    if (sessionExistsSync(synthesisAgentSession)) {
+      logDeaconEventSync(`cleanupOrphanedReviewSessions: ${reviewSession} kept — synthesis agent ${synthesisAgentSession} exists`);
       continue;
     }
-    if (sessionExists(workAgentSession)) {
-      logDeaconEvent(`cleanupOrphanedReviewSessions: ${reviewSession} kept — work agent ${workAgentSession} exists`);
+    if (sessionExistsSync(workAgentSession)) {
+      logDeaconEventSync(`cleanupOrphanedReviewSessions: ${reviewSession} kept — work agent ${workAgentSession} exists`);
       continue;
     }
 
     try {
-      await killSessionAsync(reviewSession).catch(() => {});
+      await Effect.runPromise(killSession(reviewSession)).catch(() => {});
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
-      logDeaconEvent(`cleanupOrphanedReviewSessions: error killing ${reviewSession}: ${reason}`);
+      logDeaconEventSync(`cleanupOrphanedReviewSessions: error killing ${reviewSession}: ${reason}`);
     }
 
     const msg = `Killed orphaned ${reviewSession} (synthesis ${synthesisAgentSession} and work ${workAgentSession} not running)`;
     actions.push(msg);
     console.log(`[deacon] ${msg}`);
-    logDeaconEvent(`cleanupOrphanedReviewSessions: ${msg}`);
+    logDeaconEventSync(`cleanupOrphanedReviewSessions: ${msg}`);
   }
   if (actions.length > 0) {
-    logDeaconEvent(`cleanupOrphanedReviewSessions completed: killed ${actions.length} orphaned session(s)`);
+    logDeaconEventSync(`cleanupOrphanedReviewSessions completed: killed ${actions.length} orphaned session(s)`);
   } else {
-    logDeaconEvent(`cleanupOrphanedReviewSessions completed: no orphaned sessions found`);
+    logDeaconEventSync(`cleanupOrphanedReviewSessions completed: no orphaned sessions found`);
   }
 
   return actions;
@@ -5299,13 +5451,13 @@ export async function nudgeIdleWorkAgentsWithOpenBeads(): Promise<string[]> {
   } catch { return actions; }
 
   for (const agentId of dirs) {
-    const state = getAgentState(agentId);
+    const state = getAgentStateSync(agentId);
     if (!state) continue;
     if (state.status !== 'running') continue;
     if (state.role !== 'work') continue;
 
     // Tmux must be alive; orphans are handled by recoverOrphanedAgents.
-    if (!await sessionExistsAsync(agentId)) continue;
+    if (!await Effect.runPromise(sessionExists(agentId))) continue;
 
     // Authoritative idle signal — Stop hook fired and runtime mirror is idle.
     // Skips agents currently mid-thought (state='active') and ones we already
@@ -5336,7 +5488,7 @@ export async function nudgeIdleWorkAgentsWithOpenBeads(): Promise<string[]> {
         .filter(l => /^[○◐]\s+workspace-/i.test(l.trim()))
         .map(l => l.trim());
     } catch (err: any) {
-      logDeaconEvent(`nudgeIdleWorkAgentsWithOpenBeads: ${agentId} bd ready failed: ${err?.message ?? err}`);
+      logDeaconEventSync(`nudgeIdleWorkAgentsWithOpenBeads: ${agentId} bd ready failed: ${err?.message ?? err}`);
       continue;
     }
     if (openBeads.length === 0) continue;
@@ -5359,9 +5511,9 @@ export async function nudgeIdleWorkAgentsWithOpenBeads(): Promise<string[]> {
       writeFileSync(cooldownFile, String(Date.now()), 'utf-8');
       const action = `Nudged idle ${agentId} (${state.issueId}) — ${openBeads.length} open bead(s)`;
       actions.push(action);
-      logDeaconEvent(`nudgeIdleWorkAgentsWithOpenBeads: ${action}`);
+      logDeaconEventSync(`nudgeIdleWorkAgentsWithOpenBeads: ${action}`);
     } catch (err: any) {
-      logDeaconEvent(`nudgeIdleWorkAgentsWithOpenBeads: ${agentId} messageAgent failed: ${err?.message ?? err}`);
+      logDeaconEventSync(`nudgeIdleWorkAgentsWithOpenBeads: ${agentId} messageAgent failed: ${err?.message ?? err}`);
     }
   }
 
@@ -5386,7 +5538,7 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
   const resumed: string[] = [];
   const noResumeMode = getNoResumeMode();
   if (noResumeMode.active) {
-    logDeaconEvent('PANOPTICON_NO_RESUME=1 — skipping autoResumeStoppedWorkAgents');
+    logDeaconEventSync('PANOPTICON_NO_RESUME=1 — skipping autoResumeStoppedWorkAgents');
     orphanFailureRecordedForAutoResume.clear();
     return resumed;
   }
@@ -5404,45 +5556,57 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
     return resumed;
   }
 
-  logDeaconEvent(`autoResumeStoppedWorkAgents started: scanning ${dirs.length} agent directorie(s)`);
+  logDeaconEventSync(`autoResumeStoppedWorkAgents started: scanning ${dirs.length} agent directorie(s)`);
 
   for (const agentId of dirs) {
-    const state = getAgentState(agentId);
+    const state = getAgentStateSync(agentId);
     if (!state) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — no state.json`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — no state.json`);
       continue;
     }
     if (state.status !== 'stopped') {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — status=${state.status} (not stopped)`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — status=${state.status} (not stopped)`);
       continue;
     }
     if (state.role !== 'work') {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — role=${state.role} (not work)`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — role=${state.role} (not work)`);
       continue;
     }
 
     // Skip if workspace is missing
     if (!state.workspace || !existsSync(state.workspace)) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — workspace missing (${state.workspace || 'undefined'})`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — workspace missing (${state.workspace || 'undefined'})`);
       continue;
     }
 
     if (state.paused === true) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — paused (${state.pausedReason ?? 'no reason'})`);
+      const pauseKind = isVerifyPausedAgentState(state) ? 'verify-paused' : 'manually-paused';
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — ${pauseKind} (${state.pausedReason ?? 'no reason'})`);
       continue;
     }
 
     if (state.troubled === true) {
       const failureCount = state.consecutiveFailures ?? 0;
       const since = state.firstFailureInRunAt ?? state.troubledAt ?? 'unknown';
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — troubled (${failureCount} consecutive failures since ${since})`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — troubled (${failureCount} consecutive failures since ${since})`);
+      continue;
+    }
+
+    const hasLiveTmuxSession = await Effect.runPromise(sessionExists(agentId));
+    if (hasLiveTmuxSession) {
+      const previousStatus = state.status;
+      markAgentRunningState(state);
+      await Effect.runPromise(saveAgentState(state));
+      notifyAgentStatusChanged(state, previousStatus, true);
+      const msg = `Reconciled ${agentId} (${previousStatus}→running; tmux session alive)`;
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${msg}`);
       continue;
     }
 
     if (state.lastFailureNextRetryAt !== undefined) {
       const nextRetryMs = Date.parse(state.lastFailureNextRetryAt);
       if (Number.isFinite(nextRetryMs) && nextRetryMs > Date.now()) {
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — backoff active (next retry at ${state.lastFailureNextRetryAt})`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — backoff active (next retry at ${state.lastFailureNextRetryAt})`);
         continue;
       }
     }
@@ -5452,7 +5616,7 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
     const completedFile = join(getAgentDir(agentId), 'completed');
     const processedFile = join(getAgentDir(agentId), 'completed.processed');
     if (existsSync(completedFile) || existsSync(processedFile)) {
-      const review = getReviewStatus(state.issueId);
+      const review = getReviewStatusSync(state.issueId);
       const needsFix =
         review?.reviewStatus === 'blocked' ||
         review?.reviewStatus === 'failed' ||
@@ -5460,26 +5624,26 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
       const trulyPassed =
         review?.reviewStatus === 'passed' && review?.testStatus === 'passed';
       if (needsFix) {
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} resuming despite completed marker — review/test needs fixing (review=${review?.reviewStatus}, test=${review?.testStatus})`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} resuming despite completed marker — review/test needs fixing (review=${review?.reviewStatus}, test=${review?.testStatus})`);
       } else if (trulyPassed) {
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — completed marker exists and review/test passed`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — completed marker exists and review/test passed`);
         continue;
       } else {
         // Pending state: pipeline mid-flight (review fan-out queued, test running, etc.).
         // Don't resume the agent — they're waiting for downstream signals to deliver feedback.
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — pipeline mid-flight (review=${review?.reviewStatus ?? 'none'}, test=${review?.testStatus ?? 'none'})`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — pipeline mid-flight (review=${review?.reviewStatus ?? 'none'}, test=${review?.testStatus ?? 'none'})`);
         continue;
       }
     }
 
     // Skip if already merge-ready (review+test passed) or already merged
-    const review = getReviewStatus(state.issueId);
+    const review = getReviewStatusSync(state.issueId);
     if (review?.readyForMerge && review.reviewStatus === 'passed' && review.testStatus === 'passed') {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — already merge-ready`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — already merge-ready`);
       continue;
     }
     if (review?.mergeStatus === 'merged') {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — already merged`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — already merged`);
       continue;
     }
 
@@ -5490,20 +5654,20 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
     // date (old issues may have no shadow file). Saw 10 spurious work agents
     // get respawned for already-merged issues during a mergeStatus flap window.
     if ((state as any).merged === true) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — agent state has merged=true (mergedAt=${(state as any).mergedAt ?? 'unknown'})`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — agent state has merged=true (mergedAt=${(state as any).mergedAt ?? 'unknown'})`);
       continue;
     }
 
-    const shadowState = await getShadowState(state.issueId);
+    const shadowState = await Effect.runPromise(getShadowState(state.issueId));
     const issueClosed = shadowState?.trackerStatus === 'closed';
     if (issueClosed) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — issue ${state.issueId} is CLOSED on tracker`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — issue ${state.issueId} is CLOSED on tracker`);
       continue;
     }
 
     const deliberatelyStopped = state.stoppedByUser === true;
     if (deliberatelyStopped) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — deliberately stopped by user (stoppedByUser=true)`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — deliberately stopped by user (stoppedByUser=true)`);
       continue;
     }
 
@@ -5516,34 +5680,34 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
       review?.testStatus === 'failed' ||
       review?.verificationStatus === 'failed';
     if (hasPendingReviewFeedback) {
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} resuming — review feedback pending (review=${review?.reviewStatus}, test=${review?.testStatus}, verification=${review?.verificationStatus})`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} resuming — review feedback pending (review=${review?.reviewStatus}, test=${review?.testStatus}, verification=${review?.verificationStatus})`);
     } else {
 
       // Fallback: runtime.state === 'idle' means the agent is genuinely idle,
       // not crashed. Skip auto-resume unless review feedback arrives later.
-      const runtimeState = getAgentRuntimeState(agentId);
+      const runtimeState = getAgentRuntimeStateSync(agentId);
       if (runtimeState?.state === 'idle') {
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} skipped — idle (runtime.state=idle, no review feedback)`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} skipped — idle (runtime.state=idle, no review feedback)`);
         continue;
       }
     }
 
-    const runtimeStateForLog = getAgentRuntimeState(agentId);
-    logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} candidate — calling resumeAgent (issueId=${state.issueId}, runtime.state=${runtimeStateForLog?.state || 'null'})`);
+    const runtimeStateForLog = getAgentRuntimeStateSync(agentId);
+    logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} candidate — calling resumeAgent (issueId=${state.issueId}, runtime.state=${runtimeStateForLog?.state || 'null'})`);
     try {
       const result = await resumeAgent(agentId);
       if (result.success) {
         resumed.push(agentId);
-        const resumedState = await getAgentStateAsync(agentId);
+        const resumedState = await Effect.runPromise(getAgentState(agentId));
         if (resumedState) {
-          notifyAgentStatusChanged(resumedState, state.status);
+          notifyAgentStatusChanged(resumedState, state.status, true);
         }
         const msg = `Auto-resumed ${agentId} (was orphaned by system event)`;
         console.log(`[deacon] ${msg}`);
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${msg}`);
-        logAgentLifecycle(agentId, `resumed by deacon auto-recovery (session restored after system event)`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${msg}`);
+        logAgentLifecycleSync(agentId, `resumed by deacon auto-recovery (session restored after system event)`);
         const issueId = state.issueId;
-        emitActivityEntry({
+        emitActivityEntrySync({
           source: 'cloister',
           level: 'info',
           message: issueId
@@ -5551,7 +5715,7 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
             : `Deacon auto-resumed agent ${agentId}`,
           issueId,
         });
-        emitActivityTts({
+        emitActivityTtsSync({
           utterance: issueId
             ? `Deacon auto resumed ${issueId} work agent`
             : `Deacon auto resumed agent ${agentId}`,
@@ -5563,33 +5727,33 @@ export async function autoResumeStoppedWorkAgents(): Promise<string[]> {
       } else {
         const msg = `Failed to auto-resume ${agentId}: ${result.error}`;
         if (!orphanFailureRecordedForAutoResume.has(agentId)) {
-          const failedState = await recordAgentFailureAsync(agentId, msg);
+          const failedState = await Effect.runPromise(recordAgentFailure(agentId, msg));
           if (failedState) {
-            notifyAgentStatusChanged(failedState, state.status);
+            notifyAgentStatusChanged(failedState, state.status, false);
           }
         }
         console.warn(`[deacon] ${msg}`);
-        logDeaconEvent(`autoResumeStoppedWorkAgents: ${msg}`);
-        logAgentLifecycle(agentId, `auto-resume FAILED: ${result.error}`);
+        logDeaconEventSync(`autoResumeStoppedWorkAgents: ${msg}`);
+        logAgentLifecycleSync(agentId, `auto-resume FAILED: ${result.error}`);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!orphanFailureRecordedForAutoResume.has(agentId)) {
-        const failedState = await recordAgentFailureAsync(agentId, `Auto-resume error for ${agentId}: ${msg}`);
+        const failedState = await Effect.runPromise(recordAgentFailure(agentId, `Auto-resume error for ${agentId}: ${msg}`));
         if (failedState) {
-          notifyAgentStatusChanged(failedState, state.status);
+          notifyAgentStatusChanged(failedState, state.status, false);
         }
       }
       console.warn(`[deacon] Auto-resume error for ${agentId}: ${msg}`);
-      logDeaconEvent(`autoResumeStoppedWorkAgents: ${agentId} auto-resume threw: ${msg}`);
-      logAgentLifecycle(agentId, `auto-resume threw exception: ${msg}`);
+      logDeaconEventSync(`autoResumeStoppedWorkAgents: ${agentId} auto-resume threw: ${msg}`);
+      logAgentLifecycleSync(agentId, `auto-resume threw exception: ${msg}`);
     }
   }
   if (resumed.length > 0) {
     console.log(`[deacon] Auto-resumed ${resumed.length} work agent(s): ${resumed.join(', ')}`);
-    logDeaconEvent(`autoResumeStoppedWorkAgents completed: resumed ${resumed.length} agent(s): ${resumed.join(', ')}`);
+    logDeaconEventSync(`autoResumeStoppedWorkAgents completed: resumed ${resumed.length} agent(s): ${resumed.join(', ')}`);
   } else {
-    logDeaconEvent(`autoResumeStoppedWorkAgents completed: no agents resumed`);
+    logDeaconEventSync(`autoResumeStoppedWorkAgents completed: no agents resumed`);
   }
   orphanFailureRecordedForAutoResume.clear();
   return resumed;
@@ -5603,7 +5767,7 @@ export function startDeacon(): void {
 
   config = loadConfig();
   console.log(`[deacon] Starting health monitor (patrol every ${config.patrolIntervalMs / 1000}s)`);
-  logDeaconEvent(`startDeacon: health monitor starting (patrol every ${config.patrolIntervalMs / 1000}s)`);
+  logDeaconEventSync(`startDeacon: health monitor starting (patrol every ${config.patrolIntervalMs / 1000}s)`);
 
   // Recover agents whose tmux sessions were killed by a system crash before the
   // first patrol. The recovery mutex also coalesces any interval patrol that fires
@@ -5615,7 +5779,7 @@ export function startDeacon(): void {
   })().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[deacon] Startup recovery/patrol error:', err);
-    logDeaconEvent(`startDeacon: startup recovery/patrol error: ${msg}`);
+    logDeaconEventSync(`startDeacon: startup recovery/patrol error: ${msg}`);
   });
 
   // Schedule regular patrols
@@ -5623,11 +5787,11 @@ export function startDeacon(): void {
     runPatrol().catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[deacon] Patrol error:', err);
-      logDeaconEvent(`patrol error: ${msg}`);
+      logDeaconEventSync(`patrol error: ${msg}`);
     });
   }, config.patrolIntervalMs);
 
-  logDeaconEvent('startDeacon: health monitor started');
+  logDeaconEventSync('startDeacon: health monitor started');
 }
 
 /**

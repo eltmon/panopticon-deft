@@ -20,7 +20,7 @@ import { randomBytes } from 'crypto';
 import { readFile, readdir } from 'fs/promises';
 import { basename, join, resolve } from 'path';
 import { Data, Effect } from 'effect';
-import { findSpecByIssue, getProjectPanPaths } from '../pan-dir/specs.js';
+import { getProjectPanPaths } from '../pan-dir/specs.js';
 import { readWorkspaceContinue, writeWorkspaceContinue } from '../pan-dir/continue.js';
 import type { WorkspaceContinueState } from '../pan-dir/types.js';
 import { PAN_CONTINUE_FILENAME, PAN_DIRNAME, PAN_SPEC_FILENAME } from '../pan-dir/types.js';
@@ -58,8 +58,7 @@ function findSpecByIssueSync(projectRoot: string, issueId: string): { path: stri
   return null;
 }
 
-/** Async sibling of `findSpecByIssueSync`, used by async sync-mirror helpers. */
-async function findSpecByIssueAsyncLocal(projectRoot: string, issueId: string): Promise<{ path: string } | null> {
+async function findSpecByIssueFromDisk(projectRoot: string, issueId: string): Promise<{ path: string } | null> {
   const upperIssueId = issueId.toUpperCase();
   const { specsDir } = getProjectPanPaths(projectRoot);
   if (!existsSync(specsDir)) return null;
@@ -143,8 +142,11 @@ export function issueIdFromWorkspacePath(workspacePath: string): string | null {
   return match ? match[1].toUpperCase() : null;
 }
 
-/** Derive the project root from a workspace path (two levels up). */
+/** Derive the project root from a workspace path. */
 function projectRootFromWorkspace(workspacePath: string): string {
+  if (existsSync(join(workspacePath, '.git')) && existsSync(join(workspacePath, PAN_DIRNAME, 'specs'))) {
+    return workspacePath;
+  }
   return resolve(workspacePath, '..', '..');
 }
 
@@ -152,7 +154,7 @@ function workspaceDraftPath(workspacePath: string): string {
   return join(workspacePath, PAN_DIRNAME, PAN_SPEC_FILENAME);
 }
 
-export function findWorkspaceDraftPlan(workspacePath: string): string | null {
+export function findWorkspaceDraftPlanSync(workspacePath: string): string | null {
   const path = workspaceDraftPath(workspacePath);
   if (!existsSync(path)) return null;
 
@@ -160,7 +162,7 @@ export function findWorkspaceDraftPlan(workspacePath: string): string | null {
   if (!issueId) return path;
 
   try {
-    const doc = readPlan(path);
+    const doc = readPlanSync(path);
     const planIssueId = doc.plan?.id;
     if (planIssueId && planIssueId.toLowerCase() !== issueId.toLowerCase()) return null;
   } catch {
@@ -170,28 +172,6 @@ export function findWorkspaceDraftPlan(workspacePath: string): string | null {
   return path;
 }
 
-export async function findWorkspaceDraftPlanAsync(workspacePath: string): Promise<string | null> {
-  const path = workspaceDraftPath(workspacePath);
-  try {
-    await readFile(path, 'utf-8');
-  } catch (error: any) {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
-  }
-
-  const issueId = issueIdFromWorkspacePath(workspacePath);
-  if (!issueId) return path;
-
-  try {
-    const doc = await readPlanAsync(path);
-    const planIssueId = doc.plan?.id;
-    if (planIssueId && planIssueId.toLowerCase() !== issueId.toLowerCase()) return null;
-  } catch {
-    return path;
-  }
-
-  return path;
-}
 
 /**
  * Returns the path to this workspace's vBRIEF source. The canonical main-side
@@ -201,25 +181,16 @@ export async function findWorkspaceDraftPlanAsync(workspacePath: string): Promis
  * NOTE (PAN-1249): Now runs the underlying pan-dir spec resolution via
  * `Effect.runSync` since findSpecByIssue is Effect-based. The Effect uses
  * NodeFileSystem under the hood which means this synchronous call path
- * actually blocks on async I/O — prefer `findPlanAsync` from any
- * dashboard server code. Kept sync to preserve the CLI call sites.
+ * actually blocks on async I/O. Kept sync to preserve the CLI call sites.
  */
-export function findPlan(workspacePath: string): string | null {
+export function findPlanSync(workspacePath: string): string | null {
   const issueId = issueIdFromWorkspacePath(workspacePath);
   if (!issueId) return null;
   const projectRoot = projectRootFromWorkspace(workspacePath);
   const entry = findSpecByIssueSync(projectRoot, issueId);
-  return entry ? entry.path : findWorkspaceDraftPlan(workspacePath);
+  return entry ? entry.path : findWorkspaceDraftPlanSync(workspacePath);
 }
 
-/** Async variant of findPlan — safe to call from dashboard server code. */
-export async function findPlanAsync(workspacePath: string): Promise<string | null> {
-  const issueId = issueIdFromWorkspacePath(workspacePath);
-  if (!issueId) return null;
-  const projectRoot = projectRootFromWorkspace(workspacePath);
-  const entry = await findSpecByIssueAsyncLocal(projectRoot, issueId);
-  return entry ? entry.path : findWorkspaceDraftPlanAsync(workspacePath);
-}
 
 /**
  * Reads and parses plan.vbrief.json from the given path.
@@ -237,7 +208,7 @@ export class VBriefMergeConflictError extends Error {
   }
 }
 
-export function readPlan(planPath: string): VBriefDocument {
+export function readPlanSync(planPath: string): VBriefDocument {
   const raw = readFileSync(planPath, 'utf-8');
   if (raw.includes('<<<<<<<') && raw.includes('=======') && raw.includes('>>>>>>>')) {
     throw new VBriefMergeConflictError(planPath);
@@ -257,22 +228,6 @@ export function readPlan(planPath: string): VBriefDocument {
   );
 }
 
-/** Async variant of readPlan — safe to call from server-hot-path code. */
-export async function readPlanAsync(planPath: string): Promise<VBriefDocument> {
-  const raw = await readFile(planPath, 'utf-8');
-  if (raw.includes('<<<<<<<') && raw.includes('=======') && raw.includes('>>>>>>>')) {
-    throw new VBriefMergeConflictError(planPath);
-  }
-  const parsed = JSON.parse(raw);
-  if (parsed.vBRIEFInfo && parsed.plan) {
-    return parsed as VBriefDocument;
-  }
-  throw new Error(
-    `Invalid vBRIEF format in ${planPath}: missing 'vBRIEFInfo' and/or 'plan' top-level keys. ` +
-    `vBRIEF v0.5 requires exactly { "vBRIEFInfo": { "version": "0.5" }, "plan": { ... } }. ` +
-    `See docs/VBRIEF.md for the correct format.`
-  );
-}
 
 /**
  * Apply statusOverrides from workspace continue.json onto a deep-cloned spec.
@@ -312,10 +267,10 @@ export function applyStatusOverrides(doc: VBriefDocument, overrides: Record<stri
  * statusOverrides applied from the workspace continue file.
  * Returns null if no plan exists on main or locally.
  */
-export function readWorkspacePlan(workspacePath: string): VBriefDocument | null {
-  const planPath = findPlan(workspacePath);
+export function readWorkspacePlanSync(workspacePath: string): VBriefDocument | null {
+  const planPath = findPlanSync(workspacePath);
   if (!planPath) return null;
-  const doc = readPlan(planPath);
+  const doc = readPlanSync(planPath);
 
   const continueState = readWorkspaceContinueSync(workspacePath);
   if (continueState?.statusOverrides && Object.keys(continueState.statusOverrides).length > 0) {
@@ -324,20 +279,6 @@ export function readWorkspacePlan(workspacePath: string): VBriefDocument | null 
   return doc;
 }
 
-/** Async variant of readWorkspacePlan — safe for dashboard server code. */
-export async function readWorkspacePlanAsync(workspacePath: string): Promise<VBriefDocument | null> {
-  const planPath = await findPlanAsync(workspacePath);
-  if (!planPath) return null;
-  const doc = await readPlanAsync(planPath);
-
-  const continueState = await Effect.runPromise(
-    readWorkspaceContinue(workspacePath).pipe(Effect.catch(() => Effect.succeed(null))),
-  );
-  if (continueState?.statusOverrides && Object.keys(continueState.statusOverrides).length > 0) {
-    return applyStatusOverrides(doc, continueState.statusOverrides);
-  }
-  return doc;
-}
 
 /**
  * vBRIEF lifecycle statuses that mean "planning has finished" — i.e., the
@@ -357,9 +298,6 @@ export function isPlanningProposed(workspacePath: string, planningDir?: string):
   return checkPlanStatus(workspacePath, planningDir, status => status === 'proposed');
 }
 
-export function isPlanningProposedAsync(workspacePath: string, planningDir?: string): Promise<boolean> {
-  return checkPlanStatusAsync(workspacePath, planningDir, status => status === 'proposed');
-}
 
 /**
  * Check whether planning has finished for this workspace — i.e., beads have
@@ -368,41 +306,20 @@ export function isPlanningProposedAsync(workspacePath: string, planningDir?: str
  * Returns true when `plan.status` is any of: 'proposed', 'approved', 'pending',
  * 'running', 'completed', or 'blocked'.
  */
-export function isPlanningComplete(workspacePath: string, planningDir?: string): boolean {
+export function isPlanningCompleteSync(workspacePath: string, planningDir?: string): boolean {
   return checkPlanStatus(workspacePath, planningDir, status => PLANNING_FINISHED_STATUSES.has(status));
 }
 
-export function isPlanningCompleteAsync(workspacePath: string, planningDir?: string): Promise<boolean> {
-  return checkPlanStatusAsync(workspacePath, planningDir, status => PLANNING_FINISHED_STATUSES.has(status));
-}
 
 function checkPlanStatus(
   workspacePath: string,
   _planningDir: string | undefined,
   matchStatus: (status: string) => boolean,
 ): boolean {
-  const planPath = findPlan(workspacePath);
+  const planPath = findPlanSync(workspacePath);
   if (!planPath) return false;
   try {
-    const doc = readPlan(planPath);
-    const status = doc.plan?.status;
-    if (status && matchStatus(status)) return true;
-    if (status) return false;
-  } catch {
-    // Corrupt / unreadable plan
-  }
-  return false;
-}
-
-async function checkPlanStatusAsync(
-  workspacePath: string,
-  _planningDir: string | undefined,
-  matchStatus: (status: string) => boolean,
-): Promise<boolean> {
-  const planPath = await findPlanAsync(workspacePath);
-  if (!planPath) return false;
-  try {
-    const doc = await readPlanAsync(planPath);
+    const doc = readPlanSync(planPath);
     const status = doc.plan?.status;
     if (status && matchStatus(status)) return true;
     if (status) return false;
@@ -419,10 +336,10 @@ async function checkPlanStatusAsync(
  * No-ops gracefully if no plan exists for this workspace.
  */
 export function updateItemStatus(workspacePath: string, itemId: string, status: VBriefItemStatus): void {
-  const planPath = findPlan(workspacePath);
+  const planPath = findPlanSync(workspacePath);
   if (!planPath) return;
 
-  const doc = readPlan(planPath);
+  const doc = readPlanSync(planPath);
   const item = doc.plan.items.find(i => i.id === itemId);
   if (!item) return;
 
@@ -458,10 +375,10 @@ export function updateSubItemStatus(
   subItemId: string,
   status: VBriefItemStatus,
 ): void {
-  const planPath = findPlan(workspacePath);
+  const planPath = findPlanSync(workspacePath);
   if (!planPath) return;
 
-  const doc = readPlan(planPath);
+  const doc = readPlanSync(planPath);
   const item = doc.plan.items.find(i => i.id === itemId);
   if (!item?.subItems) return;
 
@@ -501,7 +418,7 @@ export function updateSubItemStatus(
  * Effect variant of readPlanAsync — failures surface as typed errors in the
  * channel instead of thrown exceptions.
  */
-export const readPlanEffect = (
+export const readPlan = (
   planPath: string,
 ): Effect.Effect<VBriefDocument, VBriefReadError> =>
   Effect.gen(function* () {
@@ -532,16 +449,49 @@ export const readPlanEffect = (
     return obj as VBriefDocument;
   });
 
+export const findWorkspaceDraftPlan = (
+  workspacePath: string,
+): Effect.Effect<string | null, FsError> =>
+  Effect.gen(function* () {
+    const path = workspaceDraftPath(workspacePath);
+    const exists = yield* Effect.tryPromise({
+      try: async () => {
+        try {
+          await readFile(path, 'utf-8');
+          return true;
+        } catch (error: any) {
+          if (error?.code === 'ENOENT') return false;
+          throw error;
+        }
+      },
+      catch: (cause) => new FsError({ path, operation: 'readFile', cause }),
+    });
+    if (!exists) return null;
+
+    const issueId = issueIdFromWorkspacePath(workspacePath);
+    if (!issueId) return path;
+
+    const doc = yield* readPlan(path).pipe(Effect.orElseSucceed(() => null));
+    const planIssueId = doc?.plan?.id;
+    return planIssueId && planIssueId.toLowerCase() !== issueId.toLowerCase() ? null : path;
+  });
+
 /**
  * Effect variant of findPlanAsync. Returns null when the workspace has no
  * resolvable plan — only IO/decoding failures surface as errors.
  */
-export const findPlanEffect = (
+export const findPlan = (
   workspacePath: string,
 ): Effect.Effect<string | null, FsError> =>
-  Effect.tryPromise({
-    try: () => findPlanAsync(workspacePath),
-    catch: (cause) => new FsError({ path: workspacePath, operation: 'findPlan', cause }),
+  Effect.gen(function* () {
+    const issueId = issueIdFromWorkspacePath(workspacePath);
+    if (!issueId) return null;
+    const projectRoot = projectRootFromWorkspace(workspacePath);
+    const entry = yield* Effect.tryPromise({
+      try: () => findSpecByIssueFromDisk(projectRoot, issueId),
+      catch: (cause) => new FsError({ path: projectRoot, operation: 'findSpecByIssue', cause }),
+    });
+    return entry ? entry.path : yield* findWorkspaceDraftPlan(workspacePath);
   });
 
 /**
@@ -549,17 +499,31 @@ export const findPlanEffect = (
  * for the workspace; otherwise returns the merged document with statusOverrides
  * applied. IO/decoding failures surface as typed errors.
  */
-export const readWorkspacePlanEffect = (
+export const readWorkspacePlan = (
   workspacePath: string,
 ): Effect.Effect<VBriefDocument | null, VBriefReadError> =>
   Effect.gen(function* () {
-    const planPath = yield* findPlanEffect(workspacePath);
+    const planPath = yield* findPlan(workspacePath);
     if (!planPath) return null;
-    const doc = yield* readPlanEffect(planPath);
+    const doc = yield* readPlan(planPath);
 
     const continueState = yield* readWorkspaceContinue(workspacePath);
     if (continueState?.statusOverrides && Object.keys(continueState.statusOverrides).length > 0) {
       return applyStatusOverrides(doc, continueState.statusOverrides);
     }
     return doc;
+  });
+
+export const isPlanningComplete = (
+  workspacePath: string,
+  _planningDir?: string,
+): Effect.Effect<boolean, VBriefReadError> =>
+  Effect.gen(function* () {
+    const planPath = yield* findPlan(workspacePath);
+    if (!planPath) return false;
+    const doc = yield* readPlan(planPath).pipe(Effect.orElseSucceed(() => null));
+    const status = doc?.plan?.status;
+    if (status && PLANNING_FINISHED_STATUSES.has(status)) return true;
+    if (status) return false;
+    return false;
   });

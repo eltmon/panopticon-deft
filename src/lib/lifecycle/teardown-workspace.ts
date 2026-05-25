@@ -10,14 +10,15 @@
  * In Phase 2, removeWorkspace() will delegate to this module for the common steps.
  */
 
-import { existsSync, rmSync } from 'fs';
-import { readFile } from 'fs/promises';
-import { join, basename } from 'path';
+import { existsSync } from 'fs';
+import { appendFile, readFile, rm, writeFile } from 'fs/promises';
+import { join, basename, dirname } from 'path';
+import { homedir } from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { Effect } from 'effect';
 import { AGENTS_DIR } from '../paths.js';
-import { killSessionAsync, sessionExists, listSessionNamesAsync } from '../tmux.js';
+import { killSession, sessionExists, listSessionNames } from '../tmux.js';
 import type { LifecycleContext, StepResult, TeardownOptions } from './types.js';
 import { stepOk, stepSkipped, stepFailed } from './types.js';
 import { findAllWorkspacePaths, findWorkspacePath } from './archive-planning.js';
@@ -52,9 +53,9 @@ async function killTmuxSessionsImpl(issueLower: string): Promise<StepResult> {
     `planning-${issueLower}`,
   ];
   for (const session of exactPatterns) {
-    if (sessionExists(session)) {
+    if (await Effect.runPromise(sessionExists(session))) {
       try {
-        await killSessionAsync(session);
+        await Effect.runPromise(killSession(session));
         killed++;
       } catch {
         // session may have died between check and kill
@@ -74,7 +75,7 @@ async function killTmuxSessionsImpl(issueLower: string): Promise<StepResult> {
   //   - review-<ISSUE>-<timestamp>-<role>          (legacy)
   //   - specialist-<projectKey>-<ISSUE>-<role>     (canonical PAN-830/915)
   try {
-    const allSessions = await listSessionNamesAsync();
+    const allSessions = await Effect.runPromise(listSessionNames());
     const escapedLower = issueLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const escapedUpper = issueLower.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const issuePart = `(${escapedLower}|${escapedUpper})`;
@@ -86,14 +87,14 @@ async function killTmuxSessionsImpl(issueLower: string): Promise<StepResult> {
     const matchedSessions = allSessions.filter(s => patterns.some(p => p.test(s)));
     for (const session of matchedSessions) {
       try {
-        await killSessionAsync(session);
+        await Effect.runPromise(killSession(session));
         killed++;
       } catch {
         // session may have died between check and kill
       }
     }
   } catch {
-    // listSessionNamesAsync may fail if tmux server is not running
+    // Session listing may fail if tmux server is not running
   }
 
   // NOTE: Per-project ephemeral specialists (specialist-{project}-{type}) are NOT killed here.
@@ -127,8 +128,8 @@ async function stopTldrDaemonImpl(workspacePath: string): Promise<StepResult> {
     return stepSkipped(step, ['No .venv found']);
   }
   try {
-    const { getTldrDaemonService } = await import('../tldr-daemon.js');
-    const tldrService = getTldrDaemonService(workspacePath, venvPath);
+    const { getTldrDaemonServiceSync } = await import('../tldr-daemon.js');
+    const tldrService = getTldrDaemonServiceSync(workspacePath, venvPath);
     await tldrService.stop();
     return stepOk(step, ['Stopped TLDR daemon']);
   } catch {
@@ -160,7 +161,7 @@ async function stopDockerImpl(
   const step = 'teardown:docker';
   try {
     const { stopWorkspaceDocker } = await import('../workspace-manager.js');
-    await stopWorkspaceDocker(workspacePath, issueLower);
+    await Effect.runPromise(stopWorkspaceDocker(workspacePath, issueLower));
     return stepOk(step, ['Stopped Docker containers']);
   } catch {
     return stepSkipped(step, ['Docker cleanup skipped (not running or failed)']);
@@ -287,18 +288,17 @@ async function syncWorkspaceBeadsImpl(
       return stepOk(step, [`Synced workspace beads to project root for ${issueLower}`]);
     } catch {
       // bd import may not exist — try manual JSONL merge
-      const { readFileSync, appendFileSync } = await import('fs');
       const wsJsonl = join(workspacePath, '.beads', 'issues.jsonl');
       const projJsonl = join(projectPath, '.beads', 'issues.jsonl');
 
       if (existsSync(wsJsonl) && existsSync(projJsonl)) {
-        const wsContent = readFileSync(wsJsonl, 'utf-8');
+        const wsContent = await readFile(wsJsonl, 'utf-8');
         const issuePattern = issueLower.replace('-', '[-_]');
         const relevantLines = wsContent.split('\n').filter(
           line => line.trim() && new RegExp(issuePattern, 'i').test(line)
         );
         if (relevantLines.length > 0) {
-          appendFileSync(projJsonl, '\n' + relevantLines.join('\n'));
+          await appendFile(projJsonl, '\n' + relevantLines.join('\n'));
           return stepOk(step, [`Appended ${relevantLines.length} beads entries for ${issueLower} to project JSONL`]);
         }
       }
@@ -338,8 +338,7 @@ async function clearProjectBeadsImpl(
   }
 
   try {
-    const { readFileSync, writeFileSync } = await import('fs');
-    const content = readFileSync(projJsonl, 'utf-8');
+    const content = await readFile(projJsonl, 'utf-8');
     const lines = content.split('\n');
     const issueUpper = issueLower.toUpperCase();
     const before = lines.length;
@@ -357,7 +356,7 @@ async function clearProjectBeadsImpl(
     });
     const removed = before - filtered.length;
     if (removed > 0) {
-      writeFileSync(projJsonl, filtered.join('\n'));
+      await writeFile(projJsonl, filtered.join('\n'));
       return stepOk(step, [`Removed ${removed} beads entries for ${issueLower} from project JSONL`]);
     }
     return stepSkipped(step, [`No beads entries found for ${issueLower}`]);
@@ -394,7 +393,7 @@ async function removeWorktreeImpl(
 
   // Guard: never delete workspace (and its `.devcontainer/`) while containers
   // still reference compose paths inside it.
-  const orphanedContainers = await getContainersReferencingWorkspacePath(workspacePath);
+  const orphanedContainers = await Effect.runPromise(getContainersReferencingWorkspacePath(workspacePath));
   if (orphanedContainers.length > 0) {
     return stepFailed(
       step,
@@ -409,8 +408,8 @@ async function removeWorktreeImpl(
   } catch {
     // worktree remove failed — try direct removal
     try {
-      rmSync(workspacePath, { recursive: true, force: true });
-      return stepOk(step, ['Removed workspace directory (worktree remove failed, used rmSync)']);
+      await rm(workspacePath, { recursive: true, force: true });
+      return stepOk(step, ['Removed workspace directory after worktree removal failed']);
     } catch (err) {
       return stepFailed(step, `Failed to remove workspace: ${(err as Error).message}`);
     }
@@ -542,15 +541,22 @@ function clearLegacyPlanningDir(
   projectPath: string,
   issueLower: string,
 ): Effect.Effect<StepResult> {
-  return Effect.sync(() => {
-    const step = 'teardown:legacy-planning-dir';
-    const legacyDir = join(projectPath, '.planning', issueLower);
-    if (existsSync(legacyDir)) {
-      rmSync(legacyDir, { recursive: true, force: true });
+  return Effect.tryPromise({
+    try: async () => {
+      const step = 'teardown:legacy-planning-dir';
+      const legacyDir = join(projectPath, '.planning', issueLower);
+      if (!existsSync(legacyDir)) {
+        return stepSkipped(step, ['No legacy planning directory found']);
+      }
+      await rm(legacyDir, { recursive: true, force: true });
       return stepOk(step, [`Deleted legacy planning dir: ${legacyDir}`]);
-    }
-    return stepSkipped(step, ['No legacy planning directory found']);
-  });
+    },
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.succeed(stepFailed('teardown:legacy-planning-dir', `Failed to delete legacy planning dir: ${(err as Error).message}`)),
+    ),
+  );
 }
 
 /**
@@ -587,7 +593,7 @@ function removeTunnelConfig(
   return Effect.tryPromise({
     try: async () => {
       const { removeTunnelIngress } = await import('../tunnel.js');
-      const result = await removeTunnelIngress(tunnelConfig, placeholders as any);
+      const result = await Effect.runPromise(removeTunnelIngress(tunnelConfig, placeholders as any));
       return stepOk('teardown:tunnel', result.steps || ['Removed tunnel ingress']);
     },
     catch: (err) => err,
@@ -608,7 +614,7 @@ function removeHumeEviConfig(
   return Effect.tryPromise({
     try: async () => {
       const { deleteHumeConfig } = await import('../hume.js');
-      const result = await deleteHumeConfig(humeConfig, placeholders as any);
+      const result = await Effect.runPromise(deleteHumeConfig(humeConfig, placeholders as any));
       return stepOk('teardown:hume', result.steps || ['Removed Hume EVI config']);
     },
     catch: (err) => err,
@@ -730,13 +736,13 @@ function pruneCheckpointRefs(projectPath: string, issueLower: string): Effect.Ef
       const step = 'teardown:checkpoint-refs';
       const { pruneCheckpointRefsForAgents } = await import('../checkpoint/checkpoint-manager.js');
       const agentIds = [`agent-${issueLower}`, `planning-${issueLower}`];
-      await pruneCheckpointRefsForAgents(projectPath, agentIds);
-      return stepOk(step, [`Pruned checkpoint refs for ${agentIds.join(', ')}`]);
+      const pruned = await Effect.runPromise(pruneCheckpointRefsForAgents(projectPath, agentIds));
+      return stepOk(step, [`Pruned ${pruned} checkpoint ref(s) for ${agentIds.join(', ')}`]);
     },
     catch: (err) => err,
   }).pipe(
     Effect.catch((err) =>
-      Effect.succeed(stepSkipped('teardown:checkpoint-refs', [`Checkpoint prune failed (non-fatal): ${(err as Error).message}`])),
+      Effect.succeed(stepFailed('teardown:checkpoint-refs', `Checkpoint prune failed: ${(err as Error).message}`)),
     ),
   );
 }

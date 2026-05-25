@@ -13,7 +13,8 @@ import { Effect, Layer, Queue, Context, Stream } from 'effect';
 import { initEventStore } from '../event-store.js';
 import type { StoredEvent } from '../event-store.js';
 import { ReadModelService } from '../read-model.js';
-import { emitActivityDetailed } from '../../../lib/activity-logger.js';
+import { startSessionContextWriter } from './session-context-writer.js';
+import { emitActivityDetailedSync } from '../../../lib/activity-logger.js';
 import { captureCheckpoint, diffCheckpointFiles, listCheckpoints } from '../../../lib/checkpoint/checkpoint-manager.js';
 import { randomUUID } from 'crypto';
 
@@ -40,6 +41,21 @@ export class EventStoreService extends Context.Service<
 >()('panopticon/dashboard/EventStoreService') {}
 
 /** Map a domain event to a detailed activity log entry. Returns null for uninteresting events. */
+function shouldRefreshSessionContext(type: string): boolean {
+  return type === 'issues.snapshot' ||
+    type.startsWith('agent.') ||
+    type.startsWith('review.') ||
+    type.startsWith('pipeline.') ||
+    type.startsWith('planning.') ||
+    type.startsWith('plan.') ||
+    type.startsWith('workspace.') ||
+    type.startsWith('issue.') ||
+    type.startsWith('memory.') ||
+    type.startsWith('cost.') ||
+    type.startsWith('merge.') ||
+    type.startsWith('system.health_');
+}
+
 function mapDomainEventToDetailed(event: StoredEvent): {
   source: string;
   level: 'info' | 'warn' | 'error' | 'success';
@@ -158,12 +174,19 @@ export const EventStoreServiceLive = Layer.effect(
       } as any);
     });
 
+    startSessionContextWriter({
+      readSnapshot: () => Effect.runPromise(readModel.getSnapshot),
+      subscribe: (listener) => store.subscribe((event) => {
+        if (shouldRefreshSessionContext(event.type)) listener();
+      }),
+    });
+
     // Auto-emit detailed activity entries for state-change domain events.
     // Skip activity.* events to avoid infinite loops.
     store.subscribe((event) => {
       if (event.type.startsWith('activity.')) return;
       const detailed = mapDomainEventToDetailed(event);
-      if (detailed) emitActivityDetailed(detailed);
+      if (detailed) emitActivityDetailedSync(detailed);
     });
 
     // Capture checkpoints when agent activity changes.
@@ -195,14 +218,14 @@ export const EventStoreServiceLive = Layer.effect(
           const turnId = `turn-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
           // Capture checkpoint (git tag at current working tree state)
-          await captureCheckpoint(workspace, agentId, turnId);
+          await Effect.runPromise(captureCheckpoint(workspace, agentId, turnId));
 
           // Compute file changes from previous checkpoint
-          const checkpoints = await listCheckpoints(workspace, agentId);
+          const checkpoints = await Effect.runPromise(listCheckpoints(workspace, agentId));
           const prevCheckpoint = checkpoints.length >= 2 ? checkpoints[checkpoints.length - 2] : null;
           let files: Array<{ path: string; kind?: string; additions?: number; deletions?: number }> = [];
           if (prevCheckpoint) {
-            files = await diffCheckpointFiles(workspace, agentId, prevCheckpoint, turnId);
+            files = await Effect.runPromise(diffCheckpointFiles(workspace, agentId, prevCheckpoint, turnId));
           }
 
           // Only emit if there are actual changes

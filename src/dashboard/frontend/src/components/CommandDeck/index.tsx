@@ -6,6 +6,8 @@ import { ProjectNode, ProjectFeature } from './ProjectTree/ProjectNode';
 import { sessionMatchesFilter, type TreeSessionFilter } from './ProjectTree/FeatureItem';
 import { ProjectOverview, type IssueCostBreakdown } from './ProjectOverview';
 import { ZoneA } from './ZoneA';
+import { ZoneB } from './ZoneB';
+import { ZoneCConversation } from './ZoneCConversation';
 import type { OverviewTab as ZoneCOverviewTab } from './ZoneCOverview';
 import { OverviewTab } from './ZoneCOverviewTabs/OverviewTab';
 import { ActivityTab } from './ZoneCOverviewTabs/ActivityTab';
@@ -26,8 +28,9 @@ import { useCommandDeckSelection } from '../../lib/commandDeckSelection';
 import { getTransport, type PanRpcProtocolClient } from '../../lib/wsTransport';
 import { refreshDashboardState } from '../../lib/refresh-dashboard-state';
 import { isCodexBlockedResponse, setPendingCodexSpawn } from '../../lib/pending-codex-spawn';
+import { getDirectRestartRequest } from '../../lib/restartRouting';
 import { WS_METHODS } from '@panctl/contracts';
-import type { ProjectSessionTree, SessionTreeDelta } from '@panctl/contracts';
+import type { ProjectSessionTree, SessionNode, SessionTreeDelta } from '@panctl/contracts';
 import styles from './styles/command-deck.module.css';
 
 async function fetchConversations(): Promise<Conversation[]> {
@@ -272,6 +275,31 @@ function ProjectRightPaneTabs({
   // Resolve effective activeIssueId: controlled prop takes precedence
   const effectiveActiveIssueId = controlledActiveIssueId ?? activeIssueId;
 
+  // Per-issue session selection (PAN-830). When a session is selected for the
+  // active issue, the right pane shows the agent Conversation/Terminal view
+  // (ZoneB + SessionPanel) in place of the tab content — clicking any tab
+  // clears the selection and returns to the tab strip.
+  const selectSession = useCommandDeckSelection((s) => s.selectSession);
+  const selectedSessionByIssue = useCommandDeckSelection((s) => s.selectedSessionByIssue);
+  const selectedSessionId = effectiveActiveIssueId
+    ? selectedSessionByIssue[effectiveActiveIssueId] ?? null
+    : null;
+
+  const activeFeatureSessions = useMemo<readonly SessionNode[]>(() => {
+    if (!effectiveActiveIssueId) return [];
+    return features.find((feature) => feature.issueId === effectiveActiveIssueId)?.sessions ?? [];
+  }, [features, effectiveActiveIssueId]);
+
+  const selectedSession = useMemo<SessionNode | null>(() => {
+    if (!selectedSessionId) return null;
+    return activeFeatureSessions.find((session) => session.sessionId === selectedSessionId) ?? null;
+  }, [activeFeatureSessions, selectedSessionId]);
+
+  const reviewers = useMemo<readonly SessionNode[]>(() => {
+    if (selectedSession?.type !== 'review') return [];
+    return activeFeatureSessions.filter((session) => session.type === 'reviewer');
+  }, [activeFeatureSessions, selectedSession]);
+
   useEffect(() => {
     setActiveTab(readProjectTab(projectName));
     hasExplicitTabChoiceRef.current = localStorage.getItem(projectTabStorageKey(projectName)) !== null;
@@ -293,12 +321,18 @@ function ProjectRightPaneTabs({
   useEffect(() => {
     if (selectedConversation && conversations.some(c => c.name === selectedConversation)) {
       setActiveTab('conversations');
+      return;
     }
-  }, [selectedConversation, conversations]);
+    if (!selectedConversation && !controlledActiveIssueId && !hasExplicitTabChoiceRef.current) {
+      setActiveTab('pipeline');
+    }
+  }, [selectedConversation, conversations, controlledActiveIssueId]);
 
   const selectTab = (tab: ProjectRightTab) => {
     hasExplicitTabChoiceRef.current = true;
     setActiveTab(tab);
+    // Clicking a tab exits the agent Conversation/Terminal view back to the strip.
+    if (effectiveActiveIssueId) selectSession(effectiveActiveIssueId, null);
     try { localStorage.setItem(projectTabStorageKey(projectName), tab); } catch { /* ignore */ }
   };
 
@@ -341,20 +375,23 @@ function ProjectRightPaneTabs({
         />
       )}
       <div className="flex h-[48px] shrink-0 items-center gap-1 border-b border-border bg-card px-3 py-0" role="tablist" aria-label={`${projectName} right pane tabs`}>
-        {PROJECT_RIGHT_TABS.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            aria-selected={activeTab === tab.id}
-            className={`rounded-[var(--radius-sm)] px-3 py-1.5 text-xs font-medium transition-colors ${activeTab === tab.id ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-            onClick={() => selectTab(tab.id)}
-          >
-            {tab.label}
-          </button>
-        ))}
+        {PROJECT_RIGHT_TABS.map((tab) => {
+          const tabSelected = !selectedSession && activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={tabSelected}
+              className={`rounded-[var(--radius-sm)] px-3 py-1.5 text-xs font-medium transition-colors ${tabSelected ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => selectTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
       </div>
-      {activeTab !== 'pipeline' && features.length > 0 && (
+      {activeTab !== 'pipeline' && features.length > 0 && !selectedSession && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-background px-3 py-2">
           <span className="text-xs font-medium text-muted-foreground">Issue</span>
           <select
@@ -377,6 +414,21 @@ function ProjectRightPaneTabs({
           </select>
         </div>
       )}
+      {selectedSession && effectiveActiveIssueId ? (
+        <div
+          className="flex min-h-0 flex-1 flex-col"
+          data-testid="command-deck-agent-view"
+          data-command-deck-agent-session={selectedSession.sessionId}
+        >
+          <ZoneB session={selectedSession} issueId={effectiveActiveIssueId} />
+          <ZoneCConversation
+            key={selectedSession.sessionId}
+            session={selectedSession}
+            issueId={effectiveActiveIssueId}
+            reviewers={reviewers}
+          />
+        </div>
+      ) : (
       <div className="min-h-0 flex-1 overflow-auto" role="tabpanel" data-command-deck-project-tab={activeTab}>
         {activeTab === 'pipeline' && (
           <ProjectOverview
@@ -387,14 +439,14 @@ function ProjectRightPaneTabs({
             onSelectFeature={openPipelineFeature}
           />
         )}
-        {activeTab !== 'pipeline' && !effectiveActiveIssueId && (
+        {activeTab !== 'pipeline' && activeTab !== 'conversations' && !effectiveActiveIssueId && (
           <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
             No project issue is available for {tabLabel}.
           </div>
         )}
         {activeTab === 'plans' && effectiveActiveIssueId && <VBriefTab issueId={effectiveActiveIssueId} />}
         {activeTab === 'beads' && effectiveActiveIssueId && <BeadsTab issueId={effectiveActiveIssueId} />}
-        {activeTab === 'conversations' && effectiveActiveIssueId && (
+        {activeTab === 'conversations' && (
           <div className="flex min-h-full flex-col gap-4 p-4">
             {selectedConversation ? (
               (() => {
@@ -428,7 +480,7 @@ function ProjectRightPaneTabs({
               })()
             ) : (
               <>
-                <DiscussionsTab issueId={effectiveActiveIssueId} />
+                {effectiveActiveIssueId && <DiscussionsTab issueId={effectiveActiveIssueId} />}
                 <div className="flex flex-col gap-2">
                   {conversations.length > 0 ? conversations.map((conversation) => (
                     <button
@@ -448,6 +500,7 @@ function ProjectRightPaneTabs({
         {activeTab === 'activity' && effectiveActiveIssueId && <ActivityTab issueId={effectiveActiveIssueId} />}
         {activeTab === 'settings' && effectiveActiveIssueId && <OverviewTab issueId={effectiveActiveIssueId} />}
       </div>
+      )}
     </div>
   );
 }
@@ -743,17 +796,35 @@ export function CommandDeck({
   // (e.g. popstate), not on every conversations refetch.
   const appliedConvId = useRef<string | null>(null);
 
+  // Resolve the registered project (by name) that owns a conversation's cwd,
+  // or null when the conversation is unscoped — cwd not under any registered
+  // project (e.g. created without a projectKey, so cwd defaults to ~/Projects).
+  const resolveConversationProjectName = useCallback(
+    (conv: Conversation | null | undefined): string | null => {
+      if (!conv?.cwd) return null;
+      const cwd = conv.cwd;
+      const matched = registeredProjects.find(
+        (rp) => !!rp.path && (cwd === rp.path || cwd.startsWith(rp.path + '/')),
+      );
+      return matched ? (matched.name ?? matched.key) : null;
+    },
+    [registeredProjects],
+  );
+
   // On mount or when convId changes (popstate), apply the deep-link
   useEffect(() => {
     if (!convId || conversations.length === 0) return;
     if (convId === appliedConvId.current) return;
-    const conv = conversations.find((c) => String(c.id) === convId);
+    const conv = conversations.find((c) => String(c.id) === convId || c.name === convId);
     if (conv) {
       setSelectedConversation(conv.name);
-      setSelectedProject(null);
+      // A conversation selection owns the right pane — clear any feature so a
+      // stale resolvedProjectForFeature can't shadow it (see handleSelectConversation).
+      setSelectedFeature(null);
+      setSelectedProject(resolveConversationProjectName(conv));
       appliedConvId.current = convId;
     }
-  }, [convId, conversations]);
+  }, [convId, conversations, resolveConversationProjectName]);
 
   // Auto-select first conversation on initial load if no deep-link and no feature selected
   const hasAutoSelected = useRef(false);
@@ -777,9 +848,8 @@ export function CommandDeck({
     }
     const conv = conversations.find((c) => c.name === selectedConversation);
     if (conv) {
-      const nextId = String(conv.id);
-      if (nextId === convId) return;
-      onConvIdChange(nextId);
+      if (convId === String(conv.id) || convId === conv.name) return;
+      onConvIdChange(String(conv.id));
     }
   }, [selectedConversation, conversations, onConvIdChange, convId]);
 
@@ -885,34 +955,16 @@ export function CommandDeck({
           tree.features.some(f => f.issueId.toLowerCase() === issueId.toLowerCase()),
         )?.[0];
 
-      if (sessionType === 'review') {
-        // Restart all reviewers — kill coordinator + all 5, then re-dispatch.
-        // Guard here so review sessions never fall through to the work-agent restart path.
-        if (!projectKey) throw new Error(`Cannot find project for ${issueId}`);
-        const res = await fetch(`/api/specialists/${encodeURIComponent(projectKey)}/${encodeURIComponent(issueId)}/review/restart`, {
+      const directRestartRequest = getDirectRestartRequest({ projectKey, issueId, sessionId, sessionType, role, model });
+      if (directRestartRequest) {
+        const res = await fetch(directRestartRequest.endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model }),
+          body: JSON.stringify(directRestartRequest.body),
         });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || 'Failed to restart review');
-        toast.success('Review restarted');
-        await refreshDashboardState(queryClient);
-        return;
-      }
-
-      if (sessionType === 'reviewer' && role) {
-        // Restart single reviewer role.
-        // Guard here so reviewer sessions never fall through to the work-agent restart path.
-        if (!projectKey) throw new Error(`Cannot find project for ${issueId}`);
-        const res = await fetch(`/api/specialists/${encodeURIComponent(projectKey)}/${encodeURIComponent(issueId)}/reviewer/${encodeURIComponent(role)}/restart`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || `Failed to restart ${role} reviewer`);
-        toast.success(`${role} reviewer restarted`);
+        const data = await res.json().catch(() => ({})) as { error?: string };
+        if (!res.ok) throw new Error(data.error || directRestartRequest.errorMessage);
+        toast.success(directRestartRequest.successMessage);
         await refreshDashboardState(queryClient);
         return;
       }
@@ -1044,7 +1096,19 @@ export function CommandDeck({
     if (selectedFeature) {
       selectSession(selectedFeature, null);
     }
-  }, [selectSession, selectedFeature]);
+    if (name) {
+      // Selecting a conversation supersedes any feature/project selection.
+      // Without clearing selectedFeature, resolvedProjectForFeature keeps
+      // rightPaneProject pinned to the previously-selected issue, which both
+      // hides unscoped conversations (they only render when rightPaneProject
+      // is null) and shows a mismatched ZoneA issue header over scoped ones.
+      // Anchoring selectedProject to the conversation's own project keeps the
+      // "Back to conversations" control working for project-scoped chats.
+      setSelectedFeature(null);
+      const conv = conversations.find((c) => c.name === name);
+      setSelectedProject(resolveConversationProjectName(conv));
+    }
+  }, [selectSession, selectedFeature, conversations, resolveConversationProjectName]);
 
   const projectConvMutations = useConversationMutations(selectedConversation, handleSelectConversation);
 
@@ -1192,16 +1256,24 @@ export function CommandDeck({
   const resolvedProjectForConversation = useMemo(() => {
     if (!selectedConversation) return null;
     const conv = conversations.find(c => c.name === selectedConversation);
-    if (!conv || !conv.cwd) return null;
-    const matched = registeredProjects.find(rp =>
-      conv.cwd === rp.path || conv.cwd.startsWith(rp.path + '/'),
-    );
-    if (!matched) return null;
-    const name = matched.name ?? matched.key;
-    return projectsWithSessions.find(p => p.name === name) ?? null;
-  }, [conversations, selectedConversation, registeredProjects, projectsWithSessions]);
+    const projectName = resolveConversationProjectName(conv);
+    if (!projectName) return null;
+    return projectsWithSessions.find(p => p.name === projectName) ?? null;
+  }, [conversations, selectedConversation, resolveConversationProjectName, projectsWithSessions]);
 
   const rightPaneProject = selectedProjectData ?? resolvedProjectForFeature ?? resolvedProjectForConversation;
+
+  // A conversation that is not scoped to any registered project — e.g. created
+  // without a projectKey, so its cwd defaults to ~/Projects (see the POST
+  // /api/conversations handler). These are exactly the conversations listed in
+  // the sidebar's dedicated "Conversations" section. PAN-1230 made
+  // ProjectRightPaneTabs the right-pane shell, but that lens requires a
+  // project, so selecting an unscoped conversation produced no rightPaneProject
+  // and fell through to the "Select a project" empty state. Render it directly.
+  const unscopedConversation = useMemo(() => {
+    if (rightPaneProject || !selectedConversation) return null;
+    return conversations.find(c => c.name === selectedConversation) ?? null;
+  }, [rightPaneProject, selectedConversation, conversations]);
 
   const selectedIssueTitle = selectedFeature
     ? issueTitles[selectedFeature.toLowerCase()] || issueTitles[selectedFeature] || selectedFeature
@@ -1409,8 +1481,8 @@ export function CommandDeck({
               conversation={projectConvMutations.forkTarget}
               isPending={projectConvMutations.isForkPending}
               onClose={projectConvMutations.closeForkModal}
-              onConfirm={(conv, launchModel, summaryModel, plainFork, localSummaryOnly, includeThinkingInSummary, title, launchHarness, summaryHarness) => {
-                projectConvMutations.submitFork(conv, launchModel, summaryModel, plainFork, localSummaryOnly, includeThinkingInSummary, title, launchHarness, summaryHarness);
+              onConfirm={(conv, launchModel, summaryModel, forkMode, localSummaryOnly, includeThinkingInSummary, title, launchHarness, summaryHarness, focus) => {
+                projectConvMutations.submitFork(conv, launchModel, summaryModel, forkMode, localSummaryOnly, includeThinkingInSummary, title, launchHarness, summaryHarness, focus);
               }}
             />
           )}
@@ -1461,6 +1533,20 @@ export function CommandDeck({
                 if (issueId) handleSelectFeature(issueId);
               }}
             />
+          ) : unscopedConversation ? (
+            <div className="flex h-full min-h-0 flex-col">
+              <ConversationPanel
+                key={unscopedConversation.name}
+                conversation={unscopedConversation}
+                viewMode={conversationViewMode ?? 'conversation'}
+                onViewModeChange={onConversationViewModeChange}
+                agentId={selectedAgent?.id}
+                onArchived={() => {
+                  setSelectedConversation(null);
+                  queryClient.invalidateQueries({ queryKey: ['conversations'] });
+                }}
+              />
+            </div>
           ) : (
             <div className={styles.contentEmpty}>
               <div style={{ textAlign: 'center' }}>

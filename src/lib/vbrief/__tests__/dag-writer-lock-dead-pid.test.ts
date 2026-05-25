@@ -9,13 +9,13 @@
  * Fix: when the EEXIST owner.json's pid fails `process.kill(pid, 0)` with
  * ESRCH, the writer reclaims the lock and retries the acquire.
  */
+import { Effect } from 'effect';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { VBriefDocument } from '../types.js';
-import { applyTaskOperationToPlanFileAsync } from '../dag.js';
-import { isPidDead, removeStaleLockAsync } from '../dag.js';
+import { applyTaskOperationToPlanFile, isPidDead, removeStaleLock } from '../dag.js';
 
 function makeDoc(): VBriefDocument {
   return {
@@ -80,13 +80,13 @@ describe('#1174 orphan writer-lock reclaim on dead owner pid', () => {
     expect(isPidDead(-1)).toBe(false);
   });
 
-  it('removeStaleLockAsync removes lock dir and sibling .tmp files', async () => {
+  it('removeStaleLock removes lock dir and sibling .tmp files', async () => {
     const lockPath = `${planPath}.writer.lock`;
     mkdirSync(lockPath, { recursive: true });
     writeFileSync(join(lockPath, 'owner.json'), '{}', 'utf-8');
     const tmpPath = `${planPath}.${process.pid}.123.tmp`;
     writeFileSync(tmpPath, '{}', 'utf-8');
-    await removeStaleLockAsync(planPath);
+    await Effect.runPromise(removeStaleLock(planPath));
     expect(existsSync(lockPath)).toBe(false);
     expect(existsSync(tmpPath)).toBe(false);
   });
@@ -106,12 +106,12 @@ describe('#1174 orphan writer-lock reclaim on dead owner pid', () => {
       'utf-8',
     );
 
-    const result = await applyTaskOperationToPlanFileAsync(planPath, {
+    const result = await Effect.runPromise(applyTaskOperationToPlanFile(planPath, {
       type: 'claim',
       itemId: 'item-1',
       expectedSequence: 1,
       writerId: 'writer-reclaim',
-    });
+    }));
 
     expect(result.item.status).toBe('running');
     // The reclaim path removes the orphan lock, then the happy path's finally
@@ -135,12 +135,12 @@ describe('#1174 orphan writer-lock reclaim on dead owner pid', () => {
     );
 
     await expect(
-      applyTaskOperationToPlanFileAsync(planPath, {
+      Effect.runPromise(applyTaskOperationToPlanFile(planPath, {
         type: 'claim',
         itemId: 'item-1',
         expectedSequence: 1,
         writerId: 'writer-conflict',
-      }),
+      })),
     ).rejects.toThrow(/writer conflict/);
 
     expect(existsSync(lockPath)).toBe(true);

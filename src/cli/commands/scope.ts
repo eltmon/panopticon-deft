@@ -8,26 +8,27 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
+import { Effect } from 'effect';
 import { existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import {
-  findVBriefByIssue,
+  findVBriefByIssueSync,
   transitionVBriefOnMain,
   type VBriefTransitionResult,
 } from '../../lib/vbrief/lifecycle-io.js';
-import { findPlan, readPlan } from '../../lib/vbrief/io.js';
-import { readContinueState } from '../../lib/vbrief/continue-state.js';
-import { listVBriefsAsync, readVBriefDocumentAsync } from '../../lib/vbrief/vbrief-index.js';
-import { resolveProjectFromIssue, extractTeamPrefix, findProjectByTeam, listProjects } from '../../lib/projects.js';
+import { findPlanSync, readPlanSync } from '../../lib/vbrief/io.js';
+import { readContinueStateSync } from '../../lib/vbrief/continue-state.js';
+import { listVBriefs, readVBriefDocument } from '../../lib/vbrief/vbrief-index.js';
+import { resolveProjectFromIssueSync, extractTeamPrefix, findProjectByTeamSync, listProjectsSync } from '../../lib/projects.js';
 import type { VBriefDocument } from '../../lib/vbrief/types.js';
 
 function getProjectPath(issueId: string): string {
-  const resolved = resolveProjectFromIssue(issueId);
+  const resolved = resolveProjectFromIssueSync(issueId);
   if (resolved?.projectPath) {
     return resolved.projectPath;
   }
   const teamPrefix = extractTeamPrefix(issueId);
-  const project = teamPrefix ? findProjectByTeam(teamPrefix) : null;
+  const project = teamPrefix ? findProjectByTeamSync(teamPrefix) : null;
   if (project?.path) {
     return project.path;
   }
@@ -65,7 +66,7 @@ interface ScopeRow {
 
 function safeReadPlan(path: string): VBriefDocument | null {
   try {
-    return readPlan(path);
+    return readPlanSync(path);
   } catch {
     return null;
   }
@@ -87,28 +88,27 @@ function rowCreatedDate(doc: VBriefDocument | null, filenameDate: string | null,
   }
 }
 
-async function collectLifecycleRows(projectKey: string, projectPath: string): Promise<ScopeRow[]> {
-  const rows: ScopeRow[] = [];
-  const entries = await listVBriefsAsync(projectPath);
-  for (const entry of entries) {
-    let doc: VBriefDocument | null = null;
-    try {
-      doc = await readVBriefDocumentAsync(entry.path);
-    } catch {
-      doc = null;
+function collectLifecycleRows(projectKey: string, projectPath: string) {
+  return Effect.gen(function* () {
+    const rows: ScopeRow[] = [];
+    const entries = yield* listVBriefs(projectPath);
+    for (const entry of entries) {
+      const doc = yield* readVBriefDocument(entry.path).pipe(
+        Effect.catch(() => Effect.succeed(null)),
+      );
+      rows.push({
+        projectKey,
+        projectPath,
+        lifecycle: entry.lifecycleDir,
+        issueId: (doc?.plan?.id ?? entry.issueId).toUpperCase(),
+        title: doc?.plan?.title ?? '(untitled)',
+        status: doc?.plan?.status ?? (doc ? 'unknown' : 'corrupt'),
+        created: rowCreatedDate(doc, entry.date, entry.path),
+        path: entry.path,
+      });
     }
-    rows.push({
-      projectKey,
-      projectPath,
-      lifecycle: entry.lifecycleDir,
-      issueId: (doc?.plan?.id ?? entry.issueId).toUpperCase(),
-      title: doc?.plan?.title ?? '(untitled)',
-      status: doc?.plan?.status ?? (doc ? 'unknown' : 'corrupt'),
-      created: rowCreatedDate(doc, entry.date, entry.path),
-      path: entry.path,
-    });
-  }
-  return rows;
+    return rows;
+  });
 }
 
 function collectInFlightRows(projectKey: string, projectPath: string): ScopeRow[] {
@@ -124,7 +124,7 @@ function collectInFlightRows(projectKey: string, projectPath: string): ScopeRow[
   for (const ws of dirs) {
     if (!ws.startsWith('feature-')) continue;
     const wsPath = join(workspacesDir, ws);
-    const planPath = findPlan(wsPath);
+    const planPath = findPlanSync(wsPath);
     if (!planPath) continue;
     const doc = safeReadPlan(planPath);
     const inferredId = ws.replace(/^feature-/, '').toUpperCase();
@@ -234,27 +234,30 @@ function printRowsTable(rows: ScopeRow[]): void {
 }
 
 async function listCommand(options: { project?: string }): Promise<void> {
-  const allRows: ScopeRow[] = [];
-  if (options.project) {
-    const path = options.project;
-    const key = path.split('/').filter(Boolean).pop() ?? path;
-    allRows.push(...await collectLifecycleRows(key, path));
-    allRows.push(...collectInFlightRows(key, path));
-  } else {
-    // Enumerate ALL registered projects + their in-flight worktrees.
-    const projects = listProjects();
-    if (projects.length === 0) {
-      console.log(
-        chalk.yellow('No projects registered in projects.yaml. Pass --project <path> or add a project first.'),
-      );
-      return;
+  const allRows = await Effect.runPromise(Effect.gen(function* () {
+    const rows: ScopeRow[] = [];
+    if (options.project) {
+      const path = options.project;
+      const key = path.split('/').filter(Boolean).pop() ?? path;
+      rows.push(...yield* collectLifecycleRows(key, path));
+      rows.push(...collectInFlightRows(key, path));
+    } else {
+      // Enumerate ALL registered projects + their in-flight worktrees.
+      const projects = listProjectsSync();
+      if (projects.length === 0) {
+        console.log(
+          chalk.yellow('No projects registered in projects.yaml. Pass --project <path> or add a project first.'),
+        );
+        return rows;
+      }
+      for (const { key, config } of projects) {
+        if (!config.path || !existsSync(config.path)) continue;
+        rows.push(...yield* collectLifecycleRows(key, config.path));
+        rows.push(...collectInFlightRows(key, config.path));
+      }
     }
-    for (const { key, config } of projects) {
-      if (!config.path || !existsSync(config.path)) continue;
-      allRows.push(...await collectLifecycleRows(key, config.path));
-      allRows.push(...collectInFlightRows(key, config.path));
-    }
-  }
+    return rows;
+  }));
 
   const deduped = dedupeRows(allRows);
   printRowsTable(deduped);
@@ -263,7 +266,7 @@ async function listCommand(options: { project?: string }): Promise<void> {
 async function showCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
   const upperId = issueId.toUpperCase();
-  const found = findVBriefByIssue(projectPath, upperId);
+  const found = findVBriefByIssueSync(projectPath, upperId);
   if (!found) {
     console.log(chalk.red(`No vBRIEF found for ${upperId} in ${projectPath}`));
     process.exit(1);
@@ -351,7 +354,7 @@ async function showCommand(issueId: string, options: { project?: string }): Prom
   // Continue-state summary (last session, decisions count, hazards count)
   let cs;
   try {
-    cs = readContinueState(projectPath, upperId);
+    cs = readContinueStateSync(projectPath, upperId);
   } catch (err: any) {
     console.log();
     console.log(chalk.bold('Continue State:'));
@@ -387,55 +390,55 @@ async function showCommand(issueId: string, options: { project?: string }): Prom
 
 async function proposeCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
-  const result = await transitionVBriefOnMain(
+  const result = await Effect.runPromise(transitionVBriefOnMain(
     projectPath,
     issueId,
     'proposed',
     'proposed',
     `scope: propose ${issueId.toUpperCase()} vBRIEF`,
-  );
+  ));
   console.log(formatTransition(result, issueId));
 }
 
 async function approveCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
-  const result = await transitionVBriefOnMain(
+  const result = await Effect.runPromise(transitionVBriefOnMain(
     projectPath,
     issueId,
     'active',
     'approved',
     `scope: approve ${issueId.toUpperCase()} vBRIEF`,
-  );
+  ));
   console.log(formatTransition(result, issueId));
 }
 
 async function completeCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
-  const result = await transitionVBriefOnMain(
+  const result = await Effect.runPromise(transitionVBriefOnMain(
     projectPath,
     issueId,
     'completed',
     'completed',
     `scope: complete ${issueId.toUpperCase()} vBRIEF`,
-  );
+  ));
   console.log(formatTransition(result, issueId));
 }
 
 async function cancelCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
-  const result = await transitionVBriefOnMain(
+  const result = await Effect.runPromise(transitionVBriefOnMain(
     projectPath,
     issueId,
     'cancelled',
     'cancelled',
     `scope: cancel ${issueId.toUpperCase()} vBRIEF`,
-  );
+  ));
   console.log(formatTransition(result, issueId));
 }
 
 async function restoreCommand(issueId: string, options: { project?: string }): Promise<void> {
   const projectPath = options.project ? options.project : getProjectPath(issueId);
-  const found = findVBriefByIssue(projectPath, issueId);
+  const found = findVBriefByIssueSync(projectPath, issueId);
   if (!found) {
     console.log(chalk.red(`No vBRIEF found for ${issueId}`));
     process.exit(1);
@@ -444,13 +447,13 @@ async function restoreCommand(issueId: string, options: { project?: string }): P
     console.log(chalk.yellow(`vBRIEF is in ${found.lifecycleDir} — restore only works from completed/ or cancelled/`));
     process.exit(1);
   }
-  const result = await transitionVBriefOnMain(
+  const result = await Effect.runPromise(transitionVBriefOnMain(
     projectPath,
     issueId,
     'active',
     'approved',
     `scope: restore ${issueId.toUpperCase()} vBRIEF`,
-  );
+  ));
   console.log(formatTransition(result, issueId));
 }
 

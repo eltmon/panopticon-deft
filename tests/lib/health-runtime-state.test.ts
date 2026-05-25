@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -30,16 +31,19 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../../src/lib/tmux.js', () => ({
-  capturePaneAsync: vi.fn(),
-  listSessionNamesAsync: vi.fn(),
-  sessionExistsAsync: sessionExistsAsyncMock,
+  capturePane: vi.fn(() => Effect.succeed('')),
+  listSessionNames: vi.fn(() => Effect.succeed([])),
+  sessionExists: (name: string) => Effect.promise(() => sessionExistsAsyncMock(name)),
+  sessionExistsSync: (name: string) => Effect.promise(() => sessionExistsAsyncMock(name)),
 }));
 
 vi.mock('../../src/lib/agents.js', () => ({
   recoverAgent: recoverAgentMock,
   stopAgent: stopAgentMock,
   getAgentState: getAgentStateMock,
+  getAgentStateSync: getAgentStateMock,
   getAgentRuntimeState: getAgentRuntimeStateMock,
+  getAgentRuntimeStateSync: getAgentRuntimeStateMock,
 }));
 
 describe('health runtime-state classification', () => {
@@ -64,7 +68,7 @@ describe('health runtime-state classification', () => {
     });
 
     const { pingAgent } = await import('../../src/lib/health.js');
-    const health = await pingAgent('agent-pan-446');
+    const health = await Effect.runPromise(pingAgent('agent-pan-446'));
 
     expect(health.status).toBe('warning');
     expect(health.reason).toBe('Claude is waiting for your input');
@@ -83,7 +87,7 @@ describe('health runtime-state classification', () => {
     });
 
     const { pingAgent } = await import('../../src/lib/health.js');
-    const health = await pingAgent('agent-pan-446');
+    const health = await Effect.runPromise(pingAgent('agent-pan-446'));
 
     expect(health.status).toBe('stopped');
     expect(health.reason).toBe('Agent was intentionally stopped');

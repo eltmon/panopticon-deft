@@ -9,20 +9,29 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { AGENTS_DIR } from '../../lib/paths.js';
 import { runPreflightChecks } from '../../lib/work/done-preflight.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../lib/activity-logger.js';
 import { shouldSkipTrackerUpdate } from '../../lib/shadow-mode.js';
 import { updateShadowState } from '../../lib/shadow-state.js';
 import { cleanupWorkflowLabels, getLinearStateName, findLinearStateByName } from '../../core/state-mapping.js';
 import { Effect } from 'effect';
 import { getLinearApiKey } from '../../lib/shadow-utils.js';
-import { extractNumber, resolveIssueId } from '../../lib/issue-id.js';
+import { extractNumberSync, resolveIssueIdSync } from '../../lib/issue-id.js';
 import { getWorkspacePanPaths, readWorkspaceContinue, writeWorkspaceContinue } from '../../lib/pan-dir/index.js';
 import { restoreTrackedBeadsExport } from '../../lib/bd-mutex.js';
-import { resolveProjectFromIssue } from '../../lib/projects.js';
+import { resolveProjectFromIssueSync } from '../../lib/projects.js';
 import type { MergeSet } from '../../lib/merge-set.js';
 
 interface DoneOptions {
   comment?: string;
   force?: boolean;
+  /**
+   * Strike-agent shape (PAN strike role). When true, `pan done` short-circuits
+   * the review-pipeline dispatch: the strike has already merged to main and
+   * verified there, so there is no PR to open, no review specialists to spawn,
+   * and no tracker `in_review` transition. We only emit a completion activity
+   * entry and exit cleanly.
+   */
+  strike?: boolean;
 }
 
 async function updateLinearToInReview(apiKey: string, issueIdentifier: string, comment?: string): Promise<boolean> {
@@ -93,7 +102,7 @@ async function updateGitHubToInReview(issueId: string, comment?: string): Promis
     const ghConfig = getGitHubConfig();
     if (!ghConfig) return false;
 
-    const number = extractNumber(issueId);
+    const number = extractNumberSync(issueId);
     if (number === null) return false;
     const repoConfig = ghConfig.repos.find(r => r.prefix === 'PAN') || ghConfig.repos[0];
     const { owner, repo } = repoConfig;
@@ -175,13 +184,26 @@ async function isMergeSetMergedIntoTargets(
 
 export async function doneCommand(id: string, options: DoneOptions = {}): Promise<void> {
   // Support both "pan done MIN-123" and "pan done agent-min-123"
-  const issueId = resolveIssueId(id);
+  const issueId = resolveIssueIdSync(id);
   const agentId = `agent-${issueId.toLowerCase()}`;
+
+  // Strike-agent shape: the strike already merged to main and verified there,
+  // so there is no review pipeline to dispatch. Emit an activity event and exit.
+  if (options.strike) {
+    emitActivityEntrySync({
+      source: 'strike',
+      level: 'info',
+      issueId,
+      message: `Strike ${issueId} reported done${options.comment ? `: ${options.comment}` : ''}`,
+    });
+    console.log(chalk.green(`✓ Strike ${issueId} acknowledged (review pipeline skipped)`));
+    return;
+  }
 
   // Guard: reject completion for already-closed issues
   if (!options.force) {
-    const { resolveGitHubIssue } = await import('../../lib/tracker-utils.js');
-    const ghInfo = resolveGitHubIssue(issueId);
+    const { resolveGitHubIssueSync } = await import('../../lib/tracker-utils.js');
+    const ghInfo = resolveGitHubIssueSync(issueId);
     if (ghInfo.isGitHub) {
       try {
         const { stdout } = await execAsync(
@@ -205,14 +227,14 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
         process.exit(1);
       }
     } else {
-      const linearApiKey = Effect.runSync(getLinearApiKey());
+      const linearApiKey = await Effect.runPromise(getLinearApiKey());
       if (linearApiKey) {
         try {
           const { LinearClient } = await import('@linear/sdk');
           const client = new LinearClient({ apiKey: linearApiKey });
-          const { extractNumber, extractPrefix } = await import('../../lib/issue-id.js');
-          const issueNum = extractNumber(issueId);
-          const teamKey = extractPrefix(issueId);
+          const { extractNumberSync, extractPrefixSync } = await import('../../lib/issue-id.js');
+          const issueNum = extractNumberSync(issueId);
+          const teamKey = extractPrefixSync(issueId);
           if (issueNum !== null && teamKey !== null) {
             const results = await client.issues({
               filter: { number: { eq: issueNum }, team: { key: { eq: teamKey } } },
@@ -236,8 +258,8 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
 
   // Pre-flight completion checks (unless --force)
   if (!options.force) {
-    const { getAgentState } = await import('../../lib/agents.js');
-    const agentState = getAgentState(agentId);
+    const { getAgentStateSync } = await import('../../lib/agents.js');
+    const agentState = getAgentStateSync(agentId);
     const workspacePath = agentState?.workspace;
 
     if (workspacePath && existsSync(workspacePath)) {
@@ -255,7 +277,7 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
         }
       } catch { /* non-fatal */ }
 
-      const failures = await runPreflightChecks(workspacePath, issueId);
+      const failures = await Effect.runPromise(runPreflightChecks(workspacePath, issueId));
 
       if (failures.length > 0) {
         console.error(chalk.red(`\n✖ Work completion checks failed for ${issueId}:\n`));
@@ -298,18 +320,18 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     // `--ours`. Any other conflicts abort the rebase and surface a clear
     // error; the agent must resolve them and re-run `pan done`.
     {
-      const { getAgentState } = await import('../../lib/agents.js');
-      const rebaseAgentState = getAgentState(agentId);
+      const { getAgentStateSync } = await import('../../lib/agents.js');
+      const rebaseAgentState = getAgentStateSync(agentId);
       const rebaseWorkspacePath = rebaseAgentState?.workspace;
 
       if (rebaseWorkspacePath && existsSync(rebaseWorkspacePath)) {
-        const { ensureMergeSetForIssue } = await import('../../lib/merge-set.js');
+        const { ensureMergeSetForIssueSync } = await import('../../lib/merge-set.js');
         const { rebaseAndPushRepos } = await import('../../lib/rebase-helper.js');
-        const preMergeSet = ensureMergeSetForIssue(issueId);
+        const preMergeSet = ensureMergeSetForIssueSync(issueId);
 
         if (preMergeSet && preMergeSet.repos.length > 0) {
           spinner.text = 'Rebasing onto target branch and pushing...';
-          const rebaseResult = await rebaseAndPushRepos(rebaseWorkspacePath, preMergeSet);
+          const rebaseResult = await Effect.runPromise(rebaseAndPushRepos(rebaseWorkspacePath, preMergeSet));
 
           if (!rebaseResult.success) {
             const failure = rebaseResult.firstFailure!;
@@ -345,12 +367,12 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     const isGitHubIssue = issueId.startsWith('PAN-');
 
     // Step 1: Update status (either tracker or shadow)
-    const skipTrackerUpdate = await shouldSkipTrackerUpdate(issueId);
+    const skipTrackerUpdate = await Effect.runPromise(shouldSkipTrackerUpdate(issueId));
 
     if (skipTrackerUpdate) {
       shadowModeActive = true;
       spinner.text = 'Updating shadow state...';
-      await updateShadowState(issueId, 'in_review', 'pan done');
+      await Effect.runPromise(updateShadowState(issueId, 'in_review', 'pan done'));
       console.log(chalk.cyan(`  👻 Shadow mode: status updated locally`));
     } else if (isGitHubIssue) {
       // GitHub issue - update labels
@@ -362,7 +384,7 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
         console.log(chalk.yellow(`  ⚠ Failed to update GitHub labels`));
       }
     } else {
-      const apiKey = Effect.runSync(getLinearApiKey());
+      const apiKey = await Effect.runPromise(getLinearApiKey());
       if (apiKey) {
         spinner.text = 'Updating Linear to In Review...';
         trackerUpdated = await updateLinearToInReview(apiKey, issueId, options.comment);
@@ -377,8 +399,8 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     }
 
     // Step 2: Create review artifacts immediately and persist merge-set state.
-    const { getAgentState, saveAgentState } = await import('../../lib/agents.js');
-    const existingState = getAgentState(agentId);
+    const { getAgentStateSync, saveAgentStateSync } = await import('../../lib/agents.js');
+    const existingState = getAgentStateSync(agentId);
     const workspacePath = existingState?.workspace;
 
     if (!workspacePath || !existsSync(workspacePath)) {
@@ -387,11 +409,11 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
 
     spinner.text = 'Creating review artifacts...';
     const { createReviewArtifactsForIssue } = await import('../../lib/review-artifacts.js');
-    const { setReviewStatus } = await import('../../lib/review-status.js');
-    const artifactResult = await createReviewArtifactsForIssue(issueId, workspacePath);
+    const { setReviewStatusSync } = await import('../../lib/review-status.js');
+    const artifactResult = await Effect.runPromise(createReviewArtifactsForIssue(issueId, workspacePath));
     const primaryArtifact = artifactResult.mergeSet?.repos.find(repo => !!repo.artifactUrl);
     if (primaryArtifact?.artifactUrl) {
-      setReviewStatus(issueId, { prUrl: primaryArtifact.artifactUrl });
+      setReviewStatusSync(issueId, { prUrl: primaryArtifact.artifactUrl });
     }
 
     const createdArtifacts = artifactResult.artifacts.filter(artifact => !artifact.skipped && artifact.url);
@@ -408,7 +430,7 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
       existingState.status = 'stopped';
       existingState.stoppedByUser = true;
       existingState.lastActivity = new Date().toISOString();
-      saveAgentState(existingState);
+      saveAgentStateSync(existingState);
     }
     // Also update runtime state to idle
     saveAgentRuntimeState(agentId, {
@@ -456,8 +478,8 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     // Step 4b: Guard against actually-merged issues (e.g. merge completed in
     // background while agent was finishing up). Review status is cached state and
     // can be stale after re-submission, so verify git ancestry before skipping.
-    const { getReviewStatus } = await import('../../lib/review-status.js');
-    const currentStatus = getReviewStatus(issueId);
+    const { getReviewStatusSync } = await import('../../lib/review-status.js');
+    const currentStatus = getReviewStatusSync(issueId);
     if (currentStatus?.mergeStatus === 'merged') {
       const actuallyMerged = await isMergeSetMergedIntoTargets(workspacePath, artifactResult.mergeSet);
       if (actuallyMerged) {
@@ -476,7 +498,7 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     if (currentStatus?.reviewStatus === 'passed' && currentStatus?.reviewedAtCommit) {
       const { getWorkspaceGitInfo } = await import('../../lib/git-utils.js');
       try {
-        const { HEAD } = await getWorkspaceGitInfo(workspacePath);
+        const { HEAD } = await Effect.runPromise(getWorkspaceGitInfo(workspacePath));
         if (HEAD === currentStatus.reviewedAtCommit) {
           spinner.succeed(`Work complete: ${issueId} (review already passed at ${HEAD.slice(0, 8)} — no new commits, skipping re-review)`);
           console.log(chalk.green(`  ✓ Review already passed and no new commits detected. Pipeline continues normally.`));
@@ -492,7 +514,7 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     // Atomically initialize review status in SQLite so the pipeline
     // can proceed even if the dashboard is offline. The HTTP trigger below is
     // an optimization — deacon will pick this up if it fails.
-    setReviewStatus(issueId, {
+    setReviewStatusSync(issueId, {
       reviewStatus: 'pending',
       testStatus: 'pending',
       mergeStatus: 'pending',
@@ -505,6 +527,19 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
     await Effect.runPromise(restoreTrackedBeadsExport(workspacePath));
 
     spinner.succeed(`Work complete: ${issueId}`);
+    emitActivityEntrySync({
+      source: 'work-agent',
+      level: 'info',
+      message: `${issueId} work complete — entering review pipeline`,
+      issueId,
+    });
+    emitActivityTtsSync({
+      utterance: `Work agent finished ${issueId}, entering review`,
+      priority: 2,
+      issueId,
+      source: 'work-agent',
+      eventType: 'workAgent.finished',
+    });
     console.log('');
 
     // Summary
@@ -525,8 +560,8 @@ export async function doneCommand(id: string, options: DoneOptions = {}): Promis
 
     // Auto-trigger review & test (respecting circuit breaker)
     try {
-      const { getDashboardApiUrl } = await import('../../lib/config.js');
-      const dashboardUrl = getDashboardApiUrl();
+      const { getDashboardApiUrlSync } = await import('../../lib/config.js');
+      const dashboardUrl = getDashboardApiUrlSync();
 
       // Check if dashboard is running. Use fetch() so https:// URLs work
       // (e.g. when DASHBOARD_URL points at https://pan.localhost via Traefik).

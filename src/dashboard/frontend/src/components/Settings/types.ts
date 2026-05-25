@@ -1,7 +1,7 @@
 // Settings data types matching the new config.yaml structure
 // Now uses smart (capability-based) model selection instead of static presets
 
-export type Provider = 'anthropic' | 'openai' | 'google' | 'zai' | 'kimi' | 'minimax' | 'mimo' | 'openrouter' | 'nous';
+export type Provider = 'anthropic' | 'openai' | 'google' | 'zai' | 'kimi' | 'minimax' | 'mimo' | 'openrouter' | 'nous' | 'dashscope';
 
 export type ModelId = string;
 export type Harness = 'claude-code' | 'pi';
@@ -16,6 +16,7 @@ export interface ProvidersConfig {
   mimo: boolean;
   openrouter: boolean;
   nous: boolean;
+  dashscope: boolean;
 }
 
 export type WorkhorseSlot = 'expensive' | 'mid' | 'cheap';
@@ -51,6 +52,7 @@ export interface ApiKeysConfig {
   mimo?: string;
   openrouter?: string;
   nous?: string;
+  dashscope?: string;
 }
 
 export interface TrackerKeysConfig {
@@ -80,11 +82,31 @@ export interface TtsConfig {
   mutedIssues?: string[];
 }
 
+export interface MemorySettingsConfig {
+  provider?: 'anthropic' | 'cliproxy';
+  model?: string;
+  per_day_cost_cap_usd?: number;
+  fallback_provider?: 'anthropic' | 'cliproxy' | '';
+  fallback_model?: string;
+  fallback_chain?: Array<{ provider: 'anthropic' | 'cliproxy'; model: string }>;
+  observations_enabled?: boolean;
+  prompt_time_injection_enabled?: boolean;
+  rollup_pending_threshold?: number;
+  sidebar_refresh_interval_ms?: number;
+  worker_concurrency?: number;
+}
+
 export interface SettingsConfig {
   workhorses?: WorkhorsesConfig;
   roles?: RolesConfig;
   models: ModelsConfig;
   api_keys: ApiKeysConfig;
+  agents?: {
+    rtk?: {
+      enabled?: boolean;
+    };
+  };
+  memory?: MemorySettingsConfig;
   openrouter?: {
     favorites?: string[];
   };
@@ -113,8 +135,10 @@ export interface SettingsConfig {
     };
   };
   experimental?: {
-    /** Use Claude Code Channels (research-preview) for prompt delivery to eligible work agents. */
+    /** Use Claude Code Channels delivery for conversations/messages. */
     claudeCodeChannels?: boolean;
+    /** Enable legacy Claude Code Channels MCP wiring for new eligible work agents. */
+    claudeCodeChannelsMcp?: boolean;
   };
   /**
    * Permission mode for spawned Claude Code agents.

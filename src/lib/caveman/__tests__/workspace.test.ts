@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
@@ -13,6 +14,7 @@ import { getCavemanHooksDir } from '../setup.js';
 import {
   determineCavemanVariant,
   injectCavemanSettings,
+  injectMemoryHookSettings,
   readCavemanVariant,
   type CavemanVariant,
 } from '../workspace.js';
@@ -22,17 +24,22 @@ const mockGetHooksDir = vi.mocked(getCavemanHooksDir);
 let testBase: string;
 let workspaceDir: string;
 let hooksDir: string;
+let originalPanopticonHome: string | undefined;
 
 beforeEach(() => {
   testBase = join(tmpdir(), `caveman-ws-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   workspaceDir = join(testBase, 'workspace');
   hooksDir = join(testBase, 'hooks');
+  originalPanopticonHome = process.env.PANOPTICON_HOME;
+  process.env.PANOPTICON_HOME = join(testBase, 'pan-home');
   mkdirSync(workspaceDir, { recursive: true });
   mkdirSync(hooksDir, { recursive: true });
   mockGetHooksDir.mockReturnValue(hooksDir);
 });
 
 afterEach(() => {
+  if (originalPanopticonHome === undefined) delete process.env.PANOPTICON_HOME;
+  else process.env.PANOPTICON_HOME = originalPanopticonHome;
   rmSync(testBase, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -65,7 +72,7 @@ describe('determineCavemanVariant', () => {
 
 describe('readCavemanVariant', () => {
   it('returns off when variant file does not exist', async () => {
-    expect(await readCavemanVariant(workspaceDir)).toBe('off');
+    expect(await Effect.runPromise(readCavemanVariant(workspaceDir))).toBe('off');
   });
 
   it.each<[CavemanVariant]>([['enabled'], ['disabled'], ['off']])(
@@ -73,14 +80,69 @@ describe('readCavemanVariant', () => {
     async (variant) => {
       mkdirSync(join(workspaceDir, '.claude'), { recursive: true });
       writeFileSync(join(workspaceDir, '.claude', '.caveman-variant'), variant);
-      expect(await readCavemanVariant(workspaceDir)).toBe(variant);
+      expect(await Effect.runPromise(readCavemanVariant(workspaceDir))).toBe(variant);
     }
   );
 
   it('returns off for unrecognized content', async () => {
     mkdirSync(join(workspaceDir, '.claude'), { recursive: true });
     writeFileSync(join(workspaceDir, '.claude', '.caveman-variant'), 'garbage-value\n');
-    expect(await readCavemanVariant(workspaceDir)).toBe('off');
+    expect(await Effect.runPromise(readCavemanVariant(workspaceDir))).toBe('off');
+  });
+});
+
+describe('injectMemoryHookSettings', () => {
+  it('installs Stop, SessionStart, and UserPromptSubmit memory hooks into fresh settings', async () => {
+    await injectMemoryHookSettings(workspaceDir);
+
+    const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
+    expect(settings.hooks.Stop[0].hooks[0]).toMatchObject({ type: 'command', timeout: 1 });
+    expect(settings.hooks.Stop[0].hooks[0].command).toContain('panopticon-memory-hook.js" turn');
+    expect(settings.hooks.SessionStart[0].hooks[0].command).toContain('panopticon-memory-hook.js" session-start');
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0]).toMatchObject({ type: 'command', timeout: 2 });
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0].command).toContain('panopticon-memory-hook.js" prompt-inject');
+
+    const scriptPath = settings.hooks.Stop[0].hooks[0].command.match(/node "([^"]+)" turn/)?.[1];
+    expect(scriptPath).toContain(join(process.env.PANOPTICON_HOME!, 'hooks', 'memory', 'panopticon-memory-hook.js'));
+    expect(scriptPath).not.toContain(workspaceDir);
+    const script = readFileSync(scriptPath, 'utf-8');
+    expect(script).toContain('/api/memory/turn');
+    expect(script).toContain('/api/memory/session/start');
+    expect(script).toContain('/api/memory/inject');
+  });
+
+  it('preserves existing hooks and does not duplicate memory hooks on repeated setup', async () => {
+    mkdirSync(join(workspaceDir, '.claude'), { recursive: true });
+    writeFileSync(
+      join(workspaceDir, '.claude', 'settings.json'),
+      JSON.stringify({ hooks: { Stop: [{ matcher: '.*', hooks: [{ type: 'command', command: 'echo existing' }] }] } })
+    );
+
+    await injectMemoryHookSettings(workspaceDir);
+    await injectMemoryHookSettings(workspaceDir);
+
+    const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
+    expect(settings.hooks.Stop).toHaveLength(2);
+    expect(settings.hooks.Stop[0].hooks[0].command).toBe('echo existing');
+    expect(settings.hooks.Stop[1].hooks[0].command).toContain('panopticon-memory-hook.js" turn');
+    expect(settings.hooks.SessionStart).toHaveLength(1);
+    expect(settings.hooks.UserPromptSubmit).toHaveLength(1);
+  });
+
+  it('reinstalls all memory hooks after workspace settings are recreated', async () => {
+    await injectMemoryHookSettings(workspaceDir);
+    rmSync(join(workspaceDir, '.claude'), { recursive: true, force: true });
+    mkdirSync(workspaceDir, { recursive: true });
+
+    await injectMemoryHookSettings(workspaceDir);
+
+    const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
+    expect(settings.hooks.Stop).toHaveLength(1);
+    expect(settings.hooks.SessionStart).toHaveLength(1);
+    expect(settings.hooks.UserPromptSubmit).toHaveLength(1);
+    const scriptPath = settings.hooks.UserPromptSubmit[0].hooks[0].command.match(/node "([^"]+)" prompt-inject/)?.[1];
+    expect(scriptPath).not.toContain(workspaceDir);
+    expect(readFileSync(scriptPath, 'utf-8')).toContain('x-panopticon-internal-token');
   });
 });
 
@@ -88,13 +150,13 @@ describe('readCavemanVariant', () => {
 
 describe('injectCavemanSettings', () => {
   it('writes variant file "off" and leaves settings.json untouched', async () => {
-    await injectCavemanSettings(workspaceDir, 'off');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'off'));
     expect(readFileSync(join(workspaceDir, '.claude', '.caveman-variant'), 'utf-8')).toBe('off');
     expect(existsSync(join(workspaceDir, '.claude', 'settings.json'))).toBe(false);
   });
 
   it('writes variant=disabled and skips hook injection', async () => {
-    await injectCavemanSettings(workspaceDir, 'disabled');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'disabled'));
     expect(readFileSync(join(workspaceDir, '.claude', '.caveman-variant'), 'utf-8')).toBe('disabled');
     expect(existsSync(join(workspaceDir, '.claude', 'settings.json'))).toBe(false);
   });
@@ -102,7 +164,7 @@ describe('injectCavemanSettings', () => {
   it('warns and skips injection when activate script is missing', async () => {
     // hooksDir exists but has no panopticon-caveman-activate.js
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await injectCavemanSettings(workspaceDir, 'enabled');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'enabled'));
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('pan admin hooks install'));
     expect(existsSync(join(workspaceDir, '.claude', 'settings.json'))).toBe(false);
   });
@@ -111,7 +173,7 @@ describe('injectCavemanSettings', () => {
     writeFileSync(join(hooksDir, 'panopticon-caveman-activate.js'), '// activate');
     writeFileSync(join(hooksDir, 'caveman-mode-tracker.js'), '// tracker');
 
-    await injectCavemanSettings(workspaceDir, 'enabled');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'enabled'));
 
     const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
     expect(settings.hooks.SessionStart).toHaveLength(1);
@@ -130,7 +192,7 @@ describe('injectCavemanSettings', () => {
       JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo existing', timeout: 5 }] }] } })
     );
 
-    await injectCavemanSettings(workspaceDir, 'enabled');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'enabled'));
 
     const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
     expect(settings.hooks.SessionStart).toHaveLength(2);
@@ -142,8 +204,8 @@ describe('injectCavemanSettings', () => {
     writeFileSync(join(hooksDir, 'panopticon-caveman-activate.js'), '// activate');
     writeFileSync(join(hooksDir, 'caveman-mode-tracker.js'), '// tracker');
 
-    await injectCavemanSettings(workspaceDir, 'enabled');
-    await injectCavemanSettings(workspaceDir, 'enabled');
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'enabled'));
+    await Effect.runPromise(injectCavemanSettings(workspaceDir, 'enabled'));
 
     const settings = JSON.parse(readFileSync(join(workspaceDir, '.claude', 'settings.json'), 'utf-8'));
     expect(settings.hooks.SessionStart).toHaveLength(1);

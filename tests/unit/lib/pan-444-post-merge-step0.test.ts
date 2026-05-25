@@ -3,6 +3,7 @@
  * Covers the new step 0 logic in src/lib/cloister/merge-agent.ts.
  */
 
+import { Effect } from 'effect';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { join } from 'path';
 
@@ -17,6 +18,7 @@ const mockExecAsync = vi.hoisted(() => vi.fn(async (cmd: string) => {
   if (cmd.includes('gh pr list')) return { stdout: '[]', stderr: '' };
   return { stdout: '', stderr: '' };
 }));
+const mockCreateResetMarker = vi.hoisted(() => vi.fn(async (input: unknown) => ({ id: 'reset-1', ...(input as Record<string, unknown>) })));
 const mockExec = vi.hoisted(() => vi.fn((cmd: string, optionsOrCb?: any, maybeCb?: any) => {
   const callback = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
   if (typeof callback === 'function') {
@@ -63,9 +65,15 @@ vi.mock('fs', async (importOriginal) => {
 
 // ── Other dependency mocks ────────────────────────────────────────────────────
 vi.mock('../../../src/lib/tmux.js', () => ({
+  sendKeys: vi.fn(() => Effect.void),
   sendKeysAsync: vi.fn().mockResolvedValue(undefined),
-  sessionExists: vi.fn().mockReturnValue(false),
-  killSession: vi.fn(),
+  sessionExists: vi.fn(() => Effect.succeed(false)),
+  sessionExistsSync: vi.fn().mockReturnValue(false),
+  sessionExistsAsync: vi.fn().mockResolvedValue(false),
+  listSessionNames: vi.fn(() => Effect.succeed([])),
+  listSessionNamesAsync: vi.fn().mockResolvedValue([]),
+  killSession: vi.fn(() => Effect.void),
+  killSessionSync: vi.fn(() => Effect.void),
   killSessionAsync: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -82,6 +90,9 @@ vi.mock('../../../src/lib/paths.js', () => ({
 
 vi.mock('../../../src/lib/tracker-utils.js', () => ({
   resolveGitHubIssue: vi.fn().mockReturnValue({ isGitHub: false }),
+  resolveGitHubIssueSync: vi.fn().mockReturnValue({ isGitHub: false }),
+  resolveTrackerType: vi.fn().mockReturnValue('github'),
+  resolveTrackerTypeSync: vi.fn().mockReturnValue('github'),
 }));
 
 vi.mock('../../../src/lib/cloister/specialists.js', () => ({
@@ -92,7 +103,9 @@ vi.mock('../../../src/lib/cloister/specialists.js', () => ({
 
 vi.mock('../../../src/lib/projects.js', () => ({
   resolveProjectFromIssue: vi.fn().mockReturnValue(null),
+  resolveProjectFromIssueSync: vi.fn().mockReturnValue(null),
   loadProjectsConfig: vi.fn().mockReturnValue({ projects: {} }),
+  loadProjectsConfigSync: vi.fn().mockReturnValue({ projects: {} }),
 }));
 
 vi.mock('../../../src/lib/cloister/validation.js', () => ({
@@ -106,7 +119,13 @@ vi.mock('../../../src/lib/activity-log.js', () => ({
 }));
 
 vi.mock('../../../src/lib/review-status.js', () => ({
+  getReviewStatusSync: vi.fn().mockReturnValue(null),
   setReviewStatus: vi.fn(),
+  setReviewStatusSync: vi.fn(),
+}));
+
+vi.mock('../../../src/lib/memory/cli.js', () => ({
+  createResetMarker: mockCreateResetMarker,
 }));
 
 vi.mock('../../../src/lib/git-utils.js', () => ({
@@ -210,6 +229,17 @@ describe('postMergeLifecycle — step 0 deploy handoff', () => {
     await expect(postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH)).resolves.not.toThrow();
   }, 30_000);
 
+  it('creates a workspace-scoped memory reset marker in the in-process lifecycle', async () => {
+    await postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH, { skipDeploy: true });
+
+    expect(mockCreateResetMarker).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'test-project',
+      scope: 'workspace',
+      scopeId: 'feature-pan-444',
+      reason: 'post-merge cleanup',
+    }));
+  }, 30_000);
+
   it('step 0 does not run when idempotency guard is set', async () => {
     // Guard is set externally (simulating a second invocation after in-process lifecycle ran).
     // The guard check fires before step 0, so writeFile is never called.
@@ -224,6 +254,16 @@ describe('postMergeLifecycle — step 0 deploy handoff', () => {
     expect(mockWriteFile).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
   }, 30_000);
+
+  it('coalesces concurrent post-merge lifecycle calls before step 0 repeats', async () => {
+    const first = postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH);
+    const second = postMergeLifecycle(ISSUE_ID, PROJECT_PATH, SOURCE_BRANCH);
+
+    await Promise.all([first, second]);
+
+    expect(mockWriteFile).toHaveBeenCalledOnce();
+    expect(mockSpawn).toHaveBeenCalledOnce();
+  });
 });
 
 describe('postMergeLifecycle — repoRoot derivation', () => {

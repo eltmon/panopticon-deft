@@ -1,15 +1,13 @@
-import { useState, type FormEvent } from 'react';
+import { useState } from 'react';
 import { getHarness } from '@panctl/contracts';
 
-import { COMMAND_DECK_SURFACE_REGISTRY } from '../../lib/commandDeckSurfaceRegistry';
 import { getFriendlyModelName } from '../../lib/dashboard-utils';
 import { isAgentProblemStatus } from '../../lib/pipeline-state';
 import { useDashboardStore, selectAgentOutput } from '../../lib/store';
 import VerbBadge, { type VerbBadgeProps } from '../primitives/VerbBadge';
+import { AgentTellForm } from '../AgentTellForm';
 import type { Agent } from '../../types';
 import { useDrawerData } from './useDrawerData';
-
-void COMMAND_DECK_SURFACE_REGISTRY;
 
 function isActiveAgent(agent: Agent) {
   return agent.status !== 'stopped' && agent.status !== 'dead' && agent.status !== 'failed';
@@ -34,6 +32,28 @@ function verbBadgeForAgent(agent: Agent): VerbBadgeProps {
   return { variant: 'WORK RUNNING', className: 'text-[9px]' };
 }
 
+export type StreamLineKind = 'verb-line' | 'ok' | 'warn' | 'err' | 'neutral';
+
+const STREAM_LINE_COLOR_CLASS: Record<StreamLineKind, string> = {
+  'verb-line': 'text-signal-review-foreground',
+  ok: 'text-success-foreground',
+  warn: 'text-warning-foreground',
+  err: 'text-destructive-foreground',
+  neutral: 'text-foreground',
+};
+
+/**
+ * Classify a stream line for color routing per PRD §4.7 stream excerpt rules.
+ * Priority: err > warn > ok > verb-line > neutral.
+ */
+export function classifyStreamLine(line: string): StreamLineKind {
+  if (/^[✗❌]|\bERR\b|\bERROR\b|\bFAIL\b/i.test(line)) return 'err';
+  if (/^!|\bWARN\b|\bWARNING\b/i.test(line)) return 'warn';
+  if (/^✓|\bOK\b|\bPASS\b|\bdone\b/i.test(line)) return 'ok';
+  if (/^[→▸✱]/.test(line)) return 'verb-line';
+  return 'neutral';
+}
+
 function formatSpend(cost: number | undefined) {
   if (cost === undefined) return 'loading';
   if (cost >= 100) return `$${cost.toFixed(0)}`;
@@ -49,7 +69,6 @@ export default function DrawerActiveAgent() {
   const agentOutput = useDashboardStore(
     activeAgent ? selectAgentOutput(activeAgent.id) : () => [],
   );
-  const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
 
   if (!activeAgent) {
@@ -66,10 +85,8 @@ export default function DrawerActiveAgent() {
   const streamLines = agentOutput.slice(-8);
   const meta = `${getFriendlyModelName(activeAgent.model)} · ${getHarness(activeAgent)} · spend ${formatSpend(activeAgent.costSoFar)}`;
 
-  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const text = message.trim();
-    if (!text || sending) return;
+  const sendTell = async (text: string) => {
+    if (sending) return false;
 
     setSending(true);
     try {
@@ -78,14 +95,14 @@ export default function DrawerActiveAgent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
       });
-      if (response.ok) {
-        setMessage('');
-      } else {
+      if (!response.ok) {
         const body = await response.text();
         console.error('Tell failed:', body);
       }
+      return response.ok;
     } catch (error) {
       console.error('Tell failed:', error);
+      return false;
     } finally {
       setSending(false);
     }
@@ -104,27 +121,13 @@ export default function DrawerActiveAgent() {
         <div className="shrink-0 text-right font-mono text-[10px] leading-none text-muted-foreground">{meta}</div>
       </div>
 
-      <div data-testid="drawer-active-agent-stream" className="mt-[12px] max-h-[180px] overflow-auto rounded-[10px] border border-border bg-[rgb(0_0_0_/_32%)] px-[12px] py-[10px] font-mono text-[11px] leading-[16px] text-muted-foreground">
-        {streamLines.length > 0 ? streamLines.map((line, index) => <div key={`${line}-${index}`} className="truncate">{line}</div>) : <div className="italic">No recent stream output</div>}
+      <div data-testid="drawer-active-agent-stream" className="mt-[12px] max-h-[180px] overflow-auto rounded-[10px] border border-border bg-[rgb(0_0_0_/_32%)] px-[12px] py-[10px] font-mono text-[11px] leading-[16px]">
+        {streamLines.length > 0 ? streamLines.map((line, index) => (
+          <div key={`${line}-${index}`} className={`truncate ${STREAM_LINE_COLOR_CLASS[classifyStreamLine(line)]}`}>{line}</div>
+        )) : <div className="italic text-muted-foreground">No recent stream output</div>}
       </div>
 
-      <form className="mt-[12px] flex gap-[8px]" onSubmit={onSubmit}>
-        <input
-          type="text"
-          value={message}
-          onChange={(event) => setMessage(event.target.value)}
-          placeholder="Tell this agent..."
-          aria-label="Tell active agent"
-          className="h-[32px] min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-background px-[10px] text-[12px] text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-primary"
-        />
-        <button
-          type="submit"
-          disabled={!message.trim() || sending}
-          className="h-[32px] rounded-[var(--radius-sm)] bg-primary px-[12px] text-[12px] font-medium text-primary-foreground transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Send
-        </button>
-      </form>
+      <AgentTellForm className="mt-[12px] flex gap-[8px]" sending={sending} onSend={sendTell} />
     </section>
   );
 }

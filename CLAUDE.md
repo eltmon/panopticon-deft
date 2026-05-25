@@ -108,7 +108,7 @@ These block the Node.js event loop, freezing all HTTP requests, WebSocket connec
 
 Panopticon supports two coding-agent harnesses: `claude-code` (default) and `pi` (alternative, multi-provider). The harness is picked per spawn at plan kickoff, role runs, work agent start, and the conversation panel; roles read harness/model defaults from Settings. Pi + Anthropic + subscription auth is the only blocked combination (ToS gate in `src/lib/harness-policy.ts`).
 
-See [docs/HARNESSES.md](docs/HARNESSES.md) for installation, picker locations, ToS rules, and troubleshooting.
+See [configuration/harnesses.mdx](configuration/harnesses.mdx) for installation, picker locations, ToS rules, and troubleshooting. The wider field of coding-agent harnesses Panopticon could adopt is surveyed in [reference/harness-landscape.mdx](reference/harness-landscape.mdx). (`docs/HARNESSES.md` is now a redirect stub — the harness docs are published in the Mintlify site.)
 
 ## Panopticon Agent Taxonomy
 
@@ -239,50 +239,50 @@ await execAsync(`tmux send-keys -t ${session} C-m`);  // Enter
 
 Raw `tmux send-keys "text"` followed immediately by `C-m` is unreliable — Enter arrives before text is processed.
 
-## Claude Code Channels (experimental)
+## PTY supervisor for orchestrator delivery
+
+Claude Code work agents and Claude Code conversation sessions use the PTY
+supervisor as the preferred orchestrator-to-agent delivery path. The launcher
+wraps Claude as `node <projectRoot>/dist/pty-supervisor.js claude ...`, exports
+`PANOPTICON_AGENT_ID`, and writes a per-agent `pty-token` under
+`${PANOPTICON_HOME}/agents/<id>/pty-token` before the tmux session starts.
+
+The supervisor is Node 22-only because it owns a real PTY through
+`@homebridge/node-pty-prebuilt-multiarch`; do not run it under Bun. It binds
+`${PANOPTICON_HOME}/sockets/pty-<id>.sock` at mode `0600`, accepts authenticated
+HTTP-on-unix POSTs, writes each delivered message into Claude's PTY input, and
+echoes the message into the tmux transcript so operators can see what was sent.
+
+`deliverAgentMessage(agentId, message, caller?)` is the single delivery
+primitive. In automatic mode it tries, in order:
+
+1. PTY supervisor socket (`path: "supervisor"`)
+2. legacy Claude Code Channels MCP socket for already-wired sessions
+3. tmux paste-buffer fallback
+
+Docker workspaces remain excluded from supervisor wiring until host/container
+socket sharing is designed; Pi keeps using its `rpc.in` FIFO. H1 lifecycle
+semantics apply: the supervisor owns Claude's PTY master fd, so if the
+supervisor process exits, Claude exits with it and the session must be resumed
+through the normal dashboard/Deacon flow.
+
+## Claude Code Channels (experimental legacy fallback)
 
 Reference: https://code.claude.com/docs/en/channels
 
-Claude Code Channels is a research-preview MCP capability that delivers
-orchestrator-to-agent messages over a stdio JSON-RPC transport instead of
-tmux send-keys. It exists because tmux paste-buffer delivery has a long
-tail of failure modes (paste before render, dropped Enter, partial text)
-that surface as silently-unanswered prompts; Channels removes the timing
-race entirely.
+Claude Code Channels is now a legacy fallback — see the PTY supervisor section
+above for the recommended transport. Channels remains only for already-running
+agents with `state.channelsEnabled = true` and for explicit diagnostic opt-in
+via `experimental.claudeCodeChannelsMcp: true`.
 
-The integration in this repo is **opt-in and off by default**, gated
-behind a single experimental flag in the dashboard Settings page
-(`experimental.claudeCodeChannels`). Eligibility is narrow on purpose:
-the path engages only for **work agents** running the **Claude Code**
-runtime with **Anthropic auth** (claude.ai OAuth or Console API key) on
-**non-Docker workspaces**. Codex, Cursor, Gemini, Cliproxy-routed-GPT,
-Bedrock, Vertex, Foundry, and Docker workspaces all stay on tmux send-keys
-unconditionally.
-
-**Architecture:**
-
-- `src/lib/channels/panopticon-bridge.ts` — per-agent Bun stdio MCP server.
-  Spawned by `claude --dangerously-load-development-channels server:panopticon-bridge`
-  using a workspace-local `.pan/agent-mcp.json`. Listens on
-  `${PANOPTICON_HOME}/sockets/agent-<id>.sock` (mode 0o600), accepts POSTs
-  of `{ content, meta? }`, and forwards each as a
-  `notifications/claude/channel` MCP frame.
-- `deliverAgentMessage(agentId, message, caller?)` in `src/lib/agents.ts`
-  is the **single delivery primitive** — eligibility check, socket POST
-  with 2s timeout, automatic tmux fallback on any failure mode (state
-  missing, socket missing, ENOENT, ECONNREFUSED, EPIPE, non-2xx, write
-  timeout). Callers stay caller-agnostic; the primitive owns the policy.
-- The dev-channels confirmation TUI dialog (`WARNING: Loading development
-  channels`) is dismissed automatically at agent startup via one
-  `sendRawKeystrokeAsync(C-m)` call, gated on `state.channelsEnabled`.
-
-**Scope:** only the work-role prompt-delivery sites in `src/lib/agents.ts`
-migrate. The following intentionally stay on `sendKeysAsync`:
-Cloister orchestration helpers outside work-message delivery, `src/lib/runtimes/`
-(non-Claude-Code runtimes), `src/dashboard/server/routes/conversations.ts`,
-and `src/dashboard/server/routes/misc.ts`. Bidirectional reply tools and
-dashboard-routed permission relay are out of scope and tracked as separate
-follow-up issues.
+`src/lib/channels/panopticon-bridge.ts` is a per-agent Bun stdio MCP server.
+When the diagnostic override is enabled, Claude is spawned with
+`--mcp-config <workspace>/.pan/agent-mcp.json --dangerously-load-development-channels server:panopticon-bridge`,
+the bridge listens on `${PANOPTICON_HOME}/sockets/agent-<id>.sock`, and
+`deliverAgentMessage` uses it only after the supervisor tier fails. The
+`WARNING: Loading development channels` dialog is dismissed only when that MCP
+config is actually wired; supervisor-only sessions must not receive this Enter
+keystroke.
 
 ## Dashboard Server Architecture (Effect + Raw WebSocket)
 
@@ -400,13 +400,22 @@ infinite loops. NEVER remove these guards. The loop: specialists/done → onMerg
 → postMergeLifecycle → (re-trigger) → specialists/done burned 24,626 Linear API calls
 before guards were added (PAN-328).
 
-## postMergeLifecycle Docker Cleanup
+## postMergeLifecycle Verify Handoff and Docker Cleanup
 
-`postMergeLifecycle()` in `merge-agent.ts` stops Docker containers and networks after
-merge (step 6). This prevents Docker network pool exhaustion — orphaned networks from
-merged workspaces accumulate and eventually block new workspace creation with
-"all predefined address pools have been fully subnetted". Docker's default pool only
-supports ~31 bridge networks. NEVER remove this cleanup step.
+`postMergeLifecycle()` in `merge-agent.ts` is a non-destructive merge handoff. After
+merge it marks the issue `verifying_on_main`, applies the `verifying-on-main` label,
+pauses the work/planning agents, preserves workspace/state/vBRIEF/branches, and stops
+Docker containers and networks.
+
+Docker cleanup still happens at merge time because orphaned networks from merged
+workspaces accumulate and eventually block new workspace creation with "all predefined
+address pools have been fully subnetted". Docker's default pool only supports ~31 bridge
+networks. NEVER remove this cleanup step.
+
+The destructive/non-reversible completion steps are owned by close-out, not merge:
+`pan close <id>` / dashboard Close Out completes the vBRIEF, archives planning artifacts,
+optionally tears down the workspace or deletes feature branches according to `close_out`
+config, closes the tracker issue, and clears review status.
 
 ## CRITICAL: Deep-Wipe Destroys Everything — NEVER Run Without Explicit User Confirmation
 
@@ -461,6 +470,10 @@ When TLDR is available, you'll have these MCP tools:
    - 20 files × 800 tokens (TLDR) = 16k tokens (94% savings)
 
 **Use TLDR liberally to maximize your session effectiveness.**
+
+## Bash Output Compression (RTK)
+
+When `agents.rtk.enabled` is true, Bash outputs the agent sees (git status, npm output, etc.) may be compressed by RTK. Re-run with `PANOPTICON_RTK_ENABLED=0` to regenerate raw command output.
 
 ## vBRIEF Plans & Lifecycle
 
@@ -520,7 +533,8 @@ If you see an agent referencing `.planning/`, `docs/prds/planned/*.vbrief.json`,
 - `readWorkspacePlan()` returns a merged view: main spec + `statusOverrides` overlay from workspace continue.json.
 - `complete-planning` writes the vBRIEF to `<projectRoot>/.pan/specs/...` with `plan.status: "proposed"`.
 - `start-agent` flips the main-side status field. Work agents read the spec from main via `findPlan()`.
-- `postMergeLifecycle` flips the main-side `plan.status` to `"completed"` after merge.
+- `postMergeLifecycle` marks merged work as `verifying_on_main` and preserves the vBRIEF in its running/active state.
+- `closeOut` flips the main-side `plan.status` to `"completed"` after post-merge verification.
 - `findPlan(workspacePath)` resolves main-side spec via `findSpecByIssue(projectRoot, issueId)`, with fallback to workspace-local `.pan/spec.vbrief.json` for migration compat.
 
 ### Dashboard Viewer
@@ -548,7 +562,8 @@ Rules:
 - At task start, read graphify-out/GRAPH_SUMMARY.md (~700 tokens) for orientation — do NOT read the full GRAPH_REPORT.md (35K tokens) unless you need the complete community listing.
 - For cross-module questions, use the CLI instead of reading files: `graphify query "<question>"`, `graphify path "<A>" "<B>"`, `graphify explain "<concept>"` — these traverse EXTRACTED + INFERRED edges and return only relevant nodes.
 - Only read source files once you know exactly which ones to read (from graphify output or the summary).
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+The graph is refreshed automatically by the merge agent after every merge to main; agents do not need to run `graphify update` manually.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker

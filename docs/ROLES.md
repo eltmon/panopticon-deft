@@ -8,17 +8,36 @@ See [PAN-1048](./prds/planned/PAN-1048-role-primitive.md) for the migration's mo
 
 ---
 
-## The five roles
+## The six roles
 
 | Role | File | Purpose |
 |------|------|---------|
 | `plan` | `roles/plan.md` | Read issue, research codebase, write vBRIEF, create beads |
 | `work` | `roles/work.md` | Claim beads, write code, commit per bead, self-inspect (Jidoka) |
+| `strike` | `roles/strike.md` | Precision drop-in. Implements an isolated fix and merges directly to main, then verifies on main. Bypasses plan/review/test/ship. |
 | `review` | `roles/review.md` | Read manifest, gather convoy findings, approve or request changes |
 | `test` | `roles/test.md` | Run project test suite + Playwright UAT, report failures |
 | `ship` | `roles/ship.md` | Rebase, resolve conflicts, run verification, prep for merge |
 
 A **Run** is a process playing a role: `(role, model, harness)`. Runs are ephemeral — they spawn, do one role's worth of work, update the tracker, and exit. There is no long-lived agent holding state.
+
+---
+
+## `verifying_on_main` phase
+
+A merged issue is not done. After the human Merge button lands the prepared branch, Panopticon moves the issue into canonical state `verifying_on_main` and applies the GitHub label `verifying-on-main`. This phase keeps the issue open and visible while operators run post-merge UAT against `main`.
+
+Role responsibilities during this phase:
+
+| Role | Behavior |
+|------|----------|
+| `ship` | Prepares the branch for the human Merge button. It does not close the issue or tear down the workspace. |
+| merge handoff | `postMergeLifecycle()` marks `mergeStatus: "merged"`, applies `verifying-on-main`, frees runtime resources, and preserves workspace/state/vBRIEF/branches. |
+| `work` / `plan` | Remain paused so the operator can unpause for regression follow-up if verification fails. |
+| `review` / `test` | Their sessions may be killed after merge; the merged code is now evaluated on `main`, not by reusing pre-merge role sessions. |
+| close-out | `pan close <id>` or the dashboard Close Out action performs the final vBRIEF completion, archival, optional teardown/branch deletion, tracker close, and review-status clearing. |
+
+If `close_out.auto=true`, Deacon may run close-out automatically after `close_out.auto_delay_minutes`; otherwise close-out is an explicit operator ceremony.
 
 ---
 
@@ -116,7 +135,7 @@ Pick the shape that matches the use case before you start writing.
 
 **Adding a top-level role** (new pipeline stage):
 1. Create `roles/<name>.md` with Claude-compatible frontmatter (`name`, `description`, `model`, `permissionMode`, `tools`, `hooks`) and the role's prompt body.
-2. Add the role to the `Role` type in `src/lib/agents.ts` (or wherever the central role enum lives).
+2. Add the role to the `Role` type in `src/lib/agents.ts` AND to the `isRole()` guard in the same file. `parseAgentState()` returns `null` for any state.json whose role fails `isRole()`, which silently hides the agent from `listRunningAgents()`, the dashboard read-model bootstrap, and every consumer that iterates from there. The `Role` literal in `packages/contracts/src/types.ts` must also list the new role, and `VALID_ROLES` in `src/dashboard/server/read-model.ts` must accept it — otherwise `toRole()` strips it from snapshots before they reach the frontend. (PAN-1506: strike agents were invisible on the Agents page for exactly this reason — the literal was added to the contract and the role file shipped, but the runtime guards in `agents.ts` and `read-model.ts` were never updated.)
 3. Wire it through `resolveModel()`, the reactive scheduler, and any lifecycle transitions.
 4. Add coverage in `src/lib/__tests__/role-definitions.test.ts`.
 

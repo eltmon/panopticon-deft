@@ -2466,6 +2466,10 @@
   background: var(--card);
 }
 
+.conversationHeaderContainer {
+  container-type: inline-size;
+}
+
 .conversationTerminalTitle {
   font-size: 12px;
   font-weight: 600;
@@ -2579,7 +2583,7 @@
   border-radius: 4px;
   display: flex;
   align-items: center;
-  opacity: 0;
+  opacity: 0.4;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
   flex-shrink: 0;
 }
@@ -2612,6 +2616,40 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+/* "About this conversation" drawer — collapsible summary beneath the header */
+.conversationAboutDrawer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.conversationAboutText {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--foreground);
+}
+
+.conversationAboutMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.conversationAboutMuted {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted-foreground);
 }
 
 .conversationResumeOverlay {
@@ -2649,6 +2687,34 @@
 .conversationResumeBtn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* PAN-1458: "Conversation cleared — continued in conv/N" banner shown at the
+   bottom of a conversation panel when conversation.clearedToConvId is set. */
+.conversationClearedBanner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  width: 100%;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  border: none;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.conversationClearedBanner:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.conversationClearedBannerText strong {
+  color: var(--foreground);
+  font-weight: 600;
 }
 
 /* View toggle: [Conversation] [Terminal] */
@@ -2922,6 +2988,14 @@
   max-height: 200px;
   overflow-y: auto;
   line-height: 1.4;
+}
+
+/* Tool-use header — e.g. Bash description above the command body (PAN-1459) */
+.workLogToolHeader {
+  margin: 4px 0 2px 18px;
+  font-size: 12px;
+  color: var(--foreground);
+  font-weight: 500;
 }
 
 .workLogThinkingResult {
@@ -4531,6 +4605,19 @@
   cursor: not-allowed;
 }
 
+.forkModeGroup {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0 0 4px;
+}
+
+.forkModeGroup legend {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
 .forkCheckboxRow {
   display: flex;
   align-items: center;
@@ -4538,14 +4625,16 @@
   margin-top: 4px;
 }
 
-.forkCheckboxRow input[type="checkbox"] {
+.forkCheckboxRow input[type="checkbox"],
+.forkCheckboxRow input[type="radio"] {
   width: 16px;
   height: 16px;
   cursor: pointer;
   accent-color: var(--primary);
 }
 
-.forkCheckboxRow label {
+.forkCheckboxRow label,
+.forkCheckboxRow span {
   font-size: 12px;
   color: var(--muted-foreground);
   cursor: pointer;

@@ -1,22 +1,30 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { HttpServerRequest, HttpServerResponse } from 'effect/unstable/http';
 
-import { getInternalToken, INTERNAL_TOKEN_HEADER } from '../../../lib/internal-token.js';
+import { getInternalTokenSync, INTERNAL_TOKEN_HEADER } from '../../../lib/internal-token.js';
 import { jsonResponse } from '../http-helpers.js';
-import { getHeaderFromMap, type HeaderMap } from './origin-validation.js';
+import { getHeaderFromMap, getTrustedOrigins, normalizeOrigin, type HeaderMap } from './origin-validation.js';
 
 export const DASHBOARD_SESSION_COOKIE = 'panopticon_session';
+export const DASHBOARD_CSRF_HEADER = 'x-panopticon-csrf-token';
 
 let browserSessionToken: string | undefined;
+let browserCsrfToken: string | undefined;
 
 export function _resetDashboardSessionTokenForTests(): void {
   browserSessionToken = undefined;
+  browserCsrfToken = undefined;
 }
 
 function getDashboardSessionToken(): string {
   browserSessionToken ??= process.env['PANOPTICON_DASHBOARD_SESSION_TOKEN'] ?? randomBytes(32).toString('base64url');
   return browserSessionToken;
+}
+
+export function dashboardCsrfToken(): string {
+  browserCsrfToken ??= process.env['PANOPTICON_DASHBOARD_CSRF_TOKEN'] ?? randomBytes(32).toString('base64url');
+  return browserCsrfToken;
 }
 
 function getHeader(
@@ -28,10 +36,9 @@ function getHeader(
 
 function constantTimeTokenEqual(provided: string | undefined, expected: string): boolean {
   if (!provided) return false;
-  const providedBuffer = Buffer.from(provided, 'utf8');
-  const expectedBuffer = Buffer.from(expected, 'utf8');
-  if (providedBuffer.length !== expectedBuffer.length) return false;
-  return timingSafeEqual(providedBuffer, expectedBuffer);
+  const providedHash = createHash('sha256').update(provided).digest();
+  const expectedHash = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(providedHash, expectedHash);
 }
 
 function cookieValue(cookieHeader: string | undefined, name: string): string | undefined {
@@ -54,7 +61,7 @@ export function dashboardSessionCookieHeader(options: { secure?: boolean } = {})
 }
 
 export function hasDashboardInternalTokenHeaders(headers: HeaderMap): boolean {
-  const expected = getInternalToken();
+  const expected = getInternalTokenSync();
   if (!expected) return false;
 
   const internalHeader = getHeaderFromMap(headers, INTERNAL_TOKEN_HEADER);
@@ -81,10 +88,51 @@ export function hasDashboardAuth(request: HttpServerRequest.HttpServerRequest): 
   return hasDashboardAuthHeaders(request.headers as HeaderMap);
 }
 
+function isJsonContentType(headers: HeaderMap): boolean {
+  const contentType = getHeaderFromMap(headers, 'content-type');
+  if (!contentType) return false;
+  const [mime] = contentType.toLowerCase().split(';');
+  return mime.trim() === 'application/json';
+}
+
+function hasTrustedExactOrigin(headers: HeaderMap): boolean {
+  const origin = getHeaderFromMap(headers, 'origin');
+  if (!origin) return false;
+  const normalized = normalizeOrigin(origin);
+  return !!normalized && getTrustedOrigins().includes(normalized);
+}
+
+function hasValidCsrfToken(headers: HeaderMap): boolean {
+  return constantTimeTokenEqual(getHeaderFromMap(headers, DASHBOARD_CSRF_HEADER), dashboardCsrfToken());
+}
+
+export function rejectUnsafeDashboardMutationRequest(
+  request: HttpServerRequest.HttpServerRequest,
+): Response | null {
+  const authError = rejectUnauthorizedDashboardRequest(request);
+  if (authError) return authError;
+
+  const headers = request.headers as HeaderMap;
+  if (!isJsonContentType(headers)) {
+    return jsonResponse({ error: 'Content-Type must be application/json' }, { status: 400 });
+  }
+
+  if (hasDashboardInternalToken(request)) return null;
+
+  const origin = getHeaderFromMap(headers, 'origin');
+  if (origin && !hasTrustedExactOrigin(headers)) {
+    return jsonResponse({ error: 'Invalid origin' }, { status: 403 });
+  }
+  if (!hasValidCsrfToken(headers)) {
+    return jsonResponse({ error: 'Invalid CSRF token' }, { status: 403 });
+  }
+  return null;
+}
+
 export function rejectUnauthorizedDashboardSessionMintRequest(
   request: HttpServerRequest.HttpServerRequest,
 ): HttpServerResponse.HttpServerResponse | null {
-  const expected = getInternalToken();
+  const expected = getInternalTokenSync();
   if (!expected) {
     return jsonResponse({ error: 'dashboard session token not configured' }, { status: 503 });
   }
@@ -97,7 +145,7 @@ export function rejectUnauthorizedDashboardSessionMintRequest(
 export function rejectUnauthorizedDashboardRequest(
   request: HttpServerRequest.HttpServerRequest,
 ): HttpServerResponse.HttpServerResponse | null {
-  const expected = getInternalToken();
+  const expected = getInternalTokenSync();
   if (!expected) {
     return jsonResponse({ error: 'dashboard session token not configured' }, { status: 503 });
   }

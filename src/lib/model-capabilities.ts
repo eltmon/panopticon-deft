@@ -34,14 +34,20 @@ import type { SubscriptionPlan } from './subscription-types.js';
 export const MODEL_DEPRECATIONS: Record<string, ModelId> = {
   'claude-opus-4-5': 'claude-opus-4-7',
   'claude-sonnet-4-5': 'claude-sonnet-4-6',
-  // OpenAI retired/superseded models
-  'gpt-5.2-codex': 'gpt-5.3-codex', // superseded by gpt-5.3-codex (April 2026)
-  'gpt-5.5-mini': 'gpt-5.4-mini',   // hallucinated tier — never shipped
-  'gpt-5.5-nano': 'gpt-5.4-mini',   // hallucinated tier — never shipped
-  'gpt-5.4-nano': 'gpt-5.4-mini',   // hallucinated tier — never shipped
-  'o3-deep-research': 'o3',
-  // NOTE: gpt-5.4 family is Panopticon's abstraction over real OpenAI models.
-  // Do NOT treat gpt-4o/gpt-4o-mini as deprecated — they are the actual API names.
+  // OpenAI retired/superseded models — addendum 2026-05-23 trim to the
+  // Codex CLI catalog (gpt-5.5, 5.4, 5.4-mini, 5.3-codex, 5.3-codex-spark,
+  // 5.2). Pro tiers and the o-series reasoning models are out.
+  'gpt-5.2-codex': 'gpt-5.3-codex',     // superseded by gpt-5.3-codex (April 2026)
+  'gpt-5.5-mini': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.5-nano': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.4-nano': 'gpt-5.4-mini',       // hallucinated tier — never shipped
+  'gpt-5.5-pro': 'gpt-5.5',             // dropped 2026-05-23 — flagship absorbs Pro role
+  'gpt-5.4-pro': 'gpt-5.4',             // dropped 2026-05-23 — drop the -pro tier
+  'o3': 'gpt-5.4',                      // dropped 2026-05-23 — reasoning -> balanced flagship
+  'o3-deep-research': 'gpt-5.4',        // dropped 2026-05-23 — was already aliased to o3
+  'o4-mini': 'gpt-5.4-mini',            // dropped 2026-05-23 — compact reasoning -> mini
+  'gpt-4o': 'gpt-5.4',                  // dropped 2026-05-23 — legacy flagship -> current balanced
+  'gpt-4o-mini': 'gpt-5.4-mini',        // dropped 2026-05-23 — legacy economy -> mini
   // Google deprecated models
   'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
   'gemini-3-flash': 'gemini-3-flash-preview',
@@ -63,7 +69,7 @@ export const MODEL_DEPRECATIONS: Record<string, ModelId> = {
  * @param modelId - Model ID to resolve (may be deprecated)
  * @returns Current model ID
  */
-export function resolveModelId(modelId: string): ModelId {
+export function resolveModelIdSync(modelId: string): ModelId {
   return (MODEL_DEPRECATIONS[modelId] as ModelId) || (modelId as ModelId);
 }
 
@@ -86,11 +92,13 @@ export type SkillDimension =
 /**
  * Capability profile for a single model
  */
+type CapabilityModelId = ModelId;
+
 export interface ModelCapability {
   /** Model identifier */
   model: ModelId;
   /** Provider for this model */
-  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai' | 'mimo' | 'nous';
+  provider: 'anthropic' | 'openai' | 'google' | 'kimi' | 'minimax' | 'openrouter' | 'zai' | 'mimo' | 'nous' | 'dashscope';
   /** Display name */
   displayName: string;
   /** Cost per 1M tokens (average of input/output) in USD */
@@ -115,7 +123,7 @@ export interface ModelCapability {
  *
  * These are baseline scores - run Kimi 2.5 research to refine.
  */
-export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
+export const MODEL_CAPABILITIES: Record<CapabilityModelId, ModelCapability> = {
   // ═══════════════════════════════════════════════════════════════════════════
   // ANTHROPIC MODELS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -436,7 +444,34 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
       speed: 70,
       'context-length': 85,
     },
-    notes: 'Previous-generation general-purpose model (Oct 2025). Superseded by GPT-5.4.',
+    notes: 'Previous-generation general-purpose model (Oct 2025). Positioned by OpenAI for long-running agent workloads — strong candidate for orchestrator/flywheel roles.',
+  },
+
+  'gpt-5.3-codex-spark': {
+    model: 'gpt-5.3-codex-spark',
+    provider: 'openai',
+    displayName: 'GPT-5.3 Codex Spark',
+    // Headline rate card matches the Codex family ($1.75 in / $14 out) when
+    // the model is reachable, but Spark is a ChatGPT-Pro-only research
+    // preview as of 2026-05-23 — no raw API access. Panopticon routes via
+    // Codex CLI subscription auth through CLIProxy, so it is reachable
+    // when the operator has a Pro account.
+    costPer1MTokens: 7.875,
+    contextWindow: 128000, // 128K per OpenAI excerpt + multiple secondary sources
+    skills: {
+      'code-generation': 92,
+      'code-review': 86,
+      debugging: 84,
+      planning: 78,
+      documentation: 82,
+      testing: 88,
+      security: 76,
+      performance: 82,
+      synthesis: 84,
+      speed: 98, // "1000+ tok/sec" per OpenAI launch material
+      'context-length': 72, // 128K — smaller than the Codex base 400K
+    },
+    notes: 'Ultra-fast coding research preview (Feb 2026). Text-only, 128K context, ChatGPT-Pro-only. Candidate for work.inspect / high-volume code scans when a Pro account is available.',
   },
 
   // Retired OpenAI model IDs — kept for backward compat
@@ -782,20 +817,120 @@ export const MODEL_CAPABILITIES: Record<ModelId, ModelCapability> = {
     },
     notes: 'Qwen 3.6 Plus via Nous Portal. Free for a limited time; 1M-token context according to public launch material.',
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DASHSCOPE (ALIBABA) MODELS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  'qwen3-max': {
+    model: 'qwen3-max',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Max (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 95,
+      'code-review': 93,
+      debugging: 93,
+      planning: 94,
+      documentation: 91,
+      testing: 91,
+      security: 89,
+      performance: 89,
+      synthesis: 94,
+      speed: 72,
+      'context-length': 98,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3-coder-plus': {
+    model: 'qwen3-coder-plus',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Coder Plus (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 96,
+      'code-review': 94,
+      debugging: 94,
+      planning: 91,
+      documentation: 90,
+      testing: 92,
+      security: 89,
+      performance: 90,
+      synthesis: 92,
+      speed: 74,
+      'context-length': 98,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3-plus': {
+    model: 'qwen3-plus',
+    provider: 'dashscope',
+    displayName: 'Qwen3 Plus (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 131072,
+    skills: {
+      'code-generation': 88,
+      'code-review': 86,
+      debugging: 86,
+      planning: 84,
+      documentation: 84,
+      testing: 84,
+      security: 80,
+      performance: 82,
+      synthesis: 88,
+      speed: 82,
+      'context-length': 96,
+    },
+    notes: 'Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
+
+  'qwen3.7-max': {
+    model: 'qwen3.7-max',
+    provider: 'dashscope',
+    displayName: 'Qwen3.7 Max (DashScope)',
+    costPer1MTokens: 0,
+    contextWindow: 262144,
+    skills: {
+      'code-generation': 96,
+      'code-review': 94,
+      debugging: 94,
+      planning: 95,
+      documentation: 92,
+      testing: 92,
+      security: 90,
+      performance: 90,
+      synthesis: 95,
+      speed: 70,
+      'context-length': 98,
+    },
+    notes: 'Canonical DashScope ID verified from Qwen Cloud docs on 2026-05-22. Routed direct to Alibaba DashScope (Singapore intl / ap-southeast-1) via DASHSCOPE_API_KEY. Pricing placeholder pending Alibaba intl endpoint pricing.',
+  },
 };
 
 /**
  * Get capability profile for a model
  */
-export function getModelCapability(model: ModelId): ModelCapability {
-  return MODEL_CAPABILITIES[model];
+export function getModelCapabilitySync(model: ModelId): ModelCapability {
+  const capability = MODEL_CAPABILITIES[model as CapabilityModelId];
+  if (!capability) {
+    throw new Error(`No capability profile registered for model: ${model}`);
+  }
+  return capability;
+}
+
+export function hasModelCapabilitySync(model: ModelId | string): boolean {
+  return model in MODEL_CAPABILITIES;
 }
 
 /**
  * Get all models sorted by a specific skill (descending)
  */
-export function getModelsBySkill(skill: SkillDimension): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).sort(
+export function getModelsBySkillSync(skill: SkillDimension): ModelId[] {
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).sort(
     (a, b) => MODEL_CAPABILITIES[b].skills[skill] - MODEL_CAPABILITIES[a].skills[skill]
   );
 }
@@ -803,10 +938,10 @@ export function getModelsBySkill(skill: SkillDimension): ModelId[] {
 /**
  * Get all models for a provider
  */
-export function getModelsForProvider(
+export function getModelsForProviderSync(
   provider: ModelCapability['provider']
 ): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).filter(
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).filter(
     (model) => MODEL_CAPABILITIES[model].provider === provider
   );
 }
@@ -814,8 +949,8 @@ export function getModelsForProvider(
 /**
  * Get cheapest models (sorted by cost ascending)
  */
-export function getCheapestModels(): ModelId[] {
-  return (Object.keys(MODEL_CAPABILITIES) as ModelId[]).sort(
+export function getCheapestModelsSync(): ModelId[] {
+  return (Object.keys(MODEL_CAPABILITIES) as CapabilityModelId[]).sort(
     (a, b) => MODEL_CAPABILITIES[a].costPer1MTokens - MODEL_CAPABILITIES[b].costPer1MTokens
   );
 }
@@ -824,15 +959,15 @@ export function getCheapestModels(): ModelId[] {
  * Calculate cost efficiency score for a skill
  * Higher = better value (skill score / cost)
  */
-export function getValueScore(model: ModelId, skill: SkillDimension): number {
-  const cap = MODEL_CAPABILITIES[model];
+export function getValueScoreSync(model: ModelId, skill: SkillDimension): number {
+  const cap = getModelCapabilitySync(model);
   return cap.skills[skill] / Math.log10(cap.costPer1MTokens + 1);
 }
 
 /**
  * Get all skill dimensions
  */
-export function getAllSkillDimensions(): SkillDimension[] {
+export function getAllSkillDimensionsSync(): SkillDimension[] {
   return [
     'code-generation',
     'code-review',
@@ -852,34 +987,34 @@ export function getAllSkillDimensions(): SkillDimension[] {
 // All capability queries are pure lookups — additive Effect.sync wrappers.
 
 /** Resolve a (possibly-deprecated) model id to its canonical id. Pure. */
-export const resolveModelIdEffect = (modelId: string): Effect.Effect<ModelId> =>
-  Effect.sync(() => resolveModelId(modelId));
+export const resolveModelId = (modelId: string): Effect.Effect<ModelId> =>
+  Effect.sync(() => resolveModelIdSync(modelId));
 
 /** Look up a model's capability matrix. Pure. */
-export const getModelCapabilityEffect = (
+export const getModelCapability = (
   model: ModelId,
-): Effect.Effect<ModelCapability> => Effect.sync(() => getModelCapability(model));
+): Effect.Effect<ModelCapability> => Effect.sync(() => getModelCapabilitySync(model));
 
 /** List models ranked best-first for a given skill. Pure. */
-export const getModelsBySkillEffect = (
+export const getModelsBySkill = (
   skill: SkillDimension,
-): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsBySkill(skill));
+): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsBySkillSync(skill));
 
 /** List models for a specific provider. Pure. */
-export const getModelsForProviderEffect = (
+export const getModelsForProvider = (
   provider: ModelCapability['provider'],
-): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsForProvider(provider));
+): Effect.Effect<ModelId[]> => Effect.sync(() => getModelsForProviderSync(provider));
 
 /** List the cheapest models ranked best-first. Pure. */
-export const getCheapestModelsEffect = (): Effect.Effect<ModelId[]> =>
-  Effect.sync(() => getCheapestModels());
+export const getCheapestModels = (): Effect.Effect<ModelId[]> =>
+  Effect.sync(() => getCheapestModelsSync());
 
 /** Compute the cost-adjusted value score for a model + skill. Pure. */
-export const getValueScoreEffect = (
+export const getValueScore = (
   model: ModelId,
   skill: SkillDimension,
-): Effect.Effect<number> => Effect.sync(() => getValueScore(model, skill));
+): Effect.Effect<number> => Effect.sync(() => getValueScoreSync(model, skill));
 
 /** Enumerate all known skill dimensions. Pure. */
-export const getAllSkillDimensionsEffect = (): Effect.Effect<SkillDimension[]> =>
-  Effect.sync(() => getAllSkillDimensions());
+export const getAllSkillDimensions = (): Effect.Effect<SkillDimension[]> =>
+  Effect.sync(() => getAllSkillDimensionsSync());

@@ -3,15 +3,17 @@ import { useDashboardStore } from '../../lib/store';
 import { useTheme } from '../../hooks/useTheme';
 import { useConversationUiState } from '../../hooks/useConversationUiState';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Circle, Copy, Check, Loader2, Pencil, Terminal, FileCode, Search, Globe, Wrench, Zap, GitBranchPlus, CheckCircle2, AlertCircle, Archive } from 'lucide-react';
+import { Circle, Copy, Check, Loader2, Pencil, Terminal, FileCode, Search, Globe, Wrench, Zap, GitBranchPlus, CheckCircle2, AlertCircle, Archive, Sparkles, Info, RefreshCw, FileText, ExternalLink, RotateCcw, ArrowRight } from 'lucide-react';
+import { toast } from 'sonner';
 import { XTerminal } from '../XTerminal';
 import type { Conversation } from '../CommandDeck/ConversationList';
 import { updateConversationTitle } from '../CommandDeck/ConversationList';
 import { MessagesTimeline, type RoundMarker } from './MessagesTimeline';
 import { ComposerFooter } from './ComposerFooter';
+import { ContextUsageIndicator } from './ContextUsageIndicator';
 import { ModelPicker, saveStoredHarness, saveStoredModel, type Harness } from './ModelPicker';
 import { getDefaultConversationModel } from './defaultConversationModel';
-import type { ChatMessage, CompactBoundary, ProposedPlan, TurnDiffSummary, WorkLogEntry } from './chat-types';
+import type { ChatMessage, CompactBoundary, ContextUsage, ProposedPlan, TurnDiffSummary, WorkLogEntry } from './chat-types';
 import { getWorkingPhase, getPhaseLabel, getPendingToolEntry, isSpinnerPhase, type WorkingPhase } from '../../lib/workingPhase';
 import { deriveRoundMarkers } from '../../lib/deriveRoundMarkers';
 import type { ReviewerRoundMetadata } from '@panctl/contracts';
@@ -113,6 +115,7 @@ export function ConversationPanel({
   const queryClient = useQueryClient();
   const [deliveryMethod, setDeliveryMethod] = useState(conversation.deliveryMethod ?? 'auto');
   const [deliveryMethodSaving, setDeliveryMethodSaving] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
 
   // Sync the picker when the backing conversation's model changes (e.g. after a
   // resume/switch-model that persisted a new model). useState's lazy initializer
@@ -165,7 +168,12 @@ export function ConversationPanel({
   const { resolvedTheme } = useTheme();
 
   // Fetch turn diff summaries — always use JSONL-based conversation diffs
-  // (the checkpoint-based agent diffs path doesn't populate assistantMessageId)
+  // (the checkpoint-based agent diffs path doesn't populate assistantMessageId).
+  // The /diffs endpoint is keyed by a real conversations-table row; session-
+  // backed panels (SessionPanel, DrawerAgentSession) synthesize a conversation
+  // with id < 0 and have no such row, so skip the fetch — otherwise it
+  // 404-polls every 5s with the session id as the conversation name.
+  const isSyntheticConversation = conversation.id < 0;
   const { data: diffData } = useQuery({
     queryKey: ['conversation-diffs', conversation.name],
     queryFn: async () => {
@@ -173,6 +181,7 @@ export function ConversationPanel({
       if (!res.ok) return null
       return res.json() as Promise<{ summaries: TurnDiffSummary[] }>
     },
+    enabled: !isSyntheticConversation,
     refetchInterval: 5000,
   })
 
@@ -293,6 +302,59 @@ export function ConversationPanel({
     },
   });
 
+  // Regenerate the title from the whole conversation (not just the first message).
+  const retitleMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(conversation.name)}/retitle`,
+        { method: 'POST' },
+      );
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || 'Failed to regenerate title');
+      return data as { title: string };
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['conversations'] });
+      toast.success(`Renamed to "${data.title}"`, { duration: 4000 });
+    },
+    onError: (err: Error) => {
+      toast.error(err.message, { duration: 6000 });
+    },
+  });
+
+  // "About" drawer summary — fetched lazily, only while the drawer is open.
+  const aboutQuery = useQuery({
+    queryKey: ['conversation-about', conversation.name],
+    queryFn: async () => {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(conversation.name)}/about`);
+      if (!res.ok) throw new Error('Failed to load conversation summary');
+      return res.json() as Promise<{
+        summary: string | null;
+        messageCount: number;
+        generatedAt: string | null;
+      }>;
+    },
+    enabled: aboutOpen && !embedded,
+    staleTime: 60_000,
+  });
+
+  const refreshAboutMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(conversation.name)}/about?refresh=1`,
+      );
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || 'Failed to refresh summary');
+      return data as { summary: string | null; messageCount: number; generatedAt: string | null };
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData(['conversation-about', conversation.name], data);
+    },
+    onError: (err: Error) => {
+      toast.error(err.message, { duration: 6000 });
+    },
+  });
+
   const startEditingTitle = useCallback(() => {
     committingRef.current = false;
     const initial = conversation.title ?? conversation.name;
@@ -375,6 +437,16 @@ export function ConversationPanel({
     });
   }, [conversation.id, viewMode]);
 
+  const openHandoffDoc = useCallback(() => {
+    window.open(`/api/conversations/${encodeURIComponent(conversation.name)}/handoff-doc`, '_blank', 'noopener,noreferrer');
+  }, [conversation.name]);
+
+  const openHandoffTarget = useCallback(() => {
+    if (conversation.handoffTargetConvId) {
+      window.location.href = `/conv/${conversation.handoffTargetConvId}`;
+    }
+  }, [conversation.handoffTargetConvId]);
+
   const showTerminal = conversation.sessionAlive || resumed;
 
   const isForkingHeader = !!conversation.forkStatus && conversation.forkStatus !== 'failed';
@@ -389,12 +461,13 @@ export function ConversationPanel({
     ? 'var(--success)'
     : 'var(--muted-foreground)';
   const statusLabel = isForkingHeader ? 'forking' : isSpawningHeader ? 'starting' : isForkFailedHeader || isSpawnFailed ? 'failed' : conversation.sessionAlive ? 'active' : 'ended';
+  const headerContextUsage = messagesData?.contextUsage ?? conversation.contextUsage ?? null;
 
   return (
     <div className={styles.conversationTerminal}>
-      {/* Header bar — hidden in embedded mode (ZoneB already shows session info) */}
+      {/* Header bar — hidden in embedded mode (ZoneB already shows session info), so its context indicator is omitted there. */}
       {!embedded && (
-        <div className={styles.conversationTerminalHeader}>
+        <div className={`${styles.conversationTerminalHeader} ${styles.conversationHeaderContainer}`}>
           <span className={styles.conversationTerminalTitle}>
             {isWorking && (
               <span title={workingLabel} style={{ display: 'contents' }}>
@@ -429,6 +502,18 @@ export function ConversationPanel({
                 >
                   <Pencil size={12} />
                 </button>
+                <button
+                  className={styles.conversationTitleEditBtn}
+                  onClick={() => retitleMutation.mutate()}
+                  disabled={retitleMutation.isPending}
+                  title="Regenerate the title from the whole conversation"
+                  aria-label={`Regenerate title for ${conversation.name}`}
+                  style={retitleMutation.isPending ? { opacity: 1 } : undefined}
+                >
+                  {retitleMutation.isPending
+                    ? <Loader2 size={12} className={styles.spinnerIcon} />
+                    : <Sparkles size={12} />}
+                </button>
               </>
             )}
           </span>
@@ -437,6 +522,7 @@ export function ConversationPanel({
               {conversation.totalCost < 0.01 ? '<$0.01' : `$${conversation.totalCost.toFixed(2)}`}
             </span>
           )}
+          <ContextUsageIndicator contextUsage={headerContextUsage} />
           <span className={styles.conversationTerminalStatus}>
             <Circle
               size={7}
@@ -447,6 +533,28 @@ export function ConversationPanel({
           <span className={styles.conversationSessionId}>
             {conversation.sessionFile?.split('/').pop()?.replace('.jsonl', '') ?? conversation.name}
           </span>
+
+          {conversation.handoffDocPath && (
+            <button
+              className={styles.copyLinkButton}
+              onClick={openHandoffDoc}
+              title="Handoff doc"
+              aria-label={`Open handoff doc for ${conversation.name}`}
+            >
+              <FileText size={14} />
+            </button>
+          )}
+
+          {conversation.handoffTargetConvId && (
+            <button
+              className={styles.copyLinkButton}
+              onClick={openHandoffTarget}
+              title="Open handoff target"
+              aria-label={`Open handoff target for ${conversation.name}`}
+            >
+              <ExternalLink size={14} />
+            </button>
+          )}
 
           {/* Copy link button */}
           <button
@@ -466,6 +574,18 @@ export function ConversationPanel({
             style={hideToolCalls ? { color: 'var(--primary)' } : undefined}
           >
             <Wrench size={14} />
+          </button>
+
+          {/* "About this conversation" drawer toggle */}
+          <button
+            className={styles.copyLinkButton}
+            onClick={() => setAboutOpen(v => !v)}
+            title={aboutOpen ? 'Hide conversation summary' : 'What is this conversation about?'}
+            aria-label={aboutOpen ? 'Hide conversation summary' : 'Show conversation summary'}
+            aria-expanded={aboutOpen}
+            style={aboutOpen ? { color: 'var(--primary)' } : undefined}
+          >
+            <Info size={14} />
           </button>
 
           {/* Archive button with inline confirmation (dialog for favorited) */}
@@ -540,6 +660,45 @@ export function ConversationPanel({
               <option value="channels">Channels</option>
               <option value="tmux">Tmux</option>
             </select>
+          )}
+        </div>
+      )}
+
+      {/* "About this conversation" drawer — collapsible summary beneath the header */}
+      {!embedded && aboutOpen && (
+        <div className={styles.conversationAboutDrawer}>
+          {aboutQuery.isLoading || refreshAboutMutation.isPending ? (
+            <span className={styles.conversationAboutMuted}>
+              <Loader2 size={12} className={styles.spinnerIcon} />
+              Summarizing conversation…
+            </span>
+          ) : aboutQuery.isError ? (
+            <span className={styles.conversationAboutMuted}>
+              Couldn&apos;t load the conversation summary.
+            </span>
+          ) : aboutQuery.data?.summary ? (
+            <>
+              <p className={styles.conversationAboutText}>{aboutQuery.data.summary}</p>
+              <div className={styles.conversationAboutMeta}>
+                <span>
+                  Summary of {aboutQuery.data.messageCount}{' '}
+                  {aboutQuery.data.messageCount === 1 ? 'message' : 'messages'}
+                </span>
+                <button
+                  className={styles.copyLinkButton}
+                  onClick={() => refreshAboutMutation.mutate()}
+                  disabled={refreshAboutMutation.isPending}
+                  title="Regenerate summary"
+                  aria-label="Regenerate conversation summary"
+                >
+                  <RefreshCw size={12} />
+                </button>
+              </div>
+            </>
+          ) : (
+            <span className={styles.conversationAboutMuted}>
+              Not enough conversation yet to summarize.
+            </span>
           )}
         </div>
       )}
@@ -682,6 +841,7 @@ interface MessagesResponse {
   proposedPlan?: ProposedPlan;
   compactBoundaries?: CompactBoundary[];
   compacting?: boolean;
+  contextUsage?: ContextUsage | null;
 }
 
 async function fetchMessages(name: string): Promise<MessagesResponse> {
@@ -914,6 +1074,8 @@ function ConversationView({ conversation, onResume, onArchive, resumePending, mo
           compactBoundaries={data?.compactBoundaries}
           compacting={isCompacting}
           conversationName={conversation.name}
+          cwd={conversation.cwd}
+          issueId={conversation.issueId}
           turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
           onOpenTurnDiff={onOpenTurnDiff}
           resolvedTheme={resolvedTheme}
@@ -921,7 +1083,25 @@ function ConversationView({ conversation, onResume, onArchive, resumePending, mo
           workingPhase={workingPhase}
         />
       )}
-      {isForking ? null : onResume ? (
+      {/* PAN-1458: when this conversation was cleared via Claude Code's /clear, show a
+          banner linking to the sibling that continues the work. The composer/resume bar
+          is suppressed because the conversation is permanently ended — interacting here
+          would either fail or branch off historical content. */}
+      {conversation.clearedToConvId ? (
+        <button
+          type="button"
+          className={styles.conversationClearedBanner}
+          onClick={() => { window.location.href = `/conv/${conversation.clearedToConvId}`; }}
+          title={`Open conv/${conversation.clearedToConvId}`}
+          aria-label={`Open conversation that continues after /clear (conv/${conversation.clearedToConvId})`}
+        >
+          <RotateCcw size={14} />
+          <span className={styles.conversationClearedBannerText}>
+            Conversation cleared — continued in <strong>conv/{conversation.clearedToConvId}</strong>
+          </span>
+          <ArrowRight size={14} />
+        </button>
+      ) : isForking ? null : onResume ? (
         <div className={styles.conversationResumeBar}>
           {modelPicker}
           <button

@@ -16,6 +16,12 @@ import {
   SequenceNumber,
   WaitingReason,
 } from "./types"
+import {
+  MemoryObservation,
+  MemoryStatus,
+  RagDecision,
+  ResetMarker,
+} from "./memory"
 
 // ─── Agent Events ─────────────────────────────────────────────────────────────
 
@@ -33,9 +39,17 @@ export const AgentStoppedEvent = Schema.Struct({
   type: Schema.Literal("agent.stopped"),
   sequence: SequenceNumber,
   timestamp: Schema.String,
-  payload: Schema.Struct({ agentId: AgentId, issueId: IssueId }),
+  payload: Schema.Struct({ agentId: AgentId, issueId: IssueId, sessionId: Schema.optional(Schema.String) }),
 })
 export type AgentStoppedEvent = typeof AgentStoppedEvent.Type
+
+export const AgentHeartbeatDeadEvent = Schema.Struct({
+  type: Schema.Literal("agent.heartbeat_dead"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ agentId: AgentId, issueId: Schema.optional(IssueId), sessionId: Schema.optional(Schema.String) }),
+})
+export type AgentHeartbeatDeadEvent = typeof AgentHeartbeatDeadEvent.Type
 
 /** Role lifecycle — work agent completed implementation and is ready for review. */
 export const WorkCompletedEvent = Schema.Struct({
@@ -83,6 +97,7 @@ export const AgentStatusChangedEvent = Schema.Struct({
     issueId: Schema.optional(IssueId),
     status: AgentStatus,
     previousStatus: Schema.optional(AgentStatus),
+    hasLiveTmuxSession: Schema.optional(Schema.Boolean),
     stoppedByUser: Schema.optional(Schema.Boolean),
     paused: Schema.optional(Schema.Boolean),
     pausedReason: Schema.optional(Schema.NullOr(Schema.String)),
@@ -444,6 +459,32 @@ export const PipelineTestCompletedEvent = Schema.Struct({
 })
 export type PipelineTestCompletedEvent = typeof PipelineTestCompletedEvent.Type
 
+export const OperatorInterventionEvent = Schema.Struct({
+  type: Schema.Literal("operator.intervention"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    kind: Schema.Literals(["tell", "pause", "restart", "manual_edit", "deep_wipe", "unpause", "untroubled"]),
+    source: Schema.String,
+  }),
+})
+export type OperatorInterventionEvent = typeof OperatorInterventionEvent.Type
+
+export const SubstrateBugFiledEvent = Schema.Struct({
+  type: Schema.Literal("substrate.bug_filed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    runId: Schema.optional(Schema.String),
+    filedBy: Schema.Literals(["agent", "operator"]),
+    discoveredIn: Schema.optional(IssueId),
+    severity: Schema.Literals(["P0", "P1", "P2"]),
+  }),
+})
+export type SubstrateBugFiledEvent = typeof SubstrateBugFiledEvent.Type
+
 /**
  * PAN-915 — reviewer session received a new prompt (spawn or resume of a
  * canonical PAN-830 session). Drives event-driven `reviewSubStatuses[role] =
@@ -781,6 +822,65 @@ export const WorkspaceAbortedEvent = Schema.Struct({
 })
 export type WorkspaceAbortedEvent = typeof WorkspaceAbortedEvent.Type
 
+// ─── Memory Events ────────────────────────────────────────────────────────────
+
+export const MemoryObservationCreatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.observation_created"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ observation: MemoryObservation }),
+})
+export type MemoryObservationCreatedEvent = typeof MemoryObservationCreatedEvent.Type
+
+export const MemoryStatusUpdatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.status_updated"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    identity: Schema.Struct({ projectId: Schema.String, workspaceId: Schema.String, issueId: IssueId }),
+    status: MemoryStatus,
+    previousStatus: Schema.optional(MemoryStatus),
+  }),
+})
+export type MemoryStatusUpdatedEvent = typeof MemoryStatusUpdatedEvent.Type
+
+export const MemoryRollupTriggeredEvent = Schema.Struct({
+  type: Schema.Literal("memory.rollup_triggered"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    projectId: Schema.String,
+    workspaceId: Schema.String,
+    issueId: IssueId,
+    pendingCount: Schema.Number,
+    turnIds: Schema.Array(Schema.String),
+    threshold: Schema.Number,
+  }),
+})
+export type MemoryRollupTriggeredEvent = typeof MemoryRollupTriggeredEvent.Type
+
+export const MemoryResetMarkerCreatedEvent = Schema.Struct({
+  type: Schema.Literal("memory.reset_marker_created"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({ marker: ResetMarker }),
+})
+export type MemoryResetMarkerCreatedEvent = typeof MemoryResetMarkerCreatedEvent.Type
+
+export const MemoryHealthChangedEvent = Schema.Struct({
+  type: Schema.Literal("memory.health_changed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    projectId: Schema.String,
+    issueId: IssueId,
+    status: Schema.Literals(["healthy", "degraded", "failing"]),
+    reason: Schema.NullOr(Schema.String),
+    ragDecision: Schema.optional(RagDecision),
+  }),
+})
+export type MemoryHealthChangedEvent = typeof MemoryHealthChangedEvent.Type
+
 // ─── Cost Events ──────────────────────────────────────────────────────────────
 
 /** New — cost event recorded in the store */
@@ -932,6 +1032,7 @@ export const DomainEvent = Schema.Union([
   AgentEnrichmentChangedEvent,
   AgentStartedEvent,
   AgentStoppedEvent,
+  AgentHeartbeatDeadEvent,
   WorkCompletedEvent,
   AgentCompletedEvent,
   ReviewApprovedEvent,
@@ -966,6 +1067,8 @@ export const DomainEvent = Schema.Union([
   PipelineReviewCompletedEvent,
   PipelineTestStartedEvent,
   PipelineTestCompletedEvent,
+  OperatorInterventionEvent,
+  SubstrateBugFiledEvent,
   ReviewReviewerStartedEvent,
   ReviewReviewerCompletedEvent,
   ReviewSpecialistTimedOutEvent,
@@ -984,6 +1087,11 @@ export const DomainEvent = Schema.Union([
   ActivityDetailedEvent,
   ActivityTtsEvent,
   ShadowInferenceUpdateEvent,
+  MemoryObservationCreatedEvent,
+  MemoryStatusUpdatedEvent,
+  MemoryRollupTriggeredEvent,
+  MemoryResetMarkerCreatedEvent,
+  MemoryHealthChangedEvent,
   CostEventRecordedEvent,
   WorkspaceCreatedEvent,
   WorkspaceWipeStartedEvent,

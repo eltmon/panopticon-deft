@@ -2,31 +2,40 @@
  * Tests for agent directory cleanup (PAN-801)
  */
 
+import { Effect } from 'effect';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   isValidAgentDirectoryName,
   isLegacyConversationDirectory,
   getPlanningIssueId,
+  getAgentDirectoryIssueId,
   findOrphanedAgentDirs,
   cleanupAgentDirectories,
+  findClosedIssueAgentDirs,
+  cleanupClosedIssueAgentDirectories,
+  CLOSED_ISSUE_AGENT_DIR_GRACE_MS,
 } from '../agent-directory-cleanup.js';
 
 let TEST_DIR: string;
 
+const NOW_MS = Date.parse('2026-05-23T12:00:00.000Z');
+const OLD_CLOSED_AT = new Date(NOW_MS - CLOSED_ISSUE_AGENT_DIR_GRACE_MS - 1).toISOString();
+const RECENT_CLOSED_AT = new Date(NOW_MS - CLOSED_ISSUE_AGENT_DIR_GRACE_MS + 1).toISOString();
+
 // Mock tmux module
 vi.mock('../tmux.js', () => ({
-  listSessionNamesAsync: vi.fn(),
+  listSessionNames: vi.fn(),
 }));
 
-import { listSessionNamesAsync } from '../tmux.js';
+import { listSessionNames } from '../tmux.js';
 
 beforeEach(() => {
   TEST_DIR = join(tmpdir(), `agent-cleanup-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(TEST_DIR, { recursive: true });
-  vi.mocked(listSessionNamesAsync).mockReset();
+  vi.mocked(listSessionNames).mockReset();
 });
 
 afterEach(() => {
@@ -143,28 +152,41 @@ describe('getPlanningIssueId', () => {
   });
 });
 
+describe('getAgentDirectoryIssueId', () => {
+  it('extracts canonical issue IDs from role and slot agent directories', () => {
+    expect(getAgentDirectoryIssueId('agent-pan-1052-ship')).toBe('PAN-1052');
+    expect(getAgentDirectoryIssueId('agent-pan-1122-5')).toBe('PAN-1122');
+    expect(getAgentDirectoryIssueId('agent-min-215-review-security')).toBe('MIN-215');
+  });
+
+  it('rejects unrelated and uppercase directory names', () => {
+    expect(getAgentDirectoryIssueId('conv-20260411-1125')).toBeNull();
+    expect(getAgentDirectoryIssueId('agent-PAN-1052-ship')).toBeNull();
+  });
+});
+
 // ------------------------------------------------------------------
 // findOrphanedAgentDirs
 // ------------------------------------------------------------------
 
 describe('findOrphanedAgentDirs', () => {
   it('returns empty array when agents dir does not exist', async () => {
-    const result = await findOrphanedAgentDirs(join(TEST_DIR, 'nonexistent'));
+    const result = await Effect.runPromise(findOrphanedAgentDirs(join(TEST_DIR, 'nonexistent')));
     expect(result).toEqual([]);
   });
 
   it('returns empty array when all directories are valid agents with no stale planning', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue(['planning-pan-801']);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed(['planning-pan-801']));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-801'), { recursive: true });
 
-    const result = await findOrphanedAgentDirs(TEST_DIR);
+    const result = await Effect.runPromise(findOrphanedAgentDirs(TEST_DIR));
     expect(result).toEqual([]);
   });
 
   it('identifies legacy directories as orphaned', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'agent-108'), { recursive: true });
@@ -172,7 +194,7 @@ describe('findOrphanedAgentDirs', () => {
     mkdirSync(join(TEST_DIR, 'conv-20260411-1125'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'specialist-test-agent'), { recursive: true });
 
-    const result = await findOrphanedAgentDirs(TEST_DIR);
+    const result = await Effect.runPromise(findOrphanedAgentDirs(TEST_DIR));
     const names = result.map((d) => d.name).sort();
 
     expect(names).toEqual(['agent-108', 'conv-20260411-1125', 'specialist-test-agent', 'work-pan-208']);
@@ -180,25 +202,25 @@ describe('findOrphanedAgentDirs', () => {
   });
 
   it('treats stale planning directories (no running session) as orphaned', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-569'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-min-787'), { recursive: true });
 
-    const result = await findOrphanedAgentDirs(TEST_DIR);
+    const result = await Effect.runPromise(findOrphanedAgentDirs(TEST_DIR));
     const names = result.map((d) => d.name).sort();
 
     expect(names).toEqual(['planning-min-787', 'planning-pan-569']);
   });
 
   it('preserves planning directories with running tmux sessions', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue(['planning-pan-817']);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed(['planning-pan-817']));
 
     mkdirSync(join(TEST_DIR, 'planning-pan-817'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-569'), { recursive: true });
 
-    const result = await findOrphanedAgentDirs(TEST_DIR);
+    const result = await Effect.runPromise(findOrphanedAgentDirs(TEST_DIR));
     const names = result.map((d) => d.name).sort();
 
     expect(names).toEqual(['planning-pan-569']);
@@ -206,11 +228,11 @@ describe('findOrphanedAgentDirs', () => {
   });
 
   it('marks running legacy sessions as protected', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue(['conv-20260411-1125']);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed(['conv-20260411-1125']));
 
     mkdirSync(join(TEST_DIR, 'conv-20260411-1125'), { recursive: true });
 
-    const result = await findOrphanedAgentDirs(TEST_DIR);
+    const result = await Effect.runPromise(findOrphanedAgentDirs(TEST_DIR));
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe('conv-20260411-1125');
     expect(result[0].hasRunningSession).toBe(true);
@@ -223,17 +245,17 @@ describe('findOrphanedAgentDirs', () => {
 
 describe('cleanupAgentDirectories', () => {
   it('dry-run previews orphaned directories without deleting', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'agent-108'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-569'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'conv-20260411-1125'), { recursive: true });
 
-    const result = await cleanupAgentDirectories({
+    const result = await Effect.runPromise(cleanupAgentDirectories({
       dryRun: true,
       agentsDir: TEST_DIR,
-    });
+    }));
 
     expect(result.totalOrphaned).toBe(3);
     expect(result.wouldRemove).toContain('agent-108');
@@ -250,18 +272,18 @@ describe('cleanupAgentDirectories', () => {
   });
 
   it('removes orphaned directories in non-dry-run mode', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'agent-108'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-569'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'conv-20260411-1125'), { recursive: true });
 
-    const result = await cleanupAgentDirectories({
+    const result = await Effect.runPromise(cleanupAgentDirectories({
       dryRun: false,
       force: true,
       agentsDir: TEST_DIR,
-    });
+    }));
 
     expect(result.totalOrphaned).toBe(3);
     expect(result.removed).toContain('agent-108');
@@ -278,16 +300,16 @@ describe('cleanupAgentDirectories', () => {
   });
 
   it('never touches valid agent directories', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
     mkdirSync(join(TEST_DIR, 'agent-pan-801'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'agent-min-215'), { recursive: true });
 
-    const result = await cleanupAgentDirectories({
+    const result = await Effect.runPromise(cleanupAgentDirectories({
       dryRun: false,
       force: true,
       agentsDir: TEST_DIR,
-    });
+    }));
 
     expect(result.totalOrphaned).toBe(0);
     expect(result.removed).toEqual([]);
@@ -296,20 +318,20 @@ describe('cleanupAgentDirectories', () => {
   });
 
   it('protects running planning and conv sessions', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([
       'planning-pan-817',
       'conv-20260425-025517-630',
-    ]);
+    ]));
 
     mkdirSync(join(TEST_DIR, 'planning-pan-817'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'conv-20260425-025517-630'), { recursive: true });
     mkdirSync(join(TEST_DIR, 'planning-pan-569'), { recursive: true });
 
-    const result = await cleanupAgentDirectories({
+    const result = await Effect.runPromise(cleanupAgentDirectories({
       dryRun: false,
       force: true,
       agentsDir: TEST_DIR,
-    });
+    }));
 
     expect(result.totalOrphaned).toBe(2);
     expect(result.protected).toContain('conv-20260425-025517-630');
@@ -321,17 +343,85 @@ describe('cleanupAgentDirectories', () => {
   });
 
   it('handles empty agents directory', async () => {
-    vi.mocked(listSessionNamesAsync).mockResolvedValue([]);
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
 
-    const result = await cleanupAgentDirectories({
+    const result = await Effect.runPromise(cleanupAgentDirectories({
       dryRun: false,
       force: true,
       agentsDir: TEST_DIR,
-    });
+    }));
 
     expect(result.totalOrphaned).toBe(0);
     expect(result.removed).toEqual([]);
     expect(result.protected).toEqual([]);
     expect(result.wouldRemove).toEqual([]);
+  });
+});
+
+describe('closed issue agent directory cleanup', () => {
+  it('finds old closed-issue agent directories by directory name', async () => {
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
+    mkdirSync(join(TEST_DIR, 'agent-pan-1052-ship'), { recursive: true });
+
+    const result = await Effect.runPromise(findClosedIssueAgentDirs({
+      agentsDir: TEST_DIR,
+      nowMs: NOW_MS,
+      issues: [{ identifier: 'PAN-1052', status: 'done', completedAt: OLD_CLOSED_AT }],
+    }));
+
+    expect(result.map((dir) => dir.name)).toEqual(['agent-pan-1052-ship']);
+    expect(result[0].issueId).toBe('PAN-1052');
+    expect(result[0].hasRunningSession).toBe(false);
+  });
+
+  it('does not report recent closed issues or active issues', async () => {
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
+    mkdirSync(join(TEST_DIR, 'agent-pan-1331-ship'), { recursive: true });
+    mkdirSync(join(TEST_DIR, 'agent-pan-1419-work-1'), { recursive: true });
+
+    const result = await Effect.runPromise(findClosedIssueAgentDirs({
+      agentsDir: TEST_DIR,
+      nowMs: NOW_MS,
+      issues: [
+        { identifier: 'PAN-1331', status: 'done', completedAt: RECENT_CLOSED_AT },
+        { identifier: 'PAN-1419', status: 'in_progress' },
+      ],
+    }));
+
+    expect(result).toEqual([]);
+  });
+
+  it('removes old closed-issue agent directories during cleanup', async () => {
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
+    mkdirSync(join(TEST_DIR, 'agent-pan-1190-review'), { recursive: true });
+
+    const result = await Effect.runPromise(cleanupClosedIssueAgentDirectories({
+      agentsDir: TEST_DIR,
+      nowMs: NOW_MS,
+      force: true,
+      issues: [{ identifier: 'PAN-1190', status: 'closed', completedAt: OLD_CLOSED_AT }],
+    }));
+
+    expect(result.removed).toEqual(['agent-pan-1190-review']);
+    expect(existsSync(join(TEST_DIR, 'agent-pan-1190-review'))).toBe(false);
+  });
+
+  it('protects directories that contain JSONL session files', async () => {
+    vi.mocked(listSessionNames).mockReturnValue(Effect.succeed([]));
+    const agentDir = join(TEST_DIR, 'agent-pan-1148-test');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'session.jsonl'), '{}\n', 'utf8');
+
+    const result = await Effect.runPromise(cleanupClosedIssueAgentDirectories({
+      agentsDir: TEST_DIR,
+      nowMs: NOW_MS,
+      force: true,
+      issues: [{ identifier: 'PAN-1148', canonicalStatus: 'done', completedAt: OLD_CLOSED_AT }],
+    }));
+
+    expect(result.removed).toEqual([]);
+    expect(result.protected).toEqual(['agent-pan-1148-test']);
+    expect(existsSync(agentDir)).toBe(true);
+    expect(existsSync(join(agentDir, 'session.jsonl'))).toBe(true);
   });
 });

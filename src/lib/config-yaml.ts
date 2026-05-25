@@ -18,7 +18,7 @@ import yaml from 'js-yaml';
 import { parseDocument } from 'yaml';
 import { ModelId } from './settings.js';
 import { ModelProvider } from './model-fallback.js';
-import { MODEL_DEPRECATIONS, resolveModelId } from './model-capabilities.js';
+import { MODEL_DEPRECATIONS, resolveModelIdSync } from './model-capabilities.js';
 import type { SubscriptionPlan, AuthMode } from './subscription-types.js';
 import type { Role } from './agents.js';
 import type { RuntimeName } from './runtimes/types.js';
@@ -61,6 +61,61 @@ export interface TmuxConfig {
   config_mode?: TmuxConfigMode;
 }
 
+export interface MemoryConfig {
+  extraction?: {
+    provider?: 'anthropic' | 'cliproxy';
+    model?: string;
+    per_day_cost_cap_usd?: number;
+    fallback_chain?: Array<{ provider: 'anthropic' | 'cliproxy'; model: string }>;
+  };
+  features?: {
+    observations?: boolean;
+    prompt_time_injection?: boolean;
+  };
+  rollup_pending_threshold?: number;
+  sidebar_refresh_interval_ms?: number;
+  worker_concurrency?: number;
+}
+
+export const COMPLIANCE_MODES = ['off', 'advisory', 'enforcing'] as const;
+export type ComplianceMode = typeof COMPLIANCE_MODES[number];
+
+export interface ComplianceConfig {
+  mode?: ComplianceMode;
+}
+
+export interface NormalizedComplianceConfig {
+  mode: ComplianceMode;
+}
+
+export interface FeatureRegistryClassificationConfig {
+  enabled?: boolean;
+  provider?: 'anthropic' | 'cliproxy';
+  model?: string;
+  per_day_cost_cap_usd?: number;
+}
+
+export interface FeatureRegistryConfig {
+  classification?: FeatureRegistryClassificationConfig;
+}
+
+export interface NormalizedFeatureRegistryConfig {
+  classification: {
+    enabled: boolean;
+    provider: 'anthropic' | 'cliproxy';
+    model: string;
+    perDayCostCapUsd: number;
+  };
+}
+
+function isComplianceMode(value: unknown): value is ComplianceMode {
+  return typeof value === 'string' && (COMPLIANCE_MODES as readonly string[]).includes(value);
+}
+
+function isFeatureRegistryClassificationProvider(value: unknown): value is NormalizedFeatureRegistryConfig['classification']['provider'] {
+  return value === 'anthropic' || value === 'cliproxy';
+}
+
 export type ManualCompactMode = 'claude-code' | 'panopticon-native';
 
 export interface ConversationsConfig {
@@ -86,6 +141,86 @@ export interface ConversationsConfig {
   };
 }
 
+export type DocsEmbeddingProvider = 'local' | 'openai';
+export type DocsClassifierProvider = 'anthropic' | 'cliproxy';
+export type DocsPrdStatus = 'active' | 'planned' | 'completed';
+
+export interface DocsConfig {
+  enabled?: boolean;
+  prompt_injection?: boolean;
+  cli?: boolean;
+  trigger?: {
+    regexes?: string[];
+    case_sensitive?: boolean;
+  };
+  corpus?: {
+    docs?: boolean;
+    skills?: boolean;
+    rules?: boolean;
+    claude_md?: boolean;
+    prds?: boolean;
+    prd_statuses?: DocsPrdStatus[];
+    max_chunk_tokens?: number;
+  };
+  budget?: {
+    injection_rate?: number;
+    turn_window?: number;
+    max_tokens_per_injection?: number;
+    max_chunks_per_injection?: number;
+    bypass_classifier_threshold?: number;
+  };
+  embedding?: {
+    provider?: DocsEmbeddingProvider;
+    model?: string;
+    dimensions?: number;
+  };
+  classifier?: {
+    enabled?: boolean;
+    provider?: DocsClassifierProvider;
+    model?: string;
+    threshold?: number;
+    timeout_ms?: number;
+  };
+}
+
+export interface NormalizedDocsConfig {
+  enabled: boolean;
+  promptInjectionEnabled: boolean;
+  cliEnabled: boolean;
+  trigger: {
+    regexes: string[];
+    caseSensitive: boolean;
+  };
+  corpus: {
+    docs: boolean;
+    skills: boolean;
+    rules: boolean;
+    claudeMd: boolean;
+    prds: boolean;
+    prdStatuses: DocsPrdStatus[];
+    maxChunkTokens: number;
+  };
+  budget: {
+    injectionRate: number;
+    turnWindow: number;
+    maxTokensPerInjection: number;
+    maxChunksPerInjection: number;
+    bypassClassifierThreshold: number;
+  };
+  embedding: {
+    provider: DocsEmbeddingProvider;
+    model: string;
+    dimensions: number;
+  };
+  classifier: {
+    enabled: boolean;
+    provider: DocsClassifierProvider;
+    model: string;
+    threshold: number;
+    timeoutMs: number;
+  };
+}
+
 /**
  * TTS summarizer configuration
  */
@@ -100,6 +235,8 @@ export interface TtsSummarizerConfig {
 
 export interface TtsDaemonConfig {
   enabled?: boolean;
+  /** Announce planning/work agent lifecycle (start + finish) via TTS. Default true. */
+  lifecycle?: boolean;
   voice?: string;
   statusVoice?: string;
   volume?: number;
@@ -119,6 +256,12 @@ export interface TtsDaemonConfig {
 
 export interface NormalizedTtsDaemonConfig {
   enabled: boolean;
+  /**
+   * Announce planning/work agent lifecycle events (start + finish) via TTS.
+   * Default true. Set false to mute the substrate-breathing announcements
+   * without disabling TTS overall.
+   */
+  lifecycle: boolean;
   voice: string;
   statusVoice?: string;
   volume: number;
@@ -136,6 +279,7 @@ export interface NormalizedTtsDaemonConfig {
 
 export type WorkhorseSlot = 'expensive' | 'mid' | 'cheap';
 export type ModelRef = string;
+export const PARENT_MODEL_REF = 'parent';
 
 /**
  * Canonical workhorse slot list. Anything outside this set is rejected by
@@ -156,6 +300,17 @@ export interface RoleConfig {
   model: ModelRef;
   harness?: 'claude-code' | 'pi';
   effort?: RoleEffort;
+  /**
+   * Target minimum concurrent agents the role should keep launched. The
+   * orchestrator MUST be aggressive about reaching this number — if the active
+   * count is below `minAgents`, launching new agents is the tick's primary
+   * action, not optional. For the flywheel role only.
+   */
+  minAgents?: number;
+  /**
+   * Hard ceiling on concurrent agents. The orchestrator never spawns past
+   * this number, even if more work is queued.
+   */
   maxAgents?: number;
   scope?: FlywheelScope;
   sub?: Record<string, RoleSubConfig>;
@@ -170,6 +325,9 @@ export const DEFAULT_MODEL_REFS: Record<Role, ModelRef> = {
   test: 'workhorse:mid',
   ship: 'workhorse:mid',
   flywheel: 'claude-opus-4-7',
+  // Strike merges directly to main — precision matters, so default to the
+  // expensive workhorse slot (same as plan/review).
+  strike: 'workhorse:expensive',
 };
 
 export const DEFAULT_WORKHORSES: Required<WorkhorsesConfig> = {
@@ -199,11 +357,15 @@ export const DEFAULT_ROLES: Record<Role, RoleConfig> = {
   },
   test: { model: 'workhorse:mid' },
   ship: { model: 'workhorse:mid' },
+  // Strike (precision-merge-to-main role) — defaults to the expensive workhorse
+  // slot because strike skips the normal review pipeline and lands directly.
+  strike: { model: 'workhorse:expensive' },
   flywheel: {
     harness: 'claude-code',
     model: 'claude-opus-4-7',
     effort: 'high',
-    maxAgents: 8,
+    minAgents: 20,
+    maxAgents: 30,
     scope: 'pan-only',
   },
 };
@@ -247,6 +409,7 @@ export interface YamlConfig {
       mimo?: ProviderConfig | boolean;
       openrouter?: ProviderConfig | boolean;
       nous?: ProviderConfig | boolean;
+      dashscope?: ProviderConfig | boolean;
     };
 
     /** Per-work-type overrides (explicit model for specific tasks) */
@@ -276,6 +439,7 @@ export interface YamlConfig {
     mimo?: string;
     openrouter?: string;
     nous?: string;
+    dashscope?: string;
   };
 
   /** Tracker API keys (override environment variables) */
@@ -295,6 +459,18 @@ export interface YamlConfig {
   /** Conversation-specific configuration */
   conversations?: ConversationsConfig;
 
+  /** Panopticon docs RAG configuration */
+  docs?: DocsConfig;
+
+  /** Durable memory extraction and retrieval configuration */
+  memory?: MemoryConfig;
+
+  /** Memory-first compliance audit configuration */
+  compliance?: ComplianceConfig;
+
+  /** Knowledge registry population configuration */
+  registry?: FeatureRegistryConfig;
+
   /** Multi-tool sync configuration */
   tools?: {
     /**
@@ -309,6 +485,8 @@ export interface YamlConfig {
   agents?: {
     /** Caveman compressed output mode configuration */
     caveman?: CavemanConfig;
+    /** RTK Bash output compression configuration */
+    rtk?: RtkConfig;
   };
 
   /** TTS configuration */
@@ -356,6 +534,7 @@ export interface ExperimentalConfig {
    * delivery sites continue to use tmux send-keys. Default: false.
    */
   claudeCodeChannels?: boolean;
+  claudeCodeChannelsMcp?: boolean;
 }
 
 /**
@@ -398,6 +577,10 @@ export interface CavemanConfig {
   merge?: CavemanMode;
 }
 
+export interface RtkConfig {
+  enabled?: boolean;
+}
+
 /**
  * Normalized shadow configuration
  */
@@ -437,6 +620,7 @@ export interface NormalizedConfig {
     mimo?: string;
     openrouter?: string;
     nous?: string;
+    dashscope?: string;
   };
 
   /** Provider auth mode (subscription vs api-key) by provider */
@@ -491,11 +675,38 @@ export interface NormalizedConfig {
     };
   };
 
+  /** Panopticon docs RAG behavior */
+  docs: NormalizedDocsConfig;
+
+  /** Durable memory extraction and retrieval configuration */
+  memory: {
+    extraction: {
+      provider?: 'anthropic' | 'cliproxy';
+      model?: string;
+      perDayCostCapUsd?: number;
+      fallbackChain: Array<{ provider: 'anthropic' | 'cliproxy'; model: string }>;
+    };
+    observationsEnabled: boolean;
+    promptTimeInjectionEnabled: boolean;
+    rollupPendingThreshold: number;
+    sidebarRefreshIntervalMs: number;
+    workerConcurrency: number;
+  };
+
+  /** Memory-first compliance audit configuration */
+  compliance: NormalizedComplianceConfig;
+
+  /** Knowledge registry population configuration */
+  registry: NormalizedFeatureRegistryConfig;
+
   /** Shadow mode configuration */
   shadow: NormalizedShadowConfig;
 
   /** Caveman compressed output configuration (normalised, never undefined) */
   caveman: NormalizedCavemanConfig;
+
+  /** RTK Bash output compression configuration (normalised, never undefined) */
+  rtk: NormalizedRtkConfig;
 
   /** TTS daemon configuration (normalised, never undefined) */
   tts: NormalizedTtsDaemonConfig;
@@ -530,6 +741,8 @@ export interface NormalizedConfig {
 export interface NormalizedExperimentalConfig {
   /** Whether Claude Code Channels prompt delivery is enabled for eligible work agents. */
   claudeCodeChannels: boolean;
+  /** Whether legacy Claude Code Channels MCP wiring is enabled for new spawns. */
+  claudeCodeChannelsMcp: boolean;
 }
 
 /**
@@ -547,6 +760,10 @@ export interface NormalizedCavemanConfig {
     test: CavemanMode;
     merge: CavemanMode;
   };
+}
+
+export interface NormalizedRtkConfig {
+  enabled: boolean;
 }
 
 /**
@@ -569,8 +786,8 @@ export function resolveConversationWatchDirs(config: RuntimeConversationsConfig)
   };
 }
 
-export function getConversationsConfig(): RuntimeConversationsConfig {
-  const { config } = loadConfig();
+export function getConversationsConfigSync(): RuntimeConversationsConfig {
+  const { config } = loadConfigSync();
   return resolveConversationWatchDirs({
     ...config.conversations,
     apiKeys: config.apiKeys,
@@ -578,39 +795,7 @@ export function getConversationsConfig(): RuntimeConversationsConfig {
   });
 }
 
-export async function getConversationsConfigAsync(): Promise<RuntimeConversationsConfig> {
-  const { config } = await loadConfigAsyncNoMigration();
-  return resolveConversationWatchDirs({
-    ...config.conversations,
-    apiKeys: config.apiKeys,
-    enabledProviders: config.enabledProviders,
-  });
-}
 
-export async function updateConversationsConfigAsync(updates: ConversationsConfig): Promise<void> {
-  await loadConfigAsyncNoMigration();
-  let existingContent = '{}\n';
-  try {
-    const content = await readFileAsync(GLOBAL_CONFIG_PATH, 'utf-8');
-    existingContent = content.trim().length > 0 ? content : '{}\n';
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== 'ENOENT') throw error;
-  }
-
-  const doc = parseDocument(existingContent);
-  if (doc.contents === null) {
-    doc.contents = parseDocument('{}\n').contents;
-  }
-
-  for (const [key, value] of Object.entries(updates) as Array<[keyof ConversationsConfig, unknown]>) {
-    if (value !== undefined) doc.setIn(['conversations', key], value);
-  }
-
-  await mkdirAsync(dirname(GLOBAL_CONFIG_PATH), { recursive: true });
-  await writeFileAsync(GLOBAL_CONFIG_PATH, doc.toString({ lineWidth: 120 }), 'utf-8');
-  clearConfigCache();
-}
 
 export interface MigrationResult {
   /** List of migrated model IDs */
@@ -639,6 +824,20 @@ export interface ConfigLoadResult {
 /**
  * Default configuration (used when no config files exist)
  */
+const DEFAULT_DOCS_TRIGGER_REGEXES = [
+  'pan',
+  'panopticon',
+  'cloister',
+  'deacon',
+  'workspace',
+  'specialist',
+  'harness',
+  'bd',
+  'beads',
+  'vbrief',
+  'workhorse',
+];
+
 const DEFAULT_CONFIG: NormalizedConfig = {
   tmux: {
     configMode: 'managed',
@@ -671,6 +870,64 @@ const DEFAULT_CONFIG: NormalizedConfig = {
       costConfirmThreshold: 1.00,
     },
   },
+  docs: {
+    enabled: true,
+    promptInjectionEnabled: true,
+    cliEnabled: true,
+    trigger: {
+      regexes: DEFAULT_DOCS_TRIGGER_REGEXES,
+      caseSensitive: false,
+    },
+    corpus: {
+      docs: true,
+      skills: true,
+      rules: true,
+      claudeMd: true,
+      prds: false,
+      prdStatuses: ['active', 'planned'],
+      maxChunkTokens: 500,
+    },
+    budget: {
+      injectionRate: 1,
+      turnWindow: 10,
+      maxTokensPerInjection: 3000,
+      maxChunksPerInjection: 5,
+      bypassClassifierThreshold: 0.85,
+    },
+    embedding: {
+      provider: 'local',
+      model: 'gte-small',
+      dimensions: 384,
+    },
+    classifier: {
+      enabled: false,
+      provider: 'anthropic',
+      model: 'claude-haiku-4-5',
+      threshold: 0.85,
+      timeoutMs: 1500,
+    },
+  },
+  memory: {
+    extraction: {
+      fallbackChain: [],
+    },
+    observationsEnabled: true,
+    promptTimeInjectionEnabled: true,
+    rollupPendingThreshold: 4,
+    sidebarRefreshIntervalMs: 10_000,
+    workerConcurrency: 4,
+  },
+  compliance: {
+    mode: 'advisory',
+  },
+  registry: {
+    classification: {
+      enabled: true,
+      provider: 'cliproxy',
+      model: 'gpt-4.1-nano',
+      perDayCostCapUsd: 1,
+    },
+  },
   shadow: {
     enabled: false,
     trackers: {
@@ -690,8 +947,12 @@ const DEFAULT_CONFIG: NormalizedConfig = {
       merge: 'full',
     },
   },
+  rtk: {
+    enabled: false,
+  },
   tts: {
     enabled: false,
+    lifecycle: true,
     voice: '',
     volume: 1,
     rate: 1,
@@ -718,6 +979,7 @@ const DEFAULT_CONFIG: NormalizedConfig = {
   },
   experimental: {
     claudeCodeChannels: false,
+    claudeCodeChannelsMcp: false,
   },
   claude: {
     permissionMode: 'auto',
@@ -841,7 +1103,7 @@ function loadGlobalConfig(): YamlConfig | null {
   return loadYamlFile(GLOBAL_CONFIG_PATH);
 }
 
-async function loadYamlFileAsync(filePath: string): Promise<YamlConfig | null> {
+async function loadYamlFileFromDisk(filePath: string): Promise<YamlConfig | null> {
   try {
     const content = await readFileAsync(filePath, 'utf-8');
     const parsed = yaml.load(content) as YamlConfig;
@@ -854,7 +1116,7 @@ async function loadYamlFileAsync(filePath: string): Promise<YamlConfig | null> {
   }
 }
 
-async function findProjectRootAsync(startDir: string = process.cwd()): Promise<string | null> {
+async function findProjectRootFromDisk(startDir: string = process.cwd()): Promise<string | null> {
   let currentDir = startDir;
 
   while (currentDir !== '/') {
@@ -868,29 +1130,29 @@ async function findProjectRootAsync(startDir: string = process.cwd()): Promise<s
   return null;
 }
 
-async function loadProjectConfigAsync(): Promise<YamlConfig | null> {
-  const projectRoot = await findProjectRootAsync();
+async function loadProjectConfigFromDisk(): Promise<YamlConfig | null> {
+  const projectRoot = await findProjectRootFromDisk();
   if (!projectRoot) return null;
 
   const newConfigPath = join(projectRoot, '.pan.yaml');
-  if (await pathExistsAsync(newConfigPath)) return stripProjectTtsEndpoint(await loadYamlFileAsync(newConfigPath));
+  if (await pathExistsFromDisk(newConfigPath)) return stripProjectTtsEndpoint(await loadYamlFileFromDisk(newConfigPath));
 
   const legacyConfigPath = join(projectRoot, '.panopticon.yaml');
-  if (await pathExistsAsync(legacyConfigPath)) {
+  if (await pathExistsFromDisk(legacyConfigPath)) {
     process.stderr.write(
       `[panopticon] Deprecation warning: .panopticon.yaml is deprecated. Rename it to .pan.yaml.\n`
     );
-    return stripProjectTtsEndpoint(await loadYamlFileAsync(legacyConfigPath));
+    return stripProjectTtsEndpoint(await loadYamlFileFromDisk(legacyConfigPath));
   }
 
   return null;
 }
 
-async function loadGlobalConfigAsync(): Promise<YamlConfig | null> {
-  return loadYamlFileAsync(GLOBAL_CONFIG_PATH);
+async function loadGlobalConfigFromDisk(): Promise<YamlConfig | null> {
+  return loadYamlFileFromDisk(GLOBAL_CONFIG_PATH);
 }
 
-async function pathExistsAsync(filePath: string): Promise<boolean> {
+async function pathExistsFromDisk(filePath: string): Promise<boolean> {
   try {
     await statAsync(filePath);
     return true;
@@ -960,11 +1222,117 @@ function mergeCavemanConfig(
   }
 }
 
+function mergeRtkConfig(result: NormalizedRtkConfig, config: YamlConfig | null): void {
+  const rtk = config?.agents?.rtk;
+  if (!rtk) return;
+
+  if (rtk.enabled !== undefined) {
+    result.enabled = rtk.enabled;
+  }
+}
+
+export function getDefaultRtkConfig(): NormalizedRtkConfig {
+  return {
+    enabled: DEFAULT_CONFIG.rtk.enabled,
+  };
+}
+
+export function mergeRtkConfigs(...configs: (YamlConfig | null)[]): NormalizedRtkConfig {
+  const result = getDefaultRtkConfig();
+  for (const config of configs) {
+    mergeRtkConfig(result, config);
+  }
+  return result;
+}
+
+function cloneDocsConfig(config: NormalizedDocsConfig): NormalizedDocsConfig {
+  return {
+    enabled: config.enabled,
+    promptInjectionEnabled: config.promptInjectionEnabled,
+    cliEnabled: config.cliEnabled,
+    trigger: {
+      regexes: [...config.trigger.regexes],
+      caseSensitive: config.trigger.caseSensitive,
+    },
+    corpus: {
+      docs: config.corpus.docs,
+      skills: config.corpus.skills,
+      rules: config.corpus.rules,
+      claudeMd: config.corpus.claudeMd,
+      prds: config.corpus.prds,
+      prdStatuses: [...config.corpus.prdStatuses],
+      maxChunkTokens: config.corpus.maxChunkTokens,
+    },
+    budget: { ...config.budget },
+    embedding: { ...config.embedding },
+    classifier: { ...config.classifier },
+  };
+}
+
+function mergeDocsConfig(result: NormalizedDocsConfig, config: YamlConfig | null): void {
+  const docs = config?.docs;
+  if (!docs) return;
+
+  if (docs.enabled !== undefined) result.enabled = docs.enabled;
+  if (docs.prompt_injection !== undefined) result.promptInjectionEnabled = docs.prompt_injection;
+  if (docs.cli !== undefined) result.cliEnabled = docs.cli;
+
+  if (docs.trigger) {
+    if (docs.trigger.regexes !== undefined) result.trigger.regexes = [...docs.trigger.regexes];
+    if (docs.trigger.case_sensitive !== undefined) result.trigger.caseSensitive = docs.trigger.case_sensitive;
+  }
+
+  if (docs.corpus) {
+    if (docs.corpus.docs !== undefined) result.corpus.docs = docs.corpus.docs;
+    if (docs.corpus.skills !== undefined) result.corpus.skills = docs.corpus.skills;
+    if (docs.corpus.rules !== undefined) result.corpus.rules = docs.corpus.rules;
+    if (docs.corpus.claude_md !== undefined) result.corpus.claudeMd = docs.corpus.claude_md;
+    if (docs.corpus.prds !== undefined) result.corpus.prds = docs.corpus.prds;
+    if (docs.corpus.prd_statuses !== undefined) result.corpus.prdStatuses = [...docs.corpus.prd_statuses];
+    if (docs.corpus.max_chunk_tokens !== undefined) result.corpus.maxChunkTokens = docs.corpus.max_chunk_tokens;
+  }
+
+  if (docs.budget) {
+    if (docs.budget.injection_rate !== undefined) result.budget.injectionRate = docs.budget.injection_rate;
+    if (docs.budget.turn_window !== undefined) result.budget.turnWindow = docs.budget.turn_window;
+    if (docs.budget.max_tokens_per_injection !== undefined) result.budget.maxTokensPerInjection = docs.budget.max_tokens_per_injection;
+    if (docs.budget.max_chunks_per_injection !== undefined) result.budget.maxChunksPerInjection = docs.budget.max_chunks_per_injection;
+    if (docs.budget.bypass_classifier_threshold !== undefined) result.budget.bypassClassifierThreshold = docs.budget.bypass_classifier_threshold;
+  }
+
+  if (docs.embedding) {
+    if (docs.embedding.provider !== undefined) result.embedding.provider = docs.embedding.provider;
+    if (docs.embedding.model !== undefined) result.embedding.model = docs.embedding.model;
+    if (docs.embedding.dimensions !== undefined) result.embedding.dimensions = docs.embedding.dimensions;
+  }
+
+  if (docs.classifier) {
+    if (docs.classifier.enabled !== undefined) result.classifier.enabled = docs.classifier.enabled;
+    if (docs.classifier.provider !== undefined) result.classifier.provider = docs.classifier.provider;
+    if (docs.classifier.model !== undefined) result.classifier.model = docs.classifier.model;
+    if (docs.classifier.threshold !== undefined) result.classifier.threshold = docs.classifier.threshold;
+    if (docs.classifier.timeout_ms !== undefined) result.classifier.timeoutMs = docs.classifier.timeout_ms;
+  }
+}
+
+export function getDefaultDocsConfig(): NormalizedDocsConfig {
+  return cloneDocsConfig(DEFAULT_CONFIG.docs);
+}
+
+export function mergeDocsConfigs(...configs: (YamlConfig | null)[]): NormalizedDocsConfig {
+  const result = getDefaultDocsConfig();
+  for (const config of configs) {
+    mergeDocsConfig(result, config);
+  }
+  return result;
+}
+
 function mergeTtsConfig(result: NormalizedTtsDaemonConfig, config: YamlConfig | null): void {
   const tts = config?.tts;
   if (!tts) return;
 
   if (tts.enabled !== undefined) result.enabled = tts.enabled;
+  if (tts.lifecycle !== undefined) result.lifecycle = tts.lifecycle;
   if (tts.voice !== undefined) result.voice = tts.voice;
   if (tts.statusVoice !== undefined) result.statusVoice = tts.statusVoice;
   if (tts.volume !== undefined) result.volume = tts.volume;
@@ -983,6 +1351,7 @@ function mergeTtsConfig(result: NormalizedTtsDaemonConfig, config: YamlConfig | 
 export function getDefaultTtsDaemonConfig(): NormalizedTtsDaemonConfig {
   return {
     enabled: DEFAULT_CONFIG.tts.enabled,
+    lifecycle: DEFAULT_CONFIG.tts.lifecycle ?? true,
     voice: DEFAULT_CONFIG.tts.voice,
     statusVoice: DEFAULT_CONFIG.tts.statusVoice,
     volume: DEFAULT_CONFIG.tts.volume,
@@ -1020,7 +1389,10 @@ export function derefWorkhorse(
   config: Pick<NormalizedConfig, 'workhorses'>,
   fieldPath = 'model',
 ): ModelId {
-  if (!isWorkhorseRef(ref)) return resolveModelId(ref) as ModelId;
+  if (ref === PARENT_MODEL_REF) {
+    throw new Error(`config.yaml: ${fieldPath} cannot be ${PARENT_MODEL_REF}; ${PARENT_MODEL_REF} is a resolve-only sub-role sentinel`);
+  }
+  if (!isWorkhorseRef(ref)) return resolveModelIdSync(ref) as ModelId;
 
   const slot = workhorseSlotFromRef(ref) as WorkhorseSlot;
   const resolved = config.workhorses?.[slot];
@@ -1030,7 +1402,7 @@ export function derefWorkhorse(
   if (isWorkhorseRef(resolved)) {
     throw new Error(`config.yaml: workhorses.${slot} cannot reference another workhorse`);
   }
-  return resolveModelId(resolved) as ModelId;
+  return resolveModelIdSync(resolved) as ModelId;
 }
 
 export function resolveModel(
@@ -1039,7 +1411,8 @@ export function resolveModel(
   config: Pick<NormalizedConfig, 'roles' | 'workhorses'> = {},
 ): ModelId {
   const roleConfig = config.roles?.[role];
-  const subModel = subRole ? roleConfig?.sub?.[subRole]?.model : undefined;
+  const rawSubModel = subRole ? roleConfig?.sub?.[subRole]?.model : undefined;
+  const subModel = rawSubModel === PARENT_MODEL_REF ? undefined : rawSubModel;
   const roleModel = roleConfig?.model;
   const ref = subModel ?? roleModel ?? DEFAULT_MODEL_REFS[role];
   const fieldPath = subModel
@@ -1104,6 +1477,16 @@ function validateRoleFields(role: Role, roleConfig: RoleConfig): void {
   if (roleConfig.maxAgents !== undefined && (!Number.isInteger(roleConfig.maxAgents) || roleConfig.maxAgents < 1)) {
     throw new Error(`config.yaml: roles.${role}.maxAgents must be a positive integer`);
   }
+  if (roleConfig.minAgents !== undefined && (!Number.isInteger(roleConfig.minAgents) || roleConfig.minAgents < 0)) {
+    throw new Error(`config.yaml: roles.${role}.minAgents must be a non-negative integer`);
+  }
+  if (
+    roleConfig.minAgents !== undefined &&
+    roleConfig.maxAgents !== undefined &&
+    roleConfig.minAgents > roleConfig.maxAgents
+  ) {
+    throw new Error(`config.yaml: roles.${role}.minAgents (${roleConfig.minAgents}) cannot exceed maxAgents (${roleConfig.maxAgents})`);
+  }
   if (roleConfig.scope !== undefined && roleConfig.scope !== 'pan-only' && roleConfig.scope !== 'all-tracked-projects') {
     throw new Error(`config.yaml: roles.${role}.scope must be pan-only or all-tracked-projects`);
   }
@@ -1111,10 +1494,13 @@ function validateRoleFields(role: Role, roleConfig: RoleConfig): void {
 
 function validateRoleModelRefs(config: NormalizedConfig): void {
   for (const [slot, ref] of Object.entries(config.workhorses ?? {}) as Array<[WorkhorseSlot, ModelRef]>) {
+    if (ref === PARENT_MODEL_REF) {
+      throw new Error(`config.yaml: workhorses.${slot} cannot be ${PARENT_MODEL_REF}; ${PARENT_MODEL_REF} is valid only for sub-role models`);
+    }
     if (isWorkhorseRef(ref)) {
       throw new Error(`config.yaml: workhorses.${slot} cannot reference another workhorse`);
     }
-    resolveModelId(ref);
+    resolveModelIdSync(ref);
   }
 
   for (const [role, roleConfig] of Object.entries(config.roles ?? {}) as Array<[Role, RoleConfig]>) {
@@ -1123,7 +1509,7 @@ function validateRoleModelRefs(config: NormalizedConfig): void {
       derefWorkhorse(roleConfig.model, config, `roles.${role}.model`);
     }
     for (const [subRole, subConfig] of Object.entries(roleConfig.sub ?? {})) {
-      if (subConfig.model) {
+      if (subConfig.model && subConfig.model !== PARENT_MODEL_REF) {
         derefWorkhorse(subConfig.model, config, `roles.${role}.sub.${subRole}.model`);
       }
     }
@@ -1142,6 +1528,23 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
     enabledProviders: new Set(DEFAULT_CONFIG.enabledProviders),
     workhorses: { ...DEFAULT_WORKHORSES },
     roles: cloneRoles(DEFAULT_ROLES),
+    memory: {
+      extraction: {
+        ...DEFAULT_CONFIG.memory.extraction,
+        fallbackChain: [...DEFAULT_CONFIG.memory.extraction.fallbackChain],
+      },
+      observationsEnabled: DEFAULT_CONFIG.memory.observationsEnabled,
+      promptTimeInjectionEnabled: DEFAULT_CONFIG.memory.promptTimeInjectionEnabled,
+      rollupPendingThreshold: DEFAULT_CONFIG.memory.rollupPendingThreshold,
+      sidebarRefreshIntervalMs: DEFAULT_CONFIG.memory.sidebarRefreshIntervalMs,
+      workerConcurrency: DEFAULT_CONFIG.memory.workerConcurrency,
+    },
+    compliance: {
+      mode: DEFAULT_CONFIG.compliance.mode,
+    },
+    registry: {
+      classification: { ...DEFAULT_CONFIG.registry.classification },
+    },
     shadow: {
       enabled: DEFAULT_CONFIG.shadow.enabled,
       trackers: { ...DEFAULT_CONFIG.shadow.trackers },
@@ -1151,8 +1554,13 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
       abTest: DEFAULT_CONFIG.caveman.abTest,
       modes: { ...DEFAULT_CONFIG.caveman.modes },
     },
+    rtk: {
+      enabled: DEFAULT_CONFIG.rtk.enabled,
+    },
+    docs: cloneDocsConfig(DEFAULT_CONFIG.docs),
     tts: {
       enabled: DEFAULT_CONFIG.tts.enabled,
+      lifecycle: DEFAULT_CONFIG.tts.lifecycle,
       voice: DEFAULT_CONFIG.tts.voice,
       volume: DEFAULT_CONFIG.tts.volume,
       rate: DEFAULT_CONFIG.tts.rate,
@@ -1179,6 +1587,7 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
     },
     experimental: {
       claudeCodeChannels: DEFAULT_CONFIG.experimental.claudeCodeChannels,
+      claudeCodeChannelsMcp: DEFAULT_CONFIG.experimental.claudeCodeChannelsMcp,
     },
     claude: {
       permissionMode: DEFAULT_CONFIG.claude.permissionMode,
@@ -1299,6 +1708,17 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
       } else if (providers.nous !== undefined) {
         explicitlyDisabled.add('nous');
       }
+
+      // Alibaba DashScope
+      const dashscope = normalizeProviderConfig(providers.dashscope, legacyKeys.dashscope);
+      if (dashscope.enabled) {
+        result.enabledProviders.add('dashscope');
+        if (dashscope.api_key) {
+          result.apiKeys.dashscope = resolveEnvVar(dashscope.api_key);
+        }
+      } else if (providers.dashscope !== undefined) {
+        explicitlyDisabled.add('dashscope');
+      }
     }
 
     // Merge tmux configuration
@@ -1308,7 +1728,7 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
 
     // Merge conversation configuration
     if (config.conversations?.compaction_model) {
-      result.conversations.compactionModel = resolveModelId(config.conversations.compaction_model);
+      result.conversations.compactionModel = resolveModelIdSync(config.conversations.compaction_model);
     }
     if (config.conversations?.manual_compact_mode) {
       result.conversations.manualCompactMode = config.conversations.manual_compact_mode;
@@ -1317,7 +1737,7 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
       result.conversations.richCompaction = config.conversations.rich_compaction;
     }
     if (config.conversations?.title_model) {
-      result.conversations.titleModel = resolveModelId(config.conversations.title_model);
+      result.conversations.titleModel = resolveModelIdSync(config.conversations.title_model);
     }
     if (config.conversations?.watch_dirs) {
       result.conversations.watchDirs = config.conversations.watch_dirs;
@@ -1351,6 +1771,58 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
     }
     if (config.conversations?.enrichment?.cost_confirm_threshold !== undefined) {
       result.conversations.enrichment.costConfirmThreshold = config.conversations.enrichment.cost_confirm_threshold;
+    }
+
+    if (config.memory) {
+      if (config.memory.extraction) {
+        result.memory.extraction = {
+          ...result.memory.extraction,
+          ...(config.memory.extraction.provider !== undefined ? { provider: config.memory.extraction.provider } : {}),
+          ...(config.memory.extraction.model !== undefined ? { model: config.memory.extraction.model } : {}),
+          ...(config.memory.extraction.per_day_cost_cap_usd !== undefined ? { perDayCostCapUsd: config.memory.extraction.per_day_cost_cap_usd } : {}),
+          ...(config.memory.extraction.fallback_chain !== undefined ? { fallbackChain: config.memory.extraction.fallback_chain } : {}),
+        };
+      }
+      if (config.memory.features?.observations !== undefined) {
+        result.memory.observationsEnabled = config.memory.features.observations;
+      }
+      if (config.memory.features?.prompt_time_injection !== undefined) {
+        result.memory.promptTimeInjectionEnabled = config.memory.features.prompt_time_injection;
+      }
+      if (config.memory.rollup_pending_threshold !== undefined) {
+        result.memory.rollupPendingThreshold = config.memory.rollup_pending_threshold;
+      }
+      if (config.memory.sidebar_refresh_interval_ms !== undefined) {
+        result.memory.sidebarRefreshIntervalMs = config.memory.sidebar_refresh_interval_ms;
+      }
+      if (config.memory.worker_concurrency !== undefined) {
+        result.memory.workerConcurrency = config.memory.worker_concurrency;
+      }
+    }
+
+    if (config.compliance?.mode !== undefined) {
+      if (!isComplianceMode(config.compliance.mode)) {
+        throw new Error(`config.yaml: compliance.mode must be ${COMPLIANCE_MODES.join(', ')}`);
+      }
+      result.compliance.mode = config.compliance.mode;
+    }
+
+    if (config.registry?.classification) {
+      const classification = config.registry.classification;
+      if (classification.enabled !== undefined) result.registry.classification.enabled = classification.enabled;
+      if (classification.provider !== undefined) {
+        if (!isFeatureRegistryClassificationProvider(classification.provider)) {
+          throw new Error('config.yaml: registry.classification.provider must be anthropic or cliproxy');
+        }
+        result.registry.classification.provider = classification.provider;
+      }
+      if (classification.model !== undefined) result.registry.classification.model = classification.model;
+      if (classification.per_day_cost_cap_usd !== undefined) {
+        if (typeof classification.per_day_cost_cap_usd !== 'number' || classification.per_day_cost_cap_usd < 0) {
+          throw new Error('config.yaml: registry.classification.per_day_cost_cap_usd must be a non-negative number');
+        }
+        result.registry.classification.perDayCostCapUsd = classification.per_day_cost_cap_usd;
+      }
     }
 
     // Merge OpenRouter favorites
@@ -1415,6 +1887,12 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
           result.enabledProviders.add('nous');
         }
       }
+      if (config.api_keys.dashscope) {
+        result.apiKeys.dashscope = resolveEnvVar(config.api_keys.dashscope);
+        if (!explicitlyDisabled.has('dashscope')) {
+          result.enabledProviders.add('dashscope');
+        }
+      }
     }
 
     // Merge overrides
@@ -1457,6 +1935,12 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
     // Merge caveman configuration
     mergeCavemanConfig(result.caveman, config);
 
+    // Merge RTK configuration
+    mergeRtkConfig(result.rtk, config);
+
+    // Merge docs RAG configuration
+    mergeDocsConfig(result.docs, config);
+
     // Merge TTS daemon configuration
     mergeTtsConfig(result.tts, config);
 
@@ -1467,7 +1951,7 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
         result.ttsSummarizer.enabled = s.enabled;
       }
       if (s.model) {
-        result.ttsSummarizer.model = resolveModelId(s.model) as ModelId;
+        result.ttsSummarizer.model = resolveModelIdSync(s.model) as ModelId;
       }
       if (s.batch_window_seconds !== undefined) {
         result.ttsSummarizer.batchWindowSeconds = s.batch_window_seconds;
@@ -1492,6 +1976,9 @@ export function mergeConfigs(...configs: (YamlConfig | null)[]): { config: Norma
     if (config.experimental) {
       if (typeof config.experimental.claudeCodeChannels === 'boolean') {
         result.experimental.claudeCodeChannels = config.experimental.claudeCodeChannels;
+      }
+      if (typeof config.experimental.claudeCodeChannelsMcp === 'boolean') {
+        result.experimental.claudeCodeChannelsMcp = config.experimental.claudeCodeChannelsMcp;
       }
     }
 
@@ -1640,6 +2127,10 @@ function applyEnvironmentFallbacks(config: NormalizedConfig, explicitlyDisabled:
     config.apiKeys.nous = process.env.NOUS_API_KEY;
     if (!explicitlyDisabled.has('nous')) config.enabledProviders.add('nous');
   }
+  if (process.env.DASHSCOPE_API_KEY && !config.apiKeys.dashscope) {
+    config.apiKeys.dashscope = process.env.DASHSCOPE_API_KEY;
+    if (!explicitlyDisabled.has('dashscope')) config.enabledProviders.add('dashscope');
+  }
   if (process.env.LINEAR_API_KEY && !config.trackerKeys.linear) config.trackerKeys.linear = process.env.LINEAR_API_KEY;
   if (process.env.GITHUB_TOKEN && !config.trackerKeys.github) config.trackerKeys.github = process.env.GITHUB_TOKEN;
   if (process.env.GITLAB_TOKEN && !config.trackerKeys.gitlab) config.trackerKeys.gitlab = process.env.GITLAB_TOKEN;
@@ -1675,14 +2166,14 @@ function getConfigMtimes(): { global: number; project: number } {
   return { global: globalMtime, project: projectMtime };
 }
 
-async function getConfigMtimesAsync(): Promise<{ global: number; project: number }> {
-  const globalMtime = await getMtimeAsync(GLOBAL_CONFIG_PATH);
+async function getConfigMtimesFromDisk(): Promise<{ global: number; project: number }> {
+  const globalMtime = await getMtimeFromDisk(GLOBAL_CONFIG_PATH);
   let projectMtime = 0;
 
-  const projectRoot = await findProjectRootAsync();
+  const projectRoot = await findProjectRootFromDisk();
   if (projectRoot) {
     for (const name of ['.pan.yaml', '.panopticon.yaml']) {
-      projectMtime = await getMtimeAsync(join(projectRoot, name));
+      projectMtime = await getMtimeFromDisk(join(projectRoot, name));
       if (projectMtime > 0) break;
     }
   }
@@ -1690,7 +2181,7 @@ async function getConfigMtimesAsync(): Promise<{ global: number; project: number
   return { global: globalMtime, project: projectMtime };
 }
 
-async function getMtimeAsync(filePath: string): Promise<number> {
+async function getMtimeFromDisk(filePath: string): Promise<number> {
   try {
     return (await statAsync(filePath)).mtimeMs;
   } catch {
@@ -1698,8 +2189,8 @@ async function getMtimeAsync(filePath: string): Promise<number> {
   }
 }
 
-export async function loadConfigAsyncNoMigration(): Promise<ConfigLoadResult> {
-  const mtimes = await getConfigMtimesAsync();
+async function loadConfigWithoutMigration(): Promise<ConfigLoadResult> {
+  const mtimes = await getConfigMtimesFromDisk();
   if (
     configCache &&
     configCache.globalMtime === mtimes.global &&
@@ -1709,14 +2200,14 @@ export async function loadConfigAsyncNoMigration(): Promise<ConfigLoadResult> {
   }
 
   const [globalConfig, projectConfig] = await Promise.all([
-    loadGlobalConfigAsync(),
-    loadProjectConfigAsync(),
+    loadGlobalConfigFromDisk(),
+    loadProjectConfigFromDisk(),
   ]);
   const { config, explicitlyDisabled } = mergeConfigs(projectConfig, globalConfig);
   applyEnvironmentFallbacks(config, explicitlyDisabled);
 
   const result: ConfigLoadResult = { config };
-  const freshMtimes = await getConfigMtimesAsync();
+  const freshMtimes = await getConfigMtimesFromDisk();
   configCache = {
     globalMtime: freshMtimes.global,
     projectMtime: freshMtimes.project,
@@ -1735,7 +2226,7 @@ export async function loadConfigAsyncNoMigration(): Promise<ConfigLoadResult> {
  * Results are cached in memory and invalidated when the underlying config
  * files change (checked via mtime).
  */
-export function loadConfig(): ConfigLoadResult {
+export function loadConfigSync(): ConfigLoadResult {
   const mtimes = getConfigMtimes();
   if (
     configCache &&
@@ -1773,82 +2264,7 @@ export function loadConfig(): ConfigLoadResult {
 
   const { config, explicitlyDisabled } = mergeConfigs(projectConfig, globalConfig);
 
-  // Load API keys from environment variables as fallback
-  // This allows using ~/.panopticon.env for API keys
-  // Only enable providers that weren't explicitly disabled in models.providers
-  if (process.env.OPENAI_API_KEY && !config.apiKeys.openai) {
-    config.apiKeys.openai = process.env.OPENAI_API_KEY;
-    if (!explicitlyDisabled.has('openai')) {
-      config.enabledProviders.add('openai');
-    }
-  }
-  if (process.env.VOYAGE_API_KEY && !config.apiKeys.voyage) {
-    config.apiKeys.voyage = process.env.VOYAGE_API_KEY;
-  }
-  if (process.env.GOOGLE_API_KEY && !config.apiKeys.google) {
-    config.apiKeys.google = process.env.GOOGLE_API_KEY;
-    if (!explicitlyDisabled.has('google')) {
-      config.enabledProviders.add('google');
-    }
-  }
-  if (process.env.MINIMAX_API_KEY && !config.apiKeys.minimax) {
-    config.apiKeys.minimax = process.env.MINIMAX_API_KEY;
-    if (!explicitlyDisabled.has('minimax')) {
-      config.enabledProviders.add('minimax');
-    }
-  }
-  if (process.env.ZAI_API_KEY && !config.apiKeys.zai) {
-    config.apiKeys.zai = process.env.ZAI_API_KEY;
-    if (!explicitlyDisabled.has('zai')) {
-      config.enabledProviders.add('zai');
-    }
-  }
-  const kimiKey = process.env.KIMI_CODING_API_KEY || process.env.KIMI_API_KEY;
-  if (kimiKey && !config.apiKeys.kimi) {
-    config.apiKeys.kimi = kimiKey;
-    if (!explicitlyDisabled.has('kimi')) {
-      config.enabledProviders.add('kimi');
-    }
-  }
-  if (process.env.OPENROUTER_API_KEY && !config.apiKeys.openrouter) {
-    config.apiKeys.openrouter = process.env.OPENROUTER_API_KEY;
-    if (!explicitlyDisabled.has('openrouter')) {
-      config.enabledProviders.add('openrouter');
-    }
-  }
-  if (process.env.MIMO_API_KEY && !config.apiKeys.mimo) {
-    config.apiKeys.mimo = process.env.MIMO_API_KEY;
-    if (!explicitlyDisabled.has('mimo')) {
-      config.enabledProviders.add('mimo');
-    }
-  }
-  if (process.env.NOUS_API_KEY && !config.apiKeys.nous) {
-    config.apiKeys.nous = process.env.NOUS_API_KEY;
-    if (!explicitlyDisabled.has('nous')) {
-      config.enabledProviders.add('nous');
-    }
-  }
-
-  // Load tracker API keys from environment variables as fallback
-  if (process.env.LINEAR_API_KEY && !config.trackerKeys.linear) {
-    config.trackerKeys.linear = process.env.LINEAR_API_KEY;
-  }
-  if (process.env.GITHUB_TOKEN && !config.trackerKeys.github) {
-    config.trackerKeys.github = process.env.GITHUB_TOKEN;
-  }
-  if (process.env.GITLAB_TOKEN && !config.trackerKeys.gitlab) {
-    config.trackerKeys.gitlab = process.env.GITLAB_TOKEN;
-  }
-  if (process.env.RALLY_API_KEY && !config.trackerKeys.rally) {
-    config.trackerKeys.rally = process.env.RALLY_API_KEY;
-  }
-
-  // Load shadow mode from environment as fallback
-  // Environment variable takes precedence over config file
-  if (process.env.SHADOW_MODE !== undefined) {
-    const envShadowMode = ['true', '1', 'yes'].includes(process.env.SHADOW_MODE.toLowerCase());
-    config.shadow.enabled = envShadowMode;
-  }
+  applyEnvironmentFallbacks(config, explicitlyDisabled);
 
   const result: ConfigLoadResult = { config, migration: migrationResult };
 
@@ -1908,22 +2324,26 @@ export function getProjectConfigPath(): string | null {
  * project, and env-var sources at the moment of the call.
  */
 export function isClaudeCodeChannelsEnabled(): boolean {
-  return loadConfig().config.experimental.claudeCodeChannels;
+  return loadConfigSync().config.experimental.claudeCodeChannels;
+}
+
+export function isClaudeCodeChannelsMcpEnabled(): boolean {
+  return loadConfigSync().config.experimental.claudeCodeChannelsMcp;
 }
 
 // ─── Effect variants (PAN-1249) ───────────────────────────────────────────────
 
 /**
- * Effect-native loadConfigAsyncNoMigration. Reads global + project config,
+ * Effect-native loadConfigWithoutMigration. Reads global + project config,
  * merges with defaults, applies env fallbacks. Fails with ConfigParseError
  * for malformed YAML or ConfigError for other I/O failures.
  */
-export const loadConfigAsyncNoMigrationEffect = (): Effect.Effect<
+export const loadConfigNoMigration = (): Effect.Effect<
   ConfigLoadResult,
   ConfigError | ConfigParseError
 > =>
   Effect.tryPromise({
-    try: () => loadConfigAsyncNoMigration(),
+    try: () => loadConfigWithoutMigration(),
     catch: (cause) =>
       new ConfigError({
         message: cause instanceof Error ? cause.message : String(cause),
@@ -1931,14 +2351,27 @@ export const loadConfigAsyncNoMigrationEffect = (): Effect.Effect<
       }),
   });
 
+export const getConversationsConfig = (): Effect.Effect<
+  RuntimeConversationsConfig,
+  ConfigError | ConfigParseError
+> =>
+  Effect.gen(function* () {
+    const { config } = yield* loadConfigNoMigration();
+    return resolveConversationWatchDirs({
+      ...config.conversations,
+      apiKeys: config.apiKeys,
+      enabledProviders: config.enabledProviders,
+    });
+  });
+
 /**
  * Effect-native loadConfig — sync read, wraps any failure (parse / fs) as
  * ConfigError. Use this from Effect contexts that need merged config without
  * forcing the codebase to migrate every loadConfig call site.
  */
-export const loadConfigEffect = (): Effect.Effect<ConfigLoadResult, ConfigError> =>
+export const loadConfig = (): Effect.Effect<ConfigLoadResult, ConfigError> =>
   Effect.try({
-    try: () => loadConfig(),
+    try: () => loadConfigSync(),
     catch: (cause) =>
       new ConfigError({
         message: cause instanceof Error ? cause.message : String(cause),
@@ -1951,11 +2384,34 @@ export const loadConfigEffect = (): Effect.Effect<ConfigLoadResult, ConfigError>
  * ConversationsConfig overrides into config.yaml. Fails with ConfigError on
  * write failure.
  */
-export const updateConversationsConfigAsyncEffect = (
+export const updateConversationsConfig = (
   updates: ConversationsConfig,
-): Effect.Effect<void, ConfigError> =>
+): Effect.Effect<void, ConfigError | ConfigParseError> =>
   Effect.tryPromise({
-    try: () => updateConversationsConfigAsync(updates),
+    try: async () => {
+      await loadConfigWithoutMigration();
+      let existingContent = '{}\n';
+      try {
+        const content = await readFileAsync(GLOBAL_CONFIG_PATH, 'utf-8');
+        existingContent = content.trim().length > 0 ? content : '{}\n';
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') throw error;
+      }
+
+      const doc = parseDocument(existingContent);
+      if (doc.contents === null) {
+        doc.contents = parseDocument('{}\n').contents;
+      }
+
+      for (const [key, value] of Object.entries(updates) as Array<[keyof ConversationsConfig, unknown]>) {
+        if (value !== undefined) doc.setIn(['conversations', key], value);
+      }
+
+      await mkdirAsync(dirname(GLOBAL_CONFIG_PATH), { recursive: true });
+      await writeFileAsync(GLOBAL_CONFIG_PATH, doc.toString({ lineWidth: 120 }), 'utf-8');
+      clearConfigCache();
+    },
     catch: (cause) =>
       new ConfigError({
         message: cause instanceof Error ? cause.message : String(cause),
