@@ -24,7 +24,7 @@ import {
 } from '@panctl/contracts';
 import type { AgentSnapshot, AgentStatus, Role, AgentResolution, ReviewStatusSnapshot, ReviewStatusValue, TestStatusValue, UatStatusValue, MergeStatusValue, VerificationStatusValue, ResourceStats } from '@panctl/contracts';
 import type { ReviewStatus } from '../../lib/review-status.js';
-import { logDeaconEvent } from '../../lib/persistent-logger.js';
+import { logDeaconEventSync } from '../../lib/persistent-logger.js';
 
 // ─── Exported async helpers (used by bootstrap Effect + tests) ───────────────
 
@@ -41,6 +41,80 @@ export async function discoverNewAgentIds(agentsDir: string, cachedIds: Set<stri
 
 export function shouldSkipCheckpointReconciliation(agent: Pick<AgentSnapshot, 'status' | 'workspace'>): boolean {
   return !agent.workspace || isTerminalTurnDiffSummaryStatus(agent.status)
+}
+
+type IssueReadSourceState = {
+  identifier?: unknown;
+  id?: unknown;
+  status?: unknown;
+  state?: unknown;
+  canonicalStatus?: unknown;
+  rawTrackerState?: unknown;
+  completedAt?: unknown;
+}
+
+function normalizeIssueId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toUpperCase() : null;
+}
+
+export function getClosedIssueIdsForReadSource(issues: unknown[]): Set<string> {
+  const closed = new Set<string>();
+  for (const issue of issues) {
+    if (!issue || typeof issue !== 'object') continue;
+    const item = issue as IssueReadSourceState;
+    const issueId = normalizeIssueId(item.identifier) ?? normalizeIssueId(item.id);
+    if (!issueId) continue;
+    const state = String(item.state ?? '').toLowerCase();
+    const status = String(item.status ?? '').toLowerCase();
+    const canonicalStatus = String(item.canonicalStatus ?? '').toLowerCase();
+    const rawTrackerState = String(item.rawTrackerState ?? '').toLowerCase();
+    if (
+      item.completedAt ||
+      state === 'closed' ||
+      status === 'done' ||
+      status === 'closed' ||
+      status === 'cancelled' ||
+      status === 'canceled' ||
+      status === 'completed' ||
+      canonicalStatus === 'done' ||
+      canonicalStatus === 'closed' ||
+      canonicalStatus === 'cancelled' ||
+      canonicalStatus === 'canceled' ||
+      canonicalStatus === 'completed' ||
+      rawTrackerState === 'closed' ||
+      rawTrackerState === 'done' ||
+      rawTrackerState === 'completed'
+    ) {
+      closed.add(issueId);
+    }
+  }
+  return closed;
+}
+
+export function pruneAgentsForReadSource(
+  agentsById: Record<string, AgentSnapshot>,
+  issues: unknown[],
+  agentsDir = AGENTS_DIR,
+): { agentsById: Record<string, AgentSnapshot>; prunedCount: number } {
+  const closedIssueIds = getClosedIssueIdsForReadSource(issues);
+  const nextAgentsById: Record<string, AgentSnapshot> = {};
+  let prunedCount = 0;
+
+  for (const agent of Object.values(agentsById)) {
+    if (closedIssueIds.has(agent.issueId.toUpperCase())) {
+      prunedCount++;
+      continue;
+    }
+    if (!existsSync(join(agentsDir, agent.id, 'state.json'))) {
+      prunedCount++;
+      continue;
+    }
+    nextAgentsById[agent.id] = agent;
+  }
+
+  return { agentsById: nextAgentsById, prunedCount };
 }
 
 // ─── Cached event store reference (avoids async dynamic import on each pushUpdated) ──
@@ -82,7 +156,7 @@ function cleanIssues(issues: unknown[]): unknown[] {
 // ─── Value validators for strict literal types ──────────────────────────────
 
 const VALID_AGENT_STATUSES = new Set<AgentStatus>(["starting", "running", "stopped", "error", "unknown"]);
-const VALID_ROLES = new Set<Role>(["plan", "work", "review", "test", "ship", "flywheel"]);
+const VALID_ROLES = new Set<Role>(["plan", "work", "review", "test", "ship", "flywheel", "strike"]);
 const VALID_RESOLUTIONS = new Set<AgentResolution>(["working", "done", "needs_input", "stuck", "completed", "unclear", "abandoned", "api_error"]);
 type SpecialistAgentName = 'review-agent' | 'test-agent' | 'merge-agent' | 'inspect-agent' | 'uat-agent';
 type SpecialistLifecycleState = 'active' | 'sleeping' | 'uninitialized';
@@ -281,6 +355,13 @@ export const ReadModelServiceLive = Layer.effect(
         console.error('[ReadModel] Failed to refresh issues for snapshot:', err);
       }
 
+      const pruned = pruneAgentsForReadSource(state.agentsById, state.issuesRaw);
+      if (pruned.prunedCount > 0) {
+        state = { ...state, agentsById: pruned.agentsById };
+        projectionCache?.save(buildSnapshot());
+        console.log(`[ReadModel] Pruned ${pruned.prunedCount} stale agent${pruned.prunedCount === 1 ? '' : 's'} from read source`);
+      }
+
       return buildSnapshot();
     });
 
@@ -361,10 +442,10 @@ export const ReadModelServiceLive = Layer.effect(
           // The projection cache may be stale if an agent's tmux session died while
           // the server was down — the cache still says 'running' but state.json says
           // 'stopped'. Without this step the dashboard shows incorrect action buttons.
-          const { listRunningAgentsAsync: listRunningForReconcile } = yield* Effect.promise(
+          const { listRunningAgents: listRunningForReconcile } = yield* Effect.promise(
             () => import('../../lib/agents.js'),
           );
-          const groundTruthAgents = yield* Effect.promise(() => listRunningForReconcile());
+          const groundTruthAgents = yield* listRunningForReconcile();
           const cachedAgentById = new Map(allAgents.map((a: any) => [a.id, a]));
           const agentsById: Record<string, AgentSnapshot> = {};
           for (const a of groundTruthAgents) {
@@ -372,10 +453,10 @@ export const ReadModelServiceLive = Layer.effect(
             let reconciled = a.status as AgentStatus | string;
             if (a.tmuxActive && a.status === 'stopped') {
               reconciled = 'running';
-              logDeaconEvent(`readModel cache-reconcile: ${a.id} stopped→running (tmux session alive, resumed outside API)`);
+              logDeaconEventSync(`readModel cache-reconcile: ${a.id} stopped→running (tmux session alive, resumed outside API)`);
             } else if (!a.tmuxActive && a.status === 'running') {
               reconciled = 'stopped';
-              logDeaconEvent(`readModel cache-reconcile: ${a.id} running→stopped (tmux session dead, likely reboot/crash)`);
+              logDeaconEventSync(`readModel cache-reconcile: ${a.id} running→stopped (tmux session dead, likely reboot/crash)`);
             }
             if (cachedAgent && cachedAgent.status !== toAgentStatus(reconciled)) {
               console.log(`[ReadModel] Reconciled ${a.id}: ${cachedAgent.status} → ${reconciled} (tmux=${a.tmuxActive}, state=${a.status})`);
@@ -401,6 +482,7 @@ export const ReadModelServiceLive = Layer.effect(
               costSoFar: a.costSoFar,
               sessionId: a.sessionId || undefined,
               role: toRole((a as { role?: unknown }).role),
+              hasLiveTmuxSession: a.tmuxActive,
               stoppedByUser: a.stoppedByUser,
               paused: a.paused,
               pausedReason: a.pausedReason,
@@ -454,7 +536,7 @@ export const ReadModelServiceLive = Layer.effect(
       // ── Slow path: bootstrap from lib modules ────────────────────────────────
       if (!usedProjectionCache) {
         // Lazy imports to avoid circular dependency issues
-        const [{ listRunningAgentsAsync, warnOnBareNumericIssueIds }, { getReviewStatus }, { computeAgentEnrichment }] =
+        const [{ listRunningAgents, warnOnBareNumericIssueIds }, { getReviewStatusSync }, { computeAgentEnrichment }] =
           yield* Effect.all([
             Effect.promise(() => import('../../lib/agents.js')),
             Effect.promise(() => import('../../lib/review-status.js')),
@@ -467,7 +549,7 @@ export const ReadModelServiceLive = Layer.effect(
         yield* Effect.promise(() => warnOnBareNumericIssueIds());
 
         // ── Agents ────────────────────────────────────────────────────────────
-        const running = yield* Effect.promise(() => listRunningAgentsAsync());
+        const running = yield* listRunningAgents();
         const agentsById: Record<string, AgentSnapshot> = {};
 
         // Compute enrichment for all agents in parallel during bootstrap
@@ -475,13 +557,13 @@ export const ReadModelServiceLive = Layer.effect(
         const enrichmentResults = yield* Effect.promise(() =>
           Promise.all(
             running.map(async (a) => {
-              const reviewStatus = getReviewStatus(a.issueId)
+              const reviewStatus = getReviewStatusSync(a.issueId)
               const hasActiveSpecialist =
                 reviewStatus?.reviewStatus === 'reviewing' ||
                 reviewStatus?.testStatus === 'testing' ||
                 reviewStatus?.mergeStatus === 'merging'
               try {
-                return await computeAgentEnrichment(a.id, a.startedAt, hasActiveSpecialist)
+                return await Effect.runPromise(computeAgentEnrichment(a.id, a.startedAt, hasActiveSpecialist))
               } catch {
                 return undefined
               }
@@ -515,10 +597,10 @@ export const ReadModelServiceLive = Layer.effect(
               let reconciled = a.status as AgentStatus | string;
               if (a.tmuxActive && a.status === 'stopped') {
                 reconciled = 'running';
-                logDeaconEvent(`readModel bootstrap: ${a.id} reconciled stopped→running (tmux session alive, resumed outside API)`);
+                logDeaconEventSync(`readModel bootstrap: ${a.id} reconciled stopped→running (tmux session alive, resumed outside API)`);
               } else if (!a.tmuxActive && a.status === 'running') {
                 reconciled = 'stopped';
-                logDeaconEvent(`readModel bootstrap: ${a.id} reconciled running→stopped (tmux session dead, likely reboot/crash)`);
+                logDeaconEventSync(`readModel bootstrap: ${a.id} reconciled running→stopped (tmux session dead, likely reboot/crash)`);
               }
               return toAgentStatus(reconciled);
             })(),
@@ -528,6 +610,7 @@ export const ReadModelServiceLive = Layer.effect(
             costSoFar: a.costSoFar,
             sessionId: a.sessionId || undefined,
             role: toRole((a as { role?: unknown }).role),
+            hasLiveTmuxSession: a.tmuxActive,
             paused: a.paused,
             pausedReason: a.pausedReason,
             pausedAt: a.pausedAt,
@@ -598,7 +681,7 @@ export const ReadModelServiceLive = Layer.effect(
           // Run against the first agent's workspace (all worktrees share the same parent .git).
           const firstAgentWithWorkspace = agents.find(a => a.workspace);
           if (firstAgentWithWorkspace?.workspace) {
-            const deleted = await deleteLegacyCheckpointRefs(firstAgentWithWorkspace.workspace);
+            const deleted = await Effect.runPromise(deleteLegacyCheckpointRefs(firstAgentWithWorkspace.workspace));
             if (deleted > 0) {
               console.log(`[ReadModel] Deleted ${deleted} legacy unscoped checkpoint refs`);
             }
@@ -613,7 +696,7 @@ export const ReadModelServiceLive = Layer.effect(
             if (existingSummaries && existingSummaries.length > 0) continue;
 
             try {
-              const checkpoints = await listCheckpoints(workspace, agent.id);
+              const checkpoints = await Effect.runPromise(listCheckpoints(workspace, agent.id));
               if (checkpoints.length === 0) continue;
 
               const maxRetainedSummaries = getMaxTurnDiffSummariesPerAgent();
@@ -639,10 +722,10 @@ export const ReadModelServiceLive = Layer.effect(
                 let files: Array<{ path: string; kind?: string; additions?: number; deletions?: number }> = [];
                 if (prevTurnId) {
                   try {
-                    files = await diffCheckpointFiles(workspace, agent.id, prevTurnId, turnId);
+                    files = await Effect.runPromise(diffCheckpointFiles(workspace, agent.id, prevTurnId, turnId));
                   } catch { /* checkpoint might be stale */ }
                 }
-                const completedAt = await getCheckpointTimestamp(workspace, agent.id, turnId);
+                const completedAt = await Effect.runPromise(getCheckpointTimestamp(workspace, agent.id, turnId));
                 summaries.push({
                   turnId,
                   completedAt,

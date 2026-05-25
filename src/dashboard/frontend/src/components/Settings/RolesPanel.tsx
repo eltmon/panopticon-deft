@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 
-type RoleId = 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel';
+type RoleId = 'plan' | 'work' | 'review' | 'test' | 'ship' | 'flywheel' | 'strike';
 type WorkhorseSlot = 'expensive' | 'mid' | 'cheap';
 type ModelRef = string;
 type Harness = 'claude-code' | 'pi';
@@ -103,6 +103,13 @@ const ROLES: RoleDefinition[] = [
     ],
   },
   {
+    id: 'strike',
+    name: 'Strike',
+    icon: 'bolt',
+    description: 'Precision agent — drop in, implement, land directly on main, verify on main. Bypasses plan/review/test/ship.',
+    defaultModel: 'workhorse:expensive',
+  },
+  {
     id: 'review',
     name: 'Review',
     icon: 'rate_review',
@@ -149,6 +156,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   kimi: 'Kimi',
   mimo: 'MiMo',
   nous: 'Nous Portal',
+  dashscope: 'Alibaba DashScope',
   openrouter: 'OpenRouter',
 };
 
@@ -189,6 +197,12 @@ function workhorsesWithDefaults(settings: SettingsResponse | undefined): Require
   };
 }
 
+const PARENT_MODEL_REF = 'parent';
+
+function isParentModelRef(value: ModelRef): boolean {
+  return value === PARENT_MODEL_REF;
+}
+
 function isWorkhorseRef(value: ModelRef): value is `workhorse:${WorkhorseSlot}` {
   return value.startsWith('workhorse:') && WORKHORSE_SLOTS.some((slot) => value === `workhorse:${slot.id}`);
 }
@@ -198,12 +212,20 @@ function workhorseSlotLabel(slot: WorkhorseSlot): string {
 }
 
 function displayModelRef(value: ModelRef): string {
+  if (isParentModelRef(value)) return 'Parent';
   if (!isWorkhorseRef(value)) return value;
   const slot = value.replace('workhorse:', '') as WorkhorseSlot;
   return `Workhorse: ${workhorseSlotLabel(slot)}`;
 }
 
-function modelRefTooltip(value: ModelRef, workhorses: Required<Record<WorkhorseSlot, ModelRef>>): string | undefined {
+function modelRefTooltip(
+  value: ModelRef,
+  workhorses: Required<Record<WorkhorseSlot, ModelRef>>,
+  parentModelRef?: ModelRef,
+): string | undefined {
+  if (isParentModelRef(value)) {
+    return parentModelRef ? `Parent = ${resolveModelRef(parentModelRef, workhorses)}` : undefined;
+  }
   if (!isWorkhorseRef(value)) return undefined;
   const slot = value.replace('workhorse:', '') as WorkhorseSlot;
   return `${displayModelRef(value)} = ${workhorses[slot]}`;
@@ -213,7 +235,12 @@ function modelExists(value: ModelRef, groups: Array<{ models: AvailableModel[] }
   return groups.some((group) => group.models.some((model) => model.id === value));
 }
 
-function resolveModelRef(value: ModelRef, workhorses: Required<Record<WorkhorseSlot, ModelRef>>): ModelRef {
+function resolveModelRef(
+  value: ModelRef,
+  workhorses: Required<Record<WorkhorseSlot, ModelRef>>,
+  parentModelRef?: ModelRef,
+): ModelRef {
+  if (isParentModelRef(value) && parentModelRef) return resolveModelRef(parentModelRef, workhorses);
   if (!isWorkhorseRef(value)) return value;
   const slot = value.replace('workhorse:', '') as WorkhorseSlot;
   return workhorses[slot];
@@ -229,8 +256,10 @@ function providerWarning(
   groups: Array<{ provider: string; label: string; models: AvailableModel[] }>,
   providers: Partial<Record<string, boolean>> | undefined,
   claudeAuth: ClaudeAuthStatus | undefined,
+  parentModelRef?: ModelRef,
 ): string | null {
-  const resolved = resolveModelRef(value, workhorses);
+  if (isParentModelRef(value)) return null;
+  const resolved = resolveModelRef(value, workhorses, parentModelRef);
   const provider = providerForModel(resolved, groups);
   if (!provider) return null;
   const label = PROVIDER_LABELS[provider] ?? provider;
@@ -291,14 +320,15 @@ interface ModelPickerProps {
   providerGroups: Array<{ provider: string; label: string; models: AvailableModel[] }>;
   providers?: Partial<Record<string, boolean>>;
   claudeAuth?: ClaudeAuthStatus;
+  parentModelRef?: ModelRef;
   disabled: boolean;
   onChange: (value: ModelRef) => void;
 }
 
-function ModelPicker({ label, value, workhorses, providerGroups, providers, claudeAuth, disabled, onChange }: ModelPickerProps) {
-  const currentSpecificModelMissing = value && !isWorkhorseRef(value) && !modelExists(value, providerGroups);
-  const resolved = resolveModelRef(value, workhorses);
-  const warning = providerWarning(value, workhorses, providerGroups, providers, claudeAuth);
+function ModelPicker({ label, value, workhorses, providerGroups, providers, claudeAuth, parentModelRef, disabled, onChange }: ModelPickerProps) {
+  const currentSpecificModelMissing = value && !isParentModelRef(value) && !isWorkhorseRef(value) && !modelExists(value, providerGroups);
+  const resolved = resolveModelRef(value, workhorses, parentModelRef);
+  const warning = providerWarning(value, workhorses, providerGroups, providers, claudeAuth, parentModelRef);
 
   return (
     <label className="space-y-1.5">
@@ -306,11 +336,16 @@ function ModelPicker({ label, value, workhorses, providerGroups, providers, clau
       <select
         aria-label={label}
         value={value}
-        title={modelRefTooltip(value, workhorses)}
+        title={modelRefTooltip(value, workhorses, parentModelRef)}
         onChange={(event) => onChange(event.target.value)}
         disabled={disabled}
         className="w-full px-3 py-2 bg-popover border border-border rounded-lg text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50"
       >
+        {parentModelRef && (
+          <optgroup label="Inheritance">
+            <option value={PARENT_MODEL_REF}>Parent (inherits {resolveModelRef(parentModelRef, workhorses)})</option>
+          </optgroup>
+        )}
         <optgroup label="Workhorse">
           {WORKHORSE_SLOTS.map((slot) => (
             <option key={slot.id} value={`workhorse:${slot.id}`}>
@@ -538,7 +573,7 @@ export function RolesPanel() {
                     <div className="grid gap-3 md:grid-cols-2">
                       {role.subRoles?.map((subRole) => {
                         const subModel = getSubRoleModel(settings, role, subRole);
-                        const subTooltip = modelRefTooltip(subModel, workhorses);
+                        const subTooltip = modelRefTooltip(subModel, workhorses, roleModel);
 
                         return (
                           <div key={subRole.id} className="rounded-md border border-border bg-card p-3">
@@ -559,6 +594,7 @@ export function RolesPanel() {
                               providerGroups={providerGroups}
                               providers={settings?.models?.providers}
                               claudeAuth={claudeAuthQuery.data}
+                              parentModelRef={roleModel}
                               disabled={saveMutation.isPending}
                               onChange={(modelRef) => saveMutation.mutate({ role: role.id, subRole: subRole.id, patch: { model: modelRef } })}
                             />

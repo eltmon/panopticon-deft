@@ -1,28 +1,26 @@
+import { Effect } from 'effect';
 import chalk from 'chalk';
 import ora from 'ora';
 import { execSync } from 'child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync, statSync, symlinkSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { loadConfig } from '../../lib/config.js';
+import { join } from 'path';
+import { loadConfigSync } from '../../lib/config.js';
 import { parseVBriefFilename } from '../../lib/vbrief/lifecycle.js';
-import { resolveGitHubIssue } from '../../lib/tracker-utils.js';
-import { createBackup } from '../../lib/backup.js';
-import { planSync, executeSync, refreshCache, migrateStalePersonalContent, removeLegacySkills070, planHooksSync, syncHooks, syncStatusline, mirrorProjectSkills, syncPiSettings } from '../../lib/sync.js';
-import { SYNC_TARGET, isDevMode } from '../../lib/paths.js';
-import { getDevrootPath } from '../../lib/config.js';
-import { listProjects } from '../../lib/projects.js';
-import { cleanupLegacyRuntimeSymlinks, migrateSyncTargets } from '../../lib/config-migration.js';
+import { resolveGitHubIssueSync } from '../../lib/tracker-utils.js';
+import { createBackupSync } from '../../lib/backup.js';
+import { planSyncSync, executeSyncSync, refreshCacheSync, migrateStalePersonalContentSync, removeLegacySkills070Sync, planHooksSyncSync, syncHooksSync, syncStatuslineSync, mirrorProjectSkillsSync, syncPiSettingsSync, syncContextLayersSync } from '../../lib/sync.js';
+import { SYNC_TARGET, SYNC_SOURCES, isDevMode } from '../../lib/paths.js';
+import { checkDevrootDeprecation } from '../../lib/config.js';
+import { listProjectsSync } from '../../lib/projects.js';
+import { cleanupLegacyRuntimeSymlinksSync, migrateSyncTargetsSync } from '../../lib/config-migration.js';
 import { cleanupAgentDirectories } from '../../lib/agent-directory-cleanup.js';
-import { migratePanopticonToPan } from '../../lib/workspace-manager.js';
-import { runMultiToolSync, resolveAlsoSyncTools } from '../../lib/multi-tool-sync.js';
-import { ensurePlaywrightIsolation, ensureExcalidrawMcp } from '../../lib/claude-mcp.js';
+import { migratePanopticonToPanSync } from '../../lib/workspace-manager.js';
+import { runMultiToolSyncSync, resolveAlsoSyncToolsSync } from '../../lib/multi-tool-sync.js';
+import { ensurePlaywrightIsolationSync, ensureExcalidrawMcpSync } from '../../lib/claude-mcp.js';
 
-// Get path to bundled git hooks
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const BUNDLED_GIT_HOOKS_DIR = join(__dirname, '..', '..', 'scripts', 'git-hooks');
+// Bundled git hooks distributed to registered projects (PAN-1201: sync-sources/).
+const BUNDLED_GIT_HOOKS_DIR = SYNC_SOURCES.gitHooks;
 
 // Helper to check if a command exists
 function checkCommand(cmd: string): boolean {
@@ -42,6 +40,13 @@ interface SyncOptions {
 }
 
 export async function syncCommand(options: SyncOptions): Promise<void> {
+  // PAN-1201: warn once if the deprecated sync.devroot is still configured.
+  const devrootWarning = checkDevrootDeprecation();
+  if (devrootWarning) {
+    console.log(chalk.yellow(devrootWarning));
+    console.log('');
+  }
+
   // Dry run mode
   if (options.dryRun) {
     console.log(chalk.bold('Sync Plan (dry run):\n'));
@@ -52,7 +57,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
     }
 
     // Show hooks plan
-    const hooksPlan = planHooksSync();
+    const hooksPlan = planHooksSyncSync();
     if (hooksPlan.length > 0) {
       console.log(chalk.cyan('hooks (bin scripts):'));
       for (const hook of hooksPlan) {
@@ -63,32 +68,36 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
       console.log('');
     }
 
-    const devrootPath = getDevrootPath();
-    console.log(chalk.cyan(`devroot (${devrootPath || 'disabled'}):`));
-
-    if (!devrootPath) {
-      console.log(chalk.dim('  (devroot disabled — set sync.devroot in config)'));
+    // Bundled skills + agents → ~/.claude/
+    console.log(chalk.cyan('~/.claude/ (skills + agents):'));
+    const plan = planSyncSync();
+    const allItems = [...plan.skills, ...plan.agents];
+    if (allItems.length === 0) {
+      console.log(chalk.dim('  (nothing to sync — check sync-sources/ and run `pan install`)'));
     } else {
-      const plan = planSync();
-      const allItems = [...plan.skills, ...plan.agents, ...plan.rules, ...plan.commands];
+      const count = (s: string) => allItems.filter((i) => i.status === s).length;
+      console.log(
+        `  ${chalk.green(`${count('new')} new`)}, ` +
+          `${chalk.blue(`${count('symlink')} update`)}, ` +
+          `${chalk.dim(`${count('exists')} unchanged`)}, ` +
+          `${chalk.yellow(`${count('conflict')} user-modified (skipped)`)}`,
+      );
+    }
+    console.log('');
 
-      if (allItems.length === 0) {
-        console.log(chalk.dim('  (nothing to sync)'));
-      } else {
-        for (const item of allItems) {
-          const icon = item.status === 'conflict' ? chalk.yellow('!') :
-                       item.status === 'symlink' ? chalk.blue('↻') :
-                       chalk.green('+');
-          const label = item.status === 'conflict' ? chalk.yellow('[modified]') :
-                        item.status === 'symlink' ? chalk.dim('[update]') :
-                        chalk.green('[new]');
-          console.log(`  ${icon} ${item.name} ${label}`);
-        }
+    // Context layers → CLAUDE.md managed regions
+    console.log(chalk.cyan('context layers → CLAUDE.md:'));
+    console.log(`  ${chalk.blue('↻')} global → ~/.claude/CLAUDE.md ${chalk.dim('(managed region)')}`);
+    for (const { config } of listProjectsSync()) {
+      if (existsSync(join(config.path, '.pan', 'context', 'project.md'))) {
+        console.log(
+          `  ${chalk.blue('↻')} ${config.name} → ${join(config.path, 'CLAUDE.md')} ${chalk.dim('(managed region)')}`,
+        );
       }
     }
 
     // Show .pan/skills/ source files for each registered project
-    const dryRunProjects = listProjects();
+    const dryRunProjects = listProjectsSync();
     for (const { config } of dryRunProjects) {
       if (!existsSync(config.path)) continue;
       const panSkillsDir = join(config.path, '.pan', 'skills');
@@ -105,7 +114,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
       }
 
       // Show multi-tool sync targets
-      const tools = resolveAlsoSyncTools(config.path);
+      const tools = resolveAlsoSyncToolsSync(config.path);
       if (tools.length > 0) {
         console.log(chalk.cyan(`\nmulti-tool sync (${config.name}): ${tools.join(', ')}`));
         const panSkillsDirExists = existsSync(join(config.path, '.pan', 'skills'));
@@ -123,7 +132,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
     }
 
     // Agent directory cleanup preview
-    const agentCleanupPreview = await cleanupAgentDirectories({ dryRun: true });
+    const agentCleanupPreview = await Effect.runPromise(cleanupAgentDirectories({ dryRun: true }));
     if (agentCleanupPreview.totalOrphaned > 0) {
       console.log(chalk.cyan(`\nagent cleanup (~/.panopticon/agents/):`));
       console.log(chalk.dim(`  Found ${agentCleanupPreview.totalOrphaned} orphaned directories`));
@@ -141,7 +150,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
   }
 
   // Run one-time migration: strip legacy sync targets from config.toml
-  const syncMigration = migrateSyncTargets();
+  const syncMigration = migrateSyncTargetsSync();
   if (syncMigration.migrated) {
     if (syncMigration.hadNonClaudeTargets) {
       console.log(chalk.yellow('Config updated: removed non-Claude sync targets (Panopticon now syncs to Claude Code only).'));
@@ -149,13 +158,13 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
   }
 
   // Run one-time migration: remove Panopticon-managed symlinks from legacy runtime dirs
-  const cleanupResult = cleanupLegacyRuntimeSymlinks();
+  const cleanupResult = cleanupLegacyRuntimeSymlinksSync();
   if (cleanupResult.cleaned.length > 0) {
     console.log(chalk.dim(`Removed ${cleanupResult.total} legacy runtime symlink(s): ${cleanupResult.cleaned.join(', ')}`));
   }
 
   // One-time migration: remove Panopticon symlinks from ~/.claude/ (devroot replaces this)
-  const migration = migrateStalePersonalContent();
+  const migration = migrateStalePersonalContentSync();
   if (migration.removedSymlinks.length > 0) {
     console.log(chalk.cyan(`Migrated: removed ${migration.removedSymlinks.length} Panopticon symlink(s) from ~/.claude/`));
     if (migration.preservedUserContent.length > 0) {
@@ -164,12 +173,12 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
   }
 
   // 0.7.0 upgrade: remove renamed/deleted legacy skills from ~/.claude/skills/
-  const removedLegacy = removeLegacySkills070();
+  const removedLegacy = removeLegacySkills070Sync();
   if (removedLegacy.length > 0) {
     console.log(chalk.dim(`Removed ${removedLegacy.length} legacy skill(s) from upgrade to 0.7.0: ${removedLegacy.join(', ')}`));
   }
 
-  const config = loadConfig();
+  const config = loadConfigSync();
 
   // Create backup if enabled
   if (config.sync.backup_before_sync) {
@@ -181,7 +190,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
       SYNC_TARGET.agents,
     ];
 
-    const backup = createBackup(backupDirs);
+    const backup = createBackupSync(backupDirs);
 
     if (backup.targets.length > 0) {
       spinner.succeed(`Backup created: ${backup.timestamp}`);
@@ -196,62 +205,74 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
 
   // Refresh cache from repo source
   const cacheSpinner = ora('Refreshing cache from repo...').start();
-  const cacheResult = refreshCache();
+  const cacheResult = refreshCacheSync();
   const cacheParts = [];
   if (cacheResult.skills.copied > 0) cacheParts.push(`${cacheResult.skills.copied} skills`);
   if (cacheResult.agents.copied > 0) cacheParts.push(`${cacheResult.agents.copied} agents`);
   if (cacheResult.rules.copied > 0) cacheParts.push(`${cacheResult.rules.copied} rules`);
   cacheSpinner.succeed(`Cache refreshed: ${cacheParts.length > 0 ? cacheParts.join(', ') : 'up to date'}`);
 
-  // Execute sync to devroot
-  const devrootPath = getDevrootPath();
-  const spinner = ora(`Syncing to devroot (${devrootPath || 'disabled'})...`).start();
+  // Distribute bundled skills + agents into the user's Claude Code home.
+  const spinner = ora('Distributing skills and agents to ~/.claude/...').start();
+  const result = executeSyncSync({ force: options.force, diff: options.diff });
+  const totalSynced = result.created.length + result.updated.length;
 
-  if (!devrootPath) {
-    spinner.info('Devroot disabled (set sync.devroot in config to enable)');
-  } else {
-    const result = executeSync({ force: options.force, diff: options.diff });
-    const totalSynced = result.created.length + result.updated.length;
-
-    // Show diffs if requested
-    if (result.diffs.length > 0) {
-      spinner.info(`Showing diffs for ${result.diffs.length} modified file(s):\n`);
-      for (const d of result.diffs) {
-        console.log(chalk.cyan(`--- ${d.path} (installed)`));
-        console.log(chalk.cyan(`+++ ${d.path} (current on disk)`));
-        // Simple line-by-line diff
-        const sourceLines = d.sourceContent.split('\n');
-        const targetLines = d.targetContent.split('\n');
-        const maxLines = Math.max(sourceLines.length, targetLines.length);
-        for (let i = 0; i < maxLines; i++) {
-          if (sourceLines[i] !== targetLines[i]) {
-            if (targetLines[i] !== undefined) console.log(chalk.red(`- ${targetLines[i]}`));
-            if (sourceLines[i] !== undefined) console.log(chalk.green(`+ ${sourceLines[i]}`));
-          }
+  // Show diffs if requested
+  if (result.diffs.length > 0) {
+    spinner.info(`Showing diffs for ${result.diffs.length} modified file(s):\n`);
+    for (const d of result.diffs) {
+      console.log(chalk.cyan(`--- ${d.path} (installed)`));
+      console.log(chalk.cyan(`+++ ${d.path} (current on disk)`));
+      // Simple line-by-line diff
+      const sourceLines = d.sourceContent.split('\n');
+      const targetLines = d.targetContent.split('\n');
+      const maxLines = Math.max(sourceLines.length, targetLines.length);
+      for (let i = 0; i < maxLines; i++) {
+        if (sourceLines[i] !== targetLines[i]) {
+          if (targetLines[i] !== undefined) console.log(chalk.red(`- ${targetLines[i]}`));
+          if (sourceLines[i] !== undefined) console.log(chalk.green(`+ ${sourceLines[i]}`));
         }
-        console.log('');
       }
+      console.log('');
     }
+  }
 
-    if (result.conflicts.length > 0 && !options.force) {
-      spinner.warn(`Synced ${totalSynced} items, ${result.conflicts.length} conflicts`);
-      console.log('');
-      console.log(chalk.yellow('Modified since Panopticon installed:'));
-      for (const name of result.conflicts) {
-        console.log(chalk.dim(`  - ${name}`));
-      }
-      console.log('');
-      console.log(chalk.dim('Use --force to overwrite, --diff to see changes.'));
-    } else if (result.skipped.length > 0) {
-      spinner.succeed(`Synced ${totalSynced} items to devroot (${result.skipped.length} user-owned skipped)`);
-    } else {
-      spinner.succeed(`Synced ${totalSynced} items to devroot`);
+  if (result.conflicts.length > 0 && !options.force) {
+    spinner.warn(`Synced ${totalSynced} items to ~/.claude/, ${result.conflicts.length} user-modified (skipped)`);
+    console.log('');
+    console.log(chalk.yellow('Modified since Panopticon installed:'));
+    for (const name of result.conflicts) {
+      console.log(chalk.dim(`  - ${name}`));
     }
+    console.log('');
+    console.log(chalk.dim('Use --force to overwrite, --diff to see changes.'));
+  } else if (result.skipped.length > 0) {
+    spinner.succeed(`Synced ${totalSynced} items to ~/.claude/ (${result.skipped.length} unchanged or user-owned)`);
+  } else {
+    spinner.succeed(`Synced ${totalSynced} items to ~/.claude/`);
+  }
+
+  // Render the layered context into harness CLAUDE.md files (PAN-1201).
+  const ctxSpinner = ora('Rendering context layers...').start();
+  const ctx = syncContextLayersSync();
+  const ctxParts: string[] = [];
+  if (ctx.globalStubCreated) ctxParts.push('seeded global.md');
+  if (ctx.globalWritten) ctxParts.push('~/.claude/CLAUDE.md');
+  if (ctx.projectsWritten.length > 0) {
+    ctxParts.push(`${ctx.projectsWritten.length} project CLAUDE.md`);
+  }
+  if (ctx.errors.length > 0) {
+    ctxSpinner.warn(`Context layers rendered with ${ctx.errors.length} error(s)`);
+    for (const e of ctx.errors) console.log(chalk.red(`  ✗ ${e}`));
+  } else if (ctxParts.length > 0) {
+    ctxSpinner.succeed(`Context layers rendered: ${ctxParts.join(', ')}`);
+  } else {
+    ctxSpinner.info('Context layers already up to date');
   }
 
   // Sync hooks (bin scripts)
   const hooksSpinner = ora('Syncing hooks...').start();
-  const hooksResult = syncHooks();
+  const hooksResult = syncHooksSync();
 
   if (hooksResult.errors.length > 0) {
     hooksSpinner.warn(`Synced ${hooksResult.synced.length} hooks, ${hooksResult.errors.length} errors`);
@@ -267,7 +288,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
   // Ensure beads database exists for each registered project (first-time setup guard).
   // bd install puts the binary in PATH, but bd init must be run once per project to
   // create the Dolt database. Without it, workspace beads creation silently fails.
-  const projects = listProjects();
+  const projects = listProjectsSync();
   if (projects.length > 0 && checkCommand('bd')) {
     for (const { key, config } of projects) {
       if (!existsSync(config.path)) continue;
@@ -302,7 +323,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
 
   // Sync statusline to all runtimes
   const statuslineSpinner = ora('Syncing statusline...').start();
-  const statuslineResult = syncStatusline();
+  const statuslineResult = syncStatuslineSync();
 
   if (statuslineResult.errors.length > 0) {
     statuslineSpinner.warn(`Synced statusline to ${statuslineResult.synced.length} runtime(s), ${statuslineResult.errors.length} error(s)`);
@@ -341,8 +362,8 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
   try {
     if (existsSync(mcpPath)) {
       const mcpConfig = JSON.parse(readFileSync(mcpPath, 'utf-8'));
-      const playwrightChanged = ensurePlaywrightIsolation(mcpConfig);
-      const excalidrawChanged = ensureExcalidrawMcp(mcpConfig);
+      const playwrightChanged = ensurePlaywrightIsolationSync(mcpConfig);
+      const excalidrawChanged = ensureExcalidrawMcpSync(mcpConfig);
       if (playwrightChanged || excalidrawChanged) {
         writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2) + '\n');
       }
@@ -362,7 +383,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
     if (!existsSync(config.path)) continue;
 
     // Migrate .panopticon/ subdirs → .pan/
-    const migResult = migratePanopticonToPan(config.path);
+    const migResult = migratePanopticonToPanSync(config.path);
     if (migResult.migrated.length > 0) {
       console.log(chalk.cyan(`Migrated .panopticon/ → .pan/ in ${config.name}: ${migResult.migrated.join(', ')}`));
     }
@@ -374,7 +395,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
     }
 
     // Multi-tool skill sync (cursor, codex, windsurf, cline, copilot, aider)
-    const toolSyncResults = runMultiToolSync(config.path);
+    const toolSyncResults = runMultiToolSyncSync(config.path);
     for (const r of toolSyncResults) {
       if (r.written.length > 0) {
         console.log(chalk.cyan(`Synced ${r.written.length} skill(s) to ${r.tool} in ${config.name}`));
@@ -491,7 +512,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
 
   // Pi harness — point Pi's settings file at ~/.claude/skills so it sees the
   // same skills tree we just synced. No-op when Pi is not on PATH (PAN-636).
-  const piResult = syncPiSettings();
+  const piResult = syncPiSettingsSync();
   if (piResult.status === 'created') {
     console.log(chalk.cyan(`Pi settings: created ${piResult.path.replace(homedir(), '~')}`));
   } else if (piResult.status === 'updated') {
@@ -500,9 +521,9 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
     console.log(chalk.yellow(`Pi settings: ${piResult.path.replace(homedir(), '~')} is not valid JSON — left untouched`));
   }
 
-  // Mirror project-level skills/ → .claude/skills/ against the devroot when
-  // configured, so pan sync works from any cwd (not just from inside the repo tree).
-  const skillsMirror = mirrorProjectSkills(getDevrootPath() ?? process.cwd());
+  // Mirror project-level skills/ → .claude/skills/ for a project that keeps a
+  // top-level skills/ tree, so pan sync works from inside such a project.
+  const skillsMirror = mirrorProjectSkillsSync(process.cwd());
   const skillsParts: string[] = [];
   if (skillsMirror.added.length > 0) skillsParts.push(`${skillsMirror.added.length} added`);
   if (skillsMirror.updated.length > 0) skillsParts.push(`${skillsMirror.updated.length} updated`);
@@ -513,7 +534,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
 
   // Agent directory cleanup
   const cleanupSpinner = ora('Checking for orphaned agent directories...').start();
-  const agentCleanupResult = await cleanupAgentDirectories({ dryRun: false, force: options.force });
+  const agentCleanupResult = await Effect.runPromise(cleanupAgentDirectories({ dryRun: false, force: options.force }));
 
   if (agentCleanupResult.totalOrphaned === 0) {
     cleanupSpinner.succeed('No orphaned agent directories found');
@@ -553,7 +574,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
           const parsed = parseVBriefFilename(file);
           if (!parsed) continue;
           const issueId = parsed.issueId.toUpperCase();
-          const ghInfo = resolveGitHubIssue(issueId);
+          const ghInfo = resolveGitHubIssueSync(issueId);
           if (ghInfo.isGitHub && hasGh) {
             try {
               const state = execSync(
@@ -616,7 +637,7 @@ export async function syncCommand(options: SyncOptions): Promise<void> {
           if (activeIssueIds.has(worktreeIssueId)) continue;
 
           let trackerOpen = false;
-          const ghInfo = resolveGitHubIssue(worktreeIssueId);
+          const ghInfo = resolveGitHubIssueSync(worktreeIssueId);
           if (ghInfo.isGitHub && hasGh) {
             try {
               const state = execSync(

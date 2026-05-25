@@ -17,7 +17,7 @@ import { stat } from 'fs/promises';
 import { join } from 'path';
 import { Effect, Schedule, Duration } from 'effect';
 import { PAN_DIRNAME } from '../pan-dir/types.js';
-import { sessionExistsAsync, isPaneDeadAsync } from '../tmux.js';
+import { sessionExists, isPaneDead } from '../tmux.js';
 
 export type ReviewSubRole = 'security' | 'correctness' | 'performance' | 'requirements';
 
@@ -63,16 +63,7 @@ interface ReviewerState {
   settled: boolean;
   stalledAt?: number;
   lastModifiedMs: number;
-}
-
-/**
- * Poll for reviewer output files until all have settled (written their
- * output file or been declared stalled/missing). Returns one result per
- * sub-role.
- *
- * Callers should await this after firing all spawnRun sub-role spawns.
- */
-export async function waitForReviewerOutputs(
+}async function waitForReviewerOutputsPromise(
   opts: WaitForReviewerOutputsOpts,
 ): Promise<ReviewerResult[]> {
   const {
@@ -119,7 +110,7 @@ export async function waitForReviewerOutputs(
 
       // Check if the tmux session is dead
       try {
-        const dead = await isPaneDeadAsync(s.sessionId);
+        const dead = await Effect.runPromise(isPaneDead(s.sessionId));
         if (dead) {
           s.settled = true;
           if (!existsSync(s.outputPath)) {
@@ -132,7 +123,7 @@ export async function waitForReviewerOutputs(
         }
       } catch {
         // Session may not exist
-        const exists = await sessionExistsAsync(s.sessionId);
+        const exists = await Effect.runPromise(sessionExists(s.sessionId));
         if (!exists) {
           s.settled = true;
           if (!existsSync(s.outputPath)) {
@@ -184,7 +175,7 @@ export function reviewerOutputPath(
  * raw `setTimeout`. Errors thrown by stat / tmux probes are tolerated the same
  * way as the Promise version.
  */
-export const waitForReviewerOutputsEffect = (
+export const waitForReviewerOutputs = (
   opts: WaitForReviewerOutputsOpts,
 ): Effect.Effect<ReviewerResult[]> =>
   Effect.gen(function* () {
@@ -231,10 +222,9 @@ export const waitForReviewerOutputsEffect = (
           }
         }
 
-        const dead = yield* Effect.tryPromise({
-          try: () => isPaneDeadAsync(s.sessionId),
-          catch: () => null as boolean | null,
-        }).pipe(Effect.orElseSucceed(() => null));
+        const dead = yield* isPaneDead(s.sessionId).pipe(
+          Effect.catch(() => Effect.succeed(null as boolean | null)),
+        );
 
         if (dead === true) {
           s.settled = true;
@@ -245,10 +235,9 @@ export const waitForReviewerOutputsEffect = (
           }
           continue;
         } else if (dead === null) {
-          const exists = yield* Effect.tryPromise({
-            try: () => sessionExistsAsync(s.sessionId),
-            catch: () => true,
-          }).pipe(Effect.orElseSucceed(() => true));
+          const exists = yield* sessionExists(s.sessionId).pipe(
+            Effect.catch(() => Effect.succeed(true)),
+          );
           if (!exists) {
             s.settled = true;
             if (!existsSync(s.outputPath)) s.stalledAt = now;

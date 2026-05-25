@@ -13,6 +13,7 @@ export class OpenAICompatibleProxyError extends Data.TaggedError('OpenAICompatib
 
 const UPSTREAMS: Record<string, string> = {
   nous: 'https://inference-api.nousresearch.com/v1',
+  dashscope: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
 };
 
 let server: http.Server | null = null;
@@ -24,9 +25,7 @@ export function getOpenAICompatibleProxyBaseUrl(provider: string): string {
 
 export function getProxyPathname(url: string | undefined): string {
   return new URL(url ?? '/', `http://${HOST}:${PORT}`).pathname;
-}
-
-export async function ensureOpenAICompatibleProxyRunning(): Promise<void> {
+}async function ensureOpenAICompatibleProxyRunningPromise(): Promise<void> {
   if (started && server?.listening) return;
   if (await isPortOpen()) {
     started = true;
@@ -53,9 +52,9 @@ export async function ensureOpenAICompatibleProxyRunning(): Promise<void> {
 }
 
 /** Effect variant of {@link ensureOpenAICompatibleProxyRunning}. */
-export const ensureOpenAICompatibleProxyRunningEffect = (): Effect.Effect<void, OpenAICompatibleProxyError> =>
+export const ensureOpenAICompatibleProxyRunning = (): Effect.Effect<void, OpenAICompatibleProxyError> =>
   Effect.tryPromise({
-    try: () => ensureOpenAICompatibleProxyRunning(),
+    try: () => ensureOpenAICompatibleProxyRunningPromise(),
     catch: (cause) =>
       new OpenAICompatibleProxyError({
         operation: 'ensureOpenAICompatibleProxyRunning',

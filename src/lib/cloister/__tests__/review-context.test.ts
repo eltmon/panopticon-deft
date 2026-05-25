@@ -1,6 +1,7 @@
 /**
  * Tests for review-context.ts (PAN-1059)
  */
+import { Effect } from 'effect';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'path';
 
@@ -23,6 +24,7 @@ vi.mock('fs', () => ({
 
 // ── child_process mock ─────────────────────────────────────────────────────
 const mockExecAsync = vi.fn();
+const mockReadPlan = vi.fn();
 vi.mock('child_process', () => ({
   exec: vi.fn((cmd: string, opts: unknown, cb: unknown) => {
     // promisify calls exec(cmd, opts, callback)
@@ -38,9 +40,8 @@ vi.mock('child_process', () => ({
 // ── vbrief / config mocks ──────────────────────────────────────────────────
 vi.mock('../../vbrief/io.js', () => ({
   findPlan: vi.fn(() => null),
-  readPlanAsync: vi.fn(async () => {
-    throw new Error('no plan');
-  }),
+  findPlanSync: vi.fn(() => null),
+  readPlanProgram: (...args: unknown[]) => mockReadPlan(...args),
 }));
 vi.mock('../../vbrief/lifecycle-io.js', () => ({
   findVBriefByIssue: vi.fn(() => null),
@@ -69,15 +70,16 @@ describe('buildReviewContext', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReadPlan.mockReturnValue(Effect.fail(new Error('no plan')));
     mockExistsSync.mockImplementation((p: string) => p === workspace);
   });
 
   it('throws when workspace does not exist', async () => {
     mockExistsSync.mockReturnValue(false);
 
-    await expect(buildReviewContext({ runId, issueId, workspace })).rejects.toThrow(
-      'Workspace directory does not exist',
-    );
+    await expect(Effect.runPromise(buildReviewContext({ runId, issueId, workspace }))).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringContaining('Workspace directory does not exist') }),
+    });
   });
 
   it('runs git commands and writes manifest to correct path', async () => {
@@ -92,7 +94,7 @@ describe('buildReviewContext', () => {
       'git diff "deadbeef"...HEAD': { stdout: '+some diff content\n' },
     });
 
-    const manifest = await buildReviewContext({ runId, issueId, workspace });
+    const manifest = await Effect.runPromise(buildReviewContext({ runId, issueId, workspace }));
 
     expect(mockMkdir).toHaveBeenCalledWith(
       join(workspace, '.pan', 'review', runId),
@@ -127,7 +129,7 @@ describe('buildReviewContext', () => {
       'git diff "base"...HEAD': { stdout: '' },
     });
 
-    const manifest = await buildReviewContext({ runId, issueId, workspace });
+    const manifest = await Effect.runPromise(buildReviewContext({ runId, issueId, workspace }));
 
     expect(manifest.changedFiles[0].path).toBe('src/auth/token.ts');   // HIGH=5
     expect(manifest.changedFiles[1].path).toBe('src/api/routes.ts');   // MED=3
@@ -144,7 +146,7 @@ describe('buildReviewContext', () => {
       'diff --stat': { stdout: '2 files changed, 200 insertions(+), 0 deletions(-)\n' },
     });
 
-    const manifest = await buildReviewContext({ runId, issueId, workspace });
+    const manifest = await Effect.runPromise(buildReviewContext({ runId, issueId, workspace }));
 
     expect(manifest.diff.truncated).toBe(true);
     expect(manifest.diff.stat).toContain('2 files changed');
@@ -154,7 +156,7 @@ describe('buildReviewContext', () => {
     mockExecAsync.mockRejectedValue(new Error('not a git repo'));
     mockExistsSync.mockImplementation((p: string) => p === workspace);
 
-    const manifest = await buildReviewContext({ runId, issueId, workspace });
+    const manifest = await Effect.runPromise(buildReviewContext({ runId, issueId, workspace }));
 
     expect(manifest.changedFiles).toEqual([]);
     expect(manifest.headSha).toBe('unknown');
@@ -168,6 +170,7 @@ describe('riskScore (via buildReviewContext file ranking)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReadPlan.mockReturnValue(Effect.fail(new Error('no plan')));
     mockExistsSync.mockImplementation((p: string) => p === workspace);
     mockExecAsync.mockRejectedValue(new Error('no git'));
   });
@@ -203,7 +206,7 @@ describe('riskScore (via buildReviewContext file ranking)', () => {
         return { stdout: '', stderr: '' };
       });
 
-      const manifest = await buildReviewContext({ runId: 'r', issueId: 'X-1', workspace });
+      const manifest = await Effect.runPromise(buildReviewContext({ runId: 'r', issueId: 'X-1', workspace }));
       expect(manifest.changedFiles[0]?.riskScore).toBe(5);
     });
   }
@@ -218,7 +221,7 @@ describe('riskScore (via buildReviewContext file ranking)', () => {
         return { stdout: '', stderr: '' };
       });
 
-      const manifest = await buildReviewContext({ runId: 'r', issueId: 'X-1', workspace });
+      const manifest = await Effect.runPromise(buildReviewContext({ runId: 'r', issueId: 'X-1', workspace }));
       expect(manifest.changedFiles[0]?.riskScore).toBe(1);
     });
   }

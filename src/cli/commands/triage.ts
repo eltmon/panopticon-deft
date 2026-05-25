@@ -10,8 +10,9 @@ import ora from 'ora';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { loadConfig } from '../../lib/config.js';
+import { loadConfigSync } from '../../lib/config.js';
 import type { Issue, TrackerType } from '../../lib/tracker/index.js';
+import { recordIssueFeatureClassification } from '../../lib/registry/feature-registry-population.js';
 import { createTracker, TrackerConfig } from '../../lib/tracker/index.js';
 
 interface TriageOptions {
@@ -28,7 +29,7 @@ interface TriageState {
  * Get tracker config by type from panopticon config
  */
 function getTrackerConfig(trackerType: TrackerType): TrackerConfig | null {
-  const config = loadConfig();
+  const config = loadConfigSync();
   const trackerConfig = config.trackers[trackerType];
 
   if (!trackerConfig) {
@@ -75,7 +76,7 @@ export async function triageCommand(id?: string, options: TriageOptions = {}): P
   const spinner = ora('Loading triage queue...').start();
 
   try {
-    const config = loadConfig();
+    const config = loadConfigSync();
     const primaryType = config.trackers.primary;
     const secondaryType = config.trackers.secondary;
 
@@ -164,6 +165,11 @@ repo = "your-repo"
           description: `${sourceIssue.description}\n\n---\n\n**From ${secondaryType}:** ${sourceIssue.url}`,
           team: primaryConfig.team,
         }));
+        void recordIssueFeatureClassification({
+          issueId: newIssue.ref,
+          title: newIssue.title,
+          body: newIssue.description,
+        });
 
         // Add comment to secondary issue linking to primary
         try {

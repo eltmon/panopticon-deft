@@ -40,7 +40,7 @@ function roleConfig(): Pick<NormalizedConfig, 'workhorses' | 'roles'> {
 
 describe('role model configuration', () => {
   it('exports default model refs for every role', () => {
-    expect(Object.keys(DEFAULT_MODEL_REFS).sort()).toEqual(['flywheel', 'plan', 'review', 'ship', 'test', 'work']);
+    expect(Object.keys(DEFAULT_MODEL_REFS).sort()).toEqual(['flywheel', 'plan', 'review', 'ship', 'strike', 'test', 'work']);
   });
 
   it('dereferences workhorse refs and passes literal model ids through', () => {
@@ -213,6 +213,7 @@ describe('tts daemon configuration', () => {
       rate: 1,
       maxChars: 140,
       dropInfoWhenFull: true,
+      lifecycle: true,
       daemonPort: 8787,
       daemonHost: '127.0.0.1',
       daemonAutoStart: false,
@@ -251,6 +252,7 @@ describe('tts daemon configuration', () => {
       rate: 1.25,
       maxChars: 220,
       dropInfoWhenFull: false,
+      lifecycle: true,
       daemonPort: 8788,
       daemonHost: 'localhost',
       daemonAutoStart: true,

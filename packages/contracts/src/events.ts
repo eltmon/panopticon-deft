@@ -19,7 +19,6 @@ import {
 import {
   MemoryObservation,
   MemoryStatus,
-  PendingTurn,
   RagDecision,
   ResetMarker,
 } from "./memory"
@@ -98,6 +97,7 @@ export const AgentStatusChangedEvent = Schema.Struct({
     issueId: Schema.optional(IssueId),
     status: AgentStatus,
     previousStatus: Schema.optional(AgentStatus),
+    hasLiveTmuxSession: Schema.optional(Schema.Boolean),
     stoppedByUser: Schema.optional(Schema.Boolean),
     paused: Schema.optional(Schema.Boolean),
     pausedReason: Schema.optional(Schema.NullOr(Schema.String)),
@@ -458,6 +458,32 @@ export const PipelineTestCompletedEvent = Schema.Struct({
   payload: Schema.Struct({ issueId: IssueId, passed: Schema.Boolean }),
 })
 export type PipelineTestCompletedEvent = typeof PipelineTestCompletedEvent.Type
+
+export const OperatorInterventionEvent = Schema.Struct({
+  type: Schema.Literal("operator.intervention"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    kind: Schema.Literals(["tell", "pause", "restart", "manual_edit", "deep_wipe", "unpause", "untroubled"]),
+    source: Schema.String,
+  }),
+})
+export type OperatorInterventionEvent = typeof OperatorInterventionEvent.Type
+
+export const SubstrateBugFiledEvent = Schema.Struct({
+  type: Schema.Literal("substrate.bug_filed"),
+  sequence: SequenceNumber,
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    issueId: IssueId,
+    runId: Schema.optional(Schema.String),
+    filedBy: Schema.Literals(["agent", "operator"]),
+    discoveredIn: Schema.optional(IssueId),
+    severity: Schema.Literals(["P0", "P1", "P2"]),
+  }),
+})
+export type SubstrateBugFiledEvent = typeof SubstrateBugFiledEvent.Type
 
 /**
  * PAN-915 — reviewer session received a new prompt (spawn or resume of a
@@ -1041,6 +1067,8 @@ export const DomainEvent = Schema.Union([
   PipelineReviewCompletedEvent,
   PipelineTestStartedEvent,
   PipelineTestCompletedEvent,
+  OperatorInterventionEvent,
+  SubstrateBugFiledEvent,
   ReviewReviewerStartedEvent,
   ReviewReviewerCompletedEvent,
   ReviewSpecialistTimedOutEvent,

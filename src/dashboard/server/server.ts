@@ -46,10 +46,12 @@ import { voiceRouteLayer } from './routes/voice.js';
 import { autopresoRouteLayer } from './routes/autopreso.js';
 import { metricsRouteLayer } from './routes/metrics.js'
 import { miscRouteLayer } from './routes/misc.js';
+import { paletteRouteLayer } from './routes/palette.js';
 import { conversationsRouteLayer } from './routes/conversations.js';
 import { eventsRouteLayer } from './routes/events.js';
 import { showRouteLayer } from './routes/show.js';
 import { projectsRouteLayer } from './routes/projects.js';
+import { contextRouteLayer } from './routes/context.js';
 import { adminRouteLayer } from './routes/admin.js';
 import { prereqsRouteLayer } from './routes/prereqs.js';
 import { cliproxyRouteLayer } from './routes/cliproxy.js';
@@ -61,9 +63,11 @@ import { codexAuthRouteLayer } from './routes/codex-auth.js';
 import { swarmRouteLayer } from './routes/swarm.js';
 import { discoveredSessionsRouteLayer } from './routes/discovered-sessions.js';
 import { flywheelRouteLayer } from './routes/flywheel.js';
+import { artifactsRouteLayer } from './routes/artifacts.js';
+import { featureRegistryRouteLayer } from './routes/feature-registry.js';
 import { dashboardCsrfToken, dashboardSessionCookieHeader, rejectUnauthorizedDashboardRequest, rejectUnauthorizedDashboardSessionMintRequest } from './routes/dashboard-auth.js';
 import { validateOrigin } from './routes/origin-validation.js';
-import { emitActivityEntry, emitActivityTts } from '../../lib/activity-logger.js';
+import { emitActivityEntrySync, emitActivityTtsSync } from '../../lib/activity-logger.js';
 
 // ─── Dual-runtime layers ──────────────────────────────────────────────────────
 
@@ -304,10 +308,12 @@ export const makeRoutesLayer = Layer.mergeAll(
   autopresoRouteLayer,
   metricsRouteLayer,
   miscRouteLayer,
+  paletteRouteLayer,
   conversationsRouteLayer,
   eventsRouteLayer,
   showRouteLayer,
   projectsRouteLayer,
+  contextRouteLayer,
   adminRouteLayer,
   prereqsRouteLayer,
   cliproxyRouteLayer,
@@ -319,6 +325,8 @@ export const makeRoutesLayer = Layer.mergeAll(
   swarmRouteLayer,
   discoveredSessionsRouteLayer,
   flywheelRouteLayer,
+  artifactsRouteLayer,
+  featureRegistryRouteLayer,
   staticRouteLayer,
 );
 
@@ -365,12 +373,12 @@ export const makeServerLayer = Layer.unwrap(
         yield* Effect.sync(() => {
           console.log(`[panopticon] Dashboard listening on http://${config.host}:${config.port}`);
           const mode = process.env['PANOPTICON_MODE'] === 'production' ? 'production mode' : 'development mode';
-          emitActivityEntry({
+          emitActivityEntrySync({
             source: 'dashboard',
             level: 'success',
             message: `Dashboard started in ${mode}`,
           });
-          emitActivityTts({
+          emitActivityTtsSync({
             utterance: `Dashboard started in ${mode}`,
             priority: 2,
             source: 'dashboard',

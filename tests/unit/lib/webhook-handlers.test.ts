@@ -1,6 +1,7 @@
 /**
  * Tests for webhook-handlers.ts (PAN-905)
  */
+import { Effect } from 'effect';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   handleCheckSuite,
@@ -18,10 +19,14 @@ const mockSetReviewStatus = vi.fn();
 
 vi.mock('../../../src/lib/review-status.js', () => ({
   getReviewStatus: (...args: Parameters<typeof mockGetReviewStatus>) => mockGetReviewStatus(...args),
+  getReviewStatusSync: (...args: Parameters<typeof mockGetReviewStatus>) => mockGetReviewStatus(...args),
   setReviewStatus: (...args: Parameters<typeof mockSetReviewStatus>) => mockSetReviewStatus(...args),
-  getReviewStatusAsync: async (...args: Parameters<typeof mockGetReviewStatus>) => mockGetReviewStatus(...args),
+  setReviewStatusSync: (...args: Parameters<typeof mockSetReviewStatus>) => mockSetReviewStatus(...args),
+  getReviewStatus: (...args: Parameters<typeof mockGetReviewStatus>) => Effect.sync(() => mockGetReviewStatus(...args)),
+  getReviewStatusSync: (...args: Parameters<typeof mockGetReviewStatus>) => Effect.sync(() => mockGetReviewStatus(...args)),
   // Strip the optional third arg (existing status) so test assertions stay clean.
-  setReviewStatusAsync: async (...args: [string, Record<string, unknown>]) => mockSetReviewStatus(args[0], args[1]),
+  setReviewStatus: (...args: [string, Record<string, unknown>]) => Effect.sync(() => mockSetReviewStatus(args[0], args[1])),
+  setReviewStatusSync: (...args: [string, Record<string, unknown>]) => Effect.sync(() => mockSetReviewStatus(args[0], args[1])),
 }));
 
 // Mock tracker-config so isTrackedRepository passes in tests
@@ -53,13 +58,13 @@ describe('handleCheckSuite', () => {
   it('adds failing_checks blocker on check suite failure', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'failure',
         pull_requests: [{ number: 1, head: { ref: 'feature/pan-123' } }],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-123', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -73,25 +78,25 @@ describe('handleCheckSuite', () => {
       blockerReasons: [{ type: 'failing_checks', summary: 'CI failed', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'success',
         pull_requests: [{ number: 1, head: { ref: 'feature/pan-123' } }],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-123', { blockerReasons: undefined });
   });
 
   it('ignores check suite with no pull requests', async () => {
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'failure',
         pull_requests: [],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });
@@ -99,13 +104,13 @@ describe('handleCheckSuite', () => {
   it('matches non-PAN project prefixes (MIN, KRUX, AUR, MYN)', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'failure',
         pull_requests: [{ number: 1, head: { ref: 'feature/min-42' } }],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('MIN-42', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -113,13 +118,13 @@ describe('handleCheckSuite', () => {
       ]),
     }));
 
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'failure',
         pull_requests: [{ number: 2, head: { ref: 'feature/krux-7' } }],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('KRUX-7', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -131,7 +136,7 @@ describe('handleCheckSuite', () => {
   it('processes all PRs in check_suite, not just the first', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleCheckSuite(makePayload({
+    await Effect.runPromise(handleCheckSuite(makePayload({
       check_suite: {
         status: 'completed',
         conclusion: 'failure',
@@ -140,7 +145,7 @@ describe('handleCheckSuite', () => {
           { number: 2, head: { ref: 'feature/pan-200' } },
         ],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-100', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -159,13 +164,13 @@ describe('handleCheckRun', () => {
   it('adds failing_checks blocker on check run failure', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleCheckRun(makePayload({
+    await Effect.runPromise(handleCheckRun(makePayload({
       check_run: {
         status: 'completed',
         conclusion: 'failure',
         pull_requests: [{ number: 1, head: { ref: 'feature/pan-123' } }],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-123', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -177,7 +182,7 @@ describe('handleCheckRun', () => {
   it('processes all PRs in check_run, not just the first', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleCheckRun(makePayload({
+    await Effect.runPromise(handleCheckRun(makePayload({
       check_run: {
         status: 'completed',
         conclusion: 'failure',
@@ -186,7 +191,7 @@ describe('handleCheckRun', () => {
           { number: 2, head: { ref: 'feature/pan-200' } },
         ],
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-100', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -205,7 +210,7 @@ describe('handlePullRequest', () => {
   it('adds draft_pr blocker when PR is draft', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'opened',
       pull_request: {
         number: 1,
@@ -214,7 +219,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-456', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -228,7 +233,7 @@ describe('handlePullRequest', () => {
       blockerReasons: [{ type: 'draft_pr', summary: 'Draft', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'ready_for_review',
       pull_request: {
         number: 1,
@@ -237,7 +242,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-456', expect.objectContaining({ blockerReasons: undefined }));
   });
@@ -245,7 +250,7 @@ describe('handlePullRequest', () => {
   it('adds merge_conflict blocker when mergeable_state is dirty', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -253,7 +258,7 @@ describe('handlePullRequest', () => {
         mergeable: false,
         mergeable_state: 'dirty',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -265,7 +270,7 @@ describe('handlePullRequest', () => {
   it('adds merge_conflict fallback when mergeable is false and mergeable_state is unavailable', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -273,7 +278,7 @@ describe('handlePullRequest', () => {
         mergeable: false,
         mergeable_state: null,
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -285,7 +290,7 @@ describe('handlePullRequest', () => {
   it('adds not_mergeable blocker for behind state', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -293,7 +298,7 @@ describe('handlePullRequest', () => {
         mergeable: false,
         mergeable_state: 'behind',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -305,7 +310,7 @@ describe('handlePullRequest', () => {
   it('adds not_mergeable blocker for blocked state', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -313,7 +318,7 @@ describe('handlePullRequest', () => {
         mergeable: false,
         mergeable_state: 'blocked',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -325,7 +330,7 @@ describe('handlePullRequest', () => {
   it('does not add merge_conflict for behind state', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -333,7 +338,7 @@ describe('handlePullRequest', () => {
         mergeable: false,
         mergeable_state: 'behind',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -351,7 +356,7 @@ describe('handlePullRequest', () => {
     const existingBlockers = [{ type: 'merge_conflict', summary: 'Conflict', detectedAt: '2026-04-28T10:00:00Z' }];
     mockGetReviewStatus.mockReturnValue({ blockerReasons: existingBlockers });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -359,7 +364,7 @@ describe('handlePullRequest', () => {
         mergeable: null,
         mergeable_state: 'unknown',
       },
-    }));
+    })));
 
     // Unknown state is left untouched — blockers are written back as-is
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({ blockerReasons: existingBlockers }));
@@ -373,7 +378,7 @@ describe('handlePullRequest', () => {
       ],
     });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -381,7 +386,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({ blockerReasons: undefined }));
   });
@@ -391,7 +396,7 @@ describe('handlePullRequest', () => {
       blockerReasons: [{ type: 'changes_requested', summary: 'Changes', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'review_dismissed',
       pull_request: {
         number: 1,
@@ -399,7 +404,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({ blockerReasons: undefined }));
   });
@@ -412,7 +417,7 @@ describe('handlePullRequest', () => {
       prHeadSha: 'old-sha-123',
     });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'synchronize',
       pull_request: {
         number: 1,
@@ -420,7 +425,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-789', expect.objectContaining({
       prHeadSha: 'new-sha-456',
@@ -435,7 +440,7 @@ describe('handlePullRequest', () => {
       prHeadSha: 'old-sha-123',
     });
 
-    await handlePullRequest(makePayload({
+    await Effect.runPromise(handlePullRequest(makePayload({
       action: 'labeled',
       pull_request: {
         number: 1,
@@ -443,7 +448,7 @@ describe('handlePullRequest', () => {
         mergeable: true,
         mergeable_state: 'clean',
       },
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });
@@ -453,14 +458,14 @@ describe('handlePullRequestReview', () => {
   it('adds changes_requested blocker', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequestReview(makePayload({
+    await Effect.runPromise(handlePullRequestReview(makePayload({
       action: 'submitted',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-111' },
       },
       review: { state: 'changes_requested' },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-111', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -474,14 +479,14 @@ describe('handlePullRequestReview', () => {
       blockerReasons: [{ type: 'changes_requested', summary: 'Changes', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handlePullRequestReview(makePayload({
+    await Effect.runPromise(handlePullRequestReview(makePayload({
       action: 'submitted',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-111' },
       },
       review: { state: 'approved' },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-111', { blockerReasons: undefined });
   });
@@ -491,14 +496,14 @@ describe('handlePullRequestReview', () => {
       blockerReasons: [{ type: 'changes_requested', summary: 'Changes', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handlePullRequestReview(makePayload({
+    await Effect.runPromise(handlePullRequestReview(makePayload({
       action: 'submitted',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-111' },
       },
       review: { state: 'dismissed' },
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });
@@ -508,14 +513,14 @@ describe('handlePullRequestReviewThread', () => {
   it('adds unresolved_conversations blocker with thread id tracking', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequestReviewThread(makePayload({
+    await Effect.runPromise(handlePullRequestReviewThread(makePayload({
       action: 'unresolved',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-222' },
       },
       thread: { id: 123, resolved: false },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-222', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -537,14 +542,14 @@ describe('handlePullRequestReviewThread', () => {
       }],
     });
 
-    await handlePullRequestReviewThread(makePayload({
+    await Effect.runPromise(handlePullRequestReviewThread(makePayload({
       action: 'resolved',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-222' },
       },
       thread: { id: 123, resolved: true },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-222', { blockerReasons: undefined });
   });
@@ -559,14 +564,14 @@ describe('handlePullRequestReviewThread', () => {
       }],
     });
 
-    await handlePullRequestReviewThread(makePayload({
+    await Effect.runPromise(handlePullRequestReviewThread(makePayload({
       action: 'resolved',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-222' },
       },
       thread: { id: 123, resolved: true },
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-222', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -590,14 +595,14 @@ describe('handlePullRequestReviewThread', () => {
       }],
     });
 
-    await handlePullRequestReviewThread(makePayload({
+    await Effect.runPromise(handlePullRequestReviewThread(makePayload({
       action: 'resolved',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-222' },
       },
       thread: { resolved: true },
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });
@@ -606,14 +611,14 @@ describe('handlePullRequestReviewThread', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handlePullRequestReviewThread(makePayload({
+    await Effect.runPromise(handlePullRequestReviewThread(makePayload({
       action: 'unresolved',
       pull_request: {
         number: 1,
         head: { ref: 'feature/pan-222' },
       },
       thread: { resolved: false },
-    }));
+    })));
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Unresolved review thread without id'));
     warnSpy.mockRestore();
@@ -624,10 +629,10 @@ describe('handleStatus', () => {
   it('adds failing_checks blocker on status failure', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'failure',
       branches: [{ name: 'main' }, { name: 'feature/pan-333' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-333', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -639,10 +644,10 @@ describe('handleStatus', () => {
   it('adds failing_checks blocker on status error', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'error',
       branches: [{ name: 'feature/pan-444' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-444', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -656,10 +661,10 @@ describe('handleStatus', () => {
       blockerReasons: [{ type: 'failing_checks', summary: 'CI failed', detectedAt: '2026-04-28T10:00:00Z' }],
     });
 
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'success',
       branches: [{ name: 'main' }, { name: 'feature/pan-333' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-333', { blockerReasons: undefined });
   });
@@ -667,10 +672,10 @@ describe('handleStatus', () => {
   it('skips non-feature branches and acts on the first matching feature branch', async () => {
     mockGetReviewStatus.mockReturnValue({ blockerReasons: [] });
 
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'failure',
       branches: [{ name: 'main' }, { name: 'release' }, { name: 'feature/pan-555' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-555', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -684,11 +689,11 @@ describe('handleStatus', () => {
       .mockReturnValueOnce(null)
       .mockReturnValueOnce({ blockerReasons: [] });
 
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'failure',
       sha: 'abc123',
       branches: [{ name: 'feature/pan-111' }, { name: 'feature/pan-222' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).toHaveBeenCalledWith('PAN-222', expect.objectContaining({
       blockerReasons: expect.arrayContaining([
@@ -698,19 +703,19 @@ describe('handleStatus', () => {
   });
 
   it('ignores status events with no matching feature branches', async () => {
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'failure',
       branches: [{ name: 'main' }, { name: 'release' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });
 
   it('does not partial-match branches with alphanumeric suffixes', async () => {
-    await handleStatus(makePayload({
+    await Effect.runPromise(handleStatus(makePayload({
       state: 'failure',
       branches: [{ name: 'feature/pan-3uwo' }],
-    }));
+    })));
 
     expect(mockSetReviewStatus).not.toHaveBeenCalled();
   });

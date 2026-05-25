@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ApiSettingsConfig } from '../settings-api.js';
 
@@ -14,6 +15,7 @@ vi.mock('fs/promises', () => ({
 }));
 
 vi.mock('../config-yaml.js', () => ({
+  PARENT_MODEL_REF: 'parent',
   DEFAULT_MODEL_REFS: {
     plan: 'workhorse:expensive',
     work: 'workhorse:mid',
@@ -36,6 +38,7 @@ vi.mock('../config-yaml.js', () => ({
     flywheel: { harness: 'claude-code', model: 'claude-opus-4-7', effort: 'high', maxAgents: 8, scope: 'pan-only' },
   },
   loadConfig: () => mockLoadConfig(),
+  loadConfigSync: () => mockLoadConfig(),
   getGlobalConfigPath: () => '/tmp/config.yaml',
   clearConfigCache: () => mockClearConfigCache(),
   mergeConfigs: (...args: unknown[]) => mockMergeConfigs(...args),
@@ -49,12 +52,33 @@ vi.mock('../model-capabilities.js', () => ({
     'gpt-5.5': { provider: 'openai', displayName: 'GPT-5.5', costPer1MTokens: 1 },
     'gpt-5.5-mini': { provider: 'openai', displayName: 'GPT-5.5 Mini', costPer1MTokens: 1 },
     'minimax-m2.7-highspeed': { provider: 'minimax', displayName: 'MiniMax M2.7', costPer1MTokens: 1 },
+    'qwen3-coder-plus': { provider: 'dashscope', displayName: 'Qwen3 Coder Plus', costPer1MTokens: 1 },
   },
   MODEL_DEPRECATIONS: {
     'claude-opus-4-6': 'claude-opus-4-7',
   },
   getModelCapability: vi.fn(),
+  getModelCapabilitySync: vi.fn(),
+  hasModelCapability: (modelId: string) => [
+    'claude-opus-4-7',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5',
+    'gpt-5.5',
+    'gpt-5.5-mini',
+    'minimax-m2.7-highspeed',
+    'qwen3-coder-plus',
+  ].includes(modelId),
+  hasModelCapabilitySync: (modelId: string) => [
+    'claude-opus-4-7',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5',
+    'gpt-5.5',
+    'gpt-5.5-mini',
+    'minimax-m2.7-highspeed',
+    'qwen3-coder-plus',
+  ].includes(modelId),
   resolveModelId: (modelId: string) => mockResolveModelId(modelId),
+  resolveModelIdSync: (modelId: string) => mockResolveModelId(modelId),
 }));
 
 
@@ -83,7 +107,8 @@ function baseConfig(overrides: Record<string, unknown> = {}) {
         rollupPendingThreshold: 4,
         sidebarRefreshIntervalMs: 10000,
       },
-      experimental: { claudeCodeChannels: false },
+      experimental: { claudeCodeChannels: false, claudeCodeChannelsMcp: false },
+      rtk: { enabled: false },
       claude: { permissionMode: 'auto' },
       tts: {
         enabled: false,
@@ -124,6 +149,15 @@ describe('getDefaultConversationModelApi', () => {
 
     expect(getDefaultConversationModelApi()).toBe('gpt-5.5');
     expect(mockResolveModelId).toHaveBeenCalledWith('gpt-5.5');
+  });
+
+  it('defaults to Qwen3 Coder Plus when only DashScope is enabled', async () => {
+    mockLoadConfig.mockReturnValue(baseConfig({ enabledProviders: new Set(['dashscope']) }));
+
+    const { getDefaultConversationModelApi } = await import('../settings-api.js');
+
+    expect(getDefaultConversationModelApi()).toBe('qwen3-coder-plus');
+    expect(mockResolveModelId).toHaveBeenCalledWith('qwen3-coder-plus');
   });
 });
 
@@ -215,13 +249,13 @@ describe('loadSettingsApi', () => {
       scope: 'pan-only',
     });
 
-    await setRoleConfig('flywheel', {
+    await Effect.runPromise(setRoleConfig('flywheel', {
       harness: 'pi',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
       maxAgents: 4,
       scope: 'all-tracked-projects',
-    });
+    }));
 
     const written = String(mockWriteFile.mock.calls[0]?.[1]);
     expect(written).toContain('flywheel:');
@@ -317,7 +351,7 @@ describe('saveSettingsApi', () => {
     const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
     const settings = loadSettingsApi();
 
-    await saveSettingsApi({
+    await Effect.runPromise(saveSettingsApi({
       ...settings,
       workhorses: { ...settings.workhorses, mid: 'gpt-5.5-mini' },
       roles: {
@@ -339,7 +373,7 @@ describe('saveSettingsApi', () => {
         rollup_pending_threshold: 6,
         sidebar_refresh_interval_ms: 15000,
       },
-    });
+    }));
 
     const written = String(mockWriteFile.mock.calls[0]?.[1]);
     expect(written).toContain('# user comment');
@@ -358,17 +392,95 @@ describe('saveSettingsApi', () => {
     expect(mockClearConfigCache).toHaveBeenCalledOnce();
   });
 
+  it('round-trips parent sub-role model refs through saved and loaded settings', async () => {
+    const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
+    const settings = loadSettingsApi();
+
+    await Effect.runPromise(saveSettingsApi({
+      ...settings,
+      roles: {
+        ...settings.roles,
+        review: {
+          ...settings.roles?.review,
+          model: 'workhorse:expensive',
+          sub: {
+            ...settings.roles?.review?.sub,
+            security: { model: 'parent' },
+          },
+        },
+      },
+    }));
+
+    const written = String(mockWriteFile.mock.calls[0]?.[1]);
+    expect(written).toContain('security:');
+    expect(written).toContain('model: parent');
+
+    mockLoadConfig.mockReturnValue(baseConfig({
+      roles: {
+        review: {
+          model: 'workhorse:expensive',
+          sub: { security: { model: 'parent' } },
+        },
+      },
+    }));
+
+    expect(loadSettingsApi().roles?.review?.sub?.security?.model).toBe('parent');
+  });
+
+  it('persists DashScope provider enablement and API key', async () => {
+    const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
+    const settings = loadSettingsApi();
+
+    await Effect.runPromise(saveSettingsApi({
+      ...settings,
+      models: {
+        ...settings.models,
+        providers: {
+          ...settings.models.providers,
+          dashscope: true,
+        },
+      },
+      api_keys: {
+        ...settings.api_keys,
+        dashscope: 'dashscope-test-key',
+      },
+    }));
+
+    const written = String(mockWriteFile.mock.calls[0]?.[1]);
+    expect(written).toContain('dashscope: true');
+    expect(written).toContain('dashscope: dashscope-test-key');
+  });
+
+  it('persists RTK agent settings without removing existing agent settings', async () => {
+    mockReadFile.mockResolvedValue('agents:\n  caveman:\n    enabled: true\n');
+    mockLoadConfig.mockReturnValue(baseConfig({ rtk: { enabled: true } }));
+    const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
+    const settings = loadSettingsApi();
+
+    expect(settings.agents?.rtk?.enabled).toBe(true);
+
+    await Effect.runPromise(saveSettingsApi({
+      ...settings,
+      agents: { rtk: { enabled: false } },
+    }));
+
+    const written = String(mockWriteFile.mock.calls[0]?.[1]);
+    expect(written).toContain('caveman:');
+    expect(written).toContain('rtk:');
+    expect(written).toContain('enabled: false');
+  });
+
   it('rejects untrusted tts daemon endpoint keys at runtime', async () => {
     const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
     const settings = loadSettingsApi();
 
-    await expect(saveSettingsApi({
+    await expect(Effect.runPromise(saveSettingsApi({
       ...settings,
       tts: {
         ...settings.tts,
         daemonHost: '169.254.169.254',
       } as typeof settings.tts,
-    })).rejects.toThrow('Unknown tts setting(s): daemonHost');
+    }))).rejects.toThrow('Unknown tts setting(s): daemonHost');
 
     expect(mockWriteFile).not.toHaveBeenCalled();
   });
@@ -378,7 +490,7 @@ describe('saveSettingsApi', () => {
     const { loadSettingsApi, saveSettingsApi } = await import('../settings-api.js');
     const settings = loadSettingsApi();
 
-    await saveSettingsApi({
+    await Effect.runPromise(saveSettingsApi({
       ...settings,
       tts: {
         ...settings.tts,
@@ -393,7 +505,7 @@ describe('saveSettingsApi', () => {
         utteranceTemplates: { readyForMerge: '{issueId} ready' },
         mutedIssues: ['PAN-123'],
       },
-    });
+    }));
 
     const written = String(mockWriteFile.mock.calls[0]?.[1]);
     expect(written).toContain('summarizer:');
@@ -431,6 +543,8 @@ describe('validateSettingsApi', () => {
         kimi: false,
         mimo: false,
         openrouter: false,
+        nous: false,
+        dashscope: false,
       },
       gemini_thinking_level: 3,
     },
@@ -516,6 +630,21 @@ describe('validateSettingsApi', () => {
     expect(result.errors).toContain('Unknown tts setting(s): daemonPort');
   });
 
+  it('rejects invalid experimental flag types', async () => {
+    const { validateSettingsApi } = await import('../settings-api.js');
+    const result = validateSettingsApi({
+      ...validSettings,
+      experimental: {
+        claudeCodeChannels: 'yes',
+        claudeCodeChannelsMcp: 'yes',
+      } as never,
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain('experimental.claudeCodeChannels must be a boolean');
+    expect(result.errors).toContain('experimental.claudeCodeChannelsMcp must be a boolean');
+  });
+
   it('rejects invalid tts field types', async () => {
     const { validateSettingsApi } = await import('../settings-api.js');
     const result = validateSettingsApi({
@@ -575,5 +704,52 @@ describe('validateSettingsApi', () => {
     expect(result.errors).toContain('memory.per_day_cost_cap_usd must be greater than or equal to 0');
     expect(result.errors).toContain('memory.rollup_pending_threshold must be a positive integer');
     expect(result.errors).toContain('memory.sidebar_refresh_interval_ms must be a positive integer');
+  });
+});
+
+describe('getAvailableModelsApi — MODEL_DEPRECATIONS filter (PAN-1122 follow-up)', () => {
+  // Regression guard: PR #1425 added the dropped OpenAI models to
+  // MODEL_DEPRECATIONS but did not update this endpoint, so the dropdown
+  // continued to surface them. Settings picker reads from this endpoint.
+  // We use a scoped vi.doMock here so the test exercises the filter against
+  // a CAPABILITIES catalog that actually contains a deprecated model — the
+  // file-level mock at the top of this file doesn't.
+  it('excludes any model whose ID appears in MODEL_DEPRECATIONS', async () => {
+    vi.resetModules();
+    vi.doMock('../model-capabilities.js', () => ({
+      MODEL_CAPABILITIES: {
+        'gpt-5.5': { provider: 'openai', displayName: 'GPT-5.5', costPer1MTokens: 1 },
+        'gpt-5.4': { provider: 'openai', displayName: 'GPT-5.4', costPer1MTokens: 1 },
+        'gpt-4o': { provider: 'openai', displayName: 'GPT-4o', costPer1MTokens: 1 },
+        'gpt-5.5-pro': { provider: 'openai', displayName: 'GPT-5.5 Pro', costPer1MTokens: 1 },
+        'o4-mini': { provider: 'openai', displayName: 'O4 Mini', costPer1MTokens: 1 },
+      },
+      MODEL_DEPRECATIONS: {
+        'gpt-4o': 'gpt-5.4',
+        'gpt-5.5-pro': 'gpt-5.5',
+        'o4-mini': 'gpt-5.4-mini',
+      },
+      getModelCapability: vi.fn(),
+      getModelCapabilitySync: vi.fn(),
+      hasModelCapability: () => true,
+      hasModelCapabilitySync: () => true,
+      resolveModelId: (modelId: string) => modelId,
+      resolveModelIdSync: (modelId: string) => modelId,
+    }));
+
+    const { getAvailableModelsApi } = await import('../settings-api.js');
+    const openaiIds = getAvailableModelsApi().openai.map(m => m.id);
+
+    // Kept models pass through.
+    expect(openaiIds).toContain('gpt-5.5');
+    expect(openaiIds).toContain('gpt-5.4');
+    // Dropped models — present in capabilities for back-compat (cost lookups
+    // on historical conversations) but excluded from user-facing pickers.
+    expect(openaiIds).not.toContain('gpt-4o');
+    expect(openaiIds).not.toContain('gpt-5.5-pro');
+    expect(openaiIds).not.toContain('o4-mini');
+
+    vi.doUnmock('../model-capabilities.js');
+    vi.resetModules();
   });
 });

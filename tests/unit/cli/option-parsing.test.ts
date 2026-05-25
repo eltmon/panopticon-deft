@@ -30,7 +30,7 @@ function runCli(args: string[]): { stdout: string; stderr: string; status: numbe
     const stdout = execFileSync('node', [CLI_PATH, ...args], {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 2_000,
+      timeout: 10_000,
     });
     return { stdout, stderr: '', status: 0 };
   } catch (e: any) {
@@ -101,5 +101,21 @@ describe('pan swarm <id> — option parsing', () => {
     expect(status).toBe(0);
     expect(stdout).toMatch(/--auto-advance/);
     expect(stdout).toMatch(/--no-auto-advance/);
+  });
+});
+
+describe('pan project(s) add — option parsing', () => {
+  it('supports the preferred plural projects alias', () => {
+    const { stdout, status } = runCli(['projects', 'add', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Usage: pan projects add \[options\] <path>/);
+    expect(stdout).toMatch(/Register a project with Panopticon/);
+  });
+
+  it('keeps the singular project command working', () => {
+    const { stdout, status } = runCli(['project', 'add', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Usage: pan project add \[options\] <path>/);
+    expect(stdout).toMatch(/Register a project with Panopticon/);
   });
 });

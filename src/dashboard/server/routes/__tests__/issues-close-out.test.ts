@@ -23,6 +23,7 @@ vi.mock('../../../../lib/projects.js', async (importOriginal) => {
   return {
     ...actual,
     resolveProjectFromIssue: resolveProjectFromIssueMock,
+    resolveProjectFromIssueSync: resolveProjectFromIssueMock,
   };
 });
 
@@ -31,6 +32,7 @@ vi.mock('../../../../lib/tracker-utils.js', async (importOriginal) => {
   return {
     ...actual,
     resolveGitHubIssue: resolveGitHubIssueMock,
+    resolveGitHubIssueSync: resolveGitHubIssueMock,
   };
 });
 
@@ -43,6 +45,24 @@ import { EventStoreService } from '../../services/domain-services.js';
 import { INTERNAL_TOKEN_HEADER, _resetInternalTokenCacheForTests } from '../../../../lib/internal-token.js';
 import { DASHBOARD_CSRF_HEADER, DASHBOARD_SESSION_COOKIE, _resetDashboardSessionTokenForTests, dashboardCsrfToken } from '../dashboard-auth.js';
 import { _resetTrustedOriginsForTests } from '../origin-validation.js';
+
+const originalApiPort = process.env.API_PORT;
+const originalPort = process.env.PORT;
+const originalDashboardUrl = process.env.DASHBOARD_URL;
+
+function restoreEnv(name: 'API_PORT' | 'PORT' | 'DASHBOARD_URL', value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
+function pinDefaultDashboardOrigin(): void {
+  process.env.API_PORT = '3011';
+  delete process.env.PORT;
+  delete process.env.DASHBOARD_URL;
+}
 
 function eventStoreLayerFor(appendedEvents: Record<string, unknown>[]) {
   return Layer.succeed(EventStoreService, {
@@ -108,6 +128,9 @@ afterEach(() => {
   delete process.env.PANOPTICON_DASHBOARD_SESSION_TOKEN;
   delete process.env.PANOPTICON_DASHBOARD_CSRF_TOKEN;
   delete process.env.PANOPTICON_TRUSTED_ORIGINS;
+  restoreEnv('API_PORT', originalApiPort);
+  restoreEnv('PORT', originalPort);
+  restoreEnv('DASHBOARD_URL', originalDashboardUrl);
   _resetInternalTokenCacheForTests();
   _resetDashboardSessionTokenForTests();
   _resetTrustedOriginsForTests();
@@ -120,6 +143,7 @@ describe('POST /api/issues/:id/close-out', () => {
     process.env.PANOPTICON_DASHBOARD_SESSION_TOKEN = 'test-browser-session-token';
     process.env.PANOPTICON_DASHBOARD_CSRF_TOKEN = 'test-csrf-token';
     delete process.env.PANOPTICON_TRUSTED_ORIGINS;
+    pinDefaultDashboardOrigin();
     _resetInternalTokenCacheForTests();
     _resetDashboardSessionTokenForTests();
     _resetTrustedOriginsForTests();
@@ -269,6 +293,7 @@ describe('POST /api/issues/bulk-close-out', () => {
     process.env.PANOPTICON_DASHBOARD_SESSION_TOKEN = 'test-browser-session-token';
     process.env.PANOPTICON_DASHBOARD_CSRF_TOKEN = 'test-csrf-token';
     delete process.env.PANOPTICON_TRUSTED_ORIGINS;
+    pinDefaultDashboardOrigin();
     _resetInternalTokenCacheForTests();
     _resetDashboardSessionTokenForTests();
     _resetTrustedOriginsForTests();

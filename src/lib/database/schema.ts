@@ -19,7 +19,7 @@ import { existsSync } from 'fs';
 import { encodeClaudeProjectDir } from '../paths.js';
 
 // Schema version — increment when making breaking schema changes
-export const SCHEMA_VERSION = 40;
+export const SCHEMA_VERSION = 47;
 
 function parseArrayColumn(value: string | null): string[] {
   if (!value) return [];
@@ -99,6 +99,7 @@ export function initDiscoveredSessionsSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_discovered_enrichment ON discovered_sessions(enrichment_level, enriched_at);
     CREATE INDEX IF NOT EXISTS idx_discovered_managed ON discovered_sessions(panopticon_managed, pan_issue_id);
     CREATE INDEX IF NOT EXISTS idx_discovered_model ON discovered_sessions(primary_model);
+    CREATE INDEX IF NOT EXISTS idx_discovered_session_id ON discovered_sessions(session_id) WHERE session_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS discovered_session_tags (
       session_id INTEGER NOT NULL REFERENCES discovered_sessions(id) ON DELETE CASCADE,
@@ -349,6 +350,28 @@ export function initSchema(db: Database.Database): void {
       limit_per_window INTEGER NOT NULL DEFAULT 1000
     );
 
+    CREATE TABLE IF NOT EXISTS flywheel_substrate_bugs (
+      issue_id               TEXT PRIMARY KEY,
+      filed_at               TEXT NOT NULL,
+      run_id                 TEXT,
+      filed_by               TEXT NOT NULL CHECK (filed_by IN ('agent','operator')),
+      discovered_in_issue_id TEXT,
+      severity               TEXT NOT NULL DEFAULT 'P2',
+      status                 TEXT NOT NULL DEFAULT 'open',
+      fix_merged_at          TEXT,
+      fix_commit_sha         TEXT,
+      updated_at             TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_filed_at
+      ON flywheel_substrate_bugs(filed_at);
+
+    CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_filed_by_filed_at
+      ON flywheel_substrate_bugs(filed_by, filed_at);
+
+    CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_status_fix_merged_at
+      ON flywheel_substrate_bugs(status, fix_merged_at);
+
     -- ===== Domain Events (PAN-428: push-first architecture) =====
     CREATE TABLE IF NOT EXISTS events (
       sequence  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -362,6 +385,14 @@ export function initSchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_events_timestamp
       ON events(timestamp);
+
+    CREATE INDEX IF NOT EXISTS idx_events_issue_type_timestamp_sequence
+      ON events(json_extract(payload, '$.issueId'), type, timestamp, sequence)
+      WHERE json_type(payload, '$.issueId') = 'text';
+
+    CREATE INDEX IF NOT EXISTS idx_events_type_timestamp_issue_sequence
+      ON events(type, timestamp, json_extract(payload, '$.issueId'), sequence)
+      WHERE json_type(payload, '$.issueId') = 'text';
 
     -- ===== Projection Cache (PAN-437: instant dashboard startup) =====
     CREATE TABLE IF NOT EXISTS projection_cache (
@@ -395,7 +426,11 @@ export function initSchema(db: Database.Database): void {
       fork_error       TEXT,                               -- error message when fork_status='failed'
       harness          TEXT,                                -- coding harness used for conversation runtime
       delivery_method  TEXT,                               -- 'auto', 'channels', or 'tmux'
-      spawn_error      TEXT                                -- error message when background spawn failed (quota, auth, etc.)
+      spawn_error      TEXT,                               -- error message when background spawn failed (quota, auth, etc.)
+      handoff_doc_path TEXT,                               -- target conversation's agent-authored handoff document path
+      handoff_target_conv_id INTEGER,                      -- source conversation's handoff target conversation id
+      fork_fallback_reason TEXT,                           -- reason a requested fork mode fell back to summary fork
+      cleared_to_conv_id INTEGER                           -- PAN-1458: if this conv was cleared via /clear, the sibling conv that continues it
     );
 
     CREATE INDEX IF NOT EXISTS idx_conversations_status
@@ -434,6 +469,34 @@ export function initSchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_merge_queue_project
       ON merge_queue(project_key, status, position);
+
+    -- ===== Pending Auto-Merges (PAN-1486: Flywheel scheduled merge cooldown) =====
+    CREATE TABLE IF NOT EXISTS pending_auto_merges (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      issueId          TEXT NOT NULL,
+      prUrl            TEXT NOT NULL,
+      prNumber         INTEGER,
+      projectKey       TEXT NOT NULL,
+      "status"         TEXT NOT NULL CHECK ("status" IN ('pending','merging','blocked','failed','merged','cancelled')),
+      scheduledMergeAt TEXT NOT NULL,
+      scheduledAt      TEXT NOT NULL,
+      mergedAt         TEXT,
+      failureReason    TEXT,
+      cancelledAt      TEXT,
+      cancelledBy      TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_auto_merges_active_issue
+      ON pending_auto_merges(issueId) WHERE "status" IN ('pending','merging');
+
+    CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_due_pending
+      ON pending_auto_merges(scheduledMergeAt, id) WHERE "status" = 'pending';
+
+    CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_actionable_issue
+      ON pending_auto_merges(issueId, id) WHERE "status" IN ('pending','merging','blocked','failed');
+
+    CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_actionable_schedule
+      ON pending_auto_merges("status", scheduledMergeAt, id);
 
     -- ===== Merge Sets (PAN-632: multi-repo merge coordination state) =====
     CREATE TABLE IF NOT EXISTS merge_sets (
@@ -541,6 +604,9 @@ export function initSchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_discovered_model
       ON discovered_sessions(primary_model);
+
+    CREATE INDEX IF NOT EXISTS idx_discovered_session_id
+      ON discovered_sessions(session_id) WHERE session_id IS NOT NULL;
 
     CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
       summary,
@@ -913,6 +979,7 @@ export function runMigrations(db: Database.Database): void {
       CREATE INDEX IF NOT EXISTS idx_discovered_enrichment ON discovered_sessions(enrichment_level, enriched_at);
       CREATE INDEX IF NOT EXISTS idx_discovered_managed ON discovered_sessions(panopticon_managed, pan_issue_id);
       CREATE INDEX IF NOT EXISTS idx_discovered_model ON discovered_sessions(primary_model);
+      CREATE INDEX IF NOT EXISTS idx_discovered_session_id ON discovered_sessions(session_id) WHERE session_id IS NOT NULL;
       CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
         summary, summary_detailed, tags, files_touched,
         content='discovered_sessions', content_rowid='id'
@@ -1120,6 +1187,7 @@ export function runMigrations(db: Database.Database): void {
       CREATE INDEX IF NOT EXISTS idx_discovered_enrichment ON discovered_sessions(enrichment_level, enriched_at);
       CREATE INDEX IF NOT EXISTS idx_discovered_managed ON discovered_sessions(panopticon_managed, pan_issue_id);
       CREATE INDEX IF NOT EXISTS idx_discovered_model ON discovered_sessions(primary_model);
+      CREATE INDEX IF NOT EXISTS idx_discovered_session_id ON discovered_sessions(session_id) WHERE session_id IS NOT NULL;
       CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
         summary, summary_detailed, tags, files_touched,
         content='discovered_sessions', content_rowid='id'
@@ -1178,6 +1246,141 @@ export function runMigrations(db: Database.Database): void {
     try { db.exec(`ALTER TABLE transcript_checkpoints ADD COLUMN claim_from INTEGER`); } catch { /* already exists */ }
     try { db.exec(`ALTER TABLE transcript_checkpoints ADD COLUMN claim_to INTEGER`); } catch { /* already exists */ }
     try { db.exec(`ALTER TABLE transcript_checkpoints ADD COLUMN claim_expires_at TEXT`); } catch { /* already exists */ }
+  }
+
+  // v40 → v41: index discovered session UUIDs for archived-conversation enrichment joins
+  if (currentVersion < 41) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_discovered_session_id
+        ON discovered_sessions(session_id) WHERE session_id IS NOT NULL;
+    `);
+  }
+
+  // v41 → v42: add handoff fork artifact and fallback metadata to conversations
+  if (currentVersion < 42) {
+    try { db.exec(`ALTER TABLE conversations ADD COLUMN handoff_doc_path TEXT`); } catch { /* already exists */ }
+    try { db.exec(`ALTER TABLE conversations ADD COLUMN handoff_target_conv_id INTEGER`); } catch { /* already exists */ }
+    try { db.exec(`ALTER TABLE conversations ADD COLUMN fork_fallback_reason TEXT`); } catch { /* already exists */ }
+  }
+
+  // v42 → v43: track post-/clear sibling relationship for Claude Code conversations (PAN-1458).
+  // When Claude Code receives /clear, a new JSONL is created with a fresh session-id. The
+  // background orphan detector in conversation-lifecycle.ts creates a sibling conversation row
+  // for the new JSONL and links the parent via this column. UI can then surface the boundary.
+  if (currentVersion < 43) {
+    try { db.exec(`ALTER TABLE conversations ADD COLUMN cleared_to_conv_id INTEGER`); } catch { /* already exists */ }
+    try {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_conversations_cleared_to
+                 ON conversations(cleared_to_conv_id) WHERE cleared_to_conv_id IS NOT NULL`);
+    } catch { /* already exists */ }
+  }
+
+  // v43 → v44: add Flywheel pending auto-merge schedule table (PAN-1486)
+  if (currentVersion < 44) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_auto_merges (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        issueId          TEXT NOT NULL,
+        prUrl            TEXT NOT NULL,
+        prNumber         INTEGER,
+        projectKey       TEXT NOT NULL,
+        "status"         TEXT NOT NULL CHECK ("status" IN ('pending','merging','blocked','failed','merged','cancelled')),
+        scheduledMergeAt TEXT NOT NULL,
+        scheduledAt      TEXT NOT NULL,
+        mergedAt         TEXT,
+        failureReason    TEXT,
+        cancelledAt      TEXT,
+        cancelledBy      TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_auto_merges_active_issue
+        ON pending_auto_merges(issueId) WHERE "status" IN ('pending','merging');
+    `);
+  }
+
+  // v44 → v45: add SQL-filtered indexes for auto-merge hot paths (PAN-1486)
+  if (currentVersion < 45) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_auto_merges (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        issueId          TEXT NOT NULL,
+        prUrl            TEXT NOT NULL,
+        prNumber         INTEGER,
+        projectKey       TEXT NOT NULL,
+        "status"         TEXT NOT NULL CHECK ("status" IN ('pending','merging','blocked','failed','merged','cancelled')),
+        scheduledMergeAt TEXT NOT NULL,
+        scheduledAt      TEXT NOT NULL,
+        mergedAt         TEXT,
+        failureReason    TEXT,
+        cancelledAt      TEXT,
+        cancelledBy      TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_auto_merges_active_issue
+        ON pending_auto_merges(issueId) WHERE "status" IN ('pending','merging');
+
+      CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_due_pending
+        ON pending_auto_merges(scheduledMergeAt, id) WHERE "status" = 'pending';
+
+      CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_actionable_issue
+        ON pending_auto_merges(issueId, id) WHERE "status" IN ('pending','merging','blocked','failed');
+
+      CREATE INDEX IF NOT EXISTS idx_pending_auto_merges_actionable_schedule
+        ON pending_auto_merges("status", scheduledMergeAt, id);
+    `);
+  }
+
+  // v45 → v46: add Flywheel substrate bug projection table (PAN-1487)
+  if (currentVersion < 46) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS flywheel_substrate_bugs (
+        issue_id               TEXT PRIMARY KEY,
+        filed_at               TEXT NOT NULL,
+        run_id                 TEXT,
+        filed_by               TEXT NOT NULL CHECK (filed_by IN ('agent','operator')),
+        discovered_in_issue_id TEXT,
+        severity               TEXT NOT NULL DEFAULT 'P2',
+        status                 TEXT NOT NULL DEFAULT 'open',
+        fix_merged_at          TEXT,
+        fix_commit_sha         TEXT,
+        updated_at             TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_filed_at
+        ON flywheel_substrate_bugs(filed_at);
+
+      CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_filed_by_filed_at
+        ON flywheel_substrate_bugs(filed_by, filed_at);
+
+      CREATE INDEX IF NOT EXISTS idx_flywheel_substrate_bugs_status_fix_merged_at
+        ON flywheel_substrate_bugs(status, fix_merged_at);
+    `);
+  }
+
+  // v46 → v47: add indexed Flywheel stats event access paths (PAN-1487)
+  if (currentVersion < 47) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS events (
+        sequence  INTEGER PRIMARY KEY AUTOINCREMENT,
+        type      TEXT    NOT NULL,
+        timestamp TEXT    NOT NULL,
+        payload   TEXT    NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_events_type
+        ON events(type);
+
+      CREATE INDEX IF NOT EXISTS idx_events_timestamp
+        ON events(timestamp);
+
+      CREATE INDEX IF NOT EXISTS idx_events_issue_type_timestamp_sequence
+        ON events(json_extract(payload, '$.issueId'), type, timestamp, sequence)
+        WHERE json_type(payload, '$.issueId') = 'text';
+
+      CREATE INDEX IF NOT EXISTS idx_events_type_timestamp_issue_sequence
+        ON events(type, timestamp, json_extract(payload, '$.issueId'), sequence)
+        WHERE json_type(payload, '$.issueId') = 'text';
+    `);
   }
 
   // After all migrations, set the version

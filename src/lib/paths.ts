@@ -21,6 +21,11 @@ export const COSTS_DIR = join(PANOPTICON_HOME, 'costs');
 export const HEARTBEATS_DIR = join(PANOPTICON_HOME, 'heartbeats');
 export const ARCHIVES_DIR = join(PANOPTICON_HOME, 'archives');
 export const LOGS_DIR = join(PANOPTICON_HOME, 'logs');
+export const HANDOFFS_DIR = join(PANOPTICON_HOME, 'handoffs');
+
+export function getHandoffsDir(): string {
+  return join(getPanopticonHome(), 'handoffs');
+}
 
 // Traefik directories
 export const TRAEFIK_DIR = join(PANOPTICON_HOME, 'traefik');
@@ -83,13 +88,34 @@ export function resolvePackageRootForDir(dir: string): string {
 
 export const packageRoot = resolvePackageRootForDir(currentDir);
 
-export const SOURCE_TEMPLATES_DIR = join(packageRoot, 'templates');
-export const SOURCE_TRAEFIK_TEMPLATES = join(SOURCE_TEMPLATES_DIR, 'traefik');
-export const SOURCE_SCRIPTS_DIR = join(packageRoot, 'scripts');
-export const SOURCE_SKILLS_DIR = join(packageRoot, 'skills');
-export const SOURCE_DEV_SKILLS_DIR = join(packageRoot, 'dev-skills');
-export const SOURCE_AGENTS_DIR = join(packageRoot, 'agents');
-export const SOURCE_RULES_DIR = join(packageRoot, 'rules');
+/**
+ * Root of Panopticon's own bundled sync sources (PAN-1201).
+ *
+ * Everything `pan sync` distributes from the package itself lives under this
+ * single explicit top-level directory — skills, dev-skills, agents, rules,
+ * hook scripts, and workspace templates. A glance at the repo root shows
+ * exactly what sync distributes.
+ *
+ * This replaces the scattered SOURCE_*_DIR constants that previously pointed
+ * at sprawled top-level dirs. That sprawl let the stale top-level `rules/`
+ * silently rot while the maintained rules accumulated elsewhere (#1359):
+ * nothing in the repo layout signalled which dirs were sync sources.
+ */
+export const SYNC_SOURCES_ROOT = join(packageRoot, 'sync-sources');
+
+/** Resolved sub-paths under {@link SYNC_SOURCES_ROOT}. */
+export const SYNC_SOURCES = {
+  root: SYNC_SOURCES_ROOT,
+  skills: join(SYNC_SOURCES_ROOT, 'skills'),
+  devSkills: join(SYNC_SOURCES_ROOT, 'dev-skills'),
+  agents: join(SYNC_SOURCES_ROOT, 'agents'),
+  rules: join(SYNC_SOURCES_ROOT, 'rules'),
+  hooks: join(SYNC_SOURCES_ROOT, 'hooks'),
+  gitHooks: join(SYNC_SOURCES_ROOT, 'hooks', 'git-hooks'),
+  templates: join(SYNC_SOURCES_ROOT, 'templates'),
+  traefikTemplates: join(SYNC_SOURCES_ROOT, 'templates', 'traefik'),
+  claudeMdSections: join(SYNC_SOURCES_ROOT, 'templates', 'claude-md', 'sections'),
+} as const;
 
 // Cache directories (where Panopticon keeps its copy of distributed content)
 export const CACHE_SKILLS_DIR = SKILLS_DIR;   // ~/.panopticon/skills/
@@ -97,11 +123,63 @@ export const CACHE_AGENTS_DIR = join(PANOPTICON_HOME, 'agent-definitions');  // 
 export const CACHE_RULES_DIR = join(PANOPTICON_HOME, 'rules');
 export const CACHE_MANIFEST = join(PANOPTICON_HOME, '.manifest.json');
 
-// Pre-workspace PRD directory (for PRDs created before workspace exists)
+// Pre-workspace PRD directory and docs RAG state directory
 export const DOCS_DIR = join(PANOPTICON_HOME, 'docs');
 export const PRDS_DIR = join(DOCS_DIR, 'prds');
 export const PRD_DRAFTS_DIR = join(PRDS_DIR, 'drafts');
 export const PRD_PUBLISHED_DIR = join(PRDS_DIR, 'published');
+export const DOCS_INDEX_FILE = join(DOCS_DIR, 'index.sqlite');
+export const DOCS_BUDGET_STATE_FILE = join(DOCS_DIR, 'budget-state.json');
+export const DOCS_DISABLE_STATE_FILE = join(DOCS_DIR, 'disable-state.json');
+export const DOCS_TELEMETRY_FILE = join(DOCS_DIR, 'telemetry.jsonl');
+
+export interface DocsPathOverrides {
+  panopticonHome?: string;
+  docsDir?: string;
+  indexPath?: string;
+  budgetStatePath?: string;
+  disableStatePath?: string;
+  telemetryPath?: string;
+}
+
+export interface DocsPaths {
+  docsDir: string;
+  indexPath: string;
+  budgetStatePath: string;
+  disableStatePath: string;
+  telemetryPath: string;
+}
+
+export function getDocsPaths(overrides: DocsPathOverrides = {}): DocsPaths {
+  const docsDir = overrides.docsDir ?? join(overrides.panopticonHome ?? getPanopticonHome(), 'docs');
+  return {
+    docsDir,
+    indexPath: overrides.indexPath ?? join(docsDir, 'index.sqlite'),
+    budgetStatePath: overrides.budgetStatePath ?? join(docsDir, 'budget-state.json'),
+    disableStatePath: overrides.disableStatePath ?? join(docsDir, 'disable-state.json'),
+    telemetryPath: overrides.telemetryPath ?? join(docsDir, 'telemetry.jsonl'),
+  };
+}
+
+export function getDocsDir(overrides: Pick<DocsPathOverrides, 'panopticonHome' | 'docsDir'> = {}): string {
+  return getDocsPaths(overrides).docsDir;
+}
+
+export function getDocsIndexPath(overrides: Pick<DocsPathOverrides, 'panopticonHome' | 'docsDir' | 'indexPath'> = {}): string {
+  return getDocsPaths(overrides).indexPath;
+}
+
+export function getDocsBudgetStatePath(overrides: Pick<DocsPathOverrides, 'panopticonHome' | 'docsDir' | 'budgetStatePath'> = {}): string {
+  return getDocsPaths(overrides).budgetStatePath;
+}
+
+export function getDocsDisableStatePath(overrides: Pick<DocsPathOverrides, 'panopticonHome' | 'docsDir' | 'disableStatePath'> = {}): string {
+  return getDocsPaths(overrides).disableStatePath;
+}
+
+export function getDocsTelemetryPath(overrides: Pick<DocsPathOverrides, 'panopticonHome' | 'docsDir' | 'telemetryPath'> = {}): string {
+  return getDocsPaths(overrides).telemetryPath;
+}
 
 // Project-relative docs paths (subdirectory names for project-level docs)
 export const PROJECT_DOCS_SUBDIR = 'docs';
@@ -111,14 +189,18 @@ export const PROJECT_PRDS_PLANNED_SUBDIR = 'planned';
 export const PROJECT_PRDS_COMPLETED_SUBDIR = 'completed';
 
 /**
- * Detect if running in development mode (from npm link or panopticon repo)
+ * Detect if running from a panopticon-cli checkout (vs an installed package).
  *
- * Dev mode is detected if:
- * 1. Running from the panopticon source directory (npm link)
- * 2. The SOURCE_DEV_SKILLS_DIR exists (only present in repo, not in npm package)
+ * The npm package ships only `dist/` plus the dirs in package.json's `files`
+ * array — never `src/`. So the presence of a `src/` directory next to the
+ * resolved package root is a reliable dev-mode signal.
+ *
+ * (PAN-1201: previously keyed off the bundled `dev-skills/` dir. That broke
+ * once dev-skills moved under the shipped `sync-sources/` tree — the package
+ * now ships dev-skills, so their presence no longer implies a checkout.)
  */
 export function isDevMode(): boolean {
-  return existsSync(SOURCE_DEV_SKILLS_DIR);
+  return existsSync(join(packageRoot, 'src'));
 }
 
 /**

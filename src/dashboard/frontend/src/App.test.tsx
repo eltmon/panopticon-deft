@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import App, {
+  SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY,
   buildConversationUrl,
   getConversationRouteState,
   getConversationViewModeFromSearch,
@@ -69,10 +70,18 @@ vi.mock('./components/MetricsSummaryRow', () => ({ MetricsSummaryRow: () => null
 vi.mock('./components/MetricsPage', () => ({ MetricsPage: () => null }));
 vi.mock('./components/CostsPage', () => ({ CostsPage: () => null }));
 vi.mock('./components/Settings/SettingsPage', () => ({ SettingsPage: () => null }));
+vi.mock('./components/sessionFeed/SessionFeedSidebar', () => ({
+  SessionFeedSidebar: ({ onClose }: { onClose: () => void }) => (
+    <aside data-testid="session-feed-sidebar">
+      <button onClick={onClose}>Close activity feed</button>
+    </aside>
+  ),
+}));
 vi.mock('./components/search/SearchModal', () => ({ SearchModal: () => null }));
 vi.mock('./components/CommandPalette', () => ({ CommandPalette: () => null }));
 vi.mock('./components/ResourcesPanel', () => ({ ResourcesPanel: () => null }));
 vi.mock('./components/GodView', () => ({ GodViewPage: () => null }));
+vi.mock('./components/context/ContextPage', () => ({ ContextPage: () => <div data-testid="context-page" /> }));
 vi.mock('./components/flywheel/FlywheelConversationPane', () => ({ FlywheelConversationPane: () => <div data-testid="flywheel-page" /> }));
 vi.mock('./components/Sidebar', () => ({ Sidebar: () => null }));
 vi.mock('./components/BootstrapGate', () => ({ BootstrapGate: ({ children }: { children: React.ReactNode }) => <>{children}</> }));
@@ -83,7 +92,7 @@ vi.mock('./components/skeletons/PipelineSkeleton', () => ({ PipelineSkeleton: ()
 vi.mock('./components/StandaloneTerminal', () => ({ StandaloneTerminal: () => null }));
 vi.mock('./hooks/useCodexAutoRetry', () => ({ useCodexAutoRetry: () => null }));
 vi.mock('./components/SystemHealthPill', () => ({ SystemHealthPill: () => null }));
-vi.mock('lucide-react', () => ({ AlertTriangle: () => null, RefreshCw: () => null, X: () => null, ArrowRight: () => null, Loader2: () => null, ChevronDown: () => null, Cpu: () => null, MemoryStick: () => null, Skull: () => null }));
+vi.mock('lucide-react', () => ({ AlertTriangle: () => null, RefreshCw: () => null, History: () => null, X: () => null, ArrowRight: () => null, Loader2: () => null, ChevronDown: () => null, Cpu: () => null, MemoryStick: () => null, Skull: () => null }));
 vi.mock('./components/upgrade-announcement/UpgradeAnnouncement', () => ({ UpgradeAnnouncement: () => null }));
 vi.mock('sonner', () => ({
   Toaster: () => null,
@@ -124,6 +133,14 @@ vi.mock('./components/CommandDeck', () => ({
 vi.mock('./components/Pipeline/PipelineView', () => ({
   PipelineView: () => <div data-testid="pipeline-view" />,
 }));
+vi.mock('./pages/HomePage', () => ({
+  HomePage: ({ onOpenWorkspaceHome }: { onOpenWorkspaceHome?: (issueId: string) => void }) => (
+    <div>
+      <div data-testid="home-page" />
+      <button onClick={() => onOpenWorkspaceHome?.('PAN-123')}>Open Home workspace</button>
+    </div>
+  ),
+}));
 vi.mock('./components/drawer/IssueDrawer', () => ({
   IssueDrawer: () => null,
 }));
@@ -155,6 +172,7 @@ beforeEach(() => {
   mockToastError.mockClear()
   mockToastInfo.mockClear()
   mockToastSuccess.mockClear()
+  window.localStorage.removeItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)
 })
 
 describe('conversation route helpers', () => {
@@ -168,8 +186,9 @@ describe('conversation route helpers', () => {
     expect(getConversationViewModeFromSearch('')).toBe('conversation');
   });
 
-  it('extracts conversation id from conversation paths only', () => {
+  it('extracts conversation route keys from conversation paths only', () => {
     expect(getConvIdFromPath('/conv/123')).toBe('123');
+    expect(getConvIdFromPath('/conv/20260523-1234')).toBe('20260523-1234');
     expect(getConvIdFromPath('/command-deck')).toBeNull();
   });
 
@@ -211,17 +230,21 @@ describe('conversation route helpers', () => {
     });
   });
 
-  it('resolves Pipeline as the default route and Board as /board', () => {
+  it('resolves Home as the default route, Pipeline as /pipeline, Board as /board, and Context as /context', () => {
     window.history.replaceState(null, '', '/');
-    expect(getConversationRouteState().tab).toBe('pipeline');
+    expect(getConversationRouteState().tab).toBe('home');
+
     window.history.replaceState(null, '', '/pipeline');
     expect(getConversationRouteState().tab).toBe('pipeline');
 
     window.history.replaceState(null, '', '/board');
     expect(getConversationRouteState().tab).toBe('kanban');
 
+    window.history.replaceState(null, '', '/context');
+    expect(getConversationRouteState().tab).toBe('context');
+
     window.history.replaceState(null, '', '/unknown');
-    expect(getConversationRouteState().tab).toBe('pipeline');
+    expect(getConversationRouteState().tab).toBe('home');
   });
 
 });
@@ -283,7 +306,7 @@ describe('App conversation view routing', () => {
   });
 });
 
-describe('App Pipeline routing', () => {
+describe('App primary routing', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -300,10 +323,20 @@ describe('App Pipeline routing', () => {
     }));
   });
 
-  it('renders PipelineView at /', () => {
+  it('renders HomePage at /', () => {
     window.history.replaceState(null, '', '/');
     renderApp();
-    expect(screen.getByTestId('pipeline-view')).toBeInTheDocument();
+    expect(screen.getByTestId('home-page')).toBeInTheDocument();
+  });
+
+  it('opens a Home workspace card through the existing board drawer route', async () => {
+    window.history.replaceState(null, '', '/');
+    renderApp();
+
+    fireEvent.click(screen.getByText('Open Home workspace'));
+
+    expect(mockOpenIssue).toHaveBeenCalledWith('PAN-123');
+    await waitFor(() => expect(screen.getByText('Open issue')).toBeInTheDocument());
   });
 
   it('renders PipelineView at /pipeline', () => {
@@ -323,6 +356,64 @@ describe('App Pipeline routing', () => {
     window.history.replaceState(null, '', '/board');
     renderApp();
     expect(screen.getByText('Open issue')).toBeInTheDocument();
+  });
+
+  it('renders ContextPage at /context', () => {
+    window.history.replaceState(null, '', '/context');
+    renderApp();
+    expect(screen.getByTestId('context-page')).toBeInTheDocument();
+  });
+});
+
+describe('App session feed sidebar', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/version') {
+        return new Response(JSON.stringify({ version: '0.5.0' }), { status: 200 });
+      }
+      if (url === '/api/tracker-status') {
+        return new Response(JSON.stringify({ primary: 'github', configured: [] }), { status: 200 });
+      }
+      if (url === '/api/confirmations') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }));
+  });
+
+  it('keeps the sidebar open by default', () => {
+    renderApp();
+
+    expect(screen.getByTestId('session-feed-sidebar')).toBeInTheDocument();
+  });
+
+  it('closes the sidebar from the toggle and persists the closed state', () => {
+    renderApp();
+
+    fireEvent.click(screen.getByLabelText('Toggle activity feed'));
+
+    expect(screen.queryByTestId('session-feed-sidebar')).toBeNull();
+    expect(window.localStorage.getItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)).toBe('false');
+  });
+
+  it('restores the open sidebar from localStorage on mount', () => {
+    window.localStorage.setItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY, 'true');
+
+    renderApp();
+
+    expect(screen.getByTestId('session-feed-sidebar')).toBeInTheDocument();
+  });
+
+  it('closes from the in-sidebar close button and persists the closed state', () => {
+    window.localStorage.setItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY, 'true');
+    renderApp();
+
+    fireEvent.click(screen.getByText('Close activity feed'));
+
+    expect(screen.queryByTestId('session-feed-sidebar')).toBeNull();
+    expect(window.localStorage.getItem(SESSION_FEED_SIDEBAR_OPEN_STORAGE_KEY)).toBe('false');
   });
 });
 

@@ -12,7 +12,8 @@ import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'fs';
 import { readFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'path';
 import { Data, Effect } from 'effect';
-import { readWorkspacePlan, updateItemStatus, updateSubItemStatus } from './io.js';
+import { withBdMutexPromise } from '../bd-mutex.js';
+import { readWorkspacePlanSync, updateItemStatus, updateSubItemStatus } from './io.js';
 import { extractACFromDocument } from './acceptance-criteria.js';
 import type { AcceptanceCriterion } from './acceptance-criteria.js';
 import type { VBriefDocument, VBriefInspectionPolicy, VBriefItem, VBriefItemStatus } from './types.js';
@@ -41,6 +42,83 @@ export interface CreateBeadsResult {
   beadIds: Map<string, string>;
 }
 
+export interface ClearBeadsResult {
+  cleared: number;
+  errors: string[];
+}
+
+function firstLine(value: unknown): string {
+  const raw = typeof value === 'string'
+    ? value
+    : value instanceof Error
+      ? value.message
+      : String(value ?? '');
+  return raw.split('\n')[0] || 'unknown error';
+}
+
+function execFileErrorMessage(error: any): string {
+  return firstLine(error?.stderr?.toString() || error?.message || error);
+}
+
+function parseBdList(stdout: unknown): any[] {
+  const parsed = JSON.parse(String(stdout || '[]'));
+  if (!Array.isArray(parsed)) throw new Error('bd list returned non-array JSON');
+  return parsed;
+}
+
+function beadIdsFromList(beads: any[]): string[] {
+  return beads
+    .map(bead => bead?.id)
+    .filter(id => id !== undefined && id !== null && String(id).length > 0)
+    .map(id => String(id));
+}
+
+async function listBeadsForIssue(workspacePath: string, issueLabel: string): Promise<any[]> {
+  const { stdout } = await execFileAsync(
+    'bd',
+    ['list', '--json', '-l', issueLabel, '--status', 'all', '--limit', '0'],
+    { encoding: 'utf-8', cwd: workspacePath, timeout: 15000 }
+  );
+  return parseBdList(stdout);
+}
+
+export async function clearBeadsForIssue(workspacePath: string, issueLabel: string): Promise<ClearBeadsResult> {
+  let existingBeads: any[];
+  try {
+    existingBeads = await listBeadsForIssue(workspacePath, issueLabel);
+  } catch (error: any) {
+    return { cleared: 0, errors: [`list failed: ${execFileErrorMessage(error)}`] };
+  }
+
+  const errors: string[] = [];
+  let cleared = 0;
+  for (const id of beadIdsFromList(existingBeads)) {
+    try {
+      await execFileAsync('bd', ['delete', id, '--force'], {
+        encoding: 'utf-8', cwd: workspacePath, timeout: 10000,
+      });
+      cleared++;
+    } catch (error: any) {
+      errors.push(`delete ${id}: ${execFileErrorMessage(error)}`);
+    }
+  }
+
+  let residualBeads: any[];
+  try {
+    residualBeads = await listBeadsForIssue(workspacePath, issueLabel);
+  } catch (error: any) {
+    errors.push(`post-delete list failed: ${execFileErrorMessage(error)}`);
+    return { cleared, errors };
+  }
+
+  const residualIds = beadIdsFromList(residualBeads);
+  if (residualIds.length > 0) {
+    errors.push(`residual ${residualIds.length} beads after delete: ${residualIds.join(', ')}`);
+  }
+
+  return { cleared, errors };
+}
+
 function resolveInspectionMetadata(policy: VBriefInspectionPolicy, item: VBriefItem): { requiresInspection: boolean; inspectionDepth: 'fast' | 'deep' } {
   if (policy === 'never') return { requiresInspection: false, inspectionDepth: 'fast' };
   if (policy === 'fast') return { requiresInspection: true, inspectionDepth: 'fast' };
@@ -53,13 +131,8 @@ function resolveInspectionMetadata(policy: VBriefInspectionPolicy, item: VBriefI
   return { requiresInspection, inspectionDepth };
 }
 
-/**
- * Converts a vBRIEF plan.vbrief.json into beads tasks with dependencies.
- *
- * @param workspacePath - Path to the workspace root (contains .planning/plan.vbrief.json)
- * @returns Result with created bead IDs and any errors
- */
-export async function createBeadsFromVBrief(workspacePath: string): Promise<CreateBeadsResult> {
+async function createBeadsFromVBriefPromise(workspacePath: string): Promise<CreateBeadsResult> {
+  return withBdMutexPromise(async () => {
   const created: string[] = [];
   const errors: string[] = [];
   const beadIds = new Map<string, string>();
@@ -104,7 +177,7 @@ export async function createBeadsFromVBrief(workspacePath: string): Promise<Crea
   }
 
   // Read the vBRIEF plan — must be spec-compliant format
-  const doc = readWorkspacePlan(workspacePath);
+  const doc = readWorkspacePlanSync(workspacePath);
   if (!doc) {
     return { success: false, created: [], errors: ['No plan.vbrief.json found in workspace'], beadIds };
   }
@@ -173,27 +246,17 @@ export async function createBeadsFromVBrief(workspacePath: string): Promise<Crea
   }
 
   // Idempotency: clear any existing beads for this issue before creating new ones.
-  // Re-planning means "the old plan was invalid" — start fresh.
-  try {
-    const { stdout: existingJson } = await execFileAsync(
-      'bd',
-      ['list', '--json', '-l', issueLabel, '--status', 'all', '--limit', '0'],
-      { encoding: 'utf-8', cwd: workspacePath, timeout: 15000 }
-    );
-    const existingBeads = JSON.parse(existingJson || '[]');
-    if (Array.isArray(existingBeads) && existingBeads.length > 0) {
-      const ids = existingBeads.map((b: any) => b.id).filter(Boolean);
-      for (const id of ids) {
-        try {
-          await execFileAsync('bd', ['delete', id, '--force'], { encoding: 'utf-8', cwd: workspacePath, timeout: 10000 });
-        } catch {
-          // Individual delete failure is non-fatal
-        }
-      }
-      console.log(`[beads] Cleared ${ids.length} existing beads for ${issueLabel} before re-creating`);
-    }
-  } catch {
-    // If listing fails (no beads exist, bd not initialized), proceed with creation
+  const clearResult = await clearBeadsForIssue(workspacePath, issueLabel);
+  if (clearResult.errors.length > 0) {
+    return {
+      success: false,
+      created: [],
+      errors: clearResult.errors.map(error => `dedup failed: ${error}`),
+      beadIds: new Map(),
+    };
+  }
+  if (clearResult.cleared > 0) {
+    console.log(`[beads] Cleared ${clearResult.cleared} existing beads for ${issueLabel} (verified)`);
   }
 
   // Build blocking-edge map: item.id → set of item IDs that block it
@@ -285,14 +348,17 @@ export async function createBeadsFromVBrief(workspacePath: string): Promise<Crea
       .join('\n');
     const description = [actionText, acLines].filter(Boolean).join('\n');
 
-    const blockingDeps = [...(blockers.get(itemId) ?? [])].map(blockerId => {
-      const beadId = beadIds.get(blockerId);
-      return beadId ? `blocks:${beadId}` : null;
-    }).filter((d): d is string => d !== null);
+    // blockers.get(itemId) = items that block itemId, so itemId depends on each.
+    // `bd create <itemId> --deps <blockerBead>` (plain id, no prefix) records
+    // "itemId depends on blockerBead" / "blockerBead blocks itemId". A `blocks:`
+    // prefix inverts that relationship — do NOT use it here.
+    const dependencyBeadIds = [...(blockers.get(itemId) ?? [])]
+      .map(blockerId => beadIds.get(blockerId) ?? null)
+      .filter((d): d is string => d !== null);
 
     const args = ['create', fullTitle, '--type', 'task', '--silent', '-l', labelStr, '--metadata', JSON.stringify(beadMetadata)];
     if (description) args.push('-d', description);
-    if (blockingDeps.length > 0) args.push('--deps', blockingDeps.join(','));
+    if (dependencyBeadIds.length > 0) args.push('--deps', dependencyBeadIds.join(','));
 
     console.log(`[beads] (${i + 1}/${orderedIds.length}) creating "${item.title}"`);
 
@@ -323,6 +389,7 @@ export async function createBeadsFromVBrief(workspacePath: string): Promise<Crea
   }
 
   return { success: errors.length === 0, created, errors, beadIds };
+  });
 }
 
 /**
@@ -349,16 +416,14 @@ async function readBeadTitleFromJsonl(beadId: string, workspacePath: string): Pr
   } catch {
     return null;
   }
-}
-
-export async function syncBeadStatusToVBrief(
+}async function syncBeadStatusToVBriefPromise(
   beadId: string,
   workspacePath: string,
   status: VBriefItemStatus = 'completed',
   knownTitle?: string
 ): Promise<string | null> {
   try {
-    const doc = readWorkspacePlan(workspacePath);
+    const doc = readWorkspacePlanSync(workspacePath);
     if (!doc) return null;
 
     let beadTitle: string | null = knownTitle ?? null;
@@ -434,8 +499,8 @@ export interface VBriefACStatus {
  *
  * Used by: verification gate, pan done, merge agent, prompt injection.
  */
-export function getVBriefACStatus(workspacePath: string): VBriefACStatus | null {
-  const doc = readWorkspacePlan(workspacePath);
+export function getVBriefACStatusSync(workspacePath: string): VBriefACStatus | null {
+  const doc = readWorkspacePlanSync(workspacePath);
   if (!doc) return null;
 
   const allCriteria = extractACFromDocument(doc);
@@ -487,12 +552,16 @@ export class BeadsOperationError extends Data.TaggedError('BeadsOperationError')
   readonly cause?: unknown;
 }> {}
 
-/** Effect variant of `createBeadsFromVBrief`. */
-export const createBeadsFromVBriefEffect = (
+/**
+ * Idempotent and internally serialized via bd-mutex. Calling N times yields
+ * exactly planItemCount beads or returns success:false with errors. Do NOT wrap
+ * callers in withBdMutex — it will deadlock.
+ */
+export const createBeadsFromVBrief = (
   workspacePath: string,
 ): Effect.Effect<CreateBeadsResult, BeadsOperationError> =>
   Effect.tryPromise({
-    try: () => createBeadsFromVBrief(workspacePath),
+    try: () => createBeadsFromVBriefPromise(workspacePath),
     catch: (cause) =>
       new BeadsOperationError({
         operation: 'createBeadsFromVBrief',
@@ -503,14 +572,14 @@ export const createBeadsFromVBriefEffect = (
   });
 
 /** Effect variant of `syncBeadStatusToVBrief`. */
-export const syncBeadStatusToVBriefEffect = (
+export const syncBeadStatusToVBrief = (
   beadId: string,
   workspacePath: string,
   status: VBriefItemStatus = 'completed',
   knownTitle?: string,
 ): Effect.Effect<string | null, BeadsOperationError> =>
   Effect.tryPromise({
-    try: () => syncBeadStatusToVBrief(beadId, workspacePath, status, knownTitle),
+    try: () => syncBeadStatusToVBriefPromise(beadId, workspacePath, status, knownTitle),
     catch: (cause) =>
       new BeadsOperationError({
         operation: 'syncBeadStatusToVBrief',
@@ -521,11 +590,11 @@ export const syncBeadStatusToVBriefEffect = (
   });
 
 /** Effect variant of `getVBriefACStatus`. */
-export const getVBriefACStatusEffect = (
+export const getVBriefACStatus = (
   workspacePath: string,
 ): Effect.Effect<VBriefACStatus | null, BeadsOperationError> =>
   Effect.try({
-    try: () => getVBriefACStatus(workspacePath),
+    try: () => getVBriefACStatusSync(workspacePath),
     catch: (cause) =>
       new BeadsOperationError({
         operation: 'getVBriefACStatus',

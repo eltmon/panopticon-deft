@@ -4,19 +4,25 @@ import { join, basename, dirname, relative } from 'path';
 import { homedir } from 'os';
 import { Effect } from 'effect';
 import {
-  SKILLS_DIR, COMMANDS_DIR, AGENTS_DIR, BIN_DIR,
-  SOURCE_SCRIPTS_DIR, SOURCE_DEV_SKILLS_DIR, SOURCE_SKILLS_DIR, SOURCE_AGENTS_DIR, SOURCE_RULES_DIR,
+  SKILLS_DIR, COMMANDS_DIR, AGENTS_DIR, BIN_DIR, CLAUDE_DIR,
+  SYNC_SOURCES,
   CACHE_AGENTS_DIR, CACHE_RULES_DIR, CACHE_MANIFEST,
   SYNC_TARGET, isDevMode,
 } from './paths.js';
 import { FsError } from './errors.js';
 import {
-  buildManifestFromDirectory, writeManifest, readManifest, hashFile,
-  setManifestEntry, collectSourceFiles,
-  type Manifest, type FileStatus,
+  buildManifestFromDirectory, writeManifestSync, readManifestSync, hashFileSync,
+  setManifestEntry, collectSourceFilesSync,
+  type Manifest,
   compareFileToManifest,
 } from './manifest.js';
-import { getDevrootPath } from './config.js';
+import { listProjectsSync } from './projects.js';
+import {
+  ensureGlobalLayer,
+  renderGlobalLayer,
+  renderProjectLayer,
+  applyManagedRegion,
+} from './context-layers/index.js';
 
 export interface SyncItem {
   name: string;
@@ -50,7 +56,7 @@ function removeTarget(targetPath: string): void {
 /**
  * Check if a path is a Panopticon-managed symlink
  */
-export function isPanopticonSymlink(targetPath: string): boolean {
+export function isPanopticonSymlinkSync(targetPath: string): boolean {
   if (!existsSync(targetPath)) return false;
 
   try {
@@ -86,7 +92,7 @@ export interface MigrationResult {
  * Plain directories are always preserved as user content — there is no reliable
  * way to prove a plain directory was created by Panopticon vs the user.
  */
-export function migrateStalePersonalContent(): MigrationResult {
+export function migrateStalePersonalContentSync(): MigrationResult {
   const claudeDir = join(homedir(), '.claude');
   const result: MigrationResult = {
     removedSymlinks: [],
@@ -134,7 +140,7 @@ export function migrateStalePersonalContent(): MigrationResult {
  * in the 0.7.0 command taxonomy reorganization. Safe to call on every sync — if the
  * skills are already gone, it's a no-op.
  */
-export function removeLegacySkills070(): string[] {
+export function removeLegacySkills070Sync(): string[] {
   // Skills renamed or removed in 0.7.0:
   // pan-issue → pan-start
   // pan-plan-finalize → deleted (subcommand of pan plan)
@@ -212,7 +218,7 @@ function copyDirectoryRecursive(source: string, dest: string): number {
  *
  * This replaces the old "skip if exists" behavior in `pan install`.
  */
-export function refreshCache(): RefreshCacheResult {
+export function refreshCacheSync(): RefreshCacheResult {
   const result: RefreshCacheResult = {
     skills: { copied: 0, total: 0 },
     agents: { copied: 0, total: 0 },
@@ -220,13 +226,13 @@ export function refreshCache(): RefreshCacheResult {
   };
 
   // Copy skills from repo to cache (always overwrite)
-  if (existsSync(SOURCE_SKILLS_DIR)) {
-    const skillDirs = readdirSync(SOURCE_SKILLS_DIR, { withFileTypes: true })
+  if (existsSync(SYNC_SOURCES.skills)) {
+    const skillDirs = readdirSync(SYNC_SOURCES.skills, { withFileTypes: true })
       .filter((d) => d.isDirectory());
 
     result.skills.total = skillDirs.length;
     for (const skillDir of skillDirs) {
-      const src = join(SOURCE_SKILLS_DIR, skillDir.name);
+      const src = join(SYNC_SOURCES.skills, skillDir.name);
       const dst = join(SKILLS_DIR, skillDir.name);
       copyDirectoryRecursive(src, dst);
       result.skills.copied++;
@@ -234,12 +240,12 @@ export function refreshCache(): RefreshCacheResult {
   }
 
   // Copy dev-skills to cache too (in dev mode only)
-  if (isDevMode() && existsSync(SOURCE_DEV_SKILLS_DIR)) {
-    const devSkillDirs = readdirSync(SOURCE_DEV_SKILLS_DIR, { withFileTypes: true })
+  if (isDevMode() && existsSync(SYNC_SOURCES.devSkills)) {
+    const devSkillDirs = readdirSync(SYNC_SOURCES.devSkills, { withFileTypes: true })
       .filter((d) => d.isDirectory());
 
     for (const skillDir of devSkillDirs) {
-      const src = join(SOURCE_DEV_SKILLS_DIR, skillDir.name);
+      const src = join(SYNC_SOURCES.devSkills, skillDir.name);
       const dst = join(SKILLS_DIR, skillDir.name);
       copyDirectoryRecursive(src, dst);
       result.skills.copied++;
@@ -262,14 +268,14 @@ export function refreshCache(): RefreshCacheResult {
   // <devroot>/.claude/agents/ via planSync/executeSync. The downstream sync
   // never deletes existing files in the target, so non-Panopticon agent
   // definitions a project may have authored stay intact.
-  if (existsSync(SOURCE_AGENTS_DIR)) {
+  if (existsSync(SYNC_SOURCES.agents)) {
     mkdirSync(CACHE_AGENTS_DIR, { recursive: true });
-    const agents = readdirSync(SOURCE_AGENTS_DIR, { withFileTypes: true })
+    const agents = readdirSync(SYNC_SOURCES.agents, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.endsWith('.md'));
 
     result.agents.total = agents.length;
     for (const agent of agents) {
-      copyFileSync(join(SOURCE_AGENTS_DIR, agent.name), join(CACHE_AGENTS_DIR, agent.name));
+      copyFileSync(join(SYNC_SOURCES.agents, agent.name), join(CACHE_AGENTS_DIR, agent.name));
       result.agents.copied++;
     }
 
@@ -298,14 +304,14 @@ export function refreshCache(): RefreshCacheResult {
   }
 
   // Copy rules from repo to cache (directory may not exist yet)
-  if (existsSync(SOURCE_RULES_DIR)) {
-    const ruleFiles = readdirSync(SOURCE_RULES_DIR, { withFileTypes: true })
+  if (existsSync(SYNC_SOURCES.rules)) {
+    const ruleFiles = readdirSync(SYNC_SOURCES.rules, { withFileTypes: true })
       .filter((entry) => entry.isFile());
 
     result.rules.total = ruleFiles.length;
     for (const rule of ruleFiles) {
       mkdirSync(CACHE_RULES_DIR, { recursive: true });
-      copyFileSync(join(SOURCE_RULES_DIR, rule.name), join(CACHE_RULES_DIR, rule.name));
+      copyFileSync(join(SYNC_SOURCES.rules, rule.name), join(CACHE_RULES_DIR, rule.name));
       result.rules.copied++;
     }
   }
@@ -316,30 +322,20 @@ export function refreshCache(): RefreshCacheResult {
     ['skills', 'agent-definitions', 'rules'],
     'panopticon',
   );
-  writeManifest(CACHE_MANIFEST, manifest);
+  writeManifestSync(CACHE_MANIFEST, manifest);
 
   return result;
 }
 
 /**
- * Devroot sync item — represents a single file to distribute.
+ * Plan what `pan sync` would distribute to ~/.claude/ (dry run).
+ *
+ * PAN-1201: targets the user's Claude Code home directly — the layered
+ * context model replaced the old `<devroot>/.claude/` indirection. Skills
+ * and agents are distributed as files; rules now fold into CLAUDE.md (see
+ * the context-layers subsystem) and are not planned here.
  */
-export interface DevrootSyncItem {
-  /** Relative path from .claude/ (e.g., "skills/beads/SKILL.md") */
-  relativePath: string;
-  /** Absolute path to source file in cache */
-  sourcePath: string;
-  /** Absolute path to target file at devroot */
-  targetPath: string;
-  /** What action to take */
-  status: FileStatus;
-}
-
-/**
- * Plan what would be synced to devroot (dry run).
- * Reads from cache, targets <devroot>/.claude/, uses manifest comparison.
- */
-export function planSync(): SyncPlan {
+export function planSyncSync(): SyncPlan {
   const plan: SyncPlan = {
     skills: [],
     commands: [],
@@ -348,70 +344,37 @@ export function planSync(): SyncPlan {
     devSkills: [],
   };
 
-  const devrootPath = getDevrootPath();
-  if (!devrootPath) return plan;
-
-  const targetBase = join(devrootPath, '.claude');
+  const targetBase = CLAUDE_DIR;
   const manifestPath = join(targetBase, '.panopticon-manifest.json');
-  const manifest = readManifest(manifestPath);
+  const manifest = readManifestSync(manifestPath);
 
-  // Plan skills
-  const skillFiles = collectSourceFiles(SKILLS_DIR, 'skills/');
-  for (const file of skillFiles) {
-    const targetFile = join(targetBase, file.relativePath);
-    const status = compareFileToManifest(targetFile, file.relativePath, manifest);
-    const skillName = file.relativePath.split('/')[1] || file.relativePath;
+  const planInto = (sourceDir: string, prefix: string, bucket: SyncItem[]): void => {
+    for (const file of collectSourceFilesSync(sourceDir, prefix)) {
+      const targetFile = join(targetBase, file.relativePath);
+      const status = compareFileToManifest(targetFile, file.relativePath, manifest);
 
-    let syncStatus: SyncItem['status'] = 'new';
-    if (status.action === 'update') syncStatus = 'symlink';  // reusing 'symlink' for "managed, safe to update"
-    else if (status.action === 'modified') syncStatus = 'conflict';
-    else if (status.action === 'user-owned') syncStatus = 'conflict';
+      let syncStatus: SyncItem['status'] = 'new';
+      if (status.action === 'update') {
+        syncStatus = 'symlink'; // 'symlink' here means "managed, safe to update"
+      } else if (status.action === 'modified') {
+        syncStatus = 'conflict';
+      } else if (status.action === 'user-owned') {
+        // Identical content sitting at the target from a previous Panopticon
+        // era is not a conflict — it would simply be adopted on the real run.
+        syncStatus = hashFileSync(targetFile) === hashFileSync(file.absolutePath) ? 'exists' : 'conflict';
+      }
 
-    plan.skills.push({
-      name: file.relativePath,
-      sourcePath: file.absolutePath,
-      targetPath: targetFile,
-      status: syncStatus,
-    });
-  }
+      bucket.push({
+        name: file.relativePath,
+        sourcePath: file.absolutePath,
+        targetPath: targetFile,
+        status: syncStatus,
+      });
+    }
+  };
 
-  // Plan agents
-  const agentFiles = collectSourceFiles(CACHE_AGENTS_DIR, 'agents/');
-  for (const file of agentFiles) {
-    const targetFile = join(targetBase, file.relativePath);
-    const status = compareFileToManifest(targetFile, file.relativePath, manifest);
-
-    let syncStatus: SyncItem['status'] = 'new';
-    if (status.action === 'update') syncStatus = 'symlink';
-    else if (status.action === 'modified') syncStatus = 'conflict';
-    else if (status.action === 'user-owned') syncStatus = 'conflict';
-
-    plan.agents.push({
-      name: file.relativePath,
-      sourcePath: file.absolutePath,
-      targetPath: targetFile,
-      status: syncStatus,
-    });
-  }
-
-  // Plan rules
-  const ruleFiles = collectSourceFiles(CACHE_RULES_DIR, 'rules/');
-  for (const file of ruleFiles) {
-    const targetFile = join(targetBase, file.relativePath);
-    const status = compareFileToManifest(targetFile, file.relativePath, manifest);
-
-    let syncStatus: SyncItem['status'] = 'new';
-    if (status.action === 'update') syncStatus = 'symlink';
-    else if (status.action === 'modified') syncStatus = 'conflict';
-    else if (status.action === 'user-owned') syncStatus = 'conflict';
-
-    plan.rules.push({
-      name: file.relativePath,
-      sourcePath: file.absolutePath,
-      targetPath: targetFile,
-      status: syncStatus,
-    });
-  }
+  planInto(SKILLS_DIR, 'skills/', plan.skills);
+  planInto(CACHE_AGENTS_DIR, 'agents/', plan.agents);
 
   return plan;
 }
@@ -431,10 +394,21 @@ export interface SyncResult {
 }
 
 /**
- * Execute sync to devroot: copy from cache to <devroot>/.claude/.
- * Uses manifest-based conflict resolution. NEVER touches ~/.claude/.
+ * Distribute cached skills and agents into the user's Claude Code home
+ * (~/.claude/skills/, ~/.claude/agents/).
+ *
+ * PAN-1201: this is the Global → claude-code half of the sync output map.
+ * It targets ~/.claude/ directly — the deprecated `<devroot>/.claude/`
+ * indirection is gone. Rules are no longer distributed as files; they fold
+ * into the rendered CLAUDE.md instead (see syncContextLayers()).
+ *
+ * Conflict resolution is manifest-based. A file already at the target but
+ * absent from the manifest (a prior Panopticon era, or a fresh ~/.claude)
+ * is *adopted* when its content is byte-identical to our source — recorded
+ * into the manifest so future syncs can update it. A target file that
+ * differs is genuinely user-owned and is left untouched.
  */
-export function executeSync(options: SyncOptions = {}): SyncResult {
+export function executeSyncSync(options: SyncOptions = {}): SyncResult {
   const result: SyncResult = {
     created: [],
     updated: [],
@@ -443,20 +417,14 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
     diffs: [],
   };
 
-  const devrootPath = getDevrootPath();
-  if (!devrootPath) {
-    return result;
-  }
-
-  const targetBase = join(devrootPath, '.claude');
+  const targetBase = CLAUDE_DIR;
   const manifestPath = join(targetBase, '.panopticon-manifest.json');
-  const manifest = readManifest(manifestPath);
+  const manifest = readManifestSync(manifestPath);
 
-  // Collect all source files from cache
+  // Collect all source files from cache (skills + agent definitions).
   const allFiles = [
-    ...collectSourceFiles(SKILLS_DIR, 'skills/'),
-    ...collectSourceFiles(CACHE_AGENTS_DIR, 'agents/'),
-    ...collectSourceFiles(CACHE_RULES_DIR, 'rules/'),
+    ...collectSourceFilesSync(SKILLS_DIR, 'skills/'),
+    ...collectSourceFilesSync(CACHE_AGENTS_DIR, 'agents/'),
   ];
 
   for (const file of allFiles) {
@@ -468,7 +436,7 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
         // File doesn't exist at target — copy it
         mkdirSync(dirname(targetFile), { recursive: true });
         copyFileSync(file.absolutePath, targetFile);
-        const hash = hashFile(targetFile);
+        const hash = hashFileSync(targetFile);
         setManifestEntry(manifest, file.relativePath, hash, 'panopticon');
         result.created.push(file.relativePath);
         break;
@@ -478,7 +446,7 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
         // File exists, hash matches manifest — safe to overwrite (user didn't modify)
         mkdirSync(dirname(targetFile), { recursive: true });
         copyFileSync(file.absolutePath, targetFile);
-        const hash = hashFile(targetFile);
+        const hash = hashFileSync(targetFile);
         setManifestEntry(manifest, file.relativePath, hash, 'panopticon');
         result.updated.push(file.relativePath);
         break;
@@ -497,7 +465,7 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
         if (options.force) {
           mkdirSync(dirname(targetFile), { recursive: true });
           copyFileSync(file.absolutePath, targetFile);
-          const hash = hashFile(targetFile);
+          const hash = hashFileSync(targetFile);
           setManifestEntry(manifest, file.relativePath, hash, 'panopticon');
           result.updated.push(file.relativePath);
         } else {
@@ -507,7 +475,13 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
       }
 
       case 'user-owned': {
-        // User placed this file, never touch it
+        // Target file exists but is absent from the manifest. If its content
+        // is byte-identical to our source, it is ours (a prior era) — adopt
+        // it so future syncs can manage it. Otherwise it is genuinely
+        // user-authored: never touch it.
+        if (hashFileSync(targetFile) === hashFileSync(file.absolutePath)) {
+          setManifestEntry(manifest, file.relativePath, hashFileSync(targetFile), 'panopticon');
+        }
         result.skipped.push(file.relativePath);
         break;
       }
@@ -515,7 +489,72 @@ export function executeSync(options: SyncOptions = {}): SyncResult {
   }
 
   // Write updated manifest
-  writeManifest(manifestPath, manifest);
+  writeManifestSync(manifestPath, manifest);
+
+  return result;
+}
+
+export interface ContextLayerSyncResult {
+  /** True when ~/.claude/CLAUDE.md's managed region was written this run. */
+  globalWritten: boolean;
+  /** True when global.md did not exist and a starter template was seeded. */
+  globalStubCreated: boolean;
+  /** Names of registered projects whose CLAUDE.md was written this run. */
+  projectsWritten: string[];
+  errors: string[];
+}
+
+/**
+ * Render the global and project context layers into harness CLAUDE.md files.
+ *
+ * PAN-1201: the layered-context half of `pan sync`. The global layer
+ * (~/.panopticon/context/global.md + the folded bundled rules) renders into
+ * the managed region of ~/.claude/CLAUDE.md; each registered project's
+ * `.pan/context/project.md` renders into the managed region of its own
+ * CLAUDE.md. Content outside the managed region is preserved untouched, so a
+ * hand-authored CLAUDE.md is never clobbered.
+ */
+export function syncContextLayersSync(): ContextLayerSyncResult {
+  const result: ContextLayerSyncResult = {
+    globalWritten: false,
+    globalStubCreated: false,
+    projectsWritten: [],
+    errors: [],
+  };
+
+  // Global layer → ~/.claude/CLAUDE.md
+  result.globalStubCreated = ensureGlobalLayer();
+  try {
+    const managed = renderGlobalLayer('claude-code', isDevMode());
+    const claudeMd = join(CLAUDE_DIR, 'CLAUDE.md');
+    const existing = existsSync(claudeMd) ? readFileSync(claudeMd, 'utf-8') : '';
+    const next = applyManagedRegion(existing, managed);
+    if (next !== existing) {
+      mkdirSync(CLAUDE_DIR, { recursive: true });
+      writeFileSync(claudeMd, next, 'utf-8');
+      result.globalWritten = true;
+    }
+  } catch (err: any) {
+    result.errors.push(`global: ${err?.message ?? err}`);
+  }
+
+  // Project layers → <projectRoot>/CLAUDE.md
+  for (const { config } of listProjectsSync()) {
+    if (!existsSync(config.path)) continue;
+    try {
+      const managed = renderProjectLayer(config.path, 'claude-code');
+      if (!managed) continue; // no project.md → leave this project's CLAUDE.md alone
+      const claudeMd = join(config.path, 'CLAUDE.md');
+      const existing = existsSync(claudeMd) ? readFileSync(claudeMd, 'utf-8') : '';
+      const next = applyManagedRegion(existing, managed);
+      if (next !== existing) {
+        writeFileSync(claudeMd, next, 'utf-8');
+        result.projectsWritten.push(config.name);
+      }
+    } catch (err: any) {
+      result.errors.push(`${config.name}: ${err?.message ?? err}`);
+    }
+  }
 
   return result;
 }
@@ -533,21 +572,21 @@ export interface HookItem {
 /**
  * Plan hooks sync (checks what would be updated)
  */
-export function planHooksSync(): HookItem[] {
+export function planHooksSyncSync(): HookItem[] {
   const hooks: HookItem[] = [];
 
-  if (!existsSync(SOURCE_SCRIPTS_DIR)) {
+  if (!existsSync(SYNC_SOURCES.hooks)) {
     return hooks;
   }
 
   // Sync hook scripts (no extension) and bundled JS scripts (.js)
   // Skip source files (.ts), shell helpers (.sh), and other non-hook files (.mjs)
-  const scripts = readdirSync(SOURCE_SCRIPTS_DIR, { withFileTypes: true })
+  const scripts = readdirSync(SYNC_SOURCES.hooks, { withFileTypes: true })
     .filter((entry) => entry.isFile() && !entry.name.startsWith('.')
       && (!entry.name.includes('.') || entry.name.endsWith('.js')));
 
   for (const script of scripts) {
-    const sourcePath = join(SOURCE_SCRIPTS_DIR, script.name);
+    const sourcePath = join(SYNC_SOURCES.hooks, script.name);
     const targetPath = join(BIN_DIR, script.name);
 
     let status: HookItem['status'] = 'new';
@@ -567,13 +606,13 @@ export function planHooksSync(): HookItem[] {
 /**
  * Sync hooks (copy scripts to ~/.panopticon/bin/)
  */
-export function syncHooks(): { synced: string[]; errors: string[] } {
+export function syncHooksSync(): { synced: string[]; errors: string[] } {
   const result = { synced: [] as string[], errors: [] as string[] };
 
   // Ensure bin directory exists
   mkdirSync(BIN_DIR, { recursive: true });
 
-  const hooks = planHooksSync();
+  const hooks = planHooksSyncSync();
 
   for (const hook of hooks) {
     try {
@@ -606,10 +645,10 @@ const STATUSLINE_TARGETS: Record<string, { configDir: string; scriptName: string
  * Copies the canonical statusline.sh from panopticon scripts to each runtime's config dir
  * and ensures the runtime's settings.json references it.
  */
-export function syncStatusline(): { synced: string[]; errors: string[] } {
+export function syncStatuslineSync(): { synced: string[]; errors: string[] } {
   const result = { synced: [] as string[], errors: [] as string[] };
 
-  const sourceScript = join(SOURCE_SCRIPTS_DIR, 'statusline.sh');
+  const sourceScript = join(SYNC_SOURCES.hooks, 'statusline.sh');
   if (!existsSync(sourceScript)) {
     return result;
   }
@@ -790,7 +829,7 @@ function getGitTrackedSkillDirNames(targetDir: string, projectRoot: string): Set
   return names;
 }
 
-export function mirrorProjectSkills(
+export function mirrorProjectSkillsSync(
   cwd: string = process.cwd(),
   opts?: { manifestDir?: string },
 ): SkillsMirrorResult {
@@ -943,7 +982,7 @@ function isPiOnPath(): boolean {
  * PATH the function returns status "skipped" without ever opening the file —
  * we never overwrite user config for a tool they have not installed.
  */
-export function syncPiSettings(): PiSettingsSyncResult {
+export function syncPiSettingsSync(): PiSettingsSyncResult {
   const settingsPath = join(homedir(), '.pi', 'agent', 'settings.json');
 
   if (!isPiOnPath()) {
@@ -992,79 +1031,86 @@ const toSyncFsError = (op: string, cause: unknown): FsError =>
   new FsError({ path: SYNC_TARGET.skills, operation: op, cause });
 
 /** True if `targetPath` is a Panopticon-managed symlink. */
-export const isPanopticonSymlinkEffect = (
+export const isPanopticonSymlink = (
   targetPath: string,
-): Effect.Effect<boolean> => Effect.sync(() => isPanopticonSymlink(targetPath));
+): Effect.Effect<boolean> => Effect.sync(() => isPanopticonSymlinkSync(targetPath));
 
 /** Migrate Panopticon-owned content out of ~/.claude/ (idempotent). */
-export const migrateStalePersonalContentEffect = (): Effect.Effect<MigrationResult, FsError> =>
+export const migrateStalePersonalContent = (): Effect.Effect<MigrationResult, FsError> =>
   Effect.try({
-    try: () => migrateStalePersonalContent(),
+    try: () => migrateStalePersonalContentSync(),
     catch: (cause) => toSyncFsError('migrateStalePersonalContent', cause),
   });
 
 /** Remove legacy 0.7.0-era skill directories that were renamed/dropped. */
-export const removeLegacySkills070Effect = (): Effect.Effect<readonly string[], FsError> =>
+export const removeLegacySkills070 = (): Effect.Effect<readonly string[], FsError> =>
   Effect.try({
-    try: () => removeLegacySkills070(),
+    try: () => removeLegacySkills070Sync(),
     catch: (cause) => toSyncFsError('removeLegacySkills070', cause),
   });
 
 /** Rebuild the sync cache from sources on disk. */
-export const refreshCacheEffect = (): Effect.Effect<RefreshCacheResult, FsError> =>
+export const refreshCache = (): Effect.Effect<RefreshCacheResult, FsError> =>
   Effect.try({
-    try: () => refreshCache(),
+    try: () => refreshCacheSync(),
     catch: (cause) => toSyncFsError('refreshCache', cause),
   });
 
 /** Compute the plan: which skills, commands, agents, rules need to be synced. */
-export const planSyncEffect = (): Effect.Effect<SyncPlan, FsError> =>
+export const planSync = (): Effect.Effect<SyncPlan, FsError> =>
   Effect.try({
-    try: () => planSync(),
+    try: () => planSyncSync(),
     catch: (cause) => toSyncFsError('planSync', cause),
   });
 
 /** Apply the sync plan to ~/.claude/. */
-export const executeSyncEffect = (options: SyncOptions = {}): Effect.Effect<SyncResult, FsError> =>
+export const executeSync = (options: SyncOptions = {}): Effect.Effect<SyncResult, FsError> =>
   Effect.try({
-    try: () => executeSync(options),
+    try: () => executeSyncSync(options),
     catch: (cause) => toSyncFsError('executeSync', cause),
   });
 
-/** Plan hook files to be synced (pure). */
-export const planHooksSyncEffect = (): Effect.Effect<readonly HookItem[], FsError> =>
+/** Render the global + project context layers into harness CLAUDE.md files. */
+export const syncContextLayers = (): Effect.Effect<ContextLayerSyncResult, FsError> =>
   Effect.try({
-    try: () => planHooksSync(),
+    try: () => syncContextLayersSync(),
+    catch: (cause) => toSyncFsError('syncContextLayers', cause),
+  });
+
+/** Plan hook files to be synced (pure). */
+export const planHooksSync = (): Effect.Effect<readonly HookItem[], FsError> =>
+  Effect.try({
+    try: () => planHooksSyncSync(),
     catch: (cause) => toSyncFsError('planHooksSync', cause),
   });
 
 /** Apply the hook sync plan to ~/.claude/. */
-export const syncHooksEffect = (): Effect.Effect<{ synced: string[]; errors: string[] }, FsError> =>
+export const syncHooks = (): Effect.Effect<{ synced: string[]; errors: string[] }, FsError> =>
   Effect.try({
-    try: () => syncHooks(),
+    try: () => syncHooksSync(),
     catch: (cause) => toSyncFsError('syncHooks', cause),
   });
 
 /** Mirror the statusline binary into ~/.claude/bin/. */
-export const syncStatuslineEffect = (): Effect.Effect<{ synced: string[]; errors: string[] }, FsError> =>
+export const syncStatusline = (): Effect.Effect<{ synced: string[]; errors: string[] }, FsError> =>
   Effect.try({
-    try: () => syncStatusline(),
+    try: () => syncStatuslineSync(),
     catch: (cause) => toSyncFsError('syncStatusline', cause),
   });
 
 /** Mirror a project's `skills/` dir into ~/.claude/skills/. */
-export const mirrorProjectSkillsEffect = (
+export const mirrorProjectSkills = (
   cwd: string = process.cwd(),
   opts?: { manifestDir?: string },
 ): Effect.Effect<SkillsMirrorResult, FsError> =>
   Effect.try({
-    try: () => mirrorProjectSkills(cwd, opts),
+    try: () => mirrorProjectSkillsSync(cwd, opts),
     catch: (cause) => toSyncFsError('mirrorProjectSkills', cause),
   });
 
 /** Inject the Panopticon skills path into `pi` CLI settings (idempotent). */
-export const syncPiSettingsEffect = (): Effect.Effect<PiSettingsSyncResult, FsError> =>
+export const syncPiSettings = (): Effect.Effect<PiSettingsSyncResult, FsError> =>
   Effect.try({
-    try: () => syncPiSettings(),
+    try: () => syncPiSettingsSync(),
     catch: (cause) => toSyncFsError('syncPiSettings', cause),
   });

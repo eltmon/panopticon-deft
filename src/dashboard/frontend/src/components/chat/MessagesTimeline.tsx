@@ -107,6 +107,8 @@ export interface MessagesTimelineProps {
   compactBoundaries?: CompactBoundary[];
   compacting?: boolean;
   conversationName?: string;
+  cwd?: string;
+  issueId?: string | null;
   turnDiffSummaryByAssistantMessageId?: Map<string, TurnDiffSummary>;
   onOpenTurnDiff?: (turnId: string, filePath?: string) => void;
   resolvedTheme?: 'light' | 'dark';
@@ -130,6 +132,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   compactBoundaries,
   compacting,
   conversationName,
+  cwd,
+  issueId,
   turnDiffSummaryByAssistantMessageId,
   onOpenTurnDiff,
   resolvedTheme,
@@ -360,6 +364,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                     row={row}
                     isStreaming={streaming}
                     conversationName={conversationName}
+                    cwd={cwd}
+                    issueId={issueId}
                     turnDiffSummary={row.kind === 'message' && row.message.role === 'assistant' ? turnDiffSummaryByAssistantMessageId?.get(row.message.id) : undefined}
                     onOpenTurnDiff={onOpenTurnDiff}
                     resolvedTheme={resolvedTheme}
@@ -387,6 +393,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 row={row}
                 isStreaming={streaming}
                 conversationName={conversationName}
+                cwd={cwd}
+                issueId={issueId}
                 turnDiffSummary={row.kind === 'message' && row.message.role === 'assistant' ? turnDiffSummaryByAssistantMessageId?.get(row.message.id) : undefined}
                 onOpenTurnDiff={onOpenTurnDiff}
                 resolvedTheme={resolvedTheme}
@@ -411,7 +419,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         {failedMessages.map((fm) => (
           <div key={fm.id} className={styles.failedMessage}>
             <div className={styles.failedMessageBubble}>
-              <ChatMarkdown text={fm.text} />
+              <ChatMarkdown text={fm.text} cwd={cwd} issueId={issueId} />
             </div>
             <div className={styles.failedMessageActions}>
               <span className={styles.failedMessageLabel}>Failed to send</span>
@@ -476,6 +484,8 @@ interface RowProps {
   row: MessagesTimelineRow;
   isStreaming: boolean;
   conversationName?: string;
+  cwd?: string;
+  issueId?: string | null;
   turnDiffSummary?: TurnDiffSummary;
   onOpenTurnDiff?: (turnId: string, filePath?: string) => void;
   resolvedTheme?: 'light' | 'dark';
@@ -483,12 +493,12 @@ interface RowProps {
   workingPhase?: WorkingPhase;
 }
 
-const TimelineRowRenderer = memo(function TimelineRowRenderer({ row, isStreaming, conversationName, turnDiffSummary, onOpenTurnDiff, resolvedTheme, hideToolCalls, workingPhase }: RowProps) {
+const TimelineRowRenderer = memo(function TimelineRowRenderer({ row, isStreaming, conversationName, cwd, issueId, turnDiffSummary, onOpenTurnDiff, resolvedTheme, hideToolCalls, workingPhase }: RowProps) {
   if (row.kind === 'working') {
     return <WorkingIndicator startedAt={row.createdAt} phase={workingPhase} />;
   }
   if (row.kind === 'work') {
-    return <WorkLogGroup entries={row.groupedEntries} hideToolCalls={hideToolCalls} />;
+    return <WorkLogGroup entries={row.groupedEntries} hideToolCalls={hideToolCalls} cwd={cwd} issueId={issueId} />;
   }
   if (row.kind === 'proposed-plan') {
     return <PlanCard plan={row.plan} conversationName={conversationName ?? ''} />;
@@ -503,13 +513,15 @@ const TimelineRowRenderer = memo(function TimelineRowRenderer({ row, isStreaming
     return <SessionPermissionsRow message={row.message} />;
   }
   if (row.message.role === 'user') {
-    return <UserMessageRow message={row.message} />;
+    return <UserMessageRow message={row.message} cwd={cwd} issueId={issueId} />;
   }
   return (
     <AssistantMessageRow
       message={row.message}
       durationStart={row.durationStart}
       isStreaming={isStreaming}
+      cwd={cwd}
+      issueId={issueId}
       turnDiffSummary={turnDiffSummary}
       onOpenTurnDiff={onOpenTurnDiff}
       resolvedTheme={resolvedTheme}
@@ -528,12 +540,24 @@ function isReviewerContextMessage(text: string): boolean {
   return text.startsWith('# Review Context\n');
 }
 
-function UserMessageRow({ message }: { message: ChatMessage }) {
+// PAN-1458: Detect a Claude Code slash-command user message (the literal token Claude
+// Code writes when the user types /clear, /compact, /resume, etc.). Returned object
+// carries the command name (e.g. '/clear') so the divider can label itself.
+function parseSlashCommandMessage(text: string): { command: string } | null {
+  const match = text.trimStart().match(/^<command-name>([^<]+)<\/command-name>/);
+  return match ? { command: match[1] } : null;
+}
+
+function UserMessageRow({ message, cwd, issueId }: { message: ChatMessage; cwd?: string; issueId?: string | null }) {
+  const slashCommand = parseSlashCommandMessage(message.text);
+  if (slashCommand) {
+    return <SlashCommandDivider command={slashCommand.command} createdAt={message.createdAt} />;
+  }
   if (isSummaryForkMessage(message.text)) {
-    return <ContextMessageBlock message={message} />;
+    return <ContextMessageBlock message={message} cwd={cwd} issueId={issueId} />;
   }
   if (isReviewerContextMessage(message.text)) {
-    return <ReviewerContextBlock message={message} />;
+    return <ReviewerContextBlock message={message} cwd={cwd} issueId={issueId} />;
   }
 
   const isPending = message.id.startsWith('optimistic-');
@@ -544,7 +568,7 @@ function UserMessageRow({ message }: { message: ChatMessage }) {
         style={isPending ? { opacity: 0.6 } : undefined}
         title={isPending ? 'Pending — waiting for agent to process' : undefined}
       >
-        <div className={styles.userMessageText}><ChatMarkdown text={message.text} /></div>
+        <div className={styles.userMessageText}><ChatMarkdown text={message.text} cwd={cwd} issueId={issueId} /></div>
         <span className={styles.messageTimestamp}>
           {isPending ? (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
@@ -562,7 +586,7 @@ function UserMessageRow({ message }: { message: ChatMessage }) {
   );
 }
 
-function ContextMessageBlock({ message }: { message: ChatMessage }) {
+function ContextMessageBlock({ message, cwd, issueId }: { message: ChatMessage; cwd?: string; issueId?: string | null }) {
   const [expanded, setExpanded] = useState(false);
   const cleanText = message.text
     .replace(/\n---\n\n\*\*Do not take any action\.\*\*.*$/s, '')
@@ -582,7 +606,7 @@ function ContextMessageBlock({ message }: { message: ChatMessage }) {
         </button>
         {expanded && (
           <div className={styles.contextMessageContent}>
-            <ChatMarkdown text={cleanText} />
+            <ChatMarkdown text={cleanText} cwd={cwd} issueId={issueId} />
           </div>
         )}
       </div>
@@ -590,7 +614,7 @@ function ContextMessageBlock({ message }: { message: ChatMessage }) {
   );
 }
 
-function ReviewerContextBlock({ message }: { message: ChatMessage }) {
+function ReviewerContextBlock({ message, cwd, issueId }: { message: ChatMessage; cwd?: string; issueId?: string | null }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -607,7 +631,7 @@ function ReviewerContextBlock({ message }: { message: ChatMessage }) {
         </button>
         {expanded && (
           <div className={styles.contextMessageContent}>
-            <ChatMarkdown text={message.text} />
+            <ChatMarkdown text={message.text} cwd={cwd} issueId={issueId} />
           </div>
         )}
       </div>
@@ -624,10 +648,14 @@ function AssistantMessageRow({
   turnDiffSummary,
   onOpenTurnDiff,
   resolvedTheme,
+  cwd,
+  issueId,
 }: {
   message: ChatMessage;
   durationStart: string;
   isStreaming: boolean;
+  cwd?: string;
+  issueId?: string | null;
   turnDiffSummary?: TurnDiffSummary;
   onOpenTurnDiff?: (turnId: string, filePath?: string) => void;
   resolvedTheme?: 'light' | 'dark';
@@ -642,7 +670,7 @@ function AssistantMessageRow({
     <div className={styles.assistantMessageRow}>
       <Bot size={14} className={styles.assistantMessageAvatar} aria-hidden="true" />
       <div className={styles.assistantMessageContent}>
-        <ChatMarkdown text={message.text} isStreaming={isStreaming && !message.completedAt} />
+        <ChatMarkdown text={message.text} isStreaming={isStreaming && !message.completedAt} cwd={cwd} issueId={issueId} />
         {turnDiffSummary && turnDiffSummary.files.length > 0 && (
           <div className="mt-2 rounded-md border border-border/50 bg-muted/30 p-2">
             <div className="flex items-center justify-between mb-1.5">
@@ -699,7 +727,7 @@ function AssistantMessageRow({
 
 // ─── Work log group ───────────────────────────────────────────────────────────
 
-function WorkLogGroup({ entries, hideToolCalls }: { entries: WorkLogEntry[]; hideToolCalls?: boolean }) {
+function WorkLogGroup({ entries, hideToolCalls, cwd, issueId }: { entries: WorkLogEntry[]; hideToolCalls?: boolean; cwd?: string; issueId?: string | null }) {
   const [expanded, setExpanded] = useState(false);
 
   const onlyToolEntries = entries.every((entry) => entry.tone === 'tool' || entry.tone === 'error');
@@ -735,7 +763,7 @@ function WorkLogGroup({ entries, hideToolCalls }: { entries: WorkLogEntry[]; hid
   return (
     <div className={styles.workLogGroup}>
       {visible.map((entry) => (
-        <SimpleWorkEntryRow key={entry.id} entry={entry} />
+        <SimpleWorkEntryRow key={entry.id} entry={entry} cwd={cwd} issueId={issueId} />
       ))}
       {hasOverflow && !expanded && (
         <button
@@ -761,7 +789,159 @@ function WorkLogGroup({ entries, hideToolCalls }: { entries: WorkLogEntry[]; hid
 
 const TERMINAL_TOOLS = new Set(['Bash', 'bash', 'terminal', 'shell']);
 
-function SimpleWorkEntryRow({ entry }: { entry: WorkLogEntry }) {
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Per-tool expanded body for a tool_use work-log entry. Reads structured
+ * fields out of `entry.toolInput` and renders them in a form that matches
+ * the tool's semantics (shell block for Bash, file chip for Read/Write/Edit,
+ * pattern + path for Grep/Glob, etc.). Unknown tools fall back to a
+ * pretty-printed JSON code block. See PAN-1459.
+ */
+function ToolUseExpanded({
+  entry,
+  cwd,
+  issueId,
+}: {
+  entry: WorkLogEntry;
+  cwd?: string;
+  issueId?: string | null;
+}) {
+  const tool = entry.toolTitle ?? entry.label;
+  const input = entry.toolInput;
+  if (!input) return null;
+
+  switch (tool) {
+    case 'Bash': {
+      const description = asString(input.description);
+      const command = asString(input.command);
+      return (
+        <>
+          {description && <div className={styles.workLogToolHeader}>{description}</div>}
+          {command && (
+            <pre className={styles.workLogResult}>
+              <code>{command}</code>
+            </pre>
+          )}
+        </>
+      );
+    }
+
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'NotebookEdit': {
+      const filePath = asString(input.file_path) ?? asString(input.notebook_path);
+      if (!filePath) break;
+      return (
+        <div className={styles.workLogResult}>
+          <ChatMarkdown text={`\`${filePath}\``} cwd={cwd} issueId={issueId} />
+        </div>
+      );
+    }
+
+    case 'Grep': {
+      const pattern = asString(input.pattern) ?? '';
+      const path = asString(input.path);
+      const glob = asString(input.glob);
+      const flags = [
+        asString(input.type) && `type=${input.type}`,
+        input['-i'] === true && 'case-insensitive',
+        input['-n'] === true && 'line-numbers',
+        glob && `glob=${glob}`,
+      ].filter(Boolean);
+      return (
+        <div className={styles.workLogResult}>
+          <code>{pattern}</code>
+          {path && <> in <code>{path}</code></>}
+          {flags.length > 0 && <> · {flags.join(' · ')}</>}
+        </div>
+      );
+    }
+
+    case 'Glob': {
+      const pattern = asString(input.pattern) ?? '';
+      const path = asString(input.path);
+      return (
+        <div className={styles.workLogResult}>
+          <code>{pattern}</code>
+          {path && <> in <code>{path}</code></>}
+        </div>
+      );
+    }
+
+    case 'WebFetch': {
+      const url = asString(input.url);
+      const prompt = asString(input.prompt);
+      return (
+        <div className={styles.workLogResult}>
+          {url && (
+            <div>
+              <a href={url} target="_blank" rel="noopener noreferrer">{url}</a>
+            </div>
+          )}
+          {prompt && <div>{prompt}</div>}
+        </div>
+      );
+    }
+
+    case 'WebSearch': {
+      const query = asString(input.query);
+      return query ? <div className={styles.workLogResult}>{query}</div> : null;
+    }
+
+    case 'TodoWrite': {
+      const todos = Array.isArray(input.todos) ? input.todos : [];
+      return (
+        <ul className={styles.workLogResult}>
+          {todos.map((todo, i) => {
+            const t = todo as Record<string, unknown>;
+            const content = asString(t.content) ?? asString(t.activeForm) ?? '(empty)';
+            const status = asString(t.status) ?? 'pending';
+            return (
+              <li key={i}>
+                <span style={{ color: 'var(--muted-foreground)' }}>[{status}]</span> {content}
+              </li>
+            );
+          })}
+        </ul>
+      );
+    }
+
+    case 'Task': {
+      const subagent = asString(input.subagent_type);
+      const description = asString(input.description);
+      const prompt = asString(input.prompt);
+      return (
+        <div className={styles.workLogResult}>
+          {(subagent || description) && (
+            <div className={styles.workLogToolHeader}>
+              {subagent && <code>{subagent}</code>}
+              {subagent && description && ' · '}
+              {description}
+            </div>
+          )}
+          {prompt && <ChatMarkdown text={prompt} cwd={cwd} issueId={issueId} />}
+        </div>
+      );
+    }
+
+    default:
+      break;
+  }
+
+  // Fallback: pretty-printed JSON. Replaces the previous behavior of stuffing
+  // JSON.stringify(input) into a one-line `detail` string with no formatting.
+  return (
+    <pre className={styles.workLogResult}>
+      <code>{JSON.stringify(input, null, 2)}</code>
+    </pre>
+  );
+}
+
+function SimpleWorkEntryRow({ entry, cwd, issueId }: { entry: WorkLogEntry; cwd?: string; issueId?: string | null }) {
   const [showResult, setShowResult] = useState(false);
   const toneColor: Record<WorkLogEntry['tone'], string> = {
     thinking: 'var(--muted-foreground)',
@@ -773,7 +953,8 @@ function SimpleWorkEntryRow({ entry }: { entry: WorkLogEntry }) {
   const isTerminal = TERMINAL_TOOLS.has(entry.toolTitle ?? entry.label);
   const isThinking = entry.tone === 'thinking';
   const hasResult = !!entry.result;
-  const isExpandable = hasResult || (isThinking && !!entry.detail);
+  const hasToolBody = !!entry.toolInput && entry.tone === 'tool';
+  const isExpandable = hasResult || hasToolBody || (isThinking && !!entry.detail);
 
   return (
     <div>
@@ -821,17 +1002,23 @@ function SimpleWorkEntryRow({ entry }: { entry: WorkLogEntry }) {
         )}
       </div>
       {showResult && (
-        isTerminal && entry.result ? (
-          <pre className={styles.workLogResult}>{entry.result}</pre>
-        ) : isThinking && entry.detail ? (
-          <div className={styles.workLogResult}>
-            <ChatMarkdown text={entry.detail} />
-          </div>
-        ) : entry.result ? (
-          <div className={styles.workLogResult}>
-            <ChatMarkdown text={entry.result} />
-          </div>
-        ) : null
+        <>
+          {hasToolBody && <ToolUseExpanded entry={entry} cwd={cwd} issueId={issueId} />}
+          {isThinking && entry.detail && (
+            <div className={styles.workLogResult}>
+              <ChatMarkdown text={entry.detail} cwd={cwd} issueId={issueId} />
+            </div>
+          )}
+          {entry.result && (
+            isTerminal ? (
+              <pre className={styles.workLogResult}>{entry.result}</pre>
+            ) : (
+              <div className={styles.workLogResult}>
+                <ChatMarkdown text={entry.result} cwd={cwd} issueId={issueId} />
+              </div>
+            )
+          )}
+        </>
       )}
     </div>
   );
@@ -947,6 +1134,31 @@ function SessionPermissionsRow({ message }: { message: ChatMessage }) {
       <ShieldCheck size={11} className={styles.sessionPermissionsIcon} />
       <span className={styles.sessionPermissionsLabel}>Permissions:</span>
       <span className={styles.sessionPermissionsTools}>{message.text}</span>
+    </div>
+  );
+}
+
+// ─── Slash-command divider (PAN-1458) ────────────────────────────────────────
+
+/**
+ * Renders a Claude Code slash command (the kind Claude Code emits as a user
+ * message wrapped in `<command-name>X</command-name>`) as a horizontal divider
+ * instead of a regular message bubble. Most relevant for `/clear`, which
+ * signals the JSONL boundary — see PAN-1458 — but applies to any slash command
+ * Claude Code happens to record this way.
+ */
+function SlashCommandDivider({ command, createdAt }: { command: string; createdAt: string }) {
+  const isClear = command === '/clear';
+  const label = isClear ? 'Conversation cleared' : `Slash command: ${command}`;
+  return (
+    <div className={styles.compactBoundaryDivider}>
+      <div className={styles.compactBoundaryLine} />
+      <div className={styles.compactBoundaryLabel}>
+        <RotateCcw size={12} />
+        <span>{label}</span>
+        <span className={styles.compactBoundaryDetail}>{formatTimestamp(createdAt)}</span>
+      </div>
+      <div className={styles.compactBoundaryLine} />
     </div>
   );
 }

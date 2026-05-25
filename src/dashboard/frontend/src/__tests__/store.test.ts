@@ -23,10 +23,11 @@ import {
   useDashboardStore,
   type DashboardState,
 } from '../lib/store'
-import type {
-  AgentSnapshot,
-  DashboardSnapshot,
-  DomainEvent,
+import {
+  INITIAL_READ_MODEL_STATE,
+  type AgentSnapshot,
+  type DashboardSnapshot,
+  type DomainEvent,
 } from '@panctl/contracts'
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
@@ -54,39 +55,10 @@ const reviewAgent: AgentSnapshot = {
 }
 
 const emptyState: DashboardState = {
+  ...INITIAL_READ_MODEL_STATE,
   drawer: { issueId: null, tab: 'overview' },
   bootstrapComplete: false,
   snapshotTimestamp: null,
-  sequence: 0,
-  agentsById: {},
-  agentRuntimeById: {},
-  reviewStatusByIssueId: {},
-  resources: null,
-  agentOutputById: {},
-  issuesRaw: [],
-  recentActivity: [],
-  detailedActivity: [],
-  ttsActivity: [],
-  shadowInferenceByIssueId: {},
-  turnDiffSummariesByAgentId: {},
-  channelPermissionRequestsById: {},
-  observationsByIssueId: {},
-  statusByIssueId: {},
-  rollupsByIssueId: {},
-  resetMarkersByScopeId: {},
-  healthByIssueId: {},
-  dashboardLifecycle: {
-    active: false,
-    reason: null,
-    issueId: null,
-    trigger: null,
-    startedAt: null,
-    completedAt: null,
-    failedAt: null,
-    error: null,
-  },
-  conversationsCompactingByName: {},
-  conversationsAwaitingPermissionByName: {},
 }
 
 function makeSnapshot(seq = 5): DashboardSnapshot {
@@ -233,11 +205,12 @@ describe('applyEventReducer — agent events', () => {
     expect(Object.keys(next.agentsById)).toHaveLength(0)
   })
 
-  it('agent.status_changed updates agent status', () => {
+  it('agent.status_changed updates agent status and tmux liveness', () => {
     const state: DashboardState = { ...emptyState, agentsById: { 'agent-1': baseAgent } }
-    const event = makeEvent('agent.status_changed', 4, { agentId: 'agent-1', status: 'stopped' })
+    const event = makeEvent('agent.status_changed', 4, { agentId: 'agent-1', status: 'stopped', hasLiveTmuxSession: false })
     const next = applyEventReducer(state, event)
     expect(next.agentsById['agent-1']!.status).toBe('stopped')
+    expect(next.agentsById['agent-1']!.hasLiveTmuxSession).toBe(false)
   })
 
   it('agent.status_changed leaves agentsById unchanged if agent not found', () => {

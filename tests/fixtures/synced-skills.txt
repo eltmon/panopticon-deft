@@ -38,12 +38,14 @@ pan-done
 pan-down
 pan-fly
 pan-flywheel
+pan-handoff
 pan-help
 pan-install
 pan-issues
 pan-kill
 pan-logs
 pan-memory
+pan-merge
 pan-network
 pan-new-project
 pan-oversee
@@ -63,6 +65,7 @@ pan-start
 pan-status
 pan-stop-all-agents
 pan-subagent-creator
+pan-swarm
 pan-sync
 pan-sync-main
 pan-tell

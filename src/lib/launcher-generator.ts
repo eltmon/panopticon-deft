@@ -1,6 +1,6 @@
 import { Effect } from 'effect';
 import type { Role } from './agents.js';
-import { shellQuoteModelId } from './model-validation.js';
+import { shellQuoteModelIdSync } from './model-validation.js';
 
 export type LauncherSpawnMode = 'conversation' | 'remote' | 'resume';
 
@@ -51,6 +51,16 @@ export interface LauncherConfig {
   promptFile?: string;
   promptFileMode?: 'argument' | 'stdin';
   promptInline?: string;
+
+  /**
+   * PAN-1201: absolute path to the workspace's assembled context bundle
+   * (`<workspace>/.pan/context/workspace.md`). When set on a Claude Code
+   * launcher the generator appends `--append-system-prompt-file <path>` so
+   * the agent's system prompt carries the layered workspace context. Ignored
+   * for Pi launchers — the Pi extension loads workspace.md at session_start.
+   */
+  appendSystemPromptFile?: string;
+  appendSystemPromptFiles?: string[];
 
   /**
    * Review sub-role launcher contract (PAN-977). When set, the launcher does
@@ -135,6 +145,11 @@ export interface LauncherConfig {
    * not also provided.
    */
   channelsBridgeServerName?: string;
+
+  /** Wrap Claude Code in the PTY supervisor: `node <supervisorScriptPath> claude ...`. Defaults to false. */
+  useSupervisor?: boolean;
+  /** Absolute path to dist/pty-supervisor.js. Required when useSupervisor=true. */
+  supervisorScriptPath?: string;
 }
 
 /**
@@ -142,7 +157,7 @@ export interface LauncherConfig {
  * e.g. shellQuote("foo'bar") → "'foo'\\''bar'"
  */
 function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\''`)}'`;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
@@ -159,6 +174,15 @@ function buildChannelsArgs(config: LauncherConfig): string {
   return ` --mcp-config ${shellQuote(config.channelsBridgeMcpConfig)} --dangerously-load-development-channels server:${serverName}`;
 }
 
+function wrapWithSupervisor(config: LauncherConfig, cmd: string): string {
+  if (!config.useSupervisor) return cmd;
+  if (config.harness === 'pi' || config.reviewSignal) return cmd;
+  if (!config.supervisorScriptPath) {
+    throw new Error('LauncherConfig.supervisorScriptPath is required when useSupervisor=true');
+  }
+  return `node ${shellQuote(config.supervisorScriptPath)} ${cmd}`;
+}
+
 /**
  * Canonical launcher script generator.
  *
@@ -167,7 +191,7 @@ function buildChannelsArgs(config: LauncherConfig): string {
  * and baseCommand strings — the generator does NOT call helper functions
  * internally (keeps coupling low, tests simple).
  */
-export function generateLauncherScript(config: LauncherConfig): string {
+export function generateLauncherScriptSync(config: LauncherConfig): string {
   const lines: string[] = [];
 
   // Shebang
@@ -322,7 +346,7 @@ export function generateLauncherScript(config: LauncherConfig): string {
  * Generate the outer `script -qfaec` wrapper for launchers that need tty logging.
  * Returns null if useScriptWrapper is false.
  */
-export function generateLauncherWrapper(config: LauncherConfig): string | null {
+export function generateLauncherWrapperSync(config: LauncherConfig): string | null {
   if (!config.useScriptWrapper || !config.scriptLogFile) {
     return null;
   }
@@ -364,7 +388,7 @@ function buildCommand(config: LauncherConfig): string[] {
       if (config.extraArgs) {
         args.push(config.extraArgs);
       }
-      parts.push(`${cmd} ${args.join(' ')}`.trim());
+      parts.push(wrapWithSupervisor(config, `${cmd} ${args.join(' ')}`.trim()));
     }
     return parts;
   }
@@ -462,10 +486,14 @@ function buildNonConversationCommand(config: LauncherConfig, useExec: boolean): 
     cmd += ` --session-id ${shellQuote(config.sessionId)}`;
   }
   if (config.model) {
-    cmd += ` --model ${shellQuoteModelId(config.model)}`;
+    cmd += ` --model ${shellQuoteModelIdSync(config.model)}`;
   }
   if (config.extraArgs) {
     cmd += ` ${config.extraArgs}`;
+  }
+  // PAN-1201: fold the layered workspace context bundle into the system prompt.
+  for (const file of systemPromptFiles(config)) {
+    cmd += ` --append-system-prompt-file ${shellQuote(file)}`;
   }
 
   // Append prompt reference
@@ -480,7 +508,8 @@ function buildNonConversationCommand(config: LauncherConfig, useExec: boolean): 
     cmd += ` ${shellQuote(config.promptInline)}`;
   }
 
-  parts.push(useExec ? `exec ${cmd.trim()}` : cmd.trim());
+  const wrapped = wrapWithSupervisor(config, cmd.trim());
+  parts.push(useExec ? `exec ${wrapped}` : wrapped);
   return parts;
 }
 
@@ -509,6 +538,13 @@ function buildNonConversationCommand(config: LauncherConfig, useExec: boolean): 
  * dropped (AC4). baseCommand is ignored — Pi launchers always start with
  * the literal `pi` so callers cannot accidentally smuggle in claude flags.
  */
+function systemPromptFiles(config: LauncherConfig): string[] {
+  return [
+    ...(config.appendSystemPromptFile ? [config.appendSystemPromptFile] : []),
+    ...(config.appendSystemPromptFiles ?? []),
+  ];
+}
+
 function buildPiCommand(config: LauncherConfig, useExec: boolean): string[] {
   const piMode = config.piMode ?? 'rpc';
   if (!config.piSessionDir) {
@@ -528,7 +564,7 @@ function buildPiCommand(config: LauncherConfig, useExec: boolean): string[] {
     tokens.push('--mode', 'rpc');
   }
   if (config.model) {
-    tokens.push('--model', shellQuoteModelId(config.model));
+    tokens.push('--model', shellQuoteModelIdSync(config.model));
   }
   tokens.push('--session-dir', shellQuote(config.piSessionDir));
   if (config.piExtensionPath) {
@@ -570,11 +606,11 @@ function buildPiCommand(config: LauncherConfig, useExec: boolean): string[] {
 // Pure-sync launcher emission — additive Effect.sync wrappers.
 
 /** Build the bash launcher script body for a Cloister role spawn. Pure. */
-export const generateLauncherScriptEffect = (
+export const generateLauncherScript = (
   config: LauncherConfig,
-): Effect.Effect<string> => Effect.sync(() => generateLauncherScript(config));
+): Effect.Effect<string> => Effect.sync(() => generateLauncherScriptSync(config));
 
 /** Build an optional launcher wrapper (returns null when not needed). Pure. */
-export const generateLauncherWrapperEffect = (
+export const generateLauncherWrapper = (
   config: LauncherConfig,
-): Effect.Effect<string | null> => Effect.sync(() => generateLauncherWrapper(config));
+): Effect.Effect<string | null> => Effect.sync(() => generateLauncherWrapperSync(config));

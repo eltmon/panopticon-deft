@@ -1,3 +1,4 @@
+import { Effect } from 'effect';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join, basename } from 'path';
@@ -102,7 +103,7 @@ describe('createBeadsFromVBrief', () => {
   it('returns error when bd CLI is not found', async () => {
     mockExecAsync.mockRejectedValueOnce(new Error('which: no bd in (PATH)'));
 
-    const result = await createBeadsFromVBrief(WORKSPACE_DIR);
+    const result = await Effect.runPromise(createBeadsFromVBrief(WORKSPACE_DIR));
 
     expect(result.success).toBe(false);
     expect(result.errors).toContain('bd (beads) CLI not found in PATH');
@@ -120,10 +121,11 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '/usr/bin/bd', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-001\n', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-002\n', stderr: '' });
 
-    const result = await createBeadsFromVBrief(WORKSPACE_DIR);
+    const result = await Effect.runPromise(createBeadsFromVBrief(WORKSPACE_DIR));
 
     expect(result.success).toBe(true);
     expect(result.created).toEqual(['PAN-500: First task', 'PAN-500: Second task']);
@@ -139,9 +141,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '/usr/bin/bd', stderr: '' })   // which bd
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd ping --json
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // bd list --json -l ...
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // post-delete bd list verification
       .mockResolvedValueOnce({ stdout: 'bead-001\n', stderr: '' });    // bd create
 
-    const result = await createBeadsFromVBrief(WORKSPACE_DIR);
+    const result = await Effect.runPromise(createBeadsFromVBrief(WORKSPACE_DIR));
 
     // Redirect file must have been written
     const redirectContent = readFileSync(join(WORKSPACE_DIR, '.beads', 'redirect'), 'utf-8');
@@ -163,7 +166,7 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd doctor --fix
       .mockRejectedValueOnce(dbError);                                 // bd ping --json (retry)
 
-    const result = await createBeadsFromVBrief(ws2.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws2.workspacePath));
 
     const doctorCalls = mockExecAsync.mock.calls.filter(
       ([file, args]: [string, string[]]) =>
@@ -196,9 +199,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd doctor --fix
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd ping --json (retry)
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // bd list --json -l ... (idempotency)
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // post-delete bd list verification
       .mockResolvedValueOnce({ stdout: 'bead-recovered\n', stderr: '' }); // bd create
 
-    const result = await createBeadsFromVBrief(ws3.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws3.workspacePath));
 
     const doctorCalls = mockExecAsync.mock.calls.filter(
       ([file, args]: [string, string[]]) =>
@@ -229,10 +233,11 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-alpha\n', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-beta\n', stderr: '' });
 
-    const result = await createBeadsFromVBrief(ws9.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws9.workspacePath));
 
     const createCalls = mockExecAsync.mock.calls.filter(
       ([file, args]: [string, string[]]) => file === 'bd' && Array.isArray(args) && args[0] === 'create',
@@ -258,9 +263,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd config set export.git-add false
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd ping --json (probe — succeeds after init)
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // bd list --json -l ... (idempotency)
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // post-delete bd list verification
       .mockResolvedValueOnce({ stdout: 'bead-002\n', stderr: '' });    // bd create
 
-    const result = await createBeadsFromVBrief(ws3.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws3.workspacePath));
 
     const initCall = mockExecAsync.mock.calls.find(
       ([file, args]: [string, string[]]) =>
@@ -287,10 +293,11 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '/usr/bin/bd', stderr: '' })   // which bd
       .mockResolvedValueOnce({ stdout: '', stderr: '' })               // bd ping --json
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // bd list --json -l ... (idempotency)
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })             // post-delete bd list verification
       .mockResolvedValueOnce({ stdout: 'bead-alpha\n', stderr: '' })  // bd create item-a
       .mockResolvedValueOnce({ stdout: 'bead-beta\n', stderr: '' });  // bd create item-b
 
-    const result = await createBeadsFromVBrief(ws4.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws4.workspacePath));
 
     expect(result.success).toBe(true);
     expect(result.errors).toHaveLength(0);
@@ -313,9 +320,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: existingBeads, stderr: '' })    // bd list --json -l ... (idempotency)
       .mockResolvedValueOnce({ stdout: '', stderr: '' })                // bd delete stale-bead-42
       .mockResolvedValueOnce({ stdout: '', stderr: '' })                // bd delete stale-bead-43
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })              // post-delete bd list verification
       .mockResolvedValueOnce({ stdout: 'fresh-bead-1\n', stderr: '' }); // bd create
 
-    const result = await createBeadsFromVBrief(ws5.workspacePath);
+    const result = await Effect.runPromise(createBeadsFromVBrief(ws5.workspacePath));
 
     // execFile form: mockExecAsync('bd', ['delete', '<id>', '--force'], opts)
     const deleteCalls = mockExecAsync.mock.calls.filter(
@@ -349,9 +357,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '/usr/bin/bd', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-auto\n', stderr: '' });
 
-    await createBeadsFromVBrief(ws6.workspacePath);
+    await Effect.runPromise(createBeadsFromVBrief(ws6.workspacePath));
 
     const createCall = mockExecAsync.mock.calls.find(
       ([file, args]: [string, string[]]) => file === 'bd' && Array.isArray(args) && args[0] === 'create',
@@ -380,9 +389,10 @@ describe('createBeadsFromVBrief', () => {
       .mockResolvedValueOnce({ stdout: '/usr/bin/bd', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+      .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
       .mockResolvedValueOnce({ stdout: 'bead-deep\n', stderr: '' });
 
-    await createBeadsFromVBrief(ws7.workspacePath);
+    await Effect.runPromise(createBeadsFromVBrief(ws7.workspacePath));
 
     const createCall = mockExecAsync.mock.calls.find(
       ([file, args]: [string, string[]]) => file === 'bd' && Array.isArray(args) && args[0] === 'create',
@@ -392,5 +402,132 @@ describe('createBeadsFromVBrief', () => {
     expect(metadata.inspectionDepth).toBe('deep');
 
     rmSync(ws7.projectRoot, { recursive: true, force: true });
+  });
+
+  describe('idempotency and dedup failure semantics', () => {
+    const createCalls = () => mockExecAsync.mock.calls.filter(
+      ([file, args]: [string, string[]]) => file === 'bd' && Array.isArray(args) && args[0] === 'create',
+    );
+
+    it('three consecutive calls leave exactly planItemCount beads', async () => {
+      const ws8 = createWorkspace('PAN-507');
+      setupRedirect(ws8.workspacePath);
+      writePlan(ws8.projectRoot, 'PAN-507', makeDoc('PAN-507', [
+        { id: 'item-a', title: 'Alpha task' },
+        { id: 'item-b', title: 'Beta task' },
+      ]));
+
+      const beads: Array<{ id: string; title: string }> = [];
+      let nextId = 1;
+      mockExecAsync.mockImplementation(async (file: string, args: string[]) => {
+        if (file === 'which') return { stdout: '/usr/bin/bd', stderr: '' };
+        if (file === 'bd' && args[0] === 'ping') return { stdout: '', stderr: '' };
+        if (file === 'bd' && args[0] === 'list') return { stdout: JSON.stringify(beads), stderr: '' };
+        if (file === 'bd' && args[0] === 'delete') {
+          const index = beads.findIndex(bead => bead.id === args[1]);
+          if (index !== -1) beads.splice(index, 1);
+          return { stdout: '', stderr: '' };
+        }
+        if (file === 'bd' && args[0] === 'create') {
+          const id = `bead-${nextId++}`;
+          beads.push({ id, title: args[1] });
+          return { stdout: `${id}\n`, stderr: '' };
+        }
+        throw new Error(`unexpected call: ${file} ${args.join(' ')}`);
+      });
+
+      for (let i = 0; i < 3; i++) {
+        const result = await Effect.runPromise(createBeadsFromVBrief(ws8.workspacePath));
+        expect(result.success).toBe(true);
+      }
+
+      expect(beads).toHaveLength(2);
+      expect(beads.map(bead => bead.title).sort()).toEqual([
+        'PAN-507: Alpha task',
+        'PAN-507: Beta task',
+      ]);
+      expect(new Set(beads.map(bead => bead.title)).size).toBe(2);
+
+      rmSync(ws8.projectRoot, { recursive: true, force: true });
+    });
+
+    it('aborts when bd list throws during dedup', async () => {
+      const ws8 = createWorkspace('PAN-508');
+      setupRedirect(ws8.workspacePath);
+      writePlan(ws8.projectRoot, 'PAN-508', makeDoc('PAN-508', [{ id: 'item-1', title: 'Blocked task' }]));
+
+      mockExecAsync.mockImplementation(async (file: string, args: string[]) => {
+        if (file === 'which') return { stdout: '/usr/bin/bd', stderr: '' };
+        if (file === 'bd' && args[0] === 'ping') return { stdout: '', stderr: '' };
+        if (file === 'bd' && args[0] === 'list') throw new Error('bd list exploded');
+        return { stdout: 'unexpected\n', stderr: '' };
+      });
+
+      const result = await Effect.runPromise(createBeadsFromVBrief(ws8.workspacePath));
+
+      expect(result.success).toBe(false);
+      expect(result.errors[0]).toContain('dedup failed:');
+      expect(result.errors[0]).toContain('list failed:');
+      expect(createCalls()).toHaveLength(0);
+
+      rmSync(ws8.projectRoot, { recursive: true, force: true });
+    });
+
+    it('aborts when any bd delete fails during dedup', async () => {
+      const ws8 = createWorkspace('PAN-509');
+      setupRedirect(ws8.workspacePath);
+      writePlan(ws8.projectRoot, 'PAN-509', makeDoc('PAN-509', [{ id: 'item-1', title: 'Blocked task' }]));
+
+      let listCalls = 0;
+      const staleBeads = [{ id: 'stale-1' }, { id: 'stale-2' }, { id: 'stale-3' }];
+      mockExecAsync.mockImplementation(async (file: string, args: string[]) => {
+        if (file === 'which') return { stdout: '/usr/bin/bd', stderr: '' };
+        if (file === 'bd' && args[0] === 'ping') return { stdout: '', stderr: '' };
+        if (file === 'bd' && args[0] === 'list') {
+          listCalls++;
+          return { stdout: JSON.stringify(listCalls === 1 ? staleBeads : []), stderr: '' };
+        }
+        if (file === 'bd' && args[0] === 'delete') {
+          if (args[1] === 'stale-2') throw Object.assign(new Error('delete exploded'), { stderr: 'delete exploded' });
+          return { stdout: '', stderr: '' };
+        }
+        return { stdout: 'unexpected\n', stderr: '' };
+      });
+
+      const result = await Effect.runPromise(createBeadsFromVBrief(ws8.workspacePath));
+
+      expect(result.success).toBe(false);
+      expect(result.errors.some(error => error.includes('dedup failed: delete stale-2:'))).toBe(true);
+      expect(createCalls()).toHaveLength(0);
+
+      rmSync(ws8.projectRoot, { recursive: true, force: true });
+    });
+
+    it('aborts when post-delete verification finds residual beads', async () => {
+      const ws8 = createWorkspace('PAN-510');
+      setupRedirect(ws8.workspacePath);
+      writePlan(ws8.projectRoot, 'PAN-510', makeDoc('PAN-510', [{ id: 'item-1', title: 'Blocked task' }]));
+
+      let listCalls = 0;
+      mockExecAsync.mockImplementation(async (file: string, args: string[]) => {
+        if (file === 'which') return { stdout: '/usr/bin/bd', stderr: '' };
+        if (file === 'bd' && args[0] === 'ping') return { stdout: '', stderr: '' };
+        if (file === 'bd' && args[0] === 'list') {
+          listCalls++;
+          const beads = listCalls === 1 ? [{ id: 'stale-1' }, { id: 'stale-2' }] : [{ id: 'stale-2' }];
+          return { stdout: JSON.stringify(beads), stderr: '' };
+        }
+        if (file === 'bd' && args[0] === 'delete') return { stdout: '', stderr: '' };
+        return { stdout: 'unexpected\n', stderr: '' };
+      });
+
+      const result = await Effect.runPromise(createBeadsFromVBrief(ws8.workspacePath));
+
+      expect(result.success).toBe(false);
+      expect(result.errors.some(error => error.includes('dedup failed: residual 1 beads after delete: stale-2'))).toBe(true);
+      expect(createCalls()).toHaveLength(0);
+
+      rmSync(ws8.projectRoot, { recursive: true, force: true });
+    });
   });
 });

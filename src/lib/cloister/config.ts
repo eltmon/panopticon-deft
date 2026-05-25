@@ -5,7 +5,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { access, mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { parse, stringify } from '@iarna/toml';
 import { join } from 'path';
 import { Effect } from 'effect';
@@ -33,6 +33,13 @@ export interface AutoActions {
   restart_on_kill: boolean;
   /** Minimum ms between pokes for the same agent. Prevents spam on repeated health checks. Default: 30 min */
   poke_cooldown_ms: number;
+}
+
+export interface StuckRemediationConfig {
+  enabled: boolean;
+  stage1_minutes: number;
+  stage2_minutes: number;
+  stage3_minutes: number;
 }
 
 /**
@@ -224,6 +231,7 @@ export interface CloisterConfig {
   startup: StartupConfig;
   thresholds: HealthThresholds;
   auto_actions: AutoActions;
+  stuck_remediation?: StuckRemediationConfig;
   monitoring: MonitoringConfig;
   notifications?: NotificationConfig;
   specialists?: SpecialistsConfig;
@@ -254,6 +262,12 @@ export const DEFAULT_CLOISTER_CONFIG: CloisterConfig = {
     kill_on_stuck: false,  // Manual by default for safety
     restart_on_kill: false,
     poke_cooldown_ms: 30 * 60 * 1000, // 30 min between pokes for the same agent
+  },
+  stuck_remediation: {
+    enabled: true,
+    stage1_minutes: 20,
+    stage2_minutes: 45,
+    stage3_minutes: 90,
   },
   monitoring: {
     check_interval: 60, // 1 minute
@@ -402,14 +416,6 @@ function applyEnvironmentOverrides(config: CloisterConfig): CloisterConfig {
   };
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Load Cloister configuration
@@ -417,7 +423,7 @@ async function fileExists(path: string): Promise<boolean> {
  * Reads from ~/.panopticon/cloister.toml and merges with defaults.
  * Creates default config file if it doesn't exist.
  */
-export function loadCloisterConfig(): CloisterConfig {
+export function loadCloisterConfigSync(): CloisterConfig {
   // Ensure panopticon home exists
   if (!existsSync(PANOPTICON_HOME)) {
     mkdirSync(PANOPTICON_HOME, { recursive: true });
@@ -427,7 +433,7 @@ export function loadCloisterConfig(): CloisterConfig {
 
   // If config file doesn't exist, create it with defaults
   if (!existsSync(CLOISTER_CONFIG_FILE)) {
-    saveCloisterConfig(DEFAULT_CLOISTER_CONFIG);
+    saveCloisterConfigSync(DEFAULT_CLOISTER_CONFIG);
   } else {
     try {
       const content = readFileSync(CLOISTER_CONFIG_FILE, 'utf-8');
@@ -445,46 +451,13 @@ export function loadCloisterConfig(): CloisterConfig {
   return applyEnvironmentOverrides(config);
 }
 
-export async function loadCloisterConfigAsync(): Promise<CloisterConfig> {
-  await mkdir(PANOPTICON_HOME, { recursive: true });
-
-  let config = DEFAULT_CLOISTER_CONFIG;
-
-  if (!(await fileExists(CLOISTER_CONFIG_FILE))) {
-    await saveCloisterConfigAsync(DEFAULT_CLOISTER_CONFIG);
-  } else {
-    try {
-      const content = await readFile(CLOISTER_CONFIG_FILE, 'utf-8');
-      const parsed = parse(content) as unknown as Partial<CloisterConfig>;
-      config = deepMerge(DEFAULT_CLOISTER_CONFIG, parsed);
-    } catch (error) {
-      console.error('Failed to load Cloister config:', error);
-      console.error('Using default configuration');
-      config = DEFAULT_CLOISTER_CONFIG;
-    }
-  }
-
-  return applyEnvironmentOverrides(config);
-}
-
-export async function saveCloisterConfigAsync(config: CloisterConfig): Promise<void> {
-  await mkdir(PANOPTICON_HOME, { recursive: true });
-
-  try {
-    const content = stringify(config as any);
-    await writeFile(CLOISTER_CONFIG_FILE, content, 'utf-8');
-  } catch (error) {
-    console.error('Failed to save Cloister config:', error);
-    throw error;
-  }
-}
 
 /**
  * Save Cloister configuration
  *
  * Writes configuration to ~/.panopticon/cloister.toml
  */
-export function saveCloisterConfig(config: CloisterConfig): void {
+export function saveCloisterConfigSync(config: CloisterConfig): void {
   // Ensure panopticon home exists
   if (!existsSync(PANOPTICON_HOME)) {
     mkdirSync(PANOPTICON_HOME, { recursive: true });
@@ -504,10 +477,10 @@ export function saveCloisterConfig(config: CloisterConfig): void {
  *
  * Merges partial config updates with existing config.
  */
-export function updateCloisterConfig(updates: Partial<CloisterConfig>): CloisterConfig {
-  const current = loadCloisterConfig();
+export function updateCloisterConfigSync(updates: Partial<CloisterConfig>): CloisterConfig {
+  const current = loadCloisterConfigSync();
   const updated = deepMerge(current, updates);
-  saveCloisterConfig(updated);
+  saveCloisterConfigSync(updated);
   return updated;
 }
 
@@ -522,7 +495,7 @@ export function getCloisterConfigPath(): string {
  * Check if Cloister should auto-start
  */
 export function shouldAutoStart(): boolean {
-  const config = loadCloisterConfig();
+  const config = loadCloisterConfigSync();
   return config.startup.auto_start;
 }
 
@@ -534,7 +507,7 @@ export function getHealthThresholdsMs(): {
   warning: number;
   stuck: number;
 } {
-  const config = loadCloisterConfig();
+  const config = loadCloisterConfigSync();
   return {
     stale: config.thresholds.stale * 60 * 1000,
     warning: config.thresholds.warning * 60 * 1000,
@@ -550,7 +523,7 @@ export function getHealthThresholdsMs(): {
 // these directly without `Effect.runSync` round-tripping.
 
 /** Effect variant of `loadCloisterConfig`. Falls back to defaults on read/parse failures. */
-export const loadCloisterConfigEffect = (): Effect.Effect<CloisterConfig, FsError | ConfigError> =>
+export const loadCloisterConfig = (): Effect.Effect<CloisterConfig, FsError | ConfigError> =>
   Effect.gen(function* () {
     yield* Effect.tryPromise({
       try: () => mkdir(PANOPTICON_HOME, { recursive: true }),
@@ -560,7 +533,7 @@ export const loadCloisterConfigEffect = (): Effect.Effect<CloisterConfig, FsErro
     let config: CloisterConfig = DEFAULT_CLOISTER_CONFIG;
 
     if (!existsSync(CLOISTER_CONFIG_FILE)) {
-      yield* saveCloisterConfigEffect(DEFAULT_CLOISTER_CONFIG);
+      yield* saveCloisterConfig(DEFAULT_CLOISTER_CONFIG);
     } else {
       const content: string | null = yield* Effect.tryPromise({
         try: () => readFile(CLOISTER_CONFIG_FILE, 'utf-8'),
@@ -603,7 +576,7 @@ export const loadCloisterConfigEffect = (): Effect.Effect<CloisterConfig, FsErro
   });
 
 /** Effect variant of `saveCloisterConfig`. */
-export const saveCloisterConfigEffect = (config: CloisterConfig): Effect.Effect<void, FsError | ConfigError> =>
+export const saveCloisterConfig = (config: CloisterConfig): Effect.Effect<void, FsError | ConfigError> =>
   Effect.gen(function* () {
     yield* Effect.tryPromise({
       try: () => mkdir(PANOPTICON_HOME, { recursive: true }),
@@ -622,12 +595,12 @@ export const saveCloisterConfigEffect = (config: CloisterConfig): Effect.Effect<
   });
 
 /** Effect variant of `updateCloisterConfig`. */
-export const updateCloisterConfigEffect = (
+export const updateCloisterConfig = (
   updates: Partial<CloisterConfig>,
 ): Effect.Effect<CloisterConfig, FsError | ConfigError> =>
   Effect.gen(function* () {
-    const current = yield* loadCloisterConfigEffect();
+    const current = yield* loadCloisterConfig();
     const updated = deepMerge(current, updates);
-    yield* saveCloisterConfigEffect(updated);
+    yield* saveCloisterConfig(updated);
     return updated;
   });
