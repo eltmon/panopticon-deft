@@ -1,0 +1,78 @@
+{
+  "version": "1",
+  "issueId": "PAN-1316",
+  "created": "2026-05-25T16:23:14.379Z",
+  "updated": "2026-05-25T16:35:00.000Z",
+  "gitState": {
+    "branch": "feature/pan-1316",
+    "sha": "2d0c4df4a",
+    "dirty": false
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Close the pause-path gap by adding stopWorkspaceDocker calls at both pause call sites (dashboard route and CLI command). Mirrors the pattern established for stop/kill in commit 2d0c4df4a — explicit teardown at the user-initiated lifecycle boundary, not inside stopAgent[Async].",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Gate teardown on the same condition that gates the tmux kill: stoppedByPause (dashboard route) / shouldStop (CLI). Pausing an already-stopped agent must NOT touch its Docker stack — it's a pure state-flag flip.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "Use the existing stopWorkspaceDocker helper unchanged (docker compose down -v --remove-orphans). Pause semantics match stop/kill — there is no state preservation today (tmux session is killed, runtime is marked stopped), so Docker volume loss on pause is consistent with the existing user-initiated-halt contract. A softer 'docker compose stop' variant is rejected; if state-preserving pause is wanted later it should be a new flag, not the default.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Scope strictly to closing the audit-flagged gap (pause paths). Do NOT pull in original issue items #2 (dashboard surfacing of orphan stacks) or #3 (pan doctor warning) — those are independent enhancements and the issue body itself says 'a teardown-on-stop fix alone resolves the reported symptom.'",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Do NOT centralize teardown inside stopAgent / stopAgentAsync. Restart paths (agent-spawner.ts:244, flywheel.ts) call stopAgentAsync and would lose Docker volumes on every restart. The call-site pattern keeps lifecycle teardown explicit and reviewable.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "Pausing an already-stopped agent must not trigger Docker teardown — the stack may already be gone and a needless docker compose down adds spurious warnings.",
+      "mitigation": "Gate the stopWorkspaceDocker call on stoppedByPause (dashboard) / shouldStop (CLI), matching the exact same boolean used to gate the tmux kill."
+    },
+    {
+      "id": "H2",
+      "summary": "stopWorkspaceDocker can throw (compose file missing, docker daemon down, timeout). A throw in the lifecycle path must NOT prevent the pause state transition from being persisted.",
+      "mitigation": "Wrap the call in try/catch and log a warning (same pattern as routes/agents.ts:1085-1087 and cli/commands/kill.ts:71-73). The pause state must already be persisted before the teardown attempt."
+    },
+    {
+      "id": "H3",
+      "summary": "Restart paths call stopAgentAsync directly (agent-spawner.ts:244-245, flywheel.ts:148). If teardown were centralized into stopAgentAsync, every restart would run 'docker compose down -v' and destroy named volumes (DB data, etc.).",
+      "mitigation": "Keep teardown at the user-initiated call site. Document this in the bead description so a future agent doesn't 'helpfully' DRY it up."
+    },
+    {
+      "id": "H4",
+      "summary": "Tests must mock stopWorkspaceDocker — a real docker compose invocation in a unit test would be slow, flaky, and would actually tear down stacks on the CI runner.",
+      "mitigation": "Mock '../../../../lib/workspace-manager.js' (route test) and '../../lib/workspace-manager.js' (CLI test) and assert mock call counts and arguments."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-7",
+  "sessionHistory": [
+    {
+      "reason": "planning",
+      "content": "Initial planning context for PAN-1316.",
+      "note": "Planning session started for PAN-1316: Stopped agents leave orphaned Docker workspace stacks — runaway dev server degrades the whole host",
+      "timestamp": "2026-05-25T16:23:14.379Z"
+    },
+    {
+      "timestamp": "2026-05-25T16:35:00.000Z",
+      "reason": "planning",
+      "note": "Auto-mode planning complete. Round-1 (commit 2d0c4df4a) closed stop/kill/delete paths; this round closes the two remaining pause paths the audit flagged: dashboard /api/agents/:id/pause and `pan pause`. Two beads, both simple mirrors of the existing patterns.",
+      "agentModel": "agent:claude-opus-4-7"
+    }
+  ],
+  "feedback": []
+}
