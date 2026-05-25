@@ -14,6 +14,12 @@ import { EventStoreService } from '../../services/domain-services.js';
 
 const mockAppendFile = vi.hoisted(() => vi.fn());
 const mockMkdir = vi.hoisted(() => vi.fn());
+const mockStopWorkspaceDocker = vi.hoisted(() => {
+  const { Effect } = require('effect') as typeof import('effect');
+  return vi.fn(() => Effect.succeed({ containersFound: true, steps: ['stopped docker'] }));
+});
+const mockResolveProjectFromIssueSync = vi.hoisted(() => vi.fn(() => ({ projectKey: 'panopticon', projectPath: '/project/root' })));
+const mockFindWorkspacePath = vi.hoisted(() => vi.fn(() => '/resolved/by/issue/path'));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
@@ -34,6 +40,20 @@ vi.mock('../../../../lib/agents.js', () => ({
 vi.mock('../../../../lib/activity-logger.js', () => ({
   emitActivityEntry: vi.fn(),
   emitActivityEntrySync: vi.fn(),
+}));
+
+vi.mock('../../../../lib/workspace-manager.js', () => ({
+  stopWorkspaceDocker: mockStopWorkspaceDocker,
+}));
+
+vi.mock('../../../../lib/projects.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../../lib/projects.js')>()),
+  resolveProjectFromIssueSync: mockResolveProjectFromIssueSync,
+}));
+
+vi.mock('../../../../lib/lifecycle/archive-planning.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../../lib/lifecycle/archive-planning.js')>()),
+  findWorkspacePath: mockFindWorkspacePath,
 }));
 
 vi.mock('../origin-validation.js', () => ({
@@ -97,6 +117,9 @@ describe('createAgentStopHandler lifecycle events', () => {
     mockStopAgent.mockReturnValue(Effect.void);
     mockAppendFile.mockResolvedValue(undefined);
     mockMkdir.mockResolvedValue(undefined);
+    mockStopWorkspaceDocker.mockImplementation(() => Effect.succeed({ containersFound: true, steps: ['stopped docker'] }));
+    mockResolveProjectFromIssueSync.mockReturnValue({ projectKey: 'panopticon', projectPath: '/project/root' });
+    mockFindWorkspacePath.mockReturnValue('/resolved/by/issue/path');
   });
 
   it("emits 'agent.delete_requested' for DELETE route", async () => {
@@ -120,5 +143,61 @@ describe('createAgentStopHandler lifecycle events', () => {
 
     expect(mockGetAgentState).toHaveBeenCalledWith('agent-pan-999');
     expect(mockStopAgent).toHaveBeenCalledWith('agent-pan-999');
+  });
+});
+
+describe('createAgentStopHandler docker teardown', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetAgentState.mockReturnValue(Effect.succeed({
+      issueId: 'PAN-1052',
+      role: 'ship',
+    } as any));
+    mockStopAgent.mockReturnValue(Effect.void);
+    mockAppendFile.mockResolvedValue(undefined);
+    mockMkdir.mockResolvedValue(undefined);
+    mockStopWorkspaceDocker.mockImplementation(() => Effect.succeed({ containersFound: true, steps: ['stopped docker'] }));
+    mockResolveProjectFromIssueSync.mockReturnValue({ projectKey: 'panopticon', projectPath: '/project/root' });
+    mockFindWorkspacePath.mockReturnValue('/resolved/by/issue/path');
+  });
+
+  it('tears down the issue workspace for a specialist without state.workspace', async () => {
+    mockGetAgentState.mockReturnValue(Effect.succeed({
+      issueId: 'PAN-1052',
+      role: 'ship',
+      workspace: undefined,
+    } as any));
+
+    await runAgentStopHandler('agent.stop_requested', 'agent-pan-1052-ship');
+
+    expect(mockResolveProjectFromIssueSync).toHaveBeenCalledWith('PAN-1052');
+    expect(mockFindWorkspacePath).toHaveBeenCalledWith('/project/root', 'pan-1052');
+    expect(mockStopWorkspaceDocker).toHaveBeenCalledWith('/resolved/by/issue/path', 'pan-1052');
+  });
+
+  it('uses the issue-resolved workspace path for work agents instead of state.workspace', async () => {
+    mockGetAgentState.mockReturnValue(Effect.succeed({
+      issueId: 'PAN-1052',
+      role: 'work',
+      workspace: '/orchestrator/wrong/path',
+    } as any));
+    mockFindWorkspacePath.mockReturnValue('/resolved/by/issue/path');
+
+    await runAgentStopHandler('agent.stop_requested', 'agent-pan-1052');
+
+    expect(mockStopWorkspaceDocker).toHaveBeenCalledWith('/resolved/by/issue/path', 'pan-1052');
+    expect(mockStopWorkspaceDocker).not.toHaveBeenCalledWith('/orchestrator/wrong/path', 'pan-1052');
+  });
+
+  it('skips docker teardown when agent state has no issueId', async () => {
+    mockGetAgentState.mockReturnValue(Effect.succeed({
+      role: 'work',
+      workspace: '/workspace/path',
+    } as any));
+
+    await runAgentStopHandler('agent.stop_requested', 'agent-pan-1052');
+
+    expect(mockFindWorkspacePath).not.toHaveBeenCalled();
+    expect(mockStopWorkspaceDocker).not.toHaveBeenCalled();
   });
 });
