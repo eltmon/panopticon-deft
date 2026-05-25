@@ -1,0 +1,93 @@
+{
+  "version": "1",
+  "issueId": "PAN-1326",
+  "created": "2026-05-25T16:23:14.525Z",
+  "updated": "2026-05-25T16:35:00.000Z",
+  "gitState": {
+    "branch": "feature/pan-1326",
+    "sha": "bd7d00787",
+    "dirty": false
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Implementation fix is already landed in commit bd7d00787 — this issue's remaining work is tests + verification only.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Add a new dedicated CLI test file at src/cli/commands/__tests__/kill.test.ts rather than extending an existing one — no kill.test.ts exists today and a focused file keeps the docker-teardown contract auditable.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "Extend the existing src/dashboard/server/routes/__tests__/agents-lifecycle-event.test.ts with docker-teardown cases rather than creating a new file — it already mocks getAgentStateAsync/stopAgentAsync/appendAgentLifecycleLog and provides the createAgentStopHandler runner, so reusing it minimizes test infrastructure.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Assert behavior by spying on stopWorkspaceDocker (and findWorkspacePath / resolveProjectFromIssue) call arguments — that is the smallest verifiable contract proving the fix and the only way to assert on the route's dynamic imports.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Cover the central regression in a single test bead per surface with two acceptance subItems (specialist + work) — both cases share identical mock scaffolding; splitting them would create duplicate-setup beads.",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    },
+    {
+      "id": "D6",
+      "summary": "Record the manual dashboard-stop verification as a docs/manual-tests/PAN-1326.md recipe (steps + expected docker ps before/after evidence) so the human verifier has a fixed playbook to run post-merge. The work agent cannot drive a live browser autonomously, so the equivalent code-level proof comes from bead 2 (route handler test).",
+      "recordedAt": "2026-05-25T16:35:00.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "The dashboard route uses dynamic `await import(...)` for resolveProjectFromIssue and findWorkspacePath inside an inner Effect.promise. Static `vi.mock('../../../lib/projects.js', ...)` and `vi.mock('../../../lib/lifecycle/archive-planning.js', ...)` from the route test file MUST still intercept these dynamic imports (vitest's module registry resolves both static and dynamic specifiers through the same mock graph).",
+      "mitigation": "Use the exact specifier strings the route uses (`../../../lib/projects.js` and `../../../lib/lifecycle/archive-planning.js`) when declaring vi.mock from the test file. Confirm with a sanity-check test that the mocked function is called when stateBeforeStop has issueId."
+    },
+    {
+      "id": "H2",
+      "summary": "stopWorkspaceDocker uses existsSync on the real filesystem — if a test mock returns a real path that doesn't exist, the function will silently no-op with containersFound=false but won't throw. That can mask a fix regression if the test only asserts on console.log.",
+      "mitigation": "Assert directly on the stopWorkspaceDocker mock's call arguments (workspacePath + issueLower) — NOT on side effects like console output or DockerCleanupResult.containersFound. The contract under test is 'we resolved the right path and called stopWorkspaceDocker with it', not 'docker actually ran'."
+    },
+    {
+      "id": "H3",
+      "summary": "The work-agent regression case must use a state.workspace value that differs from what findWorkspacePath returns — otherwise the test would pass even if the code reverted to reading state.workspace. The regression has to assert on the resolver's output, not on equality between the two.",
+      "mitigation": "In the work-agent test, set state.workspace='/orchestrator/path' but mock findWorkspacePath to return '/resolved/by/issue/path'. Assert stopWorkspaceDocker was called with '/resolved/by/issue/path' (the resolver's output), proving state.workspace was NOT used."
+    },
+    {
+      "id": "H4",
+      "summary": "kill.ts uses CommonJS-style imports of resolveProjectFromIssue and findWorkspacePath at the top of the file. The test must vi.mock these modules BEFORE the import of killCommand, otherwise the real implementations bind.",
+      "mitigation": "Follow the close.test.ts pattern: vi.hoisted({ ... }) for the mock fns, vi.mock declarations using importActual passthrough where needed, THEN import { killCommand } from '../kill.js' at the bottom of the mock block."
+    },
+    {
+      "id": "H5",
+      "summary": "process.exit(1) is called by kill.ts if stopAgent throws — tests must not let that escape and abort the suite.",
+      "mitigation": "Mock stopAgent to resolve successfully in the happy-path tests. If a test needs the error branch, stub process.exit with vi.spyOn(process, 'exit').mockImplementation(() => undefined as never)."
+    },
+    {
+      "id": "H6",
+      "summary": "The fix preserves the issueId? null-guard — if state has no issueId, docker teardown is skipped silently. Tests should include a no-issueId case so the guard doesn't get removed accidentally during a future refactor.",
+      "mitigation": "Add a third subItem to each bead asserting that when state.issueId is undefined, stopWorkspaceDocker is NOT called at all (the issue gate is upstream of the resolver chain)."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-7",
+  "sessionHistory": [
+    {
+      "timestamp": "2026-05-25T16:23:14.525Z",
+      "reason": "planning",
+      "note": "Planning session started for PAN-1326: PAN-1316 follow-up: stopWorkspaceDocker resolves wrong workspace for specialist agents",
+      "agentModel": "agent:claude-opus-4-7"
+    },
+    {
+      "timestamp": "2026-05-25T16:35:00.000Z",
+      "reason": "planning",
+      "note": "Confirmed fix already committed (bd7d00787). Scope is tests + manual-verification recipe only. Producing 3 beads: kill.ts test, agents.ts route test, manual-verification recipe doc.",
+      "agentModel": "agent:claude-opus-4-7"
+    }
+  ],
+  "feedback": []
+}
