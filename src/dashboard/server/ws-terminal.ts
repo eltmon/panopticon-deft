@@ -1,9 +1,22 @@
 /**
- * Raw WebSocket terminal handler — bypasses Effect RPC for reliable PTY streaming.
+ * Raw WebSocket terminal handler — the historical terminal data path.
  *
- * The Effect RPC stream approach queued terminal data but never delivered it to the
- * browser. This module restores the working raw WebSocket `/ws/terminal` endpoint
- * from pre-PAN-435 code.
+ * PAN-435 attempted to migrate the dashboard terminal stream off this endpoint
+ * and onto `/ws/rpc` via `PanRpcGroup`. The frontend migration was reverted with
+ * the rationale "Effect RPC stream queued terminal data but never delivered it
+ * to the browser." PAN-1536 re-measured that conclusion against a side-by-side
+ * bench (`?terminal=rpc` URL flag) and found the original rollback evidence
+ * unsupported: the RPC transport delivers PTY data correctly; the original
+ * "0 bytes received" symptom was a half-finished migration where only the
+ * frontend swapped transports while the server kept emitting on raw WS, and the
+ * rollback's reintroduction of this file bundled in unrelated PTY race-condition
+ * fixes (deferred spawn, `waitForTmuxSession`, dimension-toggle) that happened
+ * to mask the underlying confound.
+ *
+ * This endpoint is currently retained as the default path because converging on
+ * `/ws/rpc` requires deleting the 200 ms dimension-toggle in
+ * `services/terminal-service.ts` and adding a server-side snapshot frame to the
+ * RPC stream so cold-paint UX matches. Both are tracked as PAN-1536 follow-up.
  *
  * Exports a single function `setupTerminalWebSocket(server)` that installs a
  * `noServer` WebSocketServer on the given HTTP server's `upgrade` event for the

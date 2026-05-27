@@ -300,9 +300,15 @@ The dashboard server uses **Effect.js** for HTTP routes and structured RPC, plus
 
 **Two WebSocket endpoints:**
 - `/ws/rpc` — Effect RPC (PanRpcGroup): domain events, snapshots, replay. Uses typed Schema.
+  Also carries the terminal RPC surface (`terminalOpen`/`Write`/`Resize`/`Close` +
+  `subscribeTerminal`); the frontend opts in via `?terminal=rpc` (PAN-1536 spike).
 - `/ws/terminal?session=<name>` — Raw WebSocket: live PTY terminal streaming via `ws` library.
-  Terminal data bypasses Effect RPC because the RPC serialization layer can't handle
-  high-throughput binary-like terminal data reliably.
+  Historically the terminal data path bypassed Effect RPC; PAN-435 attempted to migrate to
+  `/ws/rpc` and was rolled back. PAN-1536 re-measured that decision and found the two
+  transports statistically equivalent for PTY throughput once the 200 ms dimension-toggle
+  in `terminal-service.ts` is accounted for. The split is currently retained because
+  removing it requires deleting that toggle and adding a server-side snapshot frame to
+  the RPC path — tracked as PAN-1536 follow-up.
 
 **Terminal architecture** (`ws-terminal.ts` + `XTerminal.tsx`):
 - Server: raw `WebSocketServer` with `noServer: true`, deferred PTY spawn (waits for
