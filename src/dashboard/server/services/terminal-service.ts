@@ -1,21 +1,40 @@
 /**
- * TerminalService — dual-runtime PTY terminal streaming (PAN-428 B20)
+ * TerminalService — PTY terminal streaming over PanRpcGroup (PAN-428 B20,
+ * snapshot-on-attach added in PAN-1536).
  *
  * Implements the terminal RPC surface: open, write, resize, close, and
- * streamSession. Uses Bun.spawn under Bun and node-pty under Node.
+ * streamSession. Uses node-pty under Node (Bun.spawn fallback remains for
+ * compatibility but is not exercised in production — see CLAUDE.md's
+ * "Node 22 only" rule).
  *
- * Key behaviours (from CLAUDE.md + existing /ws/terminal handler):
- *  - Deferred PTY spawn: PTY is not started until the first resize call.
- *  - Stale data suppression: suppress ~200ms of initial PTY burst, then
- *    toggle dimensions to force SIGWINCH + full repaint.
- *  - On stream/close: do NOT kill the PTY — just remove from tracking.
+ * Key behaviours:
+ *  - Deferred PTY spawn: PTY is not started until the first subscribe/resize
+ *    actually attaches. This keeps `terminalOpen` cheap when the dashboard is
+ *    just probing whether a session exists.
+ *  - Snapshot-on-attach: every `streamSession` emits a `tmux capture-pane`
+ *    snapshot as the first chunk. This makes cold paint instant (matching the
+ *    raw `/ws/terminal` UX) AND re-anchors client SGR state on every reload,
+ *    fixing the horizontal-strip / underline corruption that occurred when
+ *    PTY bytes were dropped during the subscriber-handoff gap.
+ *  - On stream end: drop the queue reference only; the PTY (and the tmux
+ *    session it's attached to) survive. Killing the PTY would force every
+ *    other client of the same hub to re-attach, which costs paint time.
+ *
+ * Historical note (PAN-1536): a 200 ms dimension-toggle was previously used
+ * here to force a tmux SIGWINCH-driven repaint. With the snapshot-on-attach
+ * in place that toggle is redundant and was removed; it was the cause of the
+ * +200 ms first-byte gap measured in PAN-1536's results section.
  */
 
 import { Cause, Effect, Layer, Queue, Context, Stream } from 'effect';
 import { homedir } from 'node:os';
 import { PanRpcError, TerminalOutput } from '@panctl/contracts';
-import { buildTmuxArgs, resizeWindow, sessionExists } from '../../../lib/tmux.js';
+import { buildTmuxArgs, capturePane, getWindowDimensions, resizeWindow, sessionExists } from '../../../lib/tmux.js';
 import { buildChildEnvWithoutTmuxSync } from '../../../lib/child-env.js';
+
+// Match raw `/ws/terminal`'s snapshot scrollback. 500 lines covers a generous
+// viewport without inflating the first frame to multi-megabyte territory.
+const SNAPSHOT_SCROLLBACK_LINES = 500;
 
 // ─── Runtime detection ────────────────────────────────────────────────────────
 
@@ -228,20 +247,6 @@ export const TerminalServiceLive = Layer.effect(
           }
         });
 
-        // Dimension toggle after 200ms: force tmux to repaint at the correct size.
-        setTimeout(() => {
-          if (!state.ptyProcess) return;
-          try { proc.resize(cols - 1, rows); } catch { return; }
-          Effect.runPromise(resizeWindow(state.sessionName, cols - 1, rows))
-            .then(() => new Promise<void>((r) => setTimeout(r, 50)))
-            .then(() => {
-              if (!state.ptyProcess) return;
-              try { proc.resize(cols, rows); } catch { return; }
-              return Effect.runPromise(resizeWindow(state.sessionName, cols, rows));
-            })
-            .catch(() => {});
-        }, 200);
-
         proc.onExit((exitCode) => {
           console.log(`[terminal-service] PTY for ${state.sessionName} exited with code ${exitCode}`);
           state.ptyProcess = null; // Mark dead so resize guards work
@@ -357,7 +362,8 @@ export const TerminalServiceLive = Layer.effect(
     const streamSession: TerminalServiceShape['streamSession'] = (sessionName, cols, rows) =>
       Stream.unwrap(
         Effect.gen(function* () {
-          // Ensure session exists and PTY is starting.
+          // Ensure session state exists. PTY spawn is deferred until the
+          // subscriber actually begins consuming (acquire callback below).
           if (!sessions.has(sessionName)) {
             sessions.set(sessionName, {
               sessionName,
@@ -369,28 +375,67 @@ export const TerminalServiceLive = Layer.effect(
               queue: null,
             });
           }
-          const state = sessions.get(sessionName)!;
 
-          const outputStream = Stream.callback<TerminalOutput, PanRpcError>((queue) =>
+          // Capture the current tmux pane state and emit it as the first chunk.
+          // This is the same `capture-pane` snapshot that the raw `/ws/terminal`
+          // path uses to anchor cold paint instantly. It also re-anchors on
+          // every reload — any PTY bytes dropped during the subscriber-handoff
+          // gap (old subscriber's queue cleared, new subscriber not yet
+          // attached) are still reflected in tmux's pane state, so the snapshot
+          // resets the client to a known-good rendering. Without this, lost
+          // SGR escapes (e.g. unmatched ESC[4m) leave the terminal stuck in
+          // an inherited style and produce the horizontal-strip corruption.
+          //
+          // The snapshot frame ALSO carries cols/rows so the client can resize
+          // xterm to match the dimensions the snapshot was rendered at. Without
+          // this, content rendered at e.g. 359-col tmux dims paints inside an
+          // xterm at 385 cols, leaving each line offset and the right edge of
+          // the snapshot clipped off-screen.
+          const snapshotDims = yield* getWindowDimensions(sessionName).pipe(
+            Effect.catch(() => Effect.succeed(null)),
+          );
+          const snapshotData = yield* capturePane(sessionName, SNAPSHOT_SCROLLBACK_LINES, {
+            escapeSequences: true,
+          }).pipe(
+            // Snapshot is best-effort. If the session hasn't been spawned yet,
+            // capture fails — live PTY data will paint the screen from scratch.
+            Effect.catch(() => Effect.succeed('')),
+          );
+
+          const liveStream = Stream.callback<TerminalOutput, PanRpcError>((queue) =>
             Effect.acquireRelease(
               Effect.sync(() => {
+                const state = sessions.get(sessionName)!;
                 state.queue = queue;
-                // Start PTY if not already started.
                 if (!state.ptyStarted) {
                   startPty(state, cols, rows);
                 }
               }),
               () =>
                 Effect.sync(() => {
-                  // On stream end, remove queue reference but do NOT kill PTY.
-                  if (state.queue === queue) {
+                  const state = sessions.get(sessionName);
+                  // Do NOT kill the PTY on stream end — only drop our queue
+                  // reference so subsequent subscribers can attach cleanly.
+                  if (state && state.queue === queue) {
                     state.queue = null;
                   }
                 }),
             ),
           );
 
-          return outputStream;
+          // Snapshot first, then live PTY chunks. Stream.concat enforces order
+          // — the subscriber sees a complete snapshot frame before any byte
+          // emitted after the capture completes. The snapshot carries its own
+          // cols/rows so the client resizes xterm to match before painting.
+          const snapshotStream = snapshotData
+            ? Stream.succeed<TerminalOutput>({
+                sessionName,
+                data: snapshotData,
+                cols: snapshotDims?.cols,
+                rows: snapshotDims?.rows,
+              })
+            : Stream.empty;
+          return Stream.concat(snapshotStream, liveStream);
         }),
       );
 

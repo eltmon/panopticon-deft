@@ -82,6 +82,14 @@ export class PanRpcError extends Schema.TaggedErrorClass<PanRpcError>()("PanRpcE
 export const TerminalOutput = Schema.Struct({
   sessionName: Schema.String,
   data: Schema.String,
+  // Cols/rows are only set on the snapshot frame emitted at the start of a
+  // `subscribeTerminal` stream (PAN-1536). The frame's `data` is a
+  // `tmux capture-pane -e` dump rendered at THESE dimensions, not the
+  // client's currently-measured xterm dims; the client must `term.resize`
+  // to match before writing the snapshot or content offsets / right-clips.
+  // Subsequent live PTY chunks omit these fields.
+  cols: Schema.optional(Schema.Number),
+  rows: Schema.optional(Schema.Number),
 })
 export type TerminalOutput = typeof TerminalOutput.Type
 

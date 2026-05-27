@@ -24,7 +24,7 @@ import { useEffect, useRef } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { WS_METHODS } from '@panctl/contracts';
+import { WS_METHODS, type TerminalOutput } from '@panctl/contracts';
 import { getTransport, type PanRpcProtocolClient } from '../lib/wsTransport';
 
 interface XTerminalRpcProps {
@@ -98,6 +98,11 @@ export function XTerminalRpc({ sessionName, onDisconnect }: XTerminalRpcProps) {
 
     let lastCols = measured.cols;
     let lastRows = measured.rows;
+    let resizeRaf: number | null = null;
+
+    // Forward-declared so the snapshot handler can call it after writing.
+    // Defined below the subscribe wiring.
+    let refitAndPushResize: () => void = () => {};
 
     // ── Send keystroke → terminalWrite RPC ────────────────────────────────────
     // Fire-and-forget; we deliberately don't await so the keystroke shows on
@@ -127,13 +132,44 @@ export function XTerminalRpc({ sessionName, onDisconnect }: XTerminalRpcProps) {
         prof(sessionName, tProf, 'terminalOpen ack');
         if (disposed) return;
 
-        unsubscribe = getTransport().subscribe(
+        unsubscribe = getTransport().subscribe<TerminalOutput>(
           (client) => {
-            return (client[WS_METHODS.subscribeTerminal] as (input: { sessionName: string; cols: number; rows: number }) => import('effect').Stream.Stream<{ sessionName: string; data: string }, Error>)(
+            return (client[WS_METHODS.subscribeTerminal] as (input: { sessionName: string; cols: number; rows: number }) => import('effect').Stream.Stream<TerminalOutput, Error>)(
               { sessionName, cols: lastCols, rows: lastRows },
             );
           },
           (chunk) => {
+            // PAN-1536: the first chunk on every subscribe is a tmux snapshot
+            // carrying its own cols/rows. Match the raw `/ws/terminal` pattern:
+            //   1. `term.reset()` clears any inherited SGR state (the
+            //      unmatched-underline / horizontal-strip corruption fix)
+            //   2. `term.resize(snapshot.cols, snapshot.rows)` so absolute
+            //      cursor escapes in the snapshot land at the right grid
+            //   3. Write the snapshot
+            //   4. After write completes, fit-to-container and push a resize
+            //      RPC so the server widens tmux to the browser's actual
+            //      viewport. Without #4 the terminal stays at the (typically
+            //      narrower) tmux pane dims, leaving the right half blank.
+            if (chunk.cols != null && chunk.rows != null) {
+              prof(
+                sessionName,
+                tProf,
+                'snapshot',
+                `cols=${chunk.cols} rows=${chunk.rows} bytes=${chunk.data.length}`,
+              );
+              const resettable = term as Terminal & { reset?: () => void };
+              resettable.reset?.();
+              if (term.cols !== chunk.cols || term.rows !== chunk.rows) {
+                try { term.resize(chunk.cols, chunk.rows); } catch { /* ignore */ }
+              }
+              lastCols = chunk.cols;
+              lastRows = chunk.rows;
+              term.write(chunk.data, () => {
+                prof(sessionName, tProf, 'snapshot xterm-parse done');
+                refitAndPushResize();
+              });
+              return;
+            }
             prof(sessionName, tProf, 'chunk', `len=${chunk.data.length}`);
             term.write(chunk.data);
           },
@@ -147,7 +183,21 @@ export function XTerminalRpc({ sessionName, onDisconnect }: XTerminalRpcProps) {
       });
 
     // ── Resize handling ───────────────────────────────────────────────────────
-    let resizeRaf: number | null = null;
+    refitAndPushResize = () => {
+      if (disposed) return;
+      try { fit.fit(); } catch { return; }
+      const next = fit.proposeDimensions() ?? { cols: term.cols, rows: term.rows };
+      if (next.cols === lastCols && next.rows === lastRows) return;
+      lastCols = next.cols;
+      lastRows = next.rows;
+      prof(sessionName, tProf, 'refit', `${next.cols}x${next.rows}`);
+      void getTransport().request((client: PanRpcProtocolClient) =>
+        (client[WS_METHODS.terminalResize] as (input: { sessionName: string; cols: number; rows: number }) => import('effect').Effect.Effect<void, Error>)(
+          { sessionName, cols: next.cols, rows: next.rows },
+        ),
+      ).catch(() => { /* swallow — next resize will retry */ });
+    };
+
     const handleResize = () => {
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       resizeRaf = requestAnimationFrame(() => {
