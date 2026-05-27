@@ -2,6 +2,15 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import { XTerminalRpc } from './XTerminalRpc';
+
+const USE_RPC_TRANSPORT = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('terminal') === 'rpc';
+  } catch {
+    return false;
+  }
+})();
 
 // Debounce utility to prevent resize spam
 function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): (...args: Parameters<T>) => void {
@@ -65,7 +74,16 @@ const AUTOCOPY_STORAGE_KEY = 'panopticon.terminal.autoCopyOnSelect';
 // Check if platform is Mac
 const isMac = navigator.platform.toLowerCase().includes('mac');
 
-export function XTerminal({ sessionName, token, onDisconnect, autoCopyOnSelect: autoCopyProp }: XTerminalProps) {
+export function XTerminal(props: XTerminalProps) {
+  // PAN-1536 spike: opt into the PanRpcGroup-based transport via `?terminal=rpc`.
+  // Default behavior (raw /ws/terminal) is unchanged.
+  if (USE_RPC_TRANSPORT) {
+    return <XTerminalRpc sessionName={props.sessionName} onDisconnect={props.onDisconnect} />;
+  }
+  return <XTerminalRaw {...props} />;
+}
+
+function XTerminalRaw({ sessionName, token, onDisconnect, autoCopyOnSelect: autoCopyProp }: XTerminalProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const terminalInstance = useRef<Terminal | null>(null);
   const fitAddon = useRef<FitAddon | null>(null);
