@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Circle, Copy, Check, Loader2, Pencil, Terminal, FileCode, Search, Globe, Wrench, Zap, Folder, GitBranchPlus, GitFork, CheckCircle2, AlertCircle, Archive, Sparkles, Info, RefreshCw, FileText, ExternalLink, RotateCcw, ArrowRight } from 'lucide-react';
 import { toast } from 'sonner';
 import { XTerminal } from '../XTerminal';
+import { openNewTerminal } from '../../lib/openNewTerminal';
 import type { Conversation } from '../CommandDeck/ConversationList';
 import { updateConversationTitle } from '../CommandDeck/ConversationList';
 import { MessagesTimeline, type RoundMarker } from './MessagesTimeline';
@@ -568,6 +569,20 @@ export function ConversationPanel({
               <ExternalLink size={14} />
             </button>
           )}
+
+          {/* Open a fresh terminal at this conversation's cwd (PAN-1545) */}
+          <button
+            className={styles.copyLinkButton}
+            onClick={() => {
+              void openNewTerminal({ cwd: conversation.cwd, target: '_blank' }).catch((err) => {
+                console.error('[ConversationPanel] openNewTerminal failed:', err);
+              });
+            }}
+            title={`Open a new terminal at ${conversation.cwd ?? '$HOME'}`}
+            aria-label="Open new terminal"
+          >
+            <Terminal size={14} />
+          </button>
 
           {/* Copy link button */}
           <button

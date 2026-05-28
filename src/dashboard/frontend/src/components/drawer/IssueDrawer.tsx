@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { Terminal } from 'lucide-react';
 
 import { useDashboardStore } from '../../lib/store';
+import { openNewTerminal } from '../../lib/openNewTerminal';
 import { cn } from '../../lib/utils';
 import DrawerActionBar from './DrawerActionBar';
 import DrawerActiveAgent from './DrawerActiveAgent';
@@ -225,6 +227,19 @@ export function IssueDrawer() {
               {issue?.title ?? 'Issue details'}
             </h2>
           </div>
+          <button
+            type="button"
+            aria-label="Open new terminal at this issue's workspace"
+            title={`Open new terminal at ${issue?.workspacePath ?? '$HOME'}`}
+            className="rounded-[var(--radius-sm)] border border-border px-[10px] py-[6px] text-[13px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            onClick={() => {
+              void openNewTerminal({ cwd: issue?.workspacePath, target: '_blank' }).catch((err) => {
+                console.error('[IssueDrawer] openNewTerminal failed:', err);
+              });
+            }}
+          >
+            <Terminal size={14} />
+          </button>
           <button
             type="button"
             aria-label="Close issue drawer"

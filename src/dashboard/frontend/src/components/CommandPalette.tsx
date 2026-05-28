@@ -35,6 +35,7 @@ import {
   Eye,
 } from 'lucide-react';
 import { isAgentRunningStatus } from '../lib/pipeline-state';
+import { openNewTerminal } from '../lib/openNewTerminal';
 import { useDashboardStore, selectAgents, selectIssues } from '../lib/store';
 import type { Issue, Agent } from '../types';
 
@@ -269,6 +270,20 @@ export function CommandPalette({ isOpen, onClose, onNavigate }: CommandPalettePr
   // ─── Action builders (stable wrt query — filtered later) ────────────────────
 
   const staticActions = useMemo<PaletteAction[]>(() => [
+    {
+      id: 'new-terminal',
+      label: 'New Terminal',
+      description: 'Open a fresh bash terminal in $HOME',
+      icon: Terminal,
+      group: 'Actions',
+      keywords: ['terminal', 'shell', 'bash', 'console', 'new', 'open'],
+      onSelect: () => {
+        void openNewTerminal().catch((err) => {
+          console.error('[CommandPalette] openNewTerminal failed:', err);
+          toast.error(`Failed to open terminal: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      },
+    },
     {
       id: 'pan-flywheel',
       label: 'Run flywheel',

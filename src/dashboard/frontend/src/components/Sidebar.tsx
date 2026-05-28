@@ -2,11 +2,12 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import {
   Eye, Home, LayoutGrid, Bot, Server,
-  Terminal, BarChart3, DollarSign, HeartPulse, Cpu, Settings,
+  Terminal, TerminalSquare, BarChart3, DollarSign, HeartPulse, Cpu, Settings,
   Zap, Compass, GitBranch, GitMerge, ChevronsLeft, ChevronsRight, Sun, Moon, Menu,
   Hammer, Loader2, History, Mic, FileText,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import { openNewTerminal } from '../lib/openNewTerminal';
 import { CloisterStatusBar } from './CloisterStatusBar';
 import { FreshnessIndicator } from './FreshnessIndicator';
 import { DeaconPauseToggle } from './DeaconPauseToggle';
@@ -61,11 +62,17 @@ interface FlywheelRunSummary {
 }
 
 interface NavItem {
-  id: Tab;
+  /**
+   * Tab identifier when the item navigates; arbitrary string when the item is
+   * an action (in which case `action` is set and `onTabChange` is bypassed).
+   */
+  id: Tab | string;
   label: string;
   icon: LucideIcon;
   badge?: 'flywheel-live';
   title?: string;
+  /** If set, clicking the item invokes this instead of switching tabs. */
+  action?: () => void;
 }
 
 interface NavGroup {
@@ -91,6 +98,17 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Infrastructure',
     items: [
       { id: 'resources' as Tab, label: 'Resources', icon: Server },
+      {
+        id: 'new-terminal',
+        label: 'New Terminal',
+        icon: TerminalSquare,
+        title: 'Open a fresh bash terminal',
+        action: () => {
+          void openNewTerminal().catch((err) => {
+            console.error('[sidebar] openNewTerminal failed:', err);
+          });
+        },
+      },
     ],
   },
   {
@@ -301,13 +319,20 @@ export function Sidebar({ activeTab, onTabChange, onSearchOpen }: SidebarProps) 
                 </p>
               )}
               {collapsed && <div className="h-px mx-2 bg-border my-2" />}
-              {group.items.map(({ id, label, icon: Icon, badge, title }) => {
-                const isActive = activeTab === id;
+              {group.items.map(({ id, label, icon: Icon, badge, title, action }) => {
+                const isActive = !action && activeTab === id;
                 const liveBadge = badge === 'flywheel-live' && hasActiveFlywheelRun;
                 return (
                   <button
                     key={id}
-                    onClick={() => { onTabChange(id); setMobileOpen(false); }}
+                    onClick={() => {
+                      if (action) {
+                        action();
+                      } else {
+                        onTabChange(id as Tab);
+                      }
+                      setMobileOpen(false);
+                    }}
                     title={title ?? (collapsed ? label : undefined)}
                     data-testid={`sidebar-${id}`}
                     className={`
