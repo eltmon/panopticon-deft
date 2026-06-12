@@ -23,6 +23,7 @@ function validateSessionName(name: string): void {
 }
 
 const MANAGED_TMUX_SOCKET_NAME = 'panopticon';
+const TEST_TMUX_SOCKET_NAME_ENV = 'PANOPTICON_TMUX_SOCKET_NAME';
 const MANAGED_TMUX_CONFIG_CONTENT = [
   '# Panopticon-managed tmux config',
   '# Keep this minimal and include only behavior Panopticon intentionally depends on.',
@@ -44,7 +45,7 @@ const MANAGED_TMUX_CONFIG_CONTENT = [
 // `-L panopticon -f <configPath>`, so after the first source-file the config is live
 // on the shared server for every subsequent command. Re-writing the file and
 // re-sourcing it per call was the root of PAN-785's terminal lag.
-let tmuxContextPrepared = false;
+let tmuxContextPreparedFor: string | null = null;
 
 /**
  * Log file for tmux sendKeys operations.
@@ -63,7 +64,10 @@ export function getManagedTmuxConfigPath(): string {
 }
 
 export function getManagedTmuxSocketName(): string {
-  return MANAGED_TMUX_SOCKET_NAME;
+  const override = process.env[TEST_TMUX_SOCKET_NAME_ENV]?.trim();
+  if (!override) return MANAGED_TMUX_SOCKET_NAME;
+  validateSessionName(override);
+  return override;
 }
 
 function ensureLogDir(): void {
@@ -160,20 +164,26 @@ async function reloadManagedTmuxConfigAsync(): Promise<void> {
   }
 }
 
+function getTmuxContextKey(): string {
+  return `${getManagedTmuxSocketName()}\n${getManagedTmuxConfigPath()}`;
+}
+
 function ensureManagedTmuxConfigSync(): void {
-  if (tmuxContextPrepared) return;
+  const contextKey = getTmuxContextKey();
+  if (tmuxContextPreparedFor === contextKey) return;
   ensureManagedTmuxDirSync();
   writeFileSync(getManagedTmuxConfigPath(), MANAGED_TMUX_CONFIG_CONTENT, 'utf-8');
   reloadManagedTmuxConfigSync();
-  tmuxContextPrepared = true;
+  tmuxContextPreparedFor = contextKey;
 }
 
 async function ensureManagedTmuxConfigAsync(): Promise<void> {
-  if (tmuxContextPrepared) return;
+  const contextKey = getTmuxContextKey();
+  if (tmuxContextPreparedFor === contextKey) return;
   await ensureManagedTmuxDirAsync();
   await writeFile(getManagedTmuxConfigPath(), MANAGED_TMUX_CONFIG_CONTENT, 'utf-8');
   await reloadManagedTmuxConfigAsync();
-  tmuxContextPrepared = true;
+  tmuxContextPreparedFor = contextKey;
 }async function ensureManagedTmuxContextOncePromise(): Promise<void> {
   const mode = getTmuxConfigMode();
   await ensureTmuxContextPreparedAsync(mode);

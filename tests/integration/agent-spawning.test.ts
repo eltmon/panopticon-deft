@@ -13,11 +13,11 @@
  */
 
 import { Effect } from 'effect';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import {
   spawnAgent,
   spawnRun,
@@ -213,12 +213,16 @@ vi.mock('../../src/lib/beads-query.js', async (importOriginal) => {
   };
 });
 
+const testTmuxSocketName = `pan-test-agent-spawning-${process.pid}`;
+
 describe('PAN-1048 role primitive — agent spawning', () => {
   let testPanopticonHome: string;
   let testAgentsDir: string;
   let testWorkspace: string;
   const originalPanopticonHome = process.env.PANOPTICON_HOME;
   const originalPromptReadyTimeout = process.env.PANOPTICON_PROMPT_READY_TIMEOUT_SECONDS;
+  const originalTmuxSocketName = process.env.PANOPTICON_TMUX_SOCKET_NAME;
+  const originalPath = process.env.PATH;
 
   beforeEach(async () => {
     testPanopticonHome = join(tmpdir(), `pan-home-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -230,7 +234,22 @@ describe('PAN-1048 role primitive — agent spawning', () => {
     testWorkspace = join(testPanopticonHome, 'test-workspace');
     mkdirSync(testAgentsDir, { recursive: true });
     mkdirSync(testWorkspace, { recursive: true });
+    const stubBinDir = join(testPanopticonHome, 'bin');
+    mkdirSync(stubBinDir, { recursive: true });
+    const stubClaude = join(stubBinDir, 'claude');
+    writeFileSync(stubClaude, [
+      '#!/usr/bin/env bash',
+      'if [ -n "${PANOPTICON_HOME:-}" ] && [ -n "${PANOPTICON_AGENT_ID:-}" ]; then',
+      '  mkdir -p "$PANOPTICON_HOME/agents/$PANOPTICON_AGENT_ID"',
+      '  printf \'{"ready":true}\' > "$PANOPTICON_HOME/agents/$PANOPTICON_AGENT_ID/ready.json"',
+      'fi',
+      'while true; do sleep 60; done',
+      '',
+    ].join('\n'));
+    chmodSync(stubClaude, 0o755);
     process.env.PANOPTICON_HOME = testPanopticonHome;
+    process.env.PANOPTICON_TMUX_SOCKET_NAME = testTmuxSocketName;
+    process.env.PATH = `${stubBinDir}:${originalPath ?? ''}`;
     process.env.PANOPTICON_PROMPT_READY_TIMEOUT_SECONDS = '1';
     transcriptLandingMocks.snapshotCount = 0;
     transcriptLandingMocks.landed = false;
@@ -271,8 +290,26 @@ describe('PAN-1048 role primitive — agent spawning', () => {
     } else {
       delete process.env.PANOPTICON_PROMPT_READY_TIMEOUT_SECONDS;
     }
+    if (originalTmuxSocketName) {
+      process.env.PANOPTICON_TMUX_SOCKET_NAME = originalTmuxSocketName;
+    } else {
+      delete process.env.PANOPTICON_TMUX_SOCKET_NAME;
+    }
+    if (originalPath) {
+      process.env.PATH = originalPath;
+    } else {
+      delete process.env.PATH;
+    }
     if (existsSync(testPanopticonHome)) {
       rmSync(testPanopticonHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+    }
+  });
+
+  afterAll(() => {
+    try {
+      execFileSync('tmux', ['-L', testTmuxSocketName, 'kill-server'], { stdio: 'ignore' });
+    } catch {
+      // The server only exists if a test accidentally exercises the real tmux path.
     }
   });
 

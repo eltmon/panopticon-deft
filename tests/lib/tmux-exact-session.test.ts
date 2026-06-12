@@ -6,8 +6,30 @@
  * `kill-session -t agent-pan-977` kills `agent-pan-977-review`, etc. Prefixing
  * the name with `=` forces an exact-name match. This regression locks that in.
  */
-import { describe, it, expect } from 'vitest';
-import { exactSession, exactPaneTarget } from '../../src/lib/tmux.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { exactSession, exactPaneTarget, getManagedTmuxSocketName } from '../../src/lib/tmux.js';
+
+afterEach(() => {
+  delete process.env.PANOPTICON_TMUX_SOCKET_NAME;
+});
+
+describe('getManagedTmuxSocketName', () => {
+  it('uses the shared panopticon socket by default', () => {
+    expect(getManagedTmuxSocketName()).toBe('panopticon');
+  });
+
+  it('allows tests to inject an isolated tmux socket name', () => {
+    process.env.PANOPTICON_TMUX_SOCKET_NAME = 'pan-test-1808';
+
+    expect(getManagedTmuxSocketName()).toBe('pan-test-1808');
+  });
+
+  it('rejects invalid injected socket names', () => {
+    process.env.PANOPTICON_TMUX_SOCKET_NAME = 'bad/socket';
+
+    expect(() => getManagedTmuxSocketName()).toThrow(/Invalid tmux session name/);
+  });
+});
 
 describe('exactSession', () => {
   it('prefixes a bare session name with =', () => {
