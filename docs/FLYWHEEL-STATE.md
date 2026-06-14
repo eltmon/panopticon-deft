@@ -2593,6 +2593,57 @@ origin in its own worktree. The divergence is the operator's to reconcile; flagg
 so report-time (`pan flywheel report` does pull --rebase + push) is done carefully or
 deferred while flywheel.ts has uncommitted changes.
 
+## RUN-34 tick 2 (2026-06-14 ~03:19Z) — RED MAIN RESOLVED; operator striking the systemic blockers
+
+### PAN-1880 fix LANDED — main CI is GREEN again
+
+strike-pan-1880 (kimi-k2.7-code) executed the brief precisely and landed the fix on
+main over 3 CI iterations (~26 min, $8.15, 91% ctx by the end):
+- `75785b153` "stop partial config.js mock leaks breaking CI single-fork" — the
+  systemic fix, but CI still red (failure mode shifted).
+- `c5d5c4041` "make start-sync-main-conflict self-contained for PATH-less CI" — the
+  victim test had a workspace-creation/PATH dependency that broke under the CI
+  single-fork environment; making it self-contained got CI **green**.
+- CI run `27486787509` / sha `c5d5c4041` = **completed/success**. Merge gate reopened.
+
+**Lesson:** for the single-fork (`CI=true`/maxForks:1) pollution class, the first
+"stop the leak" fix is often necessary-but-insufficient — the victim test itself can
+carry an env dependency (PATH, workspace creation) that only fails under the CI
+single-fork harness. Verify with `CI=true npx vitest run` (the strike did), and
+expect 2 passes: (1) plug the polluter, (2) make the victim hermetic. PAN-1880 is
+still OPEN (strikes land on main without close-out); stranded feature-pan-1880-strike
+workspace + idle session are deacon-reap cruft.
+
+### Operator is striking the systemic blockers I flagged — do NOT interfere
+
+Two operator-launched strikes (no flywheelRunId → exempt from governor reaping)
+appeared this tick and directly address tick-1 findings:
+- **strike-pan-1879** (gpt-5.5) — PAN-1879 "pan restart silently re-applies stale
+  boot gates; no way to re-enable deacon/resume". This is the FIX for the boot
+  --no-resume condition that strands the stalled review/test/work set. Once it lands
+  + resume is re-enabled, the 10 stalled in-review PRs + PAN-1827 test + PAN-1845
+  should recover and flow to the now-open merge gate.
+- **strike-pan-1875** (kimi-k2.7-code) — PAN-1875 "add `pan flywheel stop` graceful
+  shutdown" (the `flywheelStopCommand` that was uncommitted on the primary worktree
+  tick 1; now committed to origin as b9477d935 + being finished).
+
+### Zombie convoys cleared; PAN-1827 test now stalled (PAN-1681)
+
+The PAN-1658/PAN-1802 zombie review convoys (10 sessions, tick 1) are gone from tmux
+(deacon idle-reap / completion). New stall: **agent-pan-1827-test** finished testing
+(verdict written) but never called `pan specialists done test` — idle ~25min,
+unchanged ctx/cost/out — the PAN-1681 "test narrates done, never signals" pattern.
+Cannot self-advance under boot --no-resume; Flywheel cannot nudge (no pan tell).
+
+### Nothing launchable for the Flywheel this tick (correct)
+
+Main green reopened the merge gate, but the in-flight set is review-stalled (PRs show
+mergeable=UNKNOWN, not review-passed) pending PAN-1879, and verifying-on-main items
+await operator close-out. auto_pickup_backlog=false forbids fresh backlog. The
+operator's strikes cover the systemic fixes. So the Flywheel's correct output this
+tick was: confirm the red-main win, emit the snapshot, and stay out of the operator's
+active work — not manufacture launches.
+
 ### Memory is NOT the limiter this run (contrast RUN-33)
 
 RAM 15/64 GB, **swap 0/8GB** (RUN-33 was 99.9% swap). The launch ceiling this run is
