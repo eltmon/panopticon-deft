@@ -1,0 +1,1174 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "created": "2026-06-14T00:02:47.000Z",
+    "author": "panopticon-cli/0.0.0",
+    "description": "Plan for PAN-1866: Backlog Sequencer — AI-ranked whole-backlog DAG with a reproducible markdown source of truth",
+    "updated": "2026-06-14T00:16:25.733Z"
+  },
+  "plan": {
+    "id": "pan-1866",
+    "title": "Backlog Sequencer — AI-ranked whole-backlog DAG with a reproducible markdown source of truth",
+    "status": "proposed",
+    "uid": "1825db7a-4090-4f82-88a7-d21b036a9260",
+    "author": "agent:claude-opus-4-8",
+    "sequence": 2,
+    "created": "2026-06-14T00:02:47.000Z",
+    "updated": "2026-06-14T00:16:25.733Z",
+    "references": [
+      {
+        "uri": "https://github.com/eltmon/panopticon-cli/issues/1866",
+        "label": "PAN-1866",
+        "type": "issue"
+      },
+      {
+        "uri": ".pan/drafts/PAN-1866.md",
+        "label": "PRD draft",
+        "type": "doc"
+      },
+      {
+        "uri": "docs/design/mockups/backlog-sequencer-scaled-opus.html",
+        "label": "Scaled mockup (canonical)",
+        "type": "doc"
+      }
+    ],
+    "tags": [
+      "backlog",
+      "sequencer",
+      "dashboard",
+      "ai-ranking",
+      "dag",
+      "flywheel"
+    ],
+    "narratives": {
+      "Problem": "Panopticon has no surface that shows the ENTIRE open backlog (522 issues for panopticon-cli) sequenced by real impact and explained. The Flywheel ranks reactively by fixed rules (P0–P3 then oldest-first) with no holistic AI evaluation; GitHub priority is thin/undefined; and there is no reproducible, durable plan-of-record. Operators cannot see, at a glance, what the next item is across the whole backlog and why.",
+      "Proposal": "Add a Backlog Sequencer: a configurable-model AI role that evaluates the whole open backlog and writes a total ordering (rank + size + importance + condition + dependency DAG) to a repo-tracked, auto-committed markdown source of truth at .pan/backlog/sequence.md. SQLite is a rebuildable cache only. A new dashboard 'Backlog' page renders the sequence as a tiered, filterable ReactFlow+dagre DAG with in-pipeline/PRD/ready signals, condition flags, an operator Ready/Block pickup gate, and an AI-suggested planning-policy field. The sequencer runs three passes (creation/incremental/review); creation/review are chunked map-reduce so they never put all 522 bodies in one prompt; incremental (the default) reads only the prior file + changed bodies and preserves prior order. Preservation/pinning/gate/edge-provenance are enforced in CODE (reconcileSequence + a `pan backlog finalize` step that mirrors `pan plan finalize`), never trusted to the LLM. The sequencer is a project-scoped server-spawned role mirroring the flywheel orchestrator.",
+      "NonGoals": "- Flywheel-executor integration (consuming sequence.md as pickup order, stopping its own P0–P3/oldest-first ranking, the eligibility filter, emergency-promote) — DEFERRED to a follow-up issue (Decision D8 / PRD work-item 9 / FR-14).\n- Planning-policy launch-routing by the Flywheel (mapping skip->`pan start --auto`, auto->`pan plan --auto`, interactive->needs-you) — DEFERRED to the same follow-up; this issue only stores, surfaces, and AI-suggests the planning-policy field.\n- Debounced delta auto-trigger and periodic review-pass cadence (PRD work-item 11) — DEFERRED; the v1 trigger is the on-demand page button only.\n- On-page dependency-edge drawing/editing UI (drag node->node) — DEFERRED; operator edges are hand-authored in sequence.md for now.\n- Bidirectional GitHub dependency sync / writing dependency edges back to GitHub — DEFERRED; sequence.md is read-only with respect to the tracker.\n- User-facing `pan backlog sequence` CLI verb and bundled `/pan-backlog` skill — DEFERRED; only the internal `pan backlog finalize` write path ships.\n- Running a full Opus creation pass over all 522 live issues during the work phase — out of scope; the work agent verifies on fixtures + a representative subset, and the operator triggers the first production pass post-merge.\n- 'Over-the-horizon' ghost nodes (faint next-tier preview inside a tier DAG) — DEFERRED (PRD §16)."
+    },
+    "items": [
+      {
+        "id": "seq-io",
+        "title": "sequence.md schema (contracts) + parseSequence/writeSequence in src/lib/backlog/sequence-io.ts",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1866",
+          "requiresInspection": true,
+          "inspectionDepth": "deep",
+          "foundationFor": [
+            "reconcile-nodes",
+            "reconcile-edges",
+            "finalize-cmd",
+            "cache",
+            "route-get",
+            "sequencer-prompt",
+            "fe-dag-node"
+          ],
+          "traces": [
+            "FR-1",
+            "NFR-3",
+            "NFR-5"
+          ]
+        },
+        "narrative": {
+          "Action": "Define the shared BacklogSequence types/enums in @panctl/contracts (packages/contracts) — SequenceDoc, SequenceNode (issue, rank, size, importance, score, condition, dependsOn, why, rationale?, gate, planningPolicy, pinned), SequenceEdge (from, to, type, source, confidence) with the D7 enums. Implement parseSequence(md): SequenceDoc (parse + validate the fenced ```json block per PRD §6) and writeSequence(projectRoot, doc): void (render the human table + `## Rationale detail` (top tier only) + the fenced JSON block, then call queueAutoCommit from src/lib/pan-dir/auto-commit.ts) in src/lib/backlog/sequence-io.ts. Honor the NFR-5 footprint budget: store each rationale ONCE — a full paragraph only for the active top tier, a one-line `why` (<=140 chars) for everyone. Rebuild packages/contracts after touching it."
+        },
+        "items": [
+          {
+            "id": "seq-io.ac1",
+            "title": "parseSequence returns a SequenceDoc with nodes, edges, and all D7 enum fields populated from a well-formed sequence.md",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "seq-io.ac2",
+            "title": "writeSequence produces a sequence.md whose fenced JSON block round-trips through parseSequence and returns an equal SequenceDoc",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "seq-io.ac3",
+            "title": "parseSequence returns a structured error result (not a throw) when given a malformed or missing JSON block",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "seq-io.ac4",
+            "title": "writeSequence commits sequence.md via queueAutoCommit with subject 'chore(state): update backlog sequence (<project>)'",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "seq-io.ac5",
+            "title": "A footprint test validates that a 522-node SequenceDoc renders to <= ~65k tokens (rationale stored once + top-tier paragraphs + one-line why)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "reconcile-nodes",
+        "title": "reconcileSequence — node preservation (pinning + operator gate/planningPolicy verbatim)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-3",
+            "FR-13",
+            "FR-15",
+            "FR-17"
+          ]
+        },
+        "narrative": {
+          "Action": "Add reconcileSequence(prior: SequenceDoc, candidate: SequenceDoc): SequenceDoc node-side logic to src/lib/backlog/sequence-io.ts. For in-pipeline (pinned) nodes, carry forward rank/why/rationale verbatim from the prior doc while refreshing live flags/condition from the candidate. For operator-owned fields (gate, operator-set planningPolicy), carry the prior value verbatim — the candidate cannot overwrite an operator override. Non-pinned, non-operator-owned fields take the candidate's new ranking. This makes preservation structural (D3), not dependent on the LLM obeying the prompt."
+        },
+        "items": [
+          {
+            "id": "reconcile-nodes.ac1",
+            "title": "reconcileSequence preserves a pinned node's rank, why, and rationale verbatim from the prior doc even when a sibling node's rank changes",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-nodes.ac2",
+            "title": "reconcileSequence preserves an operator-set gate and operator-set planningPolicy verbatim (a candidate value does not overwrite them)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-nodes.ac3",
+            "title": "reconcileSequence updates a pinned node's live flags/condition from the candidate while it preserves the node's rank",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-nodes.ac4",
+            "title": "A non-pinned node's rank and why come from the candidate (the new ranking applies wherever nothing is pinned)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "reconcile-edges",
+        "title": "reconcileSequence — edge provenance & reconciliation (github-ref / operator / ai-inferred)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-16"
+          ]
+        },
+        "narrative": {
+          "Action": "Add the edge-side logic to reconcileSequence in src/lib/backlog/sequence-io.ts. Re-derive github-ref edges each pass by parsing issue bodies for '#N' and 'blocked by PAN-N'/'depends on'/'after' references (GitHub exposes no native relations — github.ts:342 getChildIssues returns []). Preserve operator edges (source='operator') verbatim. Recompute ai-inferred edges (carry confidence 0-1). When an ai-inferred edge contradicts a github-ref/operator edge, the authoritative edge stands and the conflict is surfaced (a flag on the edge), never silently applied. Read-only with respect to GitHub (H8)."
+        },
+        "items": [
+          {
+            "id": "reconcile-edges.ac1",
+            "title": "Parsing issue bodies (#N / 'blocked by') produces github-ref edges tagged source='github-ref', re-derived each pass",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-edges.ac2",
+            "title": "reconcileSequence preserves operator-authored edges (source='operator') verbatim across a re-sequence",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-edges.ac3",
+            "title": "When an ai-inferred edge contradicts a github-ref/operator edge, the authoritative edge wins and the conflict is marked (the ai-inferred edge is not applied)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "reconcile-edges.ac4",
+            "title": "reconcileSequence produces ai-inferred edges that contain a confidence value (0-1) and recomputes them each pass",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "chunking",
+        "title": "planBatches — chunked map-reduce partitioning for creation/review passes (NFR-6)",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "NFR-6"
+          ]
+        },
+        "narrative": {
+          "Action": "Add planBatches(issues, batchSize): Batch[] to src/lib/backlog/sequence-io.ts (or a sibling) that partitions the backlog for the creation/review map-reduce. The full passes process one batch at a time against a running shortlist file so the agent never holds all 522 bodies in context (H5/NFR-6). This bead delivers the deterministic, unit-testable chunking logic; the per-batch agent loop is driven by the sequencer prompt (sequencer-prompt bead)."
+        },
+        "items": [
+          {
+            "id": "chunking.ac1",
+            "title": "planBatches(issues, batchSize) returns ceil(N/batchSize) batches for N issues (e.g. 522 with batchSize 50 returns 11 batches, not one)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "chunking.ac2",
+            "title": "planBatches produces batches in which every issue is contained in exactly one batch and no batch exceeds batchSize",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "chunking.ac3",
+            "title": "The creation/review prompt-assembly path produces one per-batch prompt and never a single prompt that contains all issue bodies",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "role-register",
+        "title": "Register the sequencer role + spawnSequencer (project-scoped, singleton, devcontainer-guarded)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-4"
+          ]
+        },
+        "narrative": {
+          "Action": "Add 'sequencer' to the Role union at src/lib/agents.ts:63, to DEFAULT_MODEL_REFS and DEFAULT_ROLES in src/lib/config-yaml.ts (~L369/L387, default 'workhorse:expensive'), and to ROLE_NAMES in src/lib/settings-api.ts:279 (H1 — all four sites or typecheck/Settings break). Implement spawnSequencer(opts) in src/lib/backlog/ (or src/lib/cloister/) mirroring spawnFlywheel: spawnRun with a fixed agentId 'backlog-sequencer', workspace=process.cwd(), allowHost=true; refuse to run inside a workspace devcontainer (mirror isFlywheelDevcontainerRuntime); enforce a singleton gate so two passes never race on sequence.md (H9)."
+        },
+        "items": [
+          {
+            "id": "role-register.ac1",
+            "title": "Adding 'sequencer' to the Role union, DEFAULT_MODEL_REFS, DEFAULT_ROLES (default workhorse:expensive), and ROLE_NAMES produces a clean `npm run typecheck` with no new errors",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "role-register.ac2",
+            "title": "spawnSequencer spawns a project-scoped run via spawnRun with a fixed agentId 'backlog-sequencer', workspace=process.cwd(), allowHost=true",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "role-register.ac3",
+            "title": "spawnSequencer refuses (throws) when invoked inside a workspace devcontainer",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "role-register.ac4",
+            "title": "spawnSequencer rejects a second concurrent run while one is active (singleton gate)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "sequencer-prompt",
+        "title": "Sequencer brief + prompt-assembly + three passes + condition/planning-policy assignment",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "expert",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-1",
+            "FR-2",
+            "FR-3",
+            "FR-10",
+            "FR-11",
+            "FR-17",
+            "NFR-6"
+          ]
+        },
+        "narrative": {
+          "Action": "Author docs/backlog-sequencer-brief.md (durable instructions, mirroring docs/flywheel-brief.md) and buildSequencerPrompt(pass, backlog, priorMd, flags): string. Creation/Review assemble per-batch prompts over a running shortlist (uses planBatches; never all bodies in one prompt — NFR-6). Incremental includes the prior sequence.md + only changed bodies and instructs preserving prior order/rationale except where a delta justifies change (FR-3). Ranking weighs urgency + relevancy + unblocking power + reach; GitHub priority and issue age are inputs, never the answer (FR-2). The prompt instructs assigning each issue a condition {ok,needs-refinement,stale} (FR-11) and an AI-suggested planningPolicy {skip,auto,interactive} (FR-17: AI-created/tiny -> non-interactive, big feature -> interactive; urgency tempers). The assignment maps a legacy needs-design/needs-discussion label to planningPolicy='interactive'. The agent's deliverable is a candidate SequenceDoc JSON; its final step runs `pan backlog finalize` (finalize-cmd bead)."
+        },
+        "items": [
+          {
+            "id": "sequencer-prompt.ac1",
+            "title": "buildSequencerPrompt('creation') produces per-batch prompts against a running shortlist; buildSequencerPrompt('incremental') produces a prompt that contains the prior sequence.md plus only the changed bodies",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "sequencer-prompt.ac2",
+            "title": "Given an unchanged backlog, the incremental pass produces an unchanged order (it preserves prior order/rationale unless a delta justifies a change)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "sequencer-prompt.ac3",
+            "title": "The sequencer produces, for every issue, a condition {ok,needs-refinement,stale} and an AI-suggested planningPolicy {skip,auto,interactive} (AI-created/tiny defaults to non-interactive; a big feature defaults to interactive)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "sequencer-prompt.ac4",
+            "title": "For an issue carrying a legacy needs-design/needs-discussion label, the sequencer defaults to planningPolicy='interactive'",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "sequencer-prompt.ac5",
+            "title": "buildSequencerPrompt('review') produces a full from-first-principles re-evaluation prompt and the resulting doc records pass='review'",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "finalize-cmd",
+        "title": "Internal `pan backlog finalize` — reconcile + write + auto-commit + rebuild cache",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-1",
+            "FR-9",
+            "NFR-3"
+          ]
+        },
+        "narrative": {
+          "Action": "Add an internal CLI command `pan backlog finalize` (the deterministic write path the sequencer agent runs as its last step, mirroring `pan plan finalize`). It reads the agent's candidate SequenceDoc + the prior sequence.md, runs reconcileSequence(prior, candidate), writes the canonical .pan/backlog/sequence.md via writeSequence (which queues the auto-commit), records pass + generatedAt, and rebuilds the SQLite backlog_sequence cache. Update the wrapper skill if any flag is documented (skills<->CLI lockstep). The broader user-facing `pan backlog sequence` verb is out of scope (D9)."
+        },
+        "items": [
+          {
+            "id": "finalize-cmd.ac1",
+            "title": "`pan backlog finalize` produces the canonical sequence.md from the candidate + prior file (via reconcileSequence) and commits it through queueAutoCommit",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "finalize-cmd.ac2",
+            "title": "finalize updates the SQLite backlog_sequence cache to match the written sequence.md",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "finalize-cmd.ac3",
+            "title": "finalize records pass and generatedAt in the written sequence.md",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "finalize-cmd.ac4",
+            "title": "finalize rejects a malformed candidate with a clear error and preserves the prior sequence.md unchanged",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "cache",
+        "title": "SQLite backlog_sequence cache — v54 migration + rebuild-from-md + read accessor",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-9",
+            "NFR-1"
+          ]
+        },
+        "narrative": {
+          "Action": "Add a backlog_sequence table to src/lib/database/schema.ts via a v53->v54 migration block (mirror the v52->v53 pattern at L1470-1474) and bump SCHEMA_VERSION to 54. Implement rebuildBacklogCache(projectRoot) (parse sequence.md -> upsert one row per node) and a rank-ordered read accessor. The cache holds ONLY data derivable from sequence.md (D2) so it is fully rebuildable. Keep DB reads off the server event loop (H3)."
+        },
+        "items": [
+          {
+            "id": "cache.ac1",
+            "title": "A v53->v54 migration creates the backlog_sequence table and bumps SCHEMA_VERSION to 54",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "cache.ac2",
+            "title": "rebuildBacklogCache(projectRoot) stores one row per node parsed from sequence.md",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "cache.ac3",
+            "title": "Dropping the cache and rebuilding from the same sequence.md produces an identical cached view (drop-and-rebuild equivalence)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "cache.ac4",
+            "title": "The read accessor returns the rank-ordered cached nodes for a project",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "route-get",
+        "title": "GET /api/backlog/sequence — joined live view + register backlogRouteLayer",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-8",
+            "FR-6",
+            "NFR-1"
+          ]
+        },
+        "narrative": {
+          "Action": "Create src/dashboard/server/routes/backlog.ts (mirror routes/feature-registry.ts: HttpRouter.add + httpHandler + Layer). GET /api/backlog/sequence returns the parsed/cached sequence joined with live per-issue state: in-pipeline (computed SERVER-side from ReviewStatus in src/lib/review-status.ts + live agent state + workspace/branch existence — NOT the frontend derivePipelineState, H2), has-PRD (.pan/drafts/<issue>.md exists), and ready (findSpecByIssue from src/lib/pan-dir/specs.ts AND beads via computeBeadCounts). If the cache is empty, reparse sequence.md so the view reproduces from the md alone (NFR-1). Register backlogRouteLayer in makeRoutesLayer (src/dashboard/server/server.ts:294-333). No execSync (H3)."
+        },
+        "items": [
+          {
+            "id": "route-get.ac1",
+            "title": "GET /api/backlog/sequence returns the parsed sequence joined with per-issue in-pipeline, has-PRD, and ready flags",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-get.ac2",
+            "title": "The route produces the in-pipeline flag server-side from ReviewStatus + agent state + workspace and does not import the frontend derivePipelineState helper",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-get.ac3",
+            "title": "With the SQLite cache deleted, GET reparses sequence.md and returns the identical view (reproducible from md alone)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-get.ac4",
+            "title": "backlogRouteLayer is registered in makeRoutesLayer and the route returns 200",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "route-regenerate",
+        "title": "POST /api/backlog/sequence/regenerate — spawn the sequencer for a selected pass",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-8",
+            "FR-10"
+          ]
+        },
+        "narrative": {
+          "Action": "Add POST /api/backlog/sequence/regenerate to routes/backlog.ts. It calls spawnSequencer with the requested pass {incremental, review}. When no sequence.md exists, it defaults to a 'creation' pass regardless of the requested pass (FR-10). It respects the singleton gate (refuse while a run is active). The route only enqueues/spawns; the agent produces the candidate and runs finalize."
+        },
+        "items": [
+          {
+            "id": "route-regenerate.ac1",
+            "title": "POST /api/backlog/sequence/regenerate spawns the sequencer (spawnSequencer) with the requested pass (incremental or review)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-regenerate.ac2",
+            "title": "When no sequence.md exists, regenerate defaults to a creation pass regardless of the requested pass",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-regenerate.ac3",
+            "title": "regenerate rejects a request while a sequencer run is already active (singleton)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "route-override",
+        "title": "POST /api/backlog/sequence/gate — operator pickup gate + planning-policy override (+ parked label)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-15",
+            "FR-17"
+          ]
+        },
+        "narrative": {
+          "Action": "Add POST /api/backlog/sequence/gate to routes/backlog.ts. It sets a node's operator-owned pickup gate {auto,ready,blocked} and (same endpoint) an operator planningPolicy override {skip,auto,interactive}, writing through reconcile/writeSequence so the change auto-commits and survives the next re-sequence. Setting gate=blocked applies a parked label (needs-design default from BLOCKER_LABELS, src/lib/cloister/auto-merge-eligibility.ts:10) so the EXISTING Flywheel skip honors it immediately (H10 — the deferred #9 integration is not required for Block to bite); setting gate to auto/ready clears the parked label. No execSync (H3)."
+        },
+        "items": [
+          {
+            "id": "route-override.ac1",
+            "title": "POST .../gate updates a node's pickup gate {auto,ready,blocked}, writes sequence.md, and the value survives a subsequent reconcile",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-override.ac2",
+            "title": "Setting gate=blocked applies a parked label (needs-design) to the issue; setting gate to auto or ready deletes it",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-override.ac3",
+            "title": "The endpoint persists an operator planningPolicy override {skip,auto,interactive} that survives the next re-sequence",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "route-override.ac4",
+            "title": "The endpoint commits the change through writeSequence (auto-commit)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-page-shell",
+        "title": "Frontend: Backlog tab/route/sidebar wiring + page shell + data fetch",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "simple",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-5"
+          ]
+        },
+        "narrative": {
+          "Action": "Add a 'backlog' tab to the Tab union (components/Header.tsx:4-23), TAB_PATHS '/backlog' + a render branch (App.tsx:87-107 and the render switch), and a Sidebar nav item (Sidebar.tsx MORE_GROUPS, label 'Backlog Sequencer', Operations group). Create pages/BacklogSequencerPage.tsx that fetches GET /api/backlog/sequence and renders the last-sequenced header + open-issue count, with an empty state (Generate/creation action) when no sequence.md exists. Style-guide conformance: DM Sans, font-medium, semantic tokens (NFR-4)."
+        },
+        "items": [
+          {
+            "id": "fe-page-shell.ac1",
+            "title": "The Sidebar shows a 'Backlog Sequencer' nav item and selecting it routes to /backlog (Tab union + TAB_PATHS + App render branch wired)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-page-shell.ac2",
+            "title": "BacklogSequencerPage fetches GET /api/backlog/sequence and renders the open-issue count and last-sequenced header",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-page-shell.ac3",
+            "title": "When no sequence.md exists the page renders an empty state that shows a Generate (creation) action",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-dag-node",
+        "title": "Frontend: BacklogDAG + IssueNode (ReactFlow+dagre, encodings, edges)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-5",
+            "FR-6",
+            "NFR-2",
+            "NFR-4"
+          ]
+        },
+        "narrative": {
+          "Action": "Create components/backlog/BacklogDAG.tsx + a custom IssueNode, reusing the PlanDAG.tsx stack (reactflow ^11 + @dagrejs/dagre, rankdir 'TB', applyDagreLayout pattern, NODE_TYPES) — NO new viz dependency (NFR-2). IssueNode encodes: rank badge (mono, top-left), AI size (XS->XL node footprint), importance heat left-border (red->amber->neutral->dim), in-pipeline glowing ring (.plan-glow) + live verb badge, PRD chip and ✓ READY chip (only when those flags are set). Edges: unblocks solid, informs dashed (mirror PlanDAG edge styling). Style-guide signal discipline (NFR-4)."
+        },
+        "items": [
+          {
+            "id": "fe-dag-node.ac1",
+            "title": "BacklogDAG renders the sequence as a ReactFlow+dagre (rankdir TB) graph with a custom IssueNode and adds no new viz dependency",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-dag-node.ac2",
+            "title": "Each IssueNode renders a rank badge, AI-size footprint, importance heat left-border, and PRD/READY chips only when those artifacts exist",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-dag-node.ac3",
+            "title": "An in-pipeline node renders a glowing ring (.plan-glow) plus a live verb badge",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-dag-node.ac4",
+            "title": "An 'unblocks' edge renders solid and an 'informs' edge renders dashed",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-rationale-panel",
+        "title": "Frontend: node-select rationale side panel",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "simple",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-7"
+          ]
+        },
+        "narrative": {
+          "Action": "Add a side panel that opens on node click and renders the selected issue's rationale (full paragraph when present, else the one-line why) from the sequence data, plus rank, size, importance, condition, and its dependencies. This panel is the host for the operator controls (fe-operator-controls bead) and condition actions (fe-conditions bead)."
+        },
+        "items": [
+          {
+            "id": "fe-rationale-panel.ac1",
+            "title": "Clicking a node opens a side panel that renders that issue's rationale/why from the sequence data",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-rationale-panel.ac2",
+            "title": "The panel renders the issue's rank, size, importance, condition, and dependencies",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-tiers",
+        "title": "Frontend: derived tiers (Now/Next/Later/Someday) + render budget (DAG vs list)",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-12"
+          ]
+        },
+        "narrative": {
+          "Action": "Derive Now/Next/Later/Someday bands from rank/score (Now size = active agent capacity / maxAgents; D8) — no AI tier field. A tier view always shows the pinned/in-pipeline set + that tier. Apply the render budget: a view with <= ~150 nodes renders as the BacklogDAG; above it, fall back to a virtualized ranked list (rank / id / size / importance / condition / flags). Someday renders as a virtualized list by default."
+        },
+        "items": [
+          {
+            "id": "fe-tiers.ac1",
+            "title": "The page produces Now/Next/Later/Someday bands from rank/score (Now sized to maxAgents capacity) with no AI tier field",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-tiers.ac2",
+            "title": "Selecting a tier renders the pinned/in-pipeline set plus that tier",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-tiers.ac3",
+            "title": "A tier view with <= ~150 nodes renders as a DAG; above 150 nodes it falls back to a virtualized ranked list",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-tiers.ac4",
+            "title": "The Someday tier renders as a virtualized ranked list by default",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-filters",
+        "title": "Frontend: filters (importance/condition/in-pipeline/ready) + long-tail collapse",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-12"
+          ]
+        },
+        "narrative": {
+          "Action": "Add filter controls (importance, condition, in-pipeline, ready) that narrow the rendered set, a Stale-candidates filter that shows all stale issues, and a long-tail collapse that hides the tail behind an expandable count. These pivot the full 522-issue set without rendering all nodes at once (FR-12)."
+        },
+        "items": [
+          {
+            "id": "fe-filters.ac1",
+            "title": "Each filter (importance, condition, in-pipeline, ready) shows only the matching subset of issues",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-filters.ac2",
+            "title": "The long tail collapses behind a count that expands on demand",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-filters.ac3",
+            "title": "The Stale-candidates filter shows all stale issues",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-conditions",
+        "title": "Frontend: condition indicators (REFINE/STALE) + actions + candidates-to-close summary",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-11"
+          ]
+        },
+        "narrative": {
+          "Action": "Render condition on nodes + in the rationale panel: needs-refinement as an amber '⚠ REFINE' indicator (amber = human-must-act), stale as a dimmed '⊘ STALE' strikethrough treatment. A stale node offers a Close issue action; a needs-refinement node offers a Draft PRD action (neither auto-modifies the tracker). Add a 'candidates to close' summary listing all stale issues. EXCEPTION (FR-11): a stale in-pipeline node renders bright + pinned + flagged (not dimmed) so the operator can abort active work."
+        },
+        "items": [
+          {
+            "id": "fe-conditions.ac1",
+            "title": "A needs-refinement node renders an amber ⚠ REFINE indicator; a (non-pipeline) stale node renders dimmed with a ⊘ STALE strikethrough treatment",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-conditions.ac2",
+            "title": "A stale node shows a Close issue action and a needs-refinement node shows a Draft PRD action",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-conditions.ac3",
+            "title": "A 'candidates to close' summary shows all stale issues",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-conditions.ac4",
+            "title": "A stale in-pipeline node renders bright, pinned, and flagged (not dimmed)",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "fe-operator-controls",
+        "title": "Frontend: operator pickup-gate + planning-policy controls + node badges",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-15",
+            "FR-17"
+          ]
+        },
+        "narrative": {
+          "Action": "In the rationale panel, add an Auto / ✓ Ready / ⛔ Block segmented control wired to POST /api/backlog/sequence/gate, and a planning-policy control (skip / auto / interactive) wired to the same override endpoint. On the node, render a 📌 PROMOTED badge when gate=ready and a ⛔ HELD badge when gate=blocked. Style-guide signal discipline (NFR-4)."
+        },
+        "items": [
+          {
+            "id": "fe-operator-controls.ac1",
+            "title": "The rationale panel renders an Auto / ✓ Ready / ⛔ Block segmented control that sends POST .../gate",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-operator-controls.ac2",
+            "title": "Setting Ready renders a 📌 PROMOTED node badge and Block renders a ⛔ HELD node badge",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "fe-operator-controls.ac3",
+            "title": "The panel renders a planning-policy control (skip/auto/interactive) that persists via the override endpoint",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "settings-role",
+        "title": "Settings → Roles: Sequencer role entry",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-14T00:02:47.000Z",
+        "metadata": {
+          "difficulty": "simple",
+          "issueLabel": "pan-1866",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-4"
+          ]
+        },
+        "narrative": {
+          "Action": "Add a Sequencer entry to the ROLES array in components/Settings/RolesPanel.tsx:88-149 (id 'sequencer', name 'Sequencer', an icon, a description, defaultModel 'workhorse:expensive'). The persistence plumbing already exists once 'sequencer' is in ROLE_NAMES (role-register bead). Verify roles.sequencer.model persists and is read at the next sequencer spawn."
+        },
+        "items": [
+          {
+            "id": "settings-role.ac1",
+            "title": "Settings → Roles renders a Sequencer role entry with default model workhorse:expensive",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "settings-role.ac2",
+            "title": "Saving a changed roles.sequencer.model persists it and the next sequencer spawn applies that model",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "from": "seq-io",
+        "to": "reconcile-nodes",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "reconcile-edges",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "chunking",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "cache",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "route-get",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "sequencer-prompt",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "finalize-cmd",
+        "type": "blocks"
+      },
+      {
+        "from": "seq-io",
+        "to": "fe-dag-node",
+        "type": "blocks"
+      },
+      {
+        "from": "reconcile-nodes",
+        "to": "finalize-cmd",
+        "type": "blocks"
+      },
+      {
+        "from": "reconcile-edges",
+        "to": "finalize-cmd",
+        "type": "blocks"
+      },
+      {
+        "from": "cache",
+        "to": "finalize-cmd",
+        "type": "blocks"
+      },
+      {
+        "from": "cache",
+        "to": "route-get",
+        "type": "blocks"
+      },
+      {
+        "from": "chunking",
+        "to": "sequencer-prompt",
+        "type": "blocks"
+      },
+      {
+        "from": "role-register",
+        "to": "route-regenerate",
+        "type": "blocks"
+      },
+      {
+        "from": "role-register",
+        "to": "settings-role",
+        "type": "blocks"
+      },
+      {
+        "from": "sequencer-prompt",
+        "to": "route-regenerate",
+        "type": "informs"
+      },
+      {
+        "from": "finalize-cmd",
+        "to": "route-regenerate",
+        "type": "informs"
+      },
+      {
+        "from": "seq-io",
+        "to": "route-override",
+        "type": "blocks"
+      },
+      {
+        "from": "reconcile-nodes",
+        "to": "route-override",
+        "type": "blocks"
+      },
+      {
+        "from": "route-get",
+        "to": "fe-page-shell",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-page-shell",
+        "to": "fe-dag-node",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-dag-node",
+        "to": "fe-rationale-panel",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-dag-node",
+        "to": "fe-tiers",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-dag-node",
+        "to": "fe-filters",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-rationale-panel",
+        "to": "fe-conditions",
+        "type": "blocks"
+      },
+      {
+        "from": "fe-rationale-panel",
+        "to": "fe-operator-controls",
+        "type": "blocks"
+      },
+      {
+        "from": "route-override",
+        "to": "fe-operator-controls",
+        "type": "blocks"
+      }
+    ],
+    "metadata": {
+      "canonicalFilename": "2026-06-14-PAN-1866-backlog-sequencer-ai-ranked-whole-backlog-dag-with-a-reproducible-markdown-source-of-truth.vbrief.json"
+    }
+  },
+  "status": "proposed"
+}
