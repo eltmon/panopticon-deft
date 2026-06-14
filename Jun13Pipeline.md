@@ -2,6 +2,30 @@
 
 Snapshot of the stabilization effort so a new session can continue. Written ~05:40 UTC.
 
+## ⟶ 2026-06-14 ~01:15 UTC reconciliation (NEWEST — read this first)
+
+Two newer handoffs supersede parts of this doc; read them alongside it:
+- `.pan/handoff-stabilization.md` — the substrate-stabilization push (harness + close-out fixes).
+- `~/.panopticon/flywheel/runs/RUN-32/report.md` — the last flywheel run (11 substrate bugs fixed, 7 PRs merged, red-main + synthesis-wedge + merge-gate reliability all fixed).
+
+**Done since this doc was written:**
+- `recovery/` (`design-artifacts/` + `pan-1762/`) IS committed on `origin/main` — durable. ✓
+- Merged-but-open strikes **PAN-1798 / PAN-1801 / PAN-1807 / PAN-1812 — all CLOSED.** ✓
+- **#1665 (deacon thundering-herd resume throttle) — CLOSED / landed.** The "land #1665 before resuming the flywheel" gate (old step 5) is satisfied.
+- Stabilization fixes on `origin/main`: **PAN-1871** (harness refuses silent claude-code/CLIProxy fallback), **PAN-1873** (close-out re-verifies merge + refuses live work agent), **PAN-1872** (`pan start` no longer crashes on sync-main conflict). **PAN-1865** deacon band-aid **REVERTED** + re-scoped (no strike; root-cause the CLIProxy "200k-window illusion" later; long-term home PAN-1837 Kimi Code CLI).
+- Flywheel **stopped cleanly + RUN-32 `report.md` archived**; active-run gate cleared (next `pan flywheel start` = fresh RUN-33). Filed **PAN-1875** (add `pan flywheel stop` so this is one verb).
+
+**Still open / carry forward (these dropped out of the narrower stabilization handoff):**
+- **#1845 — CRITICAL: remote Fly work agents lose ALL work on crash** (ephemeral rootfs + no continuous push). Definitive plan in the issue. Do NOT run remote Fly work agents until it lands.
+- **Open PRs to triage (16):** newest are **#1869 (PAN-1817)** and **#1858 (PAN-1827)** from the review convoys; plus #1836/1822/1811/1786/1784/1715/1679/1636/1630/1612/1534/1516/1514. Most predate recent `main` movement → need sync-main; drive to green + merge.
+- **#1829 (PAN-1797 PR) still OPEN** — do NOT close blind: diff its test coverage vs what `5414805e2`/PAN-1842 already merged (it carries extra tests). Same caution as the old correction note below.
+- **PAN-1873 regression tests** — PENDING: lock the two landed guards (isBranchMerged-over-stale-mergeStatus; live-agent close-out refusal). The real test home is a new direct unit test of `src/lib/close-out.ts` via the exported `executeCloseOut` (the existing `issues-close-out.test.ts` fully mocks `closeOut`, so it can't reach the guards).
+- **PAN-1762 (Swarm v2):** re-implement LOCALLY from the surviving PRD + 49KB vBRIEF spec on main; recovery artifacts in `recovery/pan-1762/`. Lower priority.
+
+**Config still current:** workhorses expensive=`claude-opus-4-8`, mid=`kimi-k2.7-code`; Fable 5 SUSPENDED (never spawn on Fable). Deacon held this whole time via `PANOPTICON_NO_RESUME=1` boot gate.
+
+**Everything below this section is the pre-reboot June-13 state; superseded where it conflicts with the above.**
+
 ## ⟶ Session progress (orchestrating conversation, ~06:40 UTC — read this first)
 **Worktree cleanup from old "Suggested next steps" #1 is DONE — do not repeat it.**
 - **Primary `main` reset to origin and verified clean:** `main == origin/main`, now at `91a96e80f`. Ahead/behind 0/0.
