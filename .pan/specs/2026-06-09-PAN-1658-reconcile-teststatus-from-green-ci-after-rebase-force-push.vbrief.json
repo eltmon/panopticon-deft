@@ -4,17 +4,17 @@
     "created": "2026-06-09T23:14:19.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1658: bug(pipeline): testStatus stuck 'pending' after rebase/force-push despite green CI — blocks merge, no reconciler",
-    "updated": "2026-06-10T07:33:33.573Z"
+    "updated": "2026-06-14T03:25:08.482Z"
   },
   "plan": {
     "id": "pan-1658",
     "title": "Reconcile testStatus from green CI after rebase/force-push",
-    "status": "proposed",
+    "status": "completed",
     "uid": "41568a01-5a58-4e5a-a085-023e6be11ea3",
     "author": "agent:claude-opus-4-8",
-    "sequence": 50,
+    "sequence": 51,
     "created": "2026-06-09T23:14:19.000Z",
-    "updated": "2026-06-10T07:33:33.573Z",
+    "updated": "2026-06-14T03:25:08.482Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1658",
@@ -321,5 +321,5 @@
       }
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
