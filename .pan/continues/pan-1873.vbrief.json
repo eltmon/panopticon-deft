@@ -1,0 +1,30 @@
+{
+  "version": "1",
+  "issueId": "PAN-1873",
+  "created": "2026-06-13T23:34:15.090Z",
+  "updated": "2026-06-13T23:46:51Z",
+  "gitState": { "branch": "feature/pan-1873", "sha": "89604a1c0", "dirty": true },
+  "decisions": [
+    { "id": "D1", "summary": "The committed fix (1f60ca8a2) landed on DEAD code. src/lib/close-out.ts (executeCloseOut/isBranchMerged) has zero importers. The live close-out path is closeOut() in src/lib/lifecycle/workflows.ts, used by the dashboard single+bulk routes, `pan close`, and the Deacon autoCloseOut. Both guards must be (re)implemented there.", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D2", "summary": "Guard 1 (merge re-check): in verifyBranchMergedImpl (workflows.ts:400), only honor mergeStatus:'merged' when `git log main..feature/<issue>` is empty; otherwise fall through to the existing git checks (which return stepFailed for genuinely-unmerged work and still recognise squash-merges via the code-diff check).", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D3", "summary": "Guard 2 (live-agent refusal): add a hard-fail step `close-out:active-agent` to closeOut() AFTER verifyBranchMerged and BEFORE archivePlanning/teardownWorkspace. Use the Effect `sessionExists` from tmux.js. Safe because postMergeLifecycle kills the agent-<issue> session at merge, so a live session reliably means re-activation.", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D4", "summary": "Delete src/lib/close-out.ts entirely (dead duplicate). Prevents recurrence of patching the wrong file. Blocked on the two guard beads so the live-path guards exist first. Zero importers verified.", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D5", "summary": "Clear the tag at the re-activation source two ways: (a) the GitHub tracker in_progress transition removes verifying-on-main/needs-close-out/merged labels (matches LIFECYCLE_LABELS); (b) on spawnAgent work-role, reset a stale mergeStatus:'merged' via a new review-status helper clearStalePostMergeStatus(issueId).", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D6", "summary": "Readiness reflects computed safety = no live agent (cheap) + no unmerged commits (enforced inside closeOut by guard 1, not re-checked in render/patrol paths). Frontend canCloseOut adds `&& !hasLiveAgent(state)`; Deacon autoCloseOut skips candidates with a live agent-<issue> session.", "recordedAt": "2026-06-13T23:46:51Z" },
+    { "id": "D7", "summary": "Each guard bead bundles its regression test (write-test-then-make-pass). The 'TOP priority regression tests' (issue AC1) are NFR-1, satisfied by the tests inside wf-merge-guard and wf-live-agent-guard, targeting the LIVE workflows.ts path — never the deleted duplicate.", "recordedAt": "2026-06-13T23:46:51Z" }
+  ],
+  "hazards": [
+    { "id": "H1", "summary": "Two close-out implementations existed (close-out.ts dead vs workflows.ts live). Patching the dead one looks correct but does nothing. Always confirm the live path: `pan close`, the /api/issues/:id/close-out + /bulk-close-out routes, and deacon autoCloseOut all import closeOut from lib/lifecycle/index.js (=workflows.ts).", "mitigation": "Item 3 deletes the dead file; all guards go to workflows.ts; tests target workflows.test.ts." },
+    { "id": "H2", "summary": "teardownWorkspace (teardown-workspace.ts:50-91) KILLS the agent-<issue> session as part of normal teardown — there is no separate guard. The live-agent refusal (guard 2) MUST run before archivePlanning/teardown, else the agent is killed before the check matters.", "mitigation": "Insert the close-out:active-agent step immediately after verifyBranchMerged and return early on a live session." },
+    { "id": "H3", "summary": "workflows.test.ts mocks review-status.js with ONLY clearReviewStatus. The merge-guard test needs loadReviewStatuses to be mocked too (returning mergeStatus:'merged') or the dynamic import inside verifyBranchMergedImpl yields undefined and the guard is never exercised.", "mitigation": "Extend the review-status.js mock in workflows.test.ts to export loadReviewStatuses for the new test." },
+    { "id": "H4", "summary": "Removing verifying-on-main/needs-close-out/merged on EVERY in_progress transition could in theory affect the normal first-start flow, but those labels are absent on first start and removeLabelSilent swallows 404s — it is a no-op there and always-correct on re-activation (you cannot be both in_progress and verifying_on_main).", "mitigation": "Use removeLabelSilent; add a tracker test asserting add in-progress + remove the three stale labels." },
+    { "id": "H5", "summary": "Fake-timers rule: none of these beads add retry/backoff/delay logic, so fake timers are not required. Do NOT add real setTimeout waits in the new tests.", "mitigation": "Keep tests synchronous over mocked exec/tmux/review-status." },
+    { "id": "H6", "summary": "Server-reachable code (workflows.ts, deacon.ts) must use async/Effect tmux + async exec — never execSync or sync send-keys. The existing files already follow this; match their style.", "mitigation": "Use Effect `sessionExists` in workflows.ts; sessionExistsSync is already used in deacon's patrol and is acceptable there." }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-8",
+  "sessionHistory": [
+    { "timestamp": "2026-06-13T23:34:15.090Z", "reason": "planning", "note": "Initial planning session", "agentModel": "agent:claude-opus-4-8" }
+  ]
+}

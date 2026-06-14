@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "issueId": "PAN-1824",
+  "created": "2026-06-13T16:40:24.917Z",
+  "updated": "2026-06-13T16:47:25.000Z",
+  "gitState": { "branch": "feature/pan-1824", "sha": "5f95d8d09", "dirty": true },
+  "decisions": [
+    { "id": "D1", "summary": "Root cause of the ~5s timeout family is ALREADY fixed on main by fd7b0cbe1 (skip managed tmux-server founding under VITEST). The whole family passes fast now (verified in CI run 27472211377: fork-retry-limit ✓338ms, UAT ✓2936ms). No work is needed on codex.test.ts / conversations.test.ts / reviewer-tree.test.ts.", "recordedAt": "2026-06-13T16:47:25.000Z" },
+    { "id": "D2", "summary": "Scope is ONLY: re-land the @slow tagging that was collateral-reverted with d9807686d, and prove the Playwright UAT is excluded from the default vitest run. Replay exactly the two known-good hunks of d9807686d (vitest.config.ts tags/tagsFilter + the UAT describe tag).", "recordedAt": "2026-06-13T16:47:25.000Z" },
+    { "id": "D3", "summary": "vitest 4.1.6 supports tags/tagsFilter/strictTags. strictTags defaults to TRUE, so the @slow tag MUST be declared in test.tags before any describe uses it — otherwise vitest errors. This forces an ordering: config bead lands before the UAT-tag bead.", "recordedAt": "2026-06-13T16:47:25.000Z" },
+    { "id": "D4", "summary": "Add a `test:slow` npm script (`vitest run --tagsFilter @slow`) so the excluded @slow set stays runnable on demand instead of being silently orphaned.", "recordedAt": "2026-06-13T16:47:25.000Z" },
+    { "id": "D5", "summary": "Local verification suffices for THIS change because @slow exclusion is pure config-level tag filtering, evaluated identically local and CI — unlike the reverted fake-timer conversion whose behavior diverged (local ops succeed → green; CI ops fail → hang).", "recordedAt": "2026-06-13T16:47:25.000Z" }
+  ],
+  "hazards": [
+    { "id": "H1", "summary": "Issue BODY says 'convert the family to fake timers' — this is STALE and WRONG. The operator's later comments re-scoped it: that conversion (d9807686d) hung both main CI jobs for the full 30-min budget and was reverted (53ac34014). Do NOT redo any fake-timer conversion of these tmux/IO suites.", "mitigation": "Treat operator comments as authoritative over the body. Plan does no fake-timer conversion; NonGoals forbid it explicitly. concerns.md updated with the hang trap." },
+    { "id": "H2", "summary": "strictTags defaults to true. Tagging the UAT describe @slow WITHOUT declaring @slow in vitest.config test.tags makes vitest throw, reddening the whole suite.", "mitigation": "Land the config bead (declares @slow + tagsFilter) before the UAT-tag bead; encoded as a blocks edge. Do not introduce any other undeclared tag." },
+    { "id": "H3", "summary": "A no-op re-land is possible if the wrong mechanism is used — the operator explicitly warned 'ONLY if verified effective'. The d9807686d mechanism IS the correct vitest 4.x API; it was never CI-proven only because the conversion in the same commit hung the job.", "mitigation": "Verify locally that default `vitest run` collects ZERO tests from the UAT file (e.g. `npx vitest run tests/playwright/conversation-supervisor-uat.test.ts` reports no tests run / filtered). This is a faithful CI proxy because the filter is deterministic config behavior." },
+    { "id": "H4", "summary": "The UAT uses real chromium.launch() + playwright; running it on demand needs the chromium browser installed. The default CI run no longer needs it once excluded, but do not remove the workflow's chromium install in this issue.", "mitigation": "Leave .github/workflows/ci.yml untouched (NonGoal). `test:slow` is opt-in." }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-8",
+  "sessionHistory": [
+    { "timestamp": "2026-06-13T16:40:24.917Z", "reason": "planning", "note": "Planning session started for PAN-1824 (re-scoped: re-land @slow exclusion only; root cause already fixed by fd7b0cbe1; fake-timer conversion forbidden).", "agentModel": "agent:claude-opus-4-8" }
+  ]
+}

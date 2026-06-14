@@ -1,0 +1,41 @@
+{
+  "version": "1",
+  "issueId": "PAN-1812",
+  "created": "2026-06-13T01:31:28.343Z",
+  "updated": "2026-06-13T01:55:00.000Z",
+  "gitState": { "branch": "feature/pan-1812", "sha": "f14be9ffa", "dirty": true },
+  "decisions": [
+    { "id": "D1", "summary": "Troubled-flag fix targets the deacon stuck ladder (stuck-remediation.ts stage 3), not pan pause. Verified: pan pause never sets troubled; deacon log shows 'stuck-remediation stage=3 issue=PAN-1787 idleMin=90 action=marked-troubled' at 2026-06-12T18:34:04.986Z. The issue's assumption that the governor set both flags was incorrect.", "recordedAt": "2026-06-13T01:55:00.000Z" },
+    { "id": "D2", "summary": "Stage 3 for work agents sets paused+pausedReason (no process stop) instead of troubled. troubled is documented as 'repeated resume failures' (agents.ts:1181); an idle-no-work agent has failed nothing. evaluateFlywheelOrchestrator stage 3 (paused-and-troubled) is deliberately unchanged.", "recordedAt": "2026-06-13T01:55:00.000Z" },
+    { "id": "D3", "summary": "Work-completeness = open + in_progress beads for the issue label from the workspace DB, implemented as tri-state getWorkspaceBeadWork ('has-work'|'no-work'|'unknown') in new leaf module src/lib/cloister/bead-work.ts. bd errors => 'unknown', never 'no-work'. Verified live: `bd list --json -l <label>` with cwd=workspace returns open+in_progress by default.", "recordedAt": "2026-06-13T01:55:00.000Z" },
+    { "id": "D4", "summary": "Provenance startedBy ('operator'|'flywheel') detected at CLI choke points via process.env.PANOPTICON_AGENT_ID === FLYWHEEL_ORCHESTRATOR_AGENT_ID ('flywheel-orchestrator', cloister/flywheel.ts:18), with explicit --initiator flag threaded through the plan->finalize->auto-spawn HTTP chain (env does not survive the complete-planning hop). Default when undetectable: 'operator' (conservative, exempt from reaping).", "recordedAt": "2026-06-13T01:55:00.000Z" },
+    { "id": "D5", "summary": "Reap gate enforced in pan pause CLI (pause.ts) AND stated in docs/flywheel-brief.md — prompt-only rules already failed in RUN-28. Config gate: SQLite app-setting flywheel.governor_reap_operator_agents (default false) following the flywheel.* pattern in src/lib/database/app-settings.ts:79-118.", "recordedAt": "2026-06-13T01:55:00.000Z" },
+    { "id": "D6", "summary": "deacon.ts nudgeIdleWorkAgentsWithOpenBeads keeps `bd ready` unchanged — ready-semantics are correct for naming the next actionable bead; it already uses cwd: state.workspace and skips on bd error (deacon.ts:6160-6173).", "recordedAt": "2026-06-13T01:55:00.000Z" }
+  ],
+  "hazards": [
+    { "id": "H1", "summary": "The issue body's evidence ('43 open + 7 in_progress beads') is misleading: those beads belong to OTHER issues, inherited from main's git-backed beads DB into the workspace .beads/. PAN-1787's own labeled beads were 23/24 closed at troubled-marking time.", "mitigation": "All completeness checks MUST be label-filtered (-l <issue-lowercase>). Never count bare `bd list` output. Do not 'fix' by counting unlabeled beads." },
+    { "id": "H2", "summary": "cleanAgentState() in agents.ts (~line 945) whitelists fields explicitly — adding startedBy to the interface without adding it to the whitelist silently drops it on every save.", "mitigation": "agent-started-by bead's AC1 requires a save/load round-trip test through cleanAgentState." },
+    { "id": "H3", "summary": "bd CLI fails under lock contention (observed 'Command failed: bd ready -l pan-1787' repeatedly from 2026-06-12T20:26Z). Any check treating bd failure as 'no work' recreates this incident.", "mitigation": "Tri-state helper: error/timeout/parse-failure => 'unknown' => no escalation, no completion claim. Same rule in triggers.ts fallback reason." },
+    { "id": "H4", "summary": "Importing FLYWHEEL_ORCHESTRATOR_AGENT_ID from cloister/flywheel.ts into CLI commands could create an import cycle (flywheel.ts imports agents.ts).", "mitigation": "It is a plain string const; if a cycle appears, move the constant to a leaf module — do NOT inline the literal in multiple places." },
+    { "id": "H5", "summary": "Legacy agents have no startedBy field; the pause gate must treat undefined as operator-started (default-deny for reaping), which means the flywheel cannot pause any pre-existing agent until provenance propagates.", "mitigation": "Intentional and conservative. The flywheel can still pause agents it launches after this ships; operator can always pause anything." },
+    { "id": "H6", "summary": "skills/pan-start (and possibly pan-pause) SKILL.md are lint-enforced against `pan <verb> --help` output (scripts/lint-skills.sh in npm run lint) — adding the --initiator flag without touching the skill may fail CI, and vice versa.", "mitigation": "Update the wrapper skill in the same commit as the CLI flag; run npm run lint before pan done." },
+    { "id": "H7", "summary": "Stuck-remediation tests must not use real timers or wall-clock waits.", "mitigation": "Follow the existing now-parameter pattern in src/lib/cloister/__tests__/stuck-remediation.test.ts and mock child_process execFile; the repo's fake-timers rule applies to any delay-based test." }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-fable-5",
+  "sessionHistory": [
+    {
+      "reason": "planning",
+      "note": "Planning session started for PAN-1812: Flywheel governor stops work agents with false 'Work complete, no open beads' — agent-pan-1787 had 43 open + 7 in-progress beads",
+      "timestamp": "2026-06-13T01:31:28.344Z"
+    },
+    {
+      "reason": "planning",
+      "note": "Auto-mode discovery complete. Reconstructed the incident from deacon logs + bead timestamps: deacon stuck-remediation stage 3 marked agent-pan-1787 troubled at 18:34Z (idleMin=90) while it was actively closing beads; flywheel RUN-28 then pan-paused it claiming 'work complete'. Plan: 8 beads across triggers.ts cwd fix, tri-state bead-work helper, stage-3 pause-not-troubled, beads-mtime ladder reset, startedBy provenance, auto-spawn threading, pan pause reap gate, and flywheel-brief governor policy. PRD draft at .pan/drafts/PAN-1812.md.",
+      "timestamp": "2026-06-13T01:55:00.000Z",
+      "agentModel": "agent:claude-fable-5"
+    }
+  ],
+  "feedback": []
+}

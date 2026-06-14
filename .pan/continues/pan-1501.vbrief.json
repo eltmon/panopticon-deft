@@ -1,0 +1,19 @@
+{
+  "version": "1",
+  "issueId": "PAN-1501",
+  "created": "2026-06-13T04:20:41.490Z",
+  "updated": "2026-06-13T15:48:44.012Z",
+  "gitState": {},
+  "decisions": [],
+  "hazards": [],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "feedback": [],
+  "sessionHistory": [
+    {
+      "reason": "feedback",
+      "note": "[2026-06-13T04:20Z] verification-gate → FAILED — seq 1",
+      "timestamp": "2026-06-13T04:20:41.490Z"
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "version": "1",
+  "issueId": "PAN-1801",
+  "created": "2026-06-13T01:30:42.422Z",
+  "updated": "2026-06-13T01:36:31Z",
+  "gitState": { "branch": "feature/pan-1801", "sha": "f14be9ffa", "dirty": false },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "New module src/lib/cloister/ci-failure-relay.ts owns the relay (scheduleCiFailureRelay). Webhook handlers call it fire-and-forget from handleCheckSuitePromise (terminal non-success) and handleStatusPromise (failure/error). handleCheckRunPromise does NOT trigger it — each Actions workflow has its own check suite, and run-level events fire before run completion.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Debounce per (issueId, headSha), marked at schedule time, in-memory Map bounded to 1000 entries (evict oldest). 60s unref'd settle timer before relaying (pattern: scheduleMergeStateReconciliation, webhook-handlers.ts:187) so sibling workflows finish first.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D3",
+      "summary": "Relay only when a live local work agent session exists (sessionExistsSync('agent-<issue-lowercase>'), tmux.ts:494). No session => log and stop; do NOT write a feedback file (the deacon stale-feedback janitor would clear it) and never auto-resume a stopped agent. The deacon's merge-time CI path (checkFailedMergeRetry, deacon.ts:3364) remains the fallback for agent-less issues.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Feedback uses the established writeFeedbackFile plumbing with a NEW specialist value 'ci-monitor' (outcome 'ci-failure') — union extended in feedback-writer.ts:19 and continue-state.ts:93. Agent nudge goes through deliverAgentMessage (agents.ts:1445), the canonical delivery primitive, with the absolute feedback path in a MUST READ message.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D5",
+      "summary": "Inherited-failure rule: compare failing PR check names against the PR base branch HEAD's failing check names (gh api repos/<repo>/commits/<base>/check-runs). Same name failing on base => labeled 'Inherited from <base> — do not chase these'. ALL inherited => suppress relay entirely (log only). Base fetch error => fail open: relay everything with an explicit 'could not compare against base' note.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D6",
+      "summary": "Log excerpts via gh CLI (async execFile, <=15s timeouts, same as refreshMergeStateFromGitHub): gh run list --commit <headSha> --json databaseId,name,workflowName,conclusion, then gh run view <id> --log-failed for <=3 failed runs, truncated to last 80 lines/run and 8KB total. No Actions runs => names-only feedback body.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    },
+    {
+      "id": "D7",
+      "summary": "Head-move abort: at fire time, gh pr view --json headRefOid; if it differs from the scheduled headSha, abort silently — the new SHA's own webhook events re-trigger the relay. No config flag for the feature: debounce + live-agent gate + inherited suppression bound the blast radius.",
+      "recordedAt": "2026-06-13T01:36:31Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "Webhook dispatch must never block or throw on relay work — GitHub expects a fast 200.",
+      "mitigation": "scheduleCiFailureRelay is synchronous (map mark + setTimeout(...).unref()); relayCiFailureNow is invoked inside the timer with .catch(console.warn). No await in handler hot path."
+    },
+    {
+      "id": "H2",
+      "summary": "Overlap with the deacon's merge-time CI notifications (checkFailedMergeRetry) could double-message an agent for the same red CI.",
+      "mitigation": "Distinct lifecycle windows (relay: PR open + live agent; deacon: mergeStatus='failed' after review+test pass, and only after 5 retries). Per-SHA debounce caps the relay at one message. Documented in docs/CI-FEEDBACK-RELAY.md; acceptable residual duplication."
+    },
+    {
+      "id": "H3",
+      "summary": "gh subprocess failures (rate limit, auth expiry, network) inside the relay.",
+      "mitigation": "Every gh call wrapped in try/catch with 15s timeout; pr-view failure aborts the relay with a warn log; base-comparison failure fails open (D5); run-log failure falls back to names-only body."
+    },
+    {
+      "id": "H4",
+      "summary": "Oversized feedback files blow the work agent's context (cheap models especially).",
+      "mitigation": "Hard caps: 3 runs, 80 lines/run, 8KB total log excerpt budget, truncation annotated (FR-8)."
+    },
+    {
+      "id": "H5",
+      "summary": "Repo rule: delay-based tests using real timers cause OOM/flake (fake-timers rule in CLAUDE.md).",
+      "mitigation": "All settle-timer/debounce tests MUST use vi.useFakeTimers() + vi.advanceTimersByTimeAsync(60000). _resetCiFailureRelayForTests() clears map + timers between cases (mirror clearAllReconciliationTimeouts)."
+    },
+    {
+      "id": "H6",
+      "summary": "check_suite payload head.sha is optional in our WebhookPayload type; status events carry no PR number.",
+      "mitigation": "headSha falls back to status.prHeadSha; prNumber for status events from status.prNumber ?? prNumberFromUrl(status.prUrl). Either still missing => skip scheduling (can't debounce or fetch safely)."
+    },
+    {
+      "id": "H7",
+      "summary": "Potential ESM import cycle: ci-failure-relay needs FAILING_CHECK_CONCLUSIONS from webhook-handlers while webhook-handlers imports the relay.",
+      "mitigation": "If the cycle bites (Node strict ESM), move the const into ci-failure-relay.ts and re-export from webhook-handlers.ts (stated fallback in W5/plan). Heavy deps (agents.js, feedback-writer.js, tmux.js) are dynamic-imported inside relayCiFailureNow."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-fable-5",
+  "sessionHistory": [
+    {
+      "reason": "planning",
+      "note": "Planning session started for PAN-1801: CI failures on a PR never reach the work agent — webhook checks feed merge gating only, no feedback relay",
+      "timestamp": "2026-06-13T01:30:42.422Z"
+    },
+    {
+      "reason": "planning",
+      "note": "Auto-mode discovery complete: verified webhook handlers stop at failing_checks blockers; only CI->agent path is deacon merge-time checkFailedMergeRetry. Plan: ci-failure-relay module + webhook wiring, 6 beads. PRD at .pan/drafts/PAN-1801.md.",
+      "timestamp": "2026-06-13T01:36:31Z",
+      "agentModel": "agent:claude-fable-5"
+    }
+  ],
+  "feedback": []
+}

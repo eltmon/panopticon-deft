@@ -1,0 +1,406 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "created": "2026-06-13T01:36:31Z",
+    "author": "panopticon-cli/0.0.0",
+    "description": "Plan for PAN-1801: CI failures on a PR never reach the work agent — webhook checks feed merge gating only, no feedback relay",
+    "updated": "2026-06-13T01:40:50.388Z"
+  },
+  "plan": {
+    "id": "pan-1801",
+    "title": "CI failures on a PR never reach the work agent — webhook checks feed merge gating only, no feedback relay",
+    "status": "proposed",
+    "uid": "d8e85d67-4b5d-454e-872a-bef4f3d3330e",
+    "author": "agent:claude-fable-5",
+    "sequence": 2,
+    "created": "2026-06-13T01:36:31Z",
+    "updated": "2026-06-13T01:40:50.388Z",
+    "references": [
+      {
+        "uri": "https://github.com/eltmon/panopticon-cli/issues/1801",
+        "label": "PAN-1801",
+        "type": "issue"
+      },
+      {
+        "uri": ".pan/drafts/PAN-1801.md",
+        "label": "PRD draft with verified file/line references and FR/NFR ids",
+        "type": "doc"
+      }
+    ],
+    "tags": [
+      "webhooks",
+      "ci",
+      "feedback",
+      "cloister",
+      "pipeline"
+    ],
+    "narratives": {
+      "Problem": "GitHub webhook handlers (handleCheckSuitePromise, handleCheckRunPromise, handleStatusPromise in src/lib/webhook-handlers.ts) ingest CI check results only into ReviewStatus failing_checks blockers, which gate readyForMerge. No path relays a red PR rollup to the live work agent — the only CI-to-agent feedback today is the deacon's merge-time checkFailedMergeRetry (src/lib/cloister/deacon.ts:3364), which fires only after review+test pass and a merge attempt fails. Observed on PAN-1579 / PR #1677: review passed, CI red, agent never told, PR silently merge-blocked until a human noticed.",
+      "Proposal": "Add src/lib/cloister/ci-failure-relay.ts exporting scheduleCiFailureRelay({issueId, repo, prNumber, headSha}), invoked fire-and-forget from the failing branches of handleCheckSuitePromise and handleStatusPromise. The relay debounces per (issueId, headSha), waits a 60s unref'd settle timer, gates on a live work agent tmux session (sessionExistsSync), aborts if the PR head moved, partitions failing checks into own vs inherited-from-base (diffed against the base branch HEAD's failing check names; all-inherited suppresses the relay), fetches truncated failing-job logs via gh run view --log-failed, writes a feedback file via writeFeedbackFile (new specialist 'ci-monitor', outcome 'ci-failure'), and nudges the agent via deliverAgentMessage with a MUST READ path — the same shape as review feedback. All subprocess calls are async execFile with timeouts; no execSync (server-reachable code).",
+      "NonGoals": "- PAN-1658 (testStatus stuck pending) reconciler — separate issue\n- Relaying to issues without a live local work agent, including remote/Fly agents (no tmux session)\n- Auto-resuming stopped agents to deliver CI feedback\n- Re-running or retrying CI from Panopticon\n- Any change to merge gating, readyForMerge derivation, or failing_checks blocker bookkeeping\n- Relay triggers from individual check_run events (suite-level and status-level only)\n- Dashboard UI surfaces for relay events"
+    },
+    "autoDecisions": [
+      {
+        "summary": "Trigger the relay from check_suite (terminal non-success) and status (failure/error) webhook events only — never individual check_run events.",
+        "rationale": "Each GitHub Actions workflow run gets its own check suite, so suite conclusions are the reliable 'rollup turned failed' moment; run-level events fire per job before run completion and would duplicate the relay."
+      },
+      {
+        "summary": "60-second unref'd settle timer between the first failing event for a SHA and the relay firing.",
+        "rationale": "Lets sibling workflows finish so one message carries the complete failure set; mirrors the existing scheduleMergeStateReconciliation timer pattern (webhook-handlers.ts:187)."
+      },
+      {
+        "summary": "Gate on a live local work agent tmux session; when absent, write nothing and never auto-resume.",
+        "rationale": "Matches the issue's stated scope ('an issue with a live work agent'); auto-resume from flaky CI would spin up agents unattended, and orphaned feedback files would be cleared by the deacon's stale-feedback janitor anyway. The deacon merge-time CI path remains the fallback."
+      },
+      {
+        "summary": "New specialist value 'ci-monitor' on feedback files instead of reusing 'merge-agent'.",
+        "rationale": "This relay fires during the work/review window, not at merge; self-describing filenames (NNN-ci-monitor-ci-failure.md) keep lifecycle stages distinguishable in .pan/feedback/."
+      },
+      {
+        "summary": "All-inherited failures (every failing PR check name also failing on the base branch HEAD) suppress the relay entirely; base-comparison fetch errors fail open with an explicit note.",
+        "rationale": "When main is red every PR inherits the failure — messaging the agent would send it chasing failures it cannot fix (the PAN-1804-adjacent caveat in the issue). Failing open on fetch errors preserves real signal at the cost of an occasional mislabeled inherited failure."
+      },
+      {
+        "summary": "No config flag for the feature.",
+        "rationale": "Simplicity-first: per-SHA debounce, the live-agent gate, and inherited suppression already bound the blast radius; a kill switch would be speculative configurability."
+      },
+      {
+        "summary": "Use the gh CLI via promisified execFile (15s timeouts) rather than the GitHub App token API in github-app.ts.",
+        "rationale": "Consistent with the adjacent refreshMergeStateFromGitHub implementation in webhook-handlers.ts; gh handles auth and pagination, and gh 2.92 (installed) supports gh run list --commit."
+      }
+    ],
+    "items": [
+      {
+        "id": "ci-monitor-specialist",
+        "title": "Add 'ci-monitor' to the two specialist unions",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "trivial",
+          "issueLabel": "pan-1801",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "NFR-4"
+          ],
+          "acJustification": "Two one-line union extensions verified by typecheck; two ACs cover both edit sites."
+        },
+        "narrative": {
+          "Action": "Append | 'ci-monitor' to WriteFeedbackOptions.specialist at src/lib/cloister/feedback-writer.ts:19 and to ContinueFeedbackEntry.specialist at src/lib/vbrief/continue-state.ts:93 (search for the union string 'verification-gate' | 'review-agent' if lines drifted). No other changes — filename generation (NNN-<specialist>-<outcome>.md) and continue-file append already handle arbitrary union members."
+        },
+        "items": [
+          {
+            "id": "ci-monitor-specialist.ac1",
+            "title": "Given a writeFeedbackFile call with specialist 'ci-monitor', npm run typecheck accepts it and exits 0",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "ci-monitor-specialist.ac2",
+            "title": "ContinueFeedbackEntry.specialist in src/lib/vbrief/continue-state.ts accepts 'ci-monitor' so appendFeedbackEntryForIssue persists relay entries without type errors",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "relay-core",
+        "title": "Create ci-failure-relay module: debounce, settle timer, live-agent gate, feedback write + nudge",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "complex",
+          "issueLabel": "pan-1801",
+          "requiresInspection": true,
+          "inspectionDepth": "fast",
+          "foundationFor": [
+            "log-excerpts",
+            "inherited-diff",
+            "webhook-wiring"
+          ],
+          "traces": [
+            "FR-2",
+            "FR-3",
+            "FR-4",
+            "FR-5",
+            "NFR-1",
+            "NFR-2",
+            "NFR-3"
+          ]
+        },
+        "narrative": {
+          "Action": "New file src/lib/cloister/ci-failure-relay.ts. Export scheduleCiFailureRelay(opts: {issueId: string; repo: string; prNumber: number; headSha: string}): void — synchronous: if debounce Map already has key `${issueId}:${headSha}` return; otherwise mark the key (Map bounded to 1000 entries, evict oldest insertion), then setTimeout(60_000).unref() invoking relayCiFailureNow(opts).catch(console.warn). relayCiFailureNow: (1) live-agent gate — dynamic-import ../tmux.js, sessionExistsSync(`agent-${issueId.toLowerCase()}`); absent => console.log and return; (2) gh pr view <prNumber> --repo <repo> --json statusCheckRollup,baseRefName,headRefOid via promisified execFile (timeout 15000); (3) abort if headRefOid !== opts.headSha; (4) collect failing checks from statusCheckRollup using FAILING_CHECK_CONCLUSIONS exported from webhook-handlers.ts:174 (fallback if an ESM cycle appears: define the const here and re-export from webhook-handlers); empty failing set => return; (5) build markdown body listing each failing check name + conclusion (log excerpts and inherited partition arrive in later beads); (6) dynamic-import ./feedback-writer.js, writeFeedbackFile({issueId, specialist: 'ci-monitor', outcome: 'ci-failure', summary, markdownBody}); (7) dynamic-import ../agents.js, deliverAgentMessage(`agent-${issueId.toLowerCase()}`, message containing 'MUST READ: <absolute feedback path>' plus 'fix, commit, push — Panopticon detects new commits and re-runs the pipeline', 'ci-failure-relay'). Also export _resetCiFailureRelayForTests() clearing the Map and pending timers (mirror clearAllReconciliationTimeouts, webhook-handlers.ts:179). Tests at tests/unit/lib/cloister/ci-failure-relay.test.ts with vi.useFakeTimers()/vi.advanceTimersByTimeAsync(60000) (repo rule: never real timers) and vi.mock of child_process, ../tmux.js, ./feedback-writer.js, ../agents.js."
+        },
+        "items": [
+          {
+            "id": "relay-core.ac1",
+            "title": "Given two scheduleCiFailureRelay calls with the same issueId and headSha, when 60s elapse under fake timers, then writeFeedbackFile receives exactly one call; a different headSha produces a second relay",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "relay-core.ac2",
+            "title": "Given no agent-<issue> tmux session, when the settle timer fires, the relay returns after a log line — writes no feedback file and sends no agent message",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "relay-core.ac3",
+            "title": "Given gh pr view returns a headRefOid different from the scheduled headSha, the relay exits without writing feedback or messaging the agent",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "relay-core.ac4",
+            "title": "Given a live session and matching head with failing checks, the relay creates .pan/feedback/NNN-ci-monitor-ci-failure.md via writeFeedbackFile and sends a deliverAgentMessage whose text contains the absolute feedback file path",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "relay-core.ac5",
+            "title": "scheduleCiFailureRelay returns synchronously with an unref'd timer, and a rejection inside relayCiFailureNow logs a warning instead of propagating to the caller",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "log-excerpts",
+        "title": "Fetch truncated failing-job log excerpts into the feedback body",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1801",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-6",
+            "FR-8"
+          ]
+        },
+        "narrative": {
+          "Action": "In ci-failure-relay.ts, after the failing set is known: gh run list --commit <headSha> --repo <repo> --json databaseId,name,workflowName,conclusion (execFile, 15s timeout); select runs whose conclusion is in the failing set; for at most 3, gh run view <databaseId> --repo <repo> --log-failed; keep only the last 80 lines per run and enforce an 8KB total budget across runs, appending a '[truncated]' annotation line whenever a cap trims output; append the excerpts to the feedback markdown under per-run headings (workflowName / run id). When gh run list returns no runs (external CI via commit statuses) or any gh call fails, fall back to the names-only body from relay-core plus a one-line note that logs were unavailable. Extend tests in tests/unit/lib/cloister/ci-failure-relay.test.ts with mocked execFile outputs."
+        },
+        "items": [
+          {
+            "id": "log-excerpts.ac1",
+            "title": "Given 4 failed Actions runs on the head SHA, the feedback body contains log excerpts for exactly 3 runs, each fetched via gh run view --log-failed",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "log-excerpts.ac2",
+            "title": "Given a run log exceeding 80 lines or excerpts exceeding 8KB total, the body preserves only the tail within the caps and contains a truncation annotation",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "log-excerpts.ac3",
+            "title": "Given gh run list returns an empty list or the gh call throws, the relay falls back to a body listing each failing check name and conclusion plus a logs-unavailable note",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "inherited-diff",
+        "title": "Partition PR failures against the base branch's failing checks; suppress all-inherited relays",
+        "status": "pending",
+        "priority": "medium",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "medium",
+          "issueLabel": "pan-1801",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-7"
+          ]
+        },
+        "narrative": {
+          "Action": "In ci-failure-relay.ts: fetch the base branch failing set via gh api repos/<repo>/commits/<baseRefName>/check-runs?per_page=100 (execFile, 15s timeout; baseRefName comes from the gh pr view call already made in relay-core); build the set of check-run names whose conclusion is in the failing set; partition the PR's failing checks by name membership. Render inherited failures in a separate section titled 'Inherited from <baseRefName> — these are failing on <baseRefName> itself; do not chase them'. If every PR failure is inherited, log '[ci-relay] all failures inherited from <base> — suppressed' and return before writing feedback or messaging the agent. If the base fetch throws, proceed with all failures listed as the PR's own and append the note 'could not compare against <baseRefName> — some failures may be inherited'. Extend the relay unit tests for all three behaviors."
+        },
+        "items": [
+          {
+            "id": "inherited-diff.ac1",
+            "title": "Given a PR failure whose check name also fails on the base branch HEAD, the feedback body renders it under an 'Inherited from <base>' section instead of the own-failures list",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "inherited-diff.ac2",
+            "title": "Given every PR failure is inherited, the relay logs a suppression line and writes no feedback file and sends no message",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "inherited-diff.ac3",
+            "title": "Given the base-branch check-runs fetch throws, the relay still writes feedback listing all failures as the PR's own and the body contains a could-not-compare note",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "webhook-wiring",
+        "title": "Invoke scheduleCiFailureRelay from check_suite and status failure branches",
+        "status": "pending",
+        "priority": "high",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "simple",
+          "issueLabel": "pan-1801",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "traces": [
+            "FR-1",
+            "FR-9"
+          ]
+        },
+        "narrative": {
+          "Action": "In src/lib/webhook-handlers.ts: (1) handleCheckSuitePromise — in the terminal non-success branch (the addFailingSource call at :275), after setReviewStatus completes, call scheduleCiFailureRelay({issueId, repo, prNumber: pr.number, headSha: pr.head.sha ?? status.prHeadSha}); skip the call when both SHAs are undefined. (2) handleStatusPromise — in the state failure/error branch (:534-536), derive prNumber = status.prNumber ?? prNumberFromUrl(status.prUrl ?? '') and headSha = payload.sha ?? status.prHeadSha; call scheduleCiFailureRelay only when both are present. (3) handleCheckRunPromise — unchanged, no relay call. Import scheduleCiFailureRelay statically from ./cloister/ci-failure-relay.js (heavy deps inside the relay are dynamic-imported, so no cycle; if Node strict ESM still reports one, apply the stated fallback of hosting FAILING_CHECK_CONCLUSIONS in the relay module). Extend tests/unit/lib/webhook-handlers.test.ts with a vi.mock of the relay module."
+        },
+        "items": [
+          {
+            "id": "webhook-wiring.ac1",
+            "title": "Given a check_suite webhook with conclusion 'failure' for a tracked PR, handleCheckSuite sends scheduleCiFailureRelay the issue id, repo, PR number, and head SHA",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "webhook-wiring.ac2",
+            "title": "Given a check_suite webhook with conclusion 'success', handleCheckSuite removes the failing source and never invokes scheduleCiFailureRelay",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "webhook-wiring.ac3",
+            "title": "Given a status webhook with state 'failure' and a stored prNumber/prHeadSha, handleStatus invokes scheduleCiFailureRelay; when prNumber or headSha cannot be derived it skips the call",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "webhook-wiring.ac4",
+            "title": "Given a failing check_run webhook, handleCheckRun updates blockers but never invokes scheduleCiFailureRelay",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      },
+      {
+        "id": "relay-docs",
+        "title": "Write docs/CI-FEEDBACK-RELAY.md describing the relay contract",
+        "status": "pending",
+        "priority": "low",
+        "created": "2026-06-13T01:36:31Z",
+        "metadata": {
+          "difficulty": "simple",
+          "issueLabel": "pan-1801",
+          "requiresInspection": false,
+          "inspectionDepth": "fast",
+          "acJustification": "Documentation bead — two ACs pin the required content; no runtime behavior to test."
+        },
+        "narrative": {
+          "Action": "Create docs/CI-FEEDBACK-RELAY.md (~60 lines) covering: trigger events (check_suite terminal non-success, status failure/error; explicitly NOT check_run), per-(issueId, headSha) debounce and 60s settle timer, the live-agent gate and no-auto-resume rule, feedback file shape (NNN-ci-monitor-ci-failure.md) and MUST READ nudge, the inherited-from-base rule including all-inherited suppression and fail-open on fetch errors, log-excerpt caps (3 runs / 80 lines / 8KB), and how this relates to the deacon's merge-time checkFailedMergeRetry path (deacon.ts) and the open PAN-1658 testStatus reconciler gap."
+        },
+        "items": [
+          {
+            "id": "relay-docs.ac1",
+            "title": "docs/CI-FEEDBACK-RELAY.md covers trigger events, debounce and settle semantics, the live-agent gate, log-excerpt caps, and the inherited-failure rule including suppression and fail-open",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          },
+          {
+            "id": "relay-docs.ac2",
+            "title": "The doc contains a section distinguishing the relay's PR-open window from the deacon's merge-time checkFailedMergeRetry path and references PAN-1658 as the adjacent unsolved gap",
+            "status": "pending",
+            "metadata": {
+              "kind": "acceptance_criterion"
+            }
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "from": "ci-monitor-specialist",
+        "to": "relay-core",
+        "type": "blocks"
+      },
+      {
+        "from": "relay-core",
+        "to": "log-excerpts",
+        "type": "blocks"
+      },
+      {
+        "from": "relay-core",
+        "to": "inherited-diff",
+        "type": "blocks"
+      },
+      {
+        "from": "relay-core",
+        "to": "webhook-wiring",
+        "type": "blocks"
+      },
+      {
+        "from": "log-excerpts",
+        "to": "relay-docs",
+        "type": "blocks"
+      },
+      {
+        "from": "inherited-diff",
+        "to": "relay-docs",
+        "type": "blocks"
+      },
+      {
+        "from": "webhook-wiring",
+        "to": "relay-docs",
+        "type": "blocks"
+      }
+    ],
+    "metadata": {
+      "canonicalFilename": "2026-06-13-PAN-1801-ci-failures-on-a-pr-never-reach-the-work-agent-webhook-checks-feed-merge-gating-only-no-feedback-relay.vbrief.json"
+    }
+  },
+  "status": "proposed"
+}

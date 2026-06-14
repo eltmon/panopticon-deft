@@ -1,0 +1,30 @@
+{
+  "version": "1",
+  "issueId": "PAN-1832",
+  "created": "2026-06-13T07:40:11.357Z",
+  "updated": "2026-06-13T07:55:42.000Z",
+  "gitState": { "branch": "feature/pan-1832", "sha": "91a96e80f", "dirty": true },
+  "decisions": [
+    { "id": "D1", "summary": "Sampling = stateless hash of the agent id. pick = hashStringToUint32(agentId) mod Σweights, walk cumulative normalized weights. No Math.random. Deterministic per agent → idempotent on restart/resume (never switches a resuming agent's model, avoiding the JSONL-resume corruption hazard). Seed embeds issueId so different issues realize the split across the fleet.", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D2", "summary": "Weights are NORMALIZED at sample time (positive ints, sample proportional to Σ). No sum-to-100 requirement. Validation still rejects: empty list, non-integer/non-positive weights, zero total.", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D3", "summary": "Realized-split dashboard view IS in scope (operator chose 'include'). Implemented as client-side aggregation in Settings → Roles (RolesPanel) from the existing GET /api/agents (already returns per-agent role+model). No new backend endpoint.", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D4", "summary": "List form supported UNIFORMLY on every role AND sub-role (review.security etc. are the rate-limit pain point per #1830). Flywheel is a singleton: a list resolves to one deterministic pick (documented, not a real split).", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D5", "summary": "resolveModel() stays DETERMINISTIC (returns primary = first list entry) for static/display callers (router-config CCR map, settings-api effort deref, specialists status map, planning-continuation launcher, specialist digest gen). A NEW seeded resolveModelForSpawn(role, subRole, seed, config) is the only sampling entry; all pipeline spawns route through it.", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D6", "summary": "A role's single effort setting must be supported by EVERY model in its distribution, else the save is rejected (settings-api). Per-model effort is out of scope.", "recordedAt": "2026-06-13T07:55:42.000Z" },
+    { "id": "D7", "summary": "Flywheel governor per-model slot caps (per-model maxAgents) are OUT of scope — the issue defers it to a follow-up.", "recordedAt": "2026-06-13T07:55:42.000Z" }
+  ],
+  "hazards": [
+    { "id": "H1", "summary": "A seedless determineModel() returns the PRIMARY (first) model deterministically, NOT a sample — so EVERY work-spawn caller must pass a seed or it silently bypasses the split. Known callers: agents.ts spawnRun:3133, spawnAgent:3469, routes/agents.ts:2792, runtimes/claude-code.ts:350 (seed=config.agentId).", "mitigation": "Audit all determineModel/resolveModel callers against the PRD caller-classification table; bead ACs assert each spawn caller threads a seed; add a test that a list config with a seed realizes the split while seedless returns the primary." },
+    { "id": "H2", "summary": "JSONL resume across model change corrupts/loses session context (concerns.md). Re-sampling a different model on resume would trigger this.", "mitigation": "Seed by the STABLE agent id → idempotent; resume already reads state.model and never re-resolves. Add an AC: same agent id always samples the same model." },
+    { "id": "H3", "summary": "resolveModel() is called by STATIC/display paths (router-config CCR map, effort validation, specialists status map at routes/specialists.ts:1662, planning-continuation launcher at routes/misc.ts:1227, specialist digest at specialist-context.ts:128). If resolveModel started sampling, these would become non-deterministic and the continuation launcher could switch a resuming plan agent's model.", "mitigation": "Keep resolveModel deterministic via primaryModelRef(first); only resolveModelForSpawn samples. NFR-2 locks this; do not reroute static callers." },
+    { "id": "H4", "summary": "Sub-role 'parent' inherit sentinel is meaningless inside a list and must be rejected; but a sub-role scalar 'parent' whose PARENT role.model is a list must inherit and SAMPLE that list.", "mitigation": "validateRoleModelConfig rejects 'parent' as a list entry; resolveModelForSpawn, when subModel==='parent', falls through to the parent role.model config (possibly a list) and samples it with the same seed — mirror resolveModel's precedence." },
+    { "id": "H5", "summary": "config-load (config-yaml.ts) and settings-api validation are two separate gates; a list form accepted by one but not the other causes a save that fails to load (or vice versa).", "mitigation": "Validate the list form in BOTH validateRoleModelRefs (load) and validateWorkhorsesAndRoles (API); shared rules; add tests on both gates." },
+    { "id": "H6", "summary": "Frontend RolesPanel uses LOCAL types (no @panctl/contracts RoleConfig); the distribution editor must keep the saved JSON shape identical to what settings-api validation expects (array of {model, weight}).", "mitigation": "Bead8 ACs assert the PUT payload shape; bead8 edged after bead3 (validation) so the contract is settled; RolesPanel.test.tsx covers the save payload." }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-8",
+  "sessionHistory": [
+    { "timestamp": "2026-06-13T07:40:11.357Z", "reason": "planning", "note": "Initial planning session", "agentModel": "agent:claude-opus-4-8" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "version": "1",
+  "issueId": "PAN-1826",
+  "created": "2026-06-13T03:43:09.530Z",
+  "updated": "2026-06-13T04:12:44.628Z",
+  "gitState": {},
+  "decisions": [],
+  "hazards": [],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "feedback": [],
+  "sessionHistory": [
+    {
+      "reason": "feedback",
+      "note": "[2026-06-13T03:43Z] review-agent → CHANGES-REQUESTED — seq 1",
+      "timestamp": "2026-06-13T03:43:09.530Z"
+    }
+  ]
+}

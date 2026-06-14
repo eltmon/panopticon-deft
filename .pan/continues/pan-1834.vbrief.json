@@ -1,0 +1,123 @@
+{
+  "version": "1",
+  "issueId": "PAN-1834",
+  "created": "2026-06-13T14:10:57.946Z",
+  "updated": "2026-06-13T20:19:44.689Z",
+  "gitState": {
+    "branch": "feature/pan-1834",
+    "sha": "4aeb458dc",
+    "dirty": true
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "summary": "Three independent root causes, three independent fixes: (a) no pane signature for the rate-limit/model-switch modal; (b) pane detections other than session_resume produce no actionable PendingInputKind; (c) hasActiveSpecialist suppresses the active specialist's OWN pending-input. Plus two amplifiers: inspect agents are never enumerated (no state.json), and the poller emits no activity/TTS on awaiting-input.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    },
+    {
+      "id": "D2",
+      "summary": "Fix the hasActiveSpecialist suppression INSIDE computeAgentEnrichmentPromise (src/lib/agent-enrichment.ts), not at the 3 call sites (poller :142, read-model.ts:674, routes/agents.ts:765). The function already knows the agent id/role; centralizing fixes all sites consistently. Treat an agent as its OWN active specialist when derived role is in {review, test, ship}; keep suppression for parked work/plan agents.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    },
+    {
+      "id": "D3",
+      "summary": "A new pane reason MUST also become a new PendingInputKind AND be promoted into pendingInputKinds (mirror the session_resume promotion at agent-enrichment.ts:502). The needs-you list (selectPendingInputSubjects, store.ts:322) is kind-gated (kinds.length>0, PAN-1591) and ignores the fuzzy hasPendingQuestion bool, so reason alone does not raise the triangle.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    },
+    {
+      "id": "D4",
+      "summary": "Inspect agents become enumerable by writing a minimal state.json at spawn (inspect-agent.ts), mirroring review-agent.ts:281 saveAgentState(run). This is deacon-safe: deacon patrols filter on agent-/specialist-/planning- prefixes (deacon.ts:978,2108,3908,4332,5430) and never match inspect-, so no auto-resume ripple.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    },
+    {
+      "id": "D5",
+      "summary": "The awaiting-input activity-feed entry + TTS fire on the RISING EDGE of pendingInputCount (not-waiting -> waiting) inside the poller pollOnce, kind-agnostic (covers rate-limit, AUQ, plan-mode, session-resume). TTS priority 1 (warn). One emit per transition, not per poll.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    },
+    {
+      "id": "D6",
+      "summary": "PendingInputKind is defined twice and MUST stay in sync: server src/lib/agent-enrichment.ts:45 and frontend src/dashboard/frontend/src/lib/pendingInput.ts:12. Adding 'rateLimit' touches both, plus the PENDING_INPUT_KIND_LABEL map in pendingInput.ts.",
+      "recordedAt": "2026-06-13T14:20:05.000Z"
+    }
+  ],
+  "hazards": [
+    {
+      "id": "H1",
+      "summary": "No live capture of the exact gpt-5.5 rate-limit modal text. Signature is built from the issue's quoted wording ('Switch to gpt-5.4-mini' / 'Keep current model').",
+      "mitigation": "Require BOTH a 'Keep current model' option line and a 'Switch to <model>' option line near the bottom of the pane, plus a recent/current prompt-index guard (like the existing detections). Ship with a fixture test in src/lib/__tests__/agent-input-detection.test.ts; if a real capture surfaces different wording, widen the regex to it and keep the two-option-pairing + recent-index guard."
+    },
+    {
+      "id": "H2",
+      "summary": "False-positive needs-you rows would erode trust (the exact failure PAN-1591 fixed).",
+      "mitigation": "Keep the signature conservative (two-option pairing + recent index). Add a negative test: a pane that merely mentions a rate limit in prose, and an answered/scrolled-away modal, must return null."
+    },
+    {
+      "id": "H3",
+      "summary": "Giving inspect agents a state.json makes them appear in OTHER listRunningAgents consumers (session tree, stopped-agent banner), and the state.json lingers as 'stopped' after the inspect finishes.",
+      "mitigation": "Accepted: visibility is the issue's goal. Deacon is prefix-safe (ignores inspect-). Reuse the sub-reviewer state.json shape so existing agent-directory-cleanup handling applies. Reviewer/UAT should confirm no auto-resume and no duplicate/duelling inspect sessions."
+    },
+    {
+      "id": "H4",
+      "summary": "Server restart clears the poller's in-memory state.lastEnrichment, so the first poll after restart sees an already-blocked agent as a fresh rising edge and re-announces it.",
+      "mitigation": "Accepted as benign — re-announcing a still-blocked agent after a restart is desirable, not noise. Do not persist edge state to disk for this."
+    },
+    {
+      "id": "H5",
+      "summary": "Inspect agents have no workspace in state.json historically, so JSONL-derived kinds (AUQ) may not resolve; pane detection (the rate-limit case) does resolve from the tmux session alone.",
+      "mitigation": "Populate the inspect state.json with the real workspace (context.workspace) so getAgentWorkspacePromise resolves the JSONL path too. The PRIMARY case (rate-limit modal) is pane-based and works regardless."
+    }
+  ],
+  "resumePoint": null,
+  "beadsMapping": {},
+  "agentModel": "agent:claude-opus-4-8",
+  "sessionHistory": [
+    {
+      "reason": "planning",
+      "content": "Planning session for PAN-1834. See .pan/drafts/PAN-1834.md for the full PRD, root-cause analysis (verified at 4aeb458dc), requirements (FR-1..FR-6, NFR-1..NFR-3), and auto-decisions. Original orchestration-context preserved in git history of this file.",
+      "note": "Planning session started for PAN-1834: Reviewer/sub-agent blocked on interactive modal shows no needs-you triangle and emits no activity-feed notification — operator can't see the stall",
+      "timestamp": "2026-06-13T14:10:57.946Z"
+    },
+    {
+      "timestamp": "2026-06-13T14:20:05.000Z",
+      "reason": "planning",
+      "note": "Discovery complete (--auto). 6 beads authored; vBRIEF written; root causes 1-5 verified against code.",
+      "agentModel": "agent:claude-opus-4-8"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.7-code",
+      "timestamp": "2026-06-13T19:51:32.566Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-06-13T20:18Z] verification-gate → FAILED — seq 1",
+      "timestamp": "2026-06-13T20:18:38.013Z"
+    },
+    {
+      "reason": "resume",
+      "agentModel": "kimi-k2.7-code",
+      "timestamp": "2026-06-13T20:18:38.334Z"
+    },
+    {
+      "reason": "feedback",
+      "note": "[2026-06-13T20:19Z] verification-gate → FAILED — seq 2",
+      "timestamp": "2026-06-13T20:19:44.689Z"
+    }
+  ],
+  "feedback": [
+    {
+      "seq": 1,
+      "specialist": "verification-gate",
+      "outcome": "failed",
+      "timestamp": "2026-06-13T20:18:37Z",
+      "markdownBody": "VERIFICATION FAILED for PAN-1834 (attempt 1/10):\n\nFailed check: lint\n\nVerification FAILED at lint (25924ms):\n\n249m}\u001b[0m\u001b[38;5;249m \u001b[0m\u001b[38;5;249m=\u001b[0m\u001b[38;5;249m \u001b[0m\u001b[38;5;249ma\u001b[0m\u001b[38;5;249mw\u001b[0m\u001b[38;5;249ma\u001b[0m\u001b[38;5;249mi\u001b[0m\u001b[38;5;249mt\u001b[0m\u001b[38;5;249m \u001b[0m\u001b[38;5;249mi\u001b[0m\u001b[38;5;249mm\u001b[0m\u001b[38;5;249mp\u001b[0m\u001b[38;5;249mo\u001b[0m\u001b[38;5;249mr\u001b[0m\u001b[38;5;249mt\u001b[0m\u001b[38;5;249m(\u001b[0m'bun:sqlite'\u001b[38;5;249m)\u001b[0m\u001b[38;5;249m;\u001b[0m\n \u001b[38;5;240m    │\u001b[0m                                       ──────┬─────  \n \u001b[38;5;240m    │\u001b[0m                                             ╰─────── Module not found, treating it as an external dependency\n\u001b[38;5;246m─────╯\u001b[0m\n\n\u001b[33m[INEFFECTIVE_DYNAMIC_IMPORT] Warning:\u001b[0m src/lib/memory/rollup.ts is dynamically imported by src/lib/memory/pending.ts but also statically imported by src/lib/memory/cli.ts, dynamic import will not move module into another chunk.\n\n\u001b[33m[PLUGIN_TIMINGS] Warning:\u001b[0m Your build spent significant time in plugins. Here is a breakdown:\n  - tsdown:deps (71%)\n  - rolldown-plugin-dts:generate (23%)\nSee https://rolldown.rs/options/checks#plugintimings for more details.\n\nskill CLI lint failed:\n  /home/eltmon/Projects/panopticon-cli/workspaces/feature-pan-1834/sync-sources/skills/pan-release/SKILL.md:43: pan release stable --version 0.7.1: could not read help for pan release stable\n  /home/eltmon/Projects/panopticon-cli/workspaces/feature-pan-1834/sync-sources/skills/pan-release/SKILL.md:44: pan release canary --version 0.8.0-canary.1: could not read help for pan release canary\n  /home/eltmon/Projects/panopticon-cli/workspaces/feature-pan-1834/sync-sources/skills/pan-review/SKILL.md:66: pan review reset <id> --session: could not read help for pan review reset\n  /home/eltmon/Projects/panopticon-cli/workspaces/feature-pan-1834/sync-sources/skills/pan-review/SKILL.md:68: pan review restart <id> --model gpt-5.4: could not read help for pan review restart\n  /home/eltmon/Projects/panopticon-cli/workspaces/feature-pan-1834/sync-sources/skills/pan-review/SKILL.md:69: pan review restart <id> --role security: could not read help for pan review restart\n\n\n## REQUIRED: Fix the failing check, push, and request a new review\n\n1. Read the error output above carefully\n2. Fix the code causing the failure\n3. Run the failing check locally to verify it passes\n4. Commit every change\n5. Invoke the /rebase-and-submit skill for PAN-1834 — this is an atomic task. Because verification already ran once (a PR exists), the skill will push your branch and run `pan review request PAN-1834 -m \"Fixed lint\"` for you. NEVER curl `/api/review/...` or any dashboard endpoint — `pan review request` is the only supported re-entry point.\n\nDo NOT stop between steps. Do NOT stop after pushing. Do NOT stop until `pan review request` has completed successfully."
+    },
+    {
+      "seq": 2,
+      "specialist": "verification-gate",
+      "outcome": "failed",
+      "timestamp": "2026-06-13T20:19:44Z",
+      "markdownBody": "VERIFICATION FAILED for PAN-1834 (attempt 1/10):\n\nFailed check: vbrief-ac\n\nAcceptance criteria check FAILED — 23/23 AC incomplete:\n\n### Add 'rate_limit' pane signature for the harness rate-limit/model-switch modal (4/4 incomplete)\n  - [ ] Given a pane containing a 'Keep current model' option and a 'Switch to gpt-5.4-mini' option near the bottom, detectAwaitingInputFromPaneSync returns { reason: 'rate_limit' }\n  - [ ] The AwaitingInputReason union contains 'rate_limit' and src/lib/agent-input-detection.ts typechecks under npm run typecheck\n  - [ ] detectAwaitingInputFromPaneSync returns null for a pane that mentions a rate limit only in prose with no option pairing\n  - [ ] detectAwaitingInputFromPaneSync returns null when the modal option lines have scrolled outside the recent-prompt window\n\n### Introduce 'rateLimit' PendingInputKind and promote 'rate_limit' detections into pendingInputKinds (4/4 incomplete)\n  - [ ] Each PendingInputKind union (server src/lib/agent-enrichment.ts and frontend src/dashboard/frontend/src/lib/pendingInput.ts) contains 'rateLimit' and both files typecheck\n  - [ ] PENDING_INPUT_KIND_LABEL contains a human label for 'rateLimit'\n  - [ ] computeAgentEnrichmentPromise produces a pendingInputKinds array carrying 'rateLimit' when the merged detection.reason equals 'rate_limit'\n  - [ ] describePendingInput(['rateLimit']) returns the human label rather than the raw kind string\n\n### Do not suppress pending-input for an agent that is itself the active specialist (4/4 incomplete)\n  - [ ] A pure helper returns true when the agent's derived role is review, test, or ship, and returns false for work, plan, or undefined\n  - [ ] computeAgentEnrichmentPromise produces a non-empty pendingInputKinds for a review-role agent when hasActiveSpecialist is true and a detection fires\n  - [ ] computeAgentEnrichmentPromise produces an empty pendingInputKinds for a work-role agent when hasActiveSpecialist is true, preserving existing parked-agent suppression\n  - [ ] hasPendingQuestion returns true for a review-role agent with a detection even when hasActiveSpecialist is true\n\n### Make inspect agents enumerable by writing a minimal state.json at spawn (4/4 incomplete)\n  - [ ] The inspect spawn path saves a state.json for the inspect agent carrying its workspace, issueId, and role\n  - [ ] getAgentStateSync('inspect-<issue>-<bead>') returns a non-null AgentState after an inspect agent spawns\n  - [ ] listRunningAgents contains the inspect agent with tmuxActive reflecting its live tmux session\n  - [ ] The inspect agent id keeps the 'inspect-' prefix so deacon orphan-recovery refuses to auto-resume it\n\n### Emit an activity-feed entry + TTS on the rising edge of an agent becoming blocked on input (4/4 incomplete)\n  - [ ] When an agent's pendingInputCount rises from 0 to greater than 0 across polls, the poller emits one activity.entry naming the agent, its issueId, and the pending kind(s)\n  - [ ] The same rising edge emits one activity.tts with priority 1 naming the blocked agent and what it is waiting for\n  - [ ] While the agent stays blocked across subsequent polls, the poller emits no further activity.entry or activity.tts for the same block\n  - [ ] The emitted activity.entry contains the agent's issueId so the activity feed associates it with the issue\n\n### Document the rate-limit kind, specialist-unsuppression, inspect enumeration, and activity/TTS notification (3/3 incomplete)\n  - [ ] docs/ASKUSERQUESTION-DASHBOARD.md contains a section describing the 'rateLimit' kind and the rate-limit/model-switch modal pane signature\n  - [ ] docs/ASKUSERQUESTION-DASHBOARD.md contains a paragraph stating active specialists are no longer suppressed by hasActiveSpecialist and that inspect agents surface via a minimal state.json\n  - [ ] docs/ASKUSERQUESTION-DASHBOARD.md contains a description of the rising-edge activity-feed and TTS notification\n\n## REQUIRED: Complete all acceptance criteria BEFORE resubmitting\n\n1. Review the incomplete AC above\n2. Implement the missing requirements and write tests\n3. Close every completed bead with `bd close` — AC statuses sync from closed beads automatically; never hand-edit spec files\n4. Commit and push ALL changes\n5. ONLY THEN resubmit: pan review request PAN-1834 -m \"Completed acceptance criteria\"\n\nDo NOT resubmit until all AC are completed."
+    }
+  ]
+}
