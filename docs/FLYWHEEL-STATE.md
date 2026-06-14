@@ -2576,6 +2576,23 @@ Genuine producers this tick = **2**: strike-pan-1880 + agent-pan-1827-test (test
 verdict written, idle). Reported agentsActive=2 (genuine producers, per the RUN-33
 lesson), not the raw 11. Flywheel cannot pan kill the zombies → openQuestion.
 
+### Primary main worktree is DIVERGED from origin + active uncommitted dev — do NOT push/rebase
+
+Mid-tick the primary `main` worktree showed 7 local commits not on origin and 2
+origin commits not local (true divergence, not just behind). The divergence is a
+double-commit of the same logical change: local `24054b9a9` "test(harness):
+reconcile harness-resolve tests with PAN-1871" vs origin `626b6f8b1` (same intent),
+plus parallel docs/state commits. Separately, `src/cli/commands/flywheel.ts` +
+`flywheel.test.ts` + `sync-sources/skills/pan-flywheel/SKILL.md` were UNCOMMITTED in
+the working tree, adding a new `flywheelStopCommand()` (graceful-stop) — active
+development, almost certainly the operator in the live `conv-20260614-cde3` session.
+**Orchestrator response: leave it ALL untouched.** Committed only docs/FLYWHEEL-STATE.md
+(separate file), did NOT push/pull/rebase (would entangle the operator's in-progress
+work + the divergence). The running strike-pan-1880 is unaffected — it merges via
+origin in its own worktree. The divergence is the operator's to reconcile; flagged
+so report-time (`pan flywheel report` does pull --rebase + push) is done carefully or
+deferred while flywheel.ts has uncommitted changes.
+
 ### Memory is NOT the limiter this run (contrast RUN-33)
 
 RAM 15/64 GB, **swap 0/8GB** (RUN-33 was 99.9% swap). The launch ceiling this run is
