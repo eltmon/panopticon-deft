@@ -4,17 +4,17 @@
     "created": "2026-06-07T02:16:46.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1642: Stream conversation view + Streamdown renderer (flag) + fix markdown table rendering",
-    "updated": "2026-06-11T00:31:12.440Z"
+    "updated": "2026-06-14T03:24:43.580Z"
   },
   "plan": {
     "id": "pan-1642",
     "title": "Stream conversation view + Streamdown renderer (flag) + fix markdown table rendering",
-    "status": "proposed",
+    "status": "completed",
     "uid": "00a069dd-f2c5-4081-98cd-2aaf86fa6e74",
     "author": "agent:claude-opus-4-8",
-    "sequence": 8,
+    "sequence": 9,
     "created": "2026-06-07T02:16:46.000Z",
-    "updated": "2026-06-11T00:31:12.440Z",
+    "updated": "2026-06-14T03:24:43.580Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1642",
@@ -507,5 +507,5 @@
       }
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
