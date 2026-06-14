@@ -4,17 +4,17 @@
     "created": "2026-05-25T08:30:00.000Z",
     "author": "panopticon-cli/0.0.0",
     "description": "Plan for PAN-1501: Substrate fix (PAN-1454 pattern 8): block pan done if AC requires tests and zero new test lines were added",
-    "updated": "2026-05-25T08:27:19.580Z"
+    "updated": "2026-06-14T03:24:59.149Z"
   },
   "plan": {
     "id": "pan-1501",
     "title": "Substrate fix (PAN-1454 pattern 8): block pan done if AC requires tests and zero new test lines were added",
-    "status": "proposed",
+    "status": "completed",
     "uid": "a5e3c70f-4a90-4b6b-9145-4c0de1501f8a",
     "author": "agent:claude-opus-4-7",
-    "sequence": 2,
+    "sequence": 3,
     "created": "2026-05-25T08:30:00.000Z",
-    "updated": "2026-05-25T08:27:19.580Z",
+    "updated": "2026-06-14T03:24:59.149Z",
     "references": [
       {
         "uri": "https://github.com/eltmon/panopticon-cli/issues/1501",
@@ -646,5 +646,5 @@
       "canonicalFilename": "2026-05-25-PAN-1501-substrate-fix-pan-1454-pattern-8-block-pan-done-if-ac-requires-tests-and-zero-new-test-lines-were-added.vbrief.json"
     }
   },
-  "status": "proposed"
+  "status": "completed"
 }
