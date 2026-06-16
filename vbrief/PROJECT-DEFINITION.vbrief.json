@@ -1,0 +1,25 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "author": "agent:deft-directive-setup",
+    "description": "Project identity gestalt",
+    "created": "2026-06-16T17:00:11Z"
+  },
+  "plan": {
+    "title": "Panopticon",
+    "status": "running",
+    "narratives": {
+      "Overview": "Panopticon is an AI agent orchestration framework — a multi-target Bun/TypeScript monorepo for orchestrating specialist agents (work, review, test, merge) across local and remote workspaces. This deft-augmented fork (eltmon/panopticon-deft) experiments with the deft framework on the Panopticon codebase without polluting the official eltmon/panopticon-cli repo.",
+      "TechStack": "Multi-target monorepo: CLI (root @panctl/cli) + Desktop App (apps/desktop, Electron) + Web App (src/dashboard server + frontend). Primary language: TypeScript (some JavaScript may be present in build/config scripts). Runtime: Bun. Framework: Effect-TS (4.0.0-beta). Persistence: SQLite via @effect/sql-sqlite-bun. Build orchestration: Bun workspaces + tsdown.",
+      "Strategy": "Use interview for this project",
+      "Quality": "Run task deft:check before every commit. Achieve >= 85% coverage overall + per-module. Store secrets in secrets/ dir. Caveat (#1027): Electron entry points in apps/desktop cannot be exercised headlessly — keep them thin (wiring only) and push testable logic into separate modules; configure the coverage tool's omit list to exclude the display-bound entry point so the 85% gate measures logic-bearing modules only. The CLI core and dashboard server test headlessly without issue.",
+      "ProjectRules": "No project-specific rules defined.",
+      "Branching": "Branch-based workflow (default). Direct commits to the default branch are blocked by the deft branch-protection policy.",
+      "DeftVersion": "0.50.0"
+    },
+    "policy": {
+      "allowDirectCommitsToMaster": false
+    },
+    "items": []
+  }
+}

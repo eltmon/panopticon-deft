@@ -1,0 +1,34 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "author": "agent:deft-directive-setup",
+    "description": "Cross-project request: make deft's vBRIEF directory location configurable so deft can adopt a consumer project's existing layout instead of hardcoding ./vbrief/. Tracked here in panopticon-deft as the canonical record of the request; the actual code change must land in a fork of github.com/deftai/directive.",
+    "created": "2026-06-16T17:00:11Z"
+  },
+  "plan": {
+    "title": "Make deft's vBRIEF directory location configurable",
+    "status": "proposed",
+    "narratives": {
+      "Overview": "Deft currently hardcodes the consumer-side vBRIEF root at ./vbrief/ (with fixed lifecycle subfolders proposed/, pending/, active/, completed/, cancelled/). Panopticon already had its own vBRIEF-equivalent layout/conventions before deft was installed, and the two diverge. The request is a deft feature: introduce a configuration knob (project-level, likely via PROJECT-DEFINITION.vbrief.json) that lets a consumer point deft at an existing directory and naming convention so deft scripts (scope_lifecycle.py, triage:queue, vbrief:preflight, etc.) read/write to the consumer's location instead of forcing ./vbrief/.",
+      "Background": "Discovered during deft v0.50.0 first-session setup on eltmon/panopticon-deft (private fork of eltmon/panopticon-cli). Panopticon is a brownfield project with an authored vbrief/specification.vbrief.json (v0.5 schema, dated 2026-05-03) describing the product architecture. The deft install scaffolded its own vbrief/ schemas + lifecycle dirs alongside, but Panopticon's existing organisational conventions (bd/beads tracker, features/, roles/, etc.) imply a different layout for ongoing scope work. Forcing deft's hardcoded ./vbrief/ on top of Panopticon's conventions is the blocker before deft can drive feature work on Panopticon cleanly.",
+      "Implementation": "MUST happen in a fork of github.com/deftai/directive — NOT inside panopticon-deft's .deft/core/ vendored copy, which is linguist-vendored and gets clobbered on every deft-install --upgrade. Sketch: add a typed plan.policy field (e.g. vbriefRoot or scopeRoot) to vbrief-core.schema.json; thread the resolved root through scope_lifecycle.py, the policy CLI, the preflight/branch-gate scripts, and the deft-directive-setup/refinement/swarm/triage skills; preserve ./vbrief/ as the default for backward compatibility; add a deft-install --vbrief-root flag for greenfield projects that want to choose at install time.",
+      "Risks": "Touches many of deft's hot paths (scope_lifecycle, preflight, triage queue, branch gate hooks). Schema migration: existing v0.6 PROJECT-DEFINITION files without the new field must continue to work. Consumer projects mid-migration could end up with two parallel vBRIEF directories — needs a clear migration story and detection guard. AGENTS.md managed-section regeneration must teach the new field. Pre-cutover detection (scripts/_precutover.py) needs to learn the configurable path.",
+      "OutOfScope": "Renaming the vBRIEF concept; changing the schema version; modifying Panopticon's existing layout (this feature exists so deft can adapt to Panopticon, not the reverse).",
+      "AcceptanceCriteria": "FR-1: A deft-installed project can declare its vBRIEF root via PROJECT-DEFINITION typed config and have all deft scripts/skills honour it end-to-end (lifecycle, preflight, triage, branch gate). FR-2: A project that does NOT declare the field continues to work with the existing ./vbrief/ default (zero-config back-compat). FR-3: Refinement and swarm skills correctly resolve scope vBRIEF paths under the configured root. FR-4: deft-install --upgrade preserves the consumer's configured root (does not silently revert to ./vbrief/). NFR-1: deft-core-guard CI still refuses PRs that mix framework payload with app code under the new configuration.",
+      "Notes": "Tracked in this consumer fork (eltmon/panopticon-deft) as the canonical record of the cross-project request. The actual implementation work requires a separate fork of github.com/deftai/directive — that fork is the next setup step once this scope is promoted. When the upstream change lands and ships in a deft release, this scope can be marked completed and Panopticon-side adoption (re-pointing the deft install at the chosen path) becomes a separate panopticon-deft follow-up scope."
+    },
+    "references": [
+      {
+        "uri": "https://github.com/deftai/directive",
+        "type": "x-vbrief/upstream-repo",
+        "title": "deftai/directive — upstream framework repo where the code change must land"
+      },
+      {
+        "uri": "https://github.com/eltmon/panopticon-deft",
+        "type": "x-vbrief/consumer-fork",
+        "title": "eltmon/panopticon-deft — consumer fork where this request was discovered"
+      }
+    ],
+    "items": []
+  }
+}
