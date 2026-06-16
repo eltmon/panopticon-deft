@@ -6,7 +6,7 @@
  * in-pipeline glow ring, PRD/READY chips, condition indicators (⚠ REFINE / ⊘ STALE).
  */
 
-import { useCallback, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo } from 'react';
 import ReactFlow, {
   type Node,
   type Edge,
@@ -227,7 +227,7 @@ export function BacklogDAG({ nodes: propNodes, edges: propEdges, onNodeClick }: 
     setEdges(rfEdges);
   }, [layouted, rfEdges, setNodes, setEdges]);
 
-  const handleNodeClick = useCallback((_: MouseEvent, node: Node) => {
+  const handleNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (onNodeClick) onNodeClick(node.data as BacklogNode);
   }, [onNodeClick]);
 
