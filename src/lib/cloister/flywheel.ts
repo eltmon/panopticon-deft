@@ -105,14 +105,28 @@ function flywheelRunConfigurationSection(options: FlywheelLifecycleOptions): str
   return configLines ? `\n\nRun configuration:\n${configLines}` : '';
 }
 
+function backlogSequenceSection(options: FlywheelLifecycleOptions): string {
+  if (!options.autoPickupBacklog) return '';
+  const workspace = options.workspace ?? process.cwd();
+  const seq = getBacklogSequence(workspace);
+  if (!seq) return '';
+  const topNodes = seq.nodes.slice(0, 20);
+  if (topNodes.length === 0) return '';
+  const rows = topNodes.map(n =>
+    `| ${n.rank} | ${n.issue} | ${n.size} | ${n.importance} | ${n.why} |`
+  ).join('\n');
+  return `\n\nBacklog sequence (top ${topNodes.length} of ${seq.openCount} open · generated ${seq.generatedAt}):\n| Rank | Issue | Size | Importance | Why |\n|------|-------|------|------------|-----|\n${rows}`;
+}
+
 function defaultFlywheelPrompt(runId: string, options: FlywheelLifecycleOptions, briefContent?: string): string {
   const configSection = flywheelRunConfigurationSection(options);
   const briefSection = options.briefPath
     ? `\n\nBrief path: ${options.briefPath}\n\n${briefContent ?? ''}`
     : '';
+  const sequenceSection = backlogSequenceSection(options);
   return `FLYWHEEL ORCHESTRATOR TASK for ${runId}:
 
-Run the Fix-All Flywheel loop. Keep status snapshots current, coordinate Panopticon roles through the normal pipeline surfaces, respect the configured run scope and agent cap, and wait for explicit lifecycle instructions when the run is paused or complete.${configSection}${briefSection}`;
+Run the Fix-All Flywheel loop. Keep status snapshots current, coordinate Panopticon roles through the normal pipeline surfaces, respect the configured run scope and agent cap, and wait for explicit lifecycle instructions when the run is paused or complete.${configSection}${briefSection}${sequenceSection}`;
 }
 
 function getLocalFlywheelRunDir(runId: string): string {

@@ -15,6 +15,8 @@ import { httpHandler } from './http-handler.js';
 import { rejectUnauthorizedDashboardRequest, rejectUnsafeDashboardMutationRequest } from './dashboard-auth.js';
 import { listProjectsSync, resolveProjectFromIssueSync } from '../../../lib/projects.js';
 import { readSequence, updateNodeGate, type SequenceDoc, type SequenceGate, type SequenceNode } from '../../../lib/backlog/sequence-io.js';
+import { listAllAgents } from '../../../lib/database/agents-db.js';
+import { spawnSequencer } from '../../../lib/cloister/sequencer.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -51,18 +53,50 @@ async function hasSpecForIssue(projectRoot: string, issueId: string): Promise<bo
   }
 }
 
+const ACTIVE_STATUSES = new Set(['running', 'starting', 'paused']);
+
+function roleToPipelinePhase(role: string): string {
+  switch (role) {
+    case 'plan': return 'planning_active';
+    case 'work': return 'in_progress_work_running';
+    case 'review': return 'in_review_reviewers_running';
+    case 'ship': return 'merging';
+    case 'test': return 'testing_running';
+    case 'flywheel': return 'in_progress_work_running';
+    default: return 'generic';
+  }
+}
+
 interface SequenceNodeEnriched extends SequenceNode {
   hasDraft: boolean;
   hasSpec: boolean;
+  inPipeline: boolean;
+  pipelinePhase: string | null;
 }
 
 async function enrichNodes(projectRoot: string, nodes: SequenceNode[]): Promise<SequenceNodeEnriched[]> {
+  const allAgents = listAllAgents();
+  const activeByIssue = new Map<string, { role: string }>();
+  for (const agent of allAgents) {
+    if (ACTIVE_STATUSES.has(agent.status) && agent.issueId) {
+      const key = agent.issueId.toUpperCase();
+      if (!activeByIssue.has(key)) {
+        activeByIssue.set(key, { role: agent.role });
+      }
+    }
+  }
+
   return Promise.all(
-    nodes.map(async n => ({
-      ...n,
-      hasDraft: hasDraftForIssue(projectRoot, n.issue),
-      hasSpec: await hasSpecForIssue(projectRoot, n.issue),
-    }))
+    nodes.map(async n => {
+      const activeAgent = activeByIssue.get(n.issue.toUpperCase());
+      return {
+        ...n,
+        hasDraft: hasDraftForIssue(projectRoot, n.issue),
+        hasSpec: await hasSpecForIssue(projectRoot, n.issue),
+        inPipeline: activeAgent != null,
+        pipelinePhase: activeAgent ? roleToPipelinePhase(activeAgent.role) : null,
+      };
+    })
   );
 }
 
@@ -118,13 +152,20 @@ const postBacklogRegenerateRoute = HttpRouter.add(
         const passType = body?.['pass'] === 'review' ? 'review' : 'incremental';
         const projectRoot = getProjectPath(projectKey);
 
-        // Sequencer agent spawn is deferred to a future implementation milestone.
-        // For now, return instructions so the operator can trigger it manually.
+        const agent = yield* Effect.promise(() =>
+          spawnSequencer({
+            projectRoot,
+            projectKey: projectKey,
+            passType: passType as 'creation' | 'incremental' | 'review',
+          })
+        );
+
         return jsonResponse({
           ok: true,
-          message: `Sequencer ${passType} pass queued for ${projectRoot}. Spawn via: pan sequencer --pass ${passType}`,
+          message: `Sequencer ${passType} pass started`,
           projectRoot,
           pass: passType,
+          agentId: agent.id,
         });
       }))
     )
