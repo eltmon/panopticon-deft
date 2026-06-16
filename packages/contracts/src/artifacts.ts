@@ -9,7 +9,7 @@ export type ArtifactSlug = typeof ArtifactSlug.Type
 export const ArtifactHash = Schema.String
 export type ArtifactHash = typeof ArtifactHash.Type
 
-export const ArtifactAgentRole = Schema.Literals(["plan", "work", "review", "test", "ship", "flywheel", "user"])
+export const ArtifactAgentRole = Schema.Literals(["plan", "work", "review", "test", "ship", "flywheel", "user", "sequencer"])
 export type ArtifactAgentRole = typeof ArtifactAgentRole.Type
 
 export const ArtifactAgentHarness = Schema.Literals(["claude-code", "pi", "codex", "user"])
