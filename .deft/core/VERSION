@@ -1,0 +1,6 @@
+ref: 'v0.50.0'
+sha: 'dcb9a84'
+tag: 'v0.50.0'
+install_root: '.deft/core'
+fetched_at: '2026-06-16T16:12:45Z'
+fetched_by: 'deft-install'

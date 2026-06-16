@@ -185,3 +185,17 @@ __pycache__/
 
 # Pre-launch sensitive marketing strategy (rebrand candidates, fundraising) — keep local
 /docs/marketing/private/
+
+# Deft framework: ignore local-only caches and scratch directories
+.deft-cache/
+.deft/ritual-state.json
+.deft/last-session.json
+vbrief/.eval/candidates.jsonl
+vbrief/.eval/summary-history.jsonl
+vbrief/.eval/scope-lifecycle.jsonl
+vbrief/.eval/decompositions/
+vbrief/.eval/doctor-state.json
+vbrief/*.lock
+.deft/core.bak-*/
+.deft/*.bak-*
+*.premigrate.*
