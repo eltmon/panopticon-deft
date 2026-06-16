@@ -14,8 +14,42 @@ import {
   setFlywheelGloballyPaused,
 } from '../database/app-settings.js';
 import { resolveLiveFlywheelRunId } from '../../dashboard/server/services/flywheel-run-state.js';
+import { readSequenceSync, type SequenceNode } from '../backlog/sequence-io.js';
 
 export const FLYWHEEL_ORCHESTRATOR_AGENT_ID = 'flywheel-orchestrator';
+
+// ─── Backlog sequence integration (PAN-1866, D8) ──────────────────────────────
+
+export interface BacklogSequenceView {
+  project: string;
+  generatedAt: string;
+  pass: string;
+  openCount: number;
+  nodes: SequenceNode[];
+}
+
+/**
+ * Read the rank-ordered backlog sequence for a project (cache view from
+ * sequence.md). Returns null when no sequence file exists — the Flywheel falls
+ * back to its rule-based P0–P3/oldest-first ordering in that case (D8).
+ *
+ * Only nodes with gate≠blocked are returned (blocked nodes are never eligible
+ * for auto-pickup). The result is already sorted by rank ascending.
+ */
+export function getBacklogSequence(projectRoot: string): BacklogSequenceView | null {
+  const doc = readSequenceSync(projectRoot);
+  if (!doc) return null;
+  const eligible = doc.nodes
+    .filter(n => n.gate !== 'blocked')
+    .sort((a, b) => a.rank - b.rank);
+  return {
+    project: doc.project,
+    generatedAt: doc.generatedAt,
+    pass: doc.pass,
+    openCount: doc.openCount,
+    nodes: eligible,
+  };
+}
 
 const FlywheelRunIdSchema = Schema.String.check(Schema.isPattern(/^RUN-\d+$/));
 const decodeFlywheelRunId = Schema.decodeUnknownSync(FlywheelRunIdSchema);

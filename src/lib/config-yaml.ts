@@ -432,6 +432,8 @@ export const DEFAULT_MODEL_REFS: Record<Role, ModelRef> = {
   // Strike merges directly to main — precision matters, so default to the
   // expensive workhorse slot (same as plan/review).
   strike: 'workhorse:expensive',
+  // Sequencer performs holistic backlog ranking — high-judgement task, expensive slot.
+  sequencer: 'workhorse:expensive',
 };
 
 export const DEFAULT_WORKHORSES: Required<WorkhorsesConfig> = {
@@ -471,6 +473,7 @@ export const DEFAULT_ROLES: Record<Role, RoleConfig> = {
     maxAgents: 30,
     scope: 'pan-only',
   },
+  sequencer: { model: 'workhorse:expensive' },
 };
 
 function cloneRoles(roles: RolesConfig): RolesConfig {

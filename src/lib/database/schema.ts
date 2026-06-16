@@ -21,7 +21,7 @@ import { encodeClaudeProjectDir, getPanopticonHome } from '../paths.js';
 import { backfillAgentsFromStateJsonSync } from './agent-backfill.js';
 
 // Schema version — increment when making breaking schema changes
-export const SCHEMA_VERSION = 55;
+export const SCHEMA_VERSION = 56;
 
 function parseArrayColumn(value: string | null): string[] {
   if (!value) return [];
@@ -726,6 +726,29 @@ export function initSchema(db: SqliteDatabase): void {
 
     CREATE INDEX IF NOT EXISTS idx_session_embeddings_model_session
       ON session_embeddings(model, session_id);
+
+    -- ===== Backlog Sequence Cache (PAN-1866) =====
+    CREATE TABLE IF NOT EXISTS backlog_sequence (
+      issue_id         TEXT    NOT NULL,
+      project_key      TEXT    NOT NULL,
+      rank             INTEGER NOT NULL,
+      size             TEXT    NOT NULL DEFAULT 'M',
+      importance       TEXT    NOT NULL DEFAULT 'medium',
+      score            INTEGER NOT NULL DEFAULT 50,
+      condition_val    TEXT    NOT NULL DEFAULT 'ok',
+      gate             TEXT    NOT NULL DEFAULT 'auto',
+      planning_policy  TEXT    NOT NULL DEFAULT 'auto',
+      depends_on       TEXT    NOT NULL DEFAULT '[]',
+      why              TEXT    NOT NULL DEFAULT '',
+      rationale        TEXT,
+      pass             TEXT    NOT NULL DEFAULT 'incremental',
+      generated_at     TEXT    NOT NULL,
+      model            TEXT    NOT NULL DEFAULT '',
+      PRIMARY KEY (issue_id, project_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_backlog_sequence_project_rank
+      ON backlog_sequence(project_key, rank);
   `);
 
   initDiscoveredSessionsSchema(db);
@@ -1628,6 +1651,33 @@ export function runMigrations(db: SqliteDatabase, dbPath?: string): void {
     } catch (err) {
       console.warn('[schema] agents-table backfill failed:', err instanceof Error ? err.message : String(err));
     }
+  }
+
+  // v55 → v56: add backlog_sequence cache table (PAN-1866)
+  if (currentVersion < 56) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS backlog_sequence (
+        issue_id         TEXT    NOT NULL,
+        project_key      TEXT    NOT NULL,
+        rank             INTEGER NOT NULL,
+        size             TEXT    NOT NULL DEFAULT 'M',
+        importance       TEXT    NOT NULL DEFAULT 'medium',
+        score            INTEGER NOT NULL DEFAULT 50,
+        condition_val    TEXT    NOT NULL DEFAULT 'ok',
+        gate             TEXT    NOT NULL DEFAULT 'auto',
+        planning_policy  TEXT    NOT NULL DEFAULT 'auto',
+        depends_on       TEXT    NOT NULL DEFAULT '[]',
+        why              TEXT    NOT NULL DEFAULT '',
+        rationale        TEXT,
+        pass             TEXT    NOT NULL DEFAULT 'incremental',
+        generated_at     TEXT    NOT NULL,
+        model            TEXT    NOT NULL DEFAULT '',
+        PRIMARY KEY (issue_id, project_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_backlog_sequence_project_rank
+        ON backlog_sequence(project_key, rank);
+    `);
   }
 
   // After all migrations, set the version

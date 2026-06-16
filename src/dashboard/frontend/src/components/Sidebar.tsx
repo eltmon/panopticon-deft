@@ -4,7 +4,7 @@ import {
   Eye, Home, LayoutGrid, Bot, Server,
   Terminal, BarChart3, DollarSign, HeartPulse, Cpu, Settings,
   Zap, Compass, GitBranch, GitMerge, ChevronsLeft, ChevronsRight, Sun, Moon, Menu,
-  Hammer, Loader2, History, Mic, FileText, ChevronDown, ChevronRight, MoreHorizontal, Shield,
+  Hammer, Loader2, History, Mic, FileText, ChevronDown, ChevronRight, MoreHorizontal, Shield, ListOrdered,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { fetchProjects, isUnscopedConversation, NO_PROJECT_KEY, NO_PROJECT_LABEL, type RegisteredProjectLite } from './CommandDeck/projectsData';
@@ -79,6 +79,7 @@ interface NavGroup {
 const PRIMARY_ITEMS: NavItem[] = [
   { id: 'home' as Tab, label: 'Home', icon: Home },
   { id: 'flywheel' as Tab, label: 'Flywheel', icon: Loader2, badge: 'flywheel-live' },
+  { id: 'backlog' as Tab, label: 'Backlog', icon: ListOrdered },
 ];
 
 const MORE_GROUPS: NavGroup[] = [

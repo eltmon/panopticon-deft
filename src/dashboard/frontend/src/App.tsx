@@ -31,6 +31,7 @@ import { SessionFeedSidebar } from './components/sessionFeed/SessionFeedSidebar'
 import { AutoPresoView } from './components/autopreso/AutoPresoView';
 import { FlywheelPage } from './pages/FlywheelPage';
 import { FlywheelConversationPane } from './components/flywheel/FlywheelConversationPane';
+import { BacklogSequencerPage } from './pages/BacklogSequencerPage';
 import { HomePage } from './pages/HomePage';
 import { Tab } from './components/Header';
 import { Sidebar } from './components/Sidebar';
@@ -92,6 +93,7 @@ const TAB_PATHS: Record<Tab, string> = {
   'command-deck': '/command-deck',
   agents: '/agents',
   flywheel: '/flywheel',
+  backlog: '/backlog',
   resources: '/resources',
   autopreso: '/autopreso',
   activity: '/activity',
@@ -1574,6 +1576,11 @@ export default function App() {
               }}
               onNavigateIssue={(issueId) => openIssue(issueId)}
             />
+          </div>
+        )}
+        {activeTab === 'backlog' && (
+          <div className="w-full h-full overflow-hidden">
+            <BacklogSequencerPage />
           </div>
         )}
         {activeTab === 'settings' && (
