@@ -38,6 +38,7 @@ vi.mock('../config-yaml.js', () => ({
     ship: { model: 'workhorse:mid' },
     strike: { model: 'workhorse:expensive' },
     flywheel: { model: 'claude-opus-4-7', effort: 'high', maxAgents: 8, scope: 'pan-only' },
+    sequencer: { model: 'workhorse:expensive' },
   },
   ROLE_EFFORTS: ['low', 'medium', 'high', 'xhigh', 'max'],
   loadConfig: () => mockLoadConfig(),

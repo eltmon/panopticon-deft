@@ -36,6 +36,17 @@ Rank suggestions by priority:
 
 Within each tier, prefer the oldest ready item. Never let easy low-priority work hide an urgent substrate fix suggestion.
 
+### Backlog sequence — executor mode (PAN-1866, D8)
+
+**When `.pan/backlog/sequence.md` exists, the Sequencer is the ranker; you are the executor.**
+
+- **Use the sequence as your ranked pickup source** instead of the P0–P3/oldest-first ordering above. The sequence is already ranked by impact; consuming it in order is your job.
+- **Eligibility filter (all must hold):** `gate ≠ blocked` · not parked (`needs-design`/`needs-discussion`) · not in-pipeline (already has a live workspace/agent/PR or non-pending review status) · passes the author/assignee security filter (above, unchanged, never weakened) · `ready` (has a spec) or has a PRD (`.pan/drafts/<id>.md`).
+- **Pick the highest-ranked eligible issue.** A `ready` issue is startable (`pan plan <id> --auto` or `pan start <id> --auto`). A PRD-only issue is plannable (`pan plan <id> --auto`).
+- **The P0–P3/oldest-first tiers above remain the fallback** when no `sequence.md` exists or when the sequence contains no eligible issues.
+- **Do not re-rank.** Your only permitted sequence write is **emergency promotion**: when you discover a new pipeline-critical issue (substrate bug blocking pipeline, P0 outage), file the issue, set `gate: ready` via `POST /api/backlog/sequence/gate`, and trigger an incremental pass via `POST /api/backlog/sequence/regenerate` with `{ "pass": "incremental" }`. Never rewrite other issues' ranks.
+- **Planning policy mapping:** `skip` → `pan start <id> --auto` · `auto` → `pan plan <id> --auto` · `interactive` → surface as needs-you, never auto-run.
+
 ### Author + assignee allowlist (hard filter — security-critical)
 
 Include an issue in inventory and suggestions **only if at least one of**:

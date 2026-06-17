@@ -14,8 +14,42 @@ import {
   setFlywheelGloballyPaused,
 } from '../database/app-settings.js';
 import { resolveLiveFlywheelRunId } from '../../dashboard/server/services/flywheel-run-state.js';
+import { readSequenceSync, type SequenceNode } from '../backlog/sequence-io.js';
 
 export const FLYWHEEL_ORCHESTRATOR_AGENT_ID = 'flywheel-orchestrator';
+
+// ─── Backlog sequence integration (PAN-1866, D8) ──────────────────────────────
+
+export interface BacklogSequenceView {
+  project: string;
+  generatedAt: string;
+  pass: string;
+  openCount: number;
+  nodes: SequenceNode[];
+}
+
+/**
+ * Read the rank-ordered backlog sequence for a project (cache view from
+ * sequence.md). Returns null when no sequence file exists — the Flywheel falls
+ * back to its rule-based P0–P3/oldest-first ordering in that case (D8).
+ *
+ * Only nodes with gate≠blocked are returned (blocked nodes are never eligible
+ * for auto-pickup). The result is already sorted by rank ascending.
+ */
+export function getBacklogSequence(projectRoot: string): BacklogSequenceView | null {
+  const doc = readSequenceSync(projectRoot);
+  if (!doc) return null;
+  const eligible = doc.nodes
+    .filter(n => n.gate !== 'blocked')
+    .sort((a, b) => a.rank - b.rank);
+  return {
+    project: doc.project,
+    generatedAt: doc.generatedAt,
+    pass: doc.pass,
+    openCount: doc.openCount,
+    nodes: eligible,
+  };
+}
 
 const FlywheelRunIdSchema = Schema.String.check(Schema.isPattern(/^RUN-\d+$/));
 const decodeFlywheelRunId = Schema.decodeUnknownSync(FlywheelRunIdSchema);
@@ -71,14 +105,28 @@ function flywheelRunConfigurationSection(options: FlywheelLifecycleOptions): str
   return configLines ? `\n\nRun configuration:\n${configLines}` : '';
 }
 
+function backlogSequenceSection(options: FlywheelLifecycleOptions): string {
+  if (!options.autoPickupBacklog) return '';
+  const workspace = options.workspace ?? process.cwd();
+  const seq = getBacklogSequence(workspace);
+  if (!seq) return '';
+  const topNodes = seq.nodes.slice(0, 20);
+  if (topNodes.length === 0) return '';
+  const rows = topNodes.map(n =>
+    `| ${n.rank} | ${n.issue} | ${n.size} | ${n.importance} | ${n.why} |`
+  ).join('\n');
+  return `\n\nBacklog sequence (top ${topNodes.length} of ${seq.openCount} open · generated ${seq.generatedAt}):\n| Rank | Issue | Size | Importance | Why |\n|------|-------|------|------------|-----|\n${rows}`;
+}
+
 function defaultFlywheelPrompt(runId: string, options: FlywheelLifecycleOptions, briefContent?: string): string {
   const configSection = flywheelRunConfigurationSection(options);
   const briefSection = options.briefPath
     ? `\n\nBrief path: ${options.briefPath}\n\n${briefContent ?? ''}`
     : '';
+  const sequenceSection = backlogSequenceSection(options);
   return `FLYWHEEL ORCHESTRATOR TASK for ${runId}:
 
-Run the Fix-All Flywheel loop. Keep status snapshots current, coordinate Panopticon roles through the normal pipeline surfaces, respect the configured run scope and agent cap, and wait for explicit lifecycle instructions when the run is paused or complete.${configSection}${briefSection}`;
+Run the Fix-All Flywheel loop. Keep status snapshots current, coordinate Panopticon roles through the normal pipeline surfaces, respect the configured run scope and agent cap, and wait for explicit lifecycle instructions when the run is paused or complete.${configSection}${briefSection}${sequenceSection}`;
 }
 
 function getLocalFlywheelRunDir(runId: string): string {
